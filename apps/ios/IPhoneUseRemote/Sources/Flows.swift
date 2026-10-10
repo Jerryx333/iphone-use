@@ -128,6 +128,7 @@ struct FlowRunResult: Equatable, Sendable {
         self.outputs = outputs.keys.sorted().map { key in
             let value = outputs[key]
             if let text = value as? String { return (key, text) }
+            if let number = value as? NSNumber { return (key, number.description) }
             if let value, let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]) {
                 return (key, String(decoding: data, as: UTF8.self))
             }

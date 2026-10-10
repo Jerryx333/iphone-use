@@ -207,10 +207,14 @@ struct ModelsPayload: Encodable, Equatable, Sendable {
 enum ModelSettingsStore {
     static let key = "agent.models.v1"
 
+    /// The saved settings; the first time, the defaults, saved at once so
+    /// the free tier keeps one id (and a key added to it later stays put).
     static func load(from defaults: UserDefaults) -> ModelSettings {
         guard let data = defaults.data(forKey: key),
               let settings = try? JSONDecoder().decode(ModelSettings.self, from: data) else {
-            return ModelSettings()
+            let fresh = ModelSettings()
+            save(fresh, to: defaults)
+            return fresh
         }
         return settings
     }
