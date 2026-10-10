@@ -114,3 +114,46 @@ xcodebuild -scheme IPhoneUseRemoteUITests -destination 'platform=iOS Simulator,n
 
 The phone being controlled must stay unlocked: iOS does not let automation type the
 lock-screen passcode.
+
+
+The app now uses a native tab bar for 设备 / 浏览器 / 任务 / 设置, system colors, and the
+system's light or dark appearance. Remote controls and pairing keep their existing paths.
+
+The Browser tab runs a local WKWebView; browsing and browser tasks do not require a paired
+Mac. It keeps its own website data, separate from Safari. The task composer uses the models
+enabled in Settings, sending the current page and recent executed steps to that service.
+OpenAI-compatible and Anthropic-format services receive a native `browser_action` tool.
+Each round reads the current page, executes one validated action, then reads the result.
+Supported actions: open/search, numbered-control click, text entry, dropdown selection,
+scroll, back, wait, finish, and human handoff. A retired free model falls back to currently
+listed free models on the same service. Discovery only selects models tagged `:free`; other
+enabled providers are tried in the configured order.
+
+Take Over pauses execution and lets you use the page; Continue reads the page again. Stop
+cancels the pending model request and rejects late answers. Backgrounding the app pauses
+execution. Native form submit buttons and recognized consequential action labels require
+confirmation; the model can request it for other actions too. Replacing a control while
+waiting invalidates that approval. Password and file inputs, plus fields marked for payment
+details or OTPs, require the person. JavaScript dialogs use native alerts and pause the agent. Cross-origin iframe content,
+trusted-gesture-only actions, CAPTCHA, and native sign-in flows may require manual handoff.
+This browser does not expose arbitrary JavaScript execution to the model or take over other
+iOS browsers.
+
+Browser acceptance uses a synthetic local website:
+
+```bash
+# Run from apps/ios; leave the fixture server running during UI tests.
+python3 -m http.server 47009 --bind 127.0.0.1 --directory Tools
+# In another terminal:
+xcodebuild -scheme IPhoneUseRemoteUITests -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:IPhoneUseRemoteUITests/MainTabsUITests test
+# Explicit opt-in to a real free-model task with synthetic data:
+TEST_RUNNER_BROWSER_LIVE_MODEL=1 xcodebuild -scheme IPhoneUseRemoteUITests \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:IPhoneUseRemoteUITests/MainTabsUITests/testLiveBrowserTaskFromTheComposer test
+```
+
+The same opt-in enables `BrowserTests/testLivePublicPageLoads` and
+`BrowserAgentTests/testLiveFreeModelCompletesTheBrowserTask` in the unit scheme. Ordinary unit
+runs skip those external calls. Debug-only `-tab browser` opens the browser directly;
+`-clearBrowserDraft YES` resets only its draft for UI tests. Neither switch changes model keys.

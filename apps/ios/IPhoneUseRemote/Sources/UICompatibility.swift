@@ -215,3 +215,30 @@ enum AppCompatibility {
         #endif
     }
 }
+
+struct AppShareLink<Label: View>: View {
+    let item: URL
+    let label: Label
+    @State private var presenting = false
+    init(item: URL, @ViewBuilder label: () -> Label) { self.item = item; self.label = label() }
+    @ViewBuilder var body: some View {
+        if #available(iOS 16, *), !AppCompatibility.forceLegacyUI { ShareLink(item: item) { label } }
+        else { Button { presenting = true } label: { label }.sheet(isPresented: $presenting) { AppShareSheet(item: item) } }
+    }
+}
+private struct AppShareSheet: UIViewControllerRepresentable {
+    let item: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: [item], applicationActivities: nil)
+        controller.popoverPresentationController?.sourceView = controller.view
+        return controller
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+extension AppShareLink where Label == SwiftUI.Label<Text, Image> {
+    init(item: URL) {
+        self.item = item
+        self.label = SwiftUI.Label("分享", systemImage: "square.and.arrow.up")
+    }
+}
