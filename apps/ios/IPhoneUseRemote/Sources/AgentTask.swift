@@ -136,6 +136,10 @@ struct AgentConfirm: Decodable, Equatable, Sendable {
 /// A task as `GET /agent/task/<id>` reports it (and, without steps, each
 /// row of `GET /agent/tasks`). Every field but `id` may be missing or null.
 struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
+    struct PlannedAction: Decodable, Equatable, Sendable {
+        var action: String
+        var target: String?
+    }
     struct Flow: Decodable, Equatable, Sendable {
         var id: String
         var outcome: String?
@@ -146,6 +150,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
     var state: AgentTaskState
     /// What is deciding right now: `flow`, `jev`, `assist`, `summary`.
     var phase: String?
+    var plannedAction: PlannedAction?
     var flow: Flow?
     var steps: [AgentStep]
     var confirm: AgentConfirm?
@@ -157,6 +162,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, goal, status, phase, flow, steps, confirm, summary, error
+        case plannedAction = "planned_action"
         case startedAtMs = "started_at_ms"
         case elapsedMs = "elapsed_ms"
         case modelsUsed = "models_used"
@@ -169,6 +175,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
         self.goal = goal
         self.state = state
         self.phase = phase
+        self.plannedAction = nil
         self.flow = flow
         self.steps = steps
         self.confirm = confirm
@@ -185,6 +192,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
         goal = try c.decodeIfPresent(String.self, forKey: .goal) ?? ""
         state = AgentTaskState(try c.decodeIfPresent(String.self, forKey: .status) ?? "running")
         phase = try c.decodeIfPresent(String.self, forKey: .phase)
+        plannedAction = try? c.decodeIfPresent(PlannedAction.self, forKey: .plannedAction)
         flow = try? c.decodeIfPresent(Flow.self, forKey: .flow)
         steps = (try? c.decodeIfPresent([AgentStep].self, forKey: .steps)) ?? []
         confirm = try? c.decodeIfPresent(AgentConfirm.self, forKey: .confirm)
