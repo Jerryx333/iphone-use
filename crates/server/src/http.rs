@@ -13503,18 +13503,8 @@ fn save_local_flow(id: &str, flow: &serde_json::Value) -> anyhow::Result<serde_j
 }
 
 async fn agent_flow_draft(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
     }
     let draft = recover(state.flow_trail.lock()).draft();
     let (status, body) = match draft {
@@ -19427,6 +19417,31 @@ mod tests {
 
     fn readiness_test_state() -> Arc<AppState> {
         fixture_app_state(None)
+    }
+
+    #[test]
+    fn flow_draft_accepts_the_apps_session_without_leaking_to_anonymous_callers() {
+        block(async {
+            let state = fixture_app_state(Some("synthetic-password"));
+            {
+                let mut trail = recover(state.flow_trail.lock());
+                let now = Instant::now();
+                trail.launched("com.apple.Preferences", now);
+                trail.record(crate::flows::Converted::Step(serde_json::json!({"kind":"launch_app","bundle":"com.apple.Preferences"})), now);
+                trail.record(crate::flows::Converted::Step(serde_json::json!({"kind":"tap_locator","locator":{"label":"电池"}})), now);
+            }
+            assert_eq!(agent_flow_draft(State(state.clone()), HeaderMap::new()).await.status(), StatusCode::UNAUTHORIZED);
+            let mut invalid = HeaderMap::new();
+            invalid.insert(header::COOKIE, HeaderValue::from_static("phone_session=invalid"));
+            assert_eq!(agent_flow_draft(State(state.clone()), invalid).await.status(), StatusCode::UNAUTHORIZED);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, HeaderValue::from_str(&make_session_cookie(&state, false)).unwrap());
+            let response = agent_flow_draft(State(state), headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let draft: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(draft["flow"]["app"], "com.apple.Preferences");
+        });
     }
 
     /// A synthetic WDA on loopback that the test owns and shuts down.
