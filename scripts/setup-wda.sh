@@ -31,6 +31,10 @@
 #   WDA_RUNNER_ICON=... the runner's Home Screen icon: auto, none, or a .png/.icns
 #   IPU_RUNNER_SRC=...  device runner sources (default: ~/.iphone-use/runner; a
 #                       repo checkout uses its own runner/)
+#   IPU_EMBED=0         build the runner without the on-phone daemon
+#   IPU_EMBED_LIB=...   on-phone daemon library to link (default:
+#                       <runner sources>/embed/libipu_embed.a; a checkout builds it)
+#   IPU_DAEMON_HOST=... where the on-phone daemon listens (default: 127.0.0.1)
 #   IPHONE_USE_XCODE=... this phone's own Xcode (`iphone-use setup --xcode`)
 #   WDA_PORT=...        control relay port (default: 8100; named instances: derived)
 #   MJPEG_PORT=...      video relay port (default: 9100; named instances: derived)

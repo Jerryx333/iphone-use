@@ -747,6 +747,9 @@ signature could invalidate.
 | `PHONE_REMOTE_OWNER_LEASE_SECS` | `300` | How long an `X-Phone-Owner` lease lives without a refreshing request. |
 | `IPU_RUNNER_SRC` | `~/.iphone-use/runner` | Device runner sources setup builds (a repo checkout's `scripts/setup-wda.sh` uses its own `runner/`). Persisted only when not the default. |
 | `WDA_RUNNER_REBUILD` | off | `1` makes the next setup ignore the recorded runner product and build again. |
+| `IPU_EMBED` | on | `0` builds the device runner without the on-phone daemon. Persisted for the supervisor. |
+| `IPU_EMBED_LIB` | `~/.iphone-use/runner/embed/libipu_embed.a` | The on-phone daemon library setup links into the runner (absolute path). A repo checkout builds it with `scripts/build-ios-embed.sh`; none found builds the plain runner. Persisted for the supervisor. |
+| `IPU_DAEMON_HOST` | `127.0.0.1` | Where the daemon inside the runner listens on the phone; `0.0.0.0` lets other devices drive this phone through it (its token is still required). Persisted for the supervisor. |
 | `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | runner default 64 | Applies to an external WebDriverAgent only; the device runner bounds its own tree reads (depth ladder, 5000 nodes). |
 | `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` | — | Same: WebDriverAgent only. |
 | `PHONE_REMOTE_ELEMENTS_AFFORDANCES` | off | `1` adds sparse `actions`, `selected`, `min`/`max` to `/agent/elements` rows. |

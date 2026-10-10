@@ -333,6 +333,9 @@ iphone-use upgrade    # 或者：curl -fsSL https://raw.githubusercontent.com/le
 | `PHONE_REMOTE_OWNER_LEASE_SECS` | `300` | `X-Phone-Owner` 租约在没有请求刷新时的存活时间。 |
 | `IPU_RUNNER_SRC` | `~/.iphone-use/runner` | setup 编译的设备 runner 源码（仓库里的 `scripts/setup-wda.sh` 用仓库自己的 `runner/`）。只有不是默认值时才持久化。 |
 | `WDA_RUNNER_REBUILD` | 关 | `1` 让下一次 setup 忽略记录的 runner 产物、重新编译。 |
+| `IPU_EMBED` | 开 | `0` 编译不带手机端 daemon 的设备 runner。会写进 supervisor。 |
+| `IPU_EMBED_LIB` | `~/.iphone-use/runner/embed/libipu_embed.a` | setup 链接进 runner 的手机端 daemon 库（绝对路径）。仓库里用 `scripts/build-ios-embed.sh` 现编；都找不到就编普通 runner。会写进 supervisor。 |
+| `IPU_DAEMON_HOST` | `127.0.0.1` | runner 里的 daemon 在手机上监听的地址；`0.0.0.0` 让别的设备也能通过它操作这台手机（仍要 token）。会写进 supervisor。 |
 | `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` | runner 默认 64 | 只对外部 WebDriverAgent 生效；设备 runner 自己限制读树（深度阶梯、5000 个节点）。 |
 | `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` | — | 同上，只对 WebDriverAgent 生效。 |
 | `PHONE_REMOTE_ELEMENTS_AFFORDANCES` | 关 | `1` 给 `/agent/elements` 的行加稀疏的 `actions`、`selected`、`min` / `max`。 |
