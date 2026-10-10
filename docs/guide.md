@@ -260,7 +260,7 @@ distributes.
 
 ## Drive the phone from the native iOS app
 
-`apps/ios` is a native SwiftUI app (iOS 17+). Connect by scanning: on the Mac, open the
+`apps/ios` is a native SwiftUI app (minimum deployment target iOS 15). Connect by scanning: on the Mac, open the
 iphone-use page and press **Scan** in the toolbar, then scan the QR code with the app (or the
 iPhone's own camera, which can also open plain browser control). The code works once, within
 5 minutes, and the app keeps a device token that renews its session; changing the control

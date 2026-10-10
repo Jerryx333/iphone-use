@@ -100,6 +100,15 @@ With the mock daemon, `__mock_long_progress__` runs a five-minute progress fixtu
 that never performs phone actions. This validates display and cancellation, not
 whether an Agent can complete a real goal.
 
+For on-phone confirmation acceptance, `Tools/confirmation_navigation_fixture.json`
+is a deliberately marked `side_effect` fixture whose only action is Home.
+Validate it with `iphone-use-mcp flow validate <file>` and save it locally as
+`qa/confirm-navigation` through `/agent/flow/save`. From the paired app, request
+that flow as an Agent task. The pending confirmation must be `RUN_FLOW` for that
+exact ID. Decline must leave Home unexecuted and end the task; approve must run
+Home once and return to the app with the result. This fixture is local QA data,
+not a published registry flow.
+
 Tests: `xcodebuild -scheme IPhoneUseRemote -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test`
 (device-list migration, `/control` outcome classification, address parsing, error mapping,
 retry backoff, and the state → screen mapping). Build signed for the simulator (not
