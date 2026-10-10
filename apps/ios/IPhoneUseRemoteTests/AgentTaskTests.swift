@@ -1,6 +1,47 @@
 import XCTest
 @testable import IPhoneUseRemote
 
+@MainActor
+final class AgentStartFailureTests: XCTestCase {
+    func testDraftSurvivesRelaunchAndStaysWithItsDevice() {
+        let suite = "agent-drafts-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = UUID(), second = UUID()
+        let agent = AgentController(defaults: defaults)
+        agent.targetID = first
+        agent.draft = "看看电量"
+        agent.targetID = second
+        XCTAssertEqual(agent.draft, "")
+        agent.draft = "打开设置"
+        let relaunched = AgentController(defaults: defaults)
+        relaunched.targetID = first
+        XCTAssertEqual(relaunched.draft, "看看电量")
+        relaunched.targetID = second
+        XCTAssertEqual(relaunched.draft, "打开设置")
+        relaunched.forget(device: first)
+        relaunched.targetID = first
+        XCTAssertEqual(relaunched.draft, "")
+    }
+    func testMissingTargetDoesNotAcceptGoal() async {
+        let defaults = UserDefaults(suiteName: "agent-start-\(UUID().uuidString)")!
+        let agent = AgentController(defaults: defaults)
+        let accepted = await agent.start(goal: "看看电量")
+        XCTAssertFalse(accepted)
+        XCTAssertNil(agent.pendingGoal)
+        XCTAssertNil(agent.live)
+        XCTAssertNotNil(agent.error)
+    }
+
+    func testThisPhoneTransportFailureExplainsTheLocalService() {
+        let error = DaemonError.transport(.cannotConnectToHost, "private details")
+        let message = AgentController.describe(error, onThisPhone: true)
+        XCTAssertEqual(message, String(localized: "本机 Agent 服务没有响应。请在 Mac 上启动这台 iPhone 的服务，再回来重试。"))
+        XCTAssertFalse(message.contains("private details"))
+        XCTAssertEqual(AgentController.describe(error, onThisPhone: false), error.localizedDescription)
+    }
+}
+
 final class AgentTaskDecodingTests: XCTestCase {
     private func decode(_ json: String) throws -> AgentTaskSnapshot {
         try JSONDecoder().decode(AgentTaskSnapshot.self, from: Data(json.utf8))

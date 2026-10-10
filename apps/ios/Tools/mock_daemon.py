@@ -191,6 +191,8 @@ class Agent:
             goal = (body.get("goal") or "").strip()
             if not goal:
                 return 400, {"error": "goal_required"}
+            if goal == "__mock_refuse_task__":
+                return 503, {"error": "service_unavailable", "message": "Mock task service is unavailable"}
             assist = ((body.get("models") or {}).get("assist") or [{}])[0]
             task = {"id": self.next_id("t"), "goal": goal, "status": "running", "phase": "jev", "flow": None,
                     "steps": [], "confirm": None, "summary": None, "error": None,

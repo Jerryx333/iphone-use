@@ -9,7 +9,6 @@ import UIKit
 struct AgentView: View {
     @Bindable var app: AppModel
     @Bindable var agent: AgentController
-    @State private var goal = ""
     @State private var showSettings = false
     @State private var pairingThisPhone = false
     @State private var showFlows = false
@@ -26,7 +25,7 @@ struct AgentView: View {
                             AgentNotice(text: note.text, symbol: note.symbol, action: note.action)
                         }
                         if agent.thread.isEmpty && agent.pendingGoal == nil {
-                            AgentEmptyState(onPick: { goal = $0; composing = true })
+                            AgentEmptyState(onPick: { agent.draft = $0; composing = true })
                         }
                         let thread = agent.thread
                         ForEach(thread) { task in
@@ -167,7 +166,7 @@ struct AgentView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: Theme.Space.s) {
-            TextField("让 agent 做点什么…", text: $goal, axis: .vertical)
+            TextField("让 agent 做点什么…", text: $agent.draft, axis: .vertical)
                 .lineLimit(1...5)
                 .focused($composing)
                 .submitLabel(.send)
@@ -211,14 +210,19 @@ struct AgentView: View {
     }
 
     private var canSend: Bool {
-        !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && agent.target != nil && !agent.busyOnTarget
+        !agent.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && agent.target != nil && !agent.busyOnTarget
     }
 
     private func send() {
         guard canSend else { return }
-        let text = goal
-        goal = ""
-        Task { await agent.start(goal: text) }
+        let text = agent.draft
+        let device = agent.targetID
+        composing = false
+        Task {
+            // Keep the draft if the request is refused or the service is away.
+            // Do not erase edits the person made while the request was in flight.
+            if await agent.start(goal: text), agent.targetID == device, agent.draft == text { agent.draft = "" }
+        }
     }
 
     private func scrollDown(_ proxy: ScrollViewProxy, animated: Bool = true) {

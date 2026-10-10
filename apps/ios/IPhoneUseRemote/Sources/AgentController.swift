@@ -36,6 +36,15 @@ final class AgentController {
     /// A goal sent and not yet acknowledged.
     private(set) var pendingGoal: String?
     var error: String?
+    private var drafts: [String: String]
+    /// Each device keeps its own unsent goal, including across app launches.
+    var draft: String {
+        get { drafts[targetID?.uuidString ?? "unselected"] ?? "" }
+        set {
+            drafts[targetID?.uuidString ?? "unselected"] = newValue
+            defaults.set(drafts, forKey: Self.draftsKey)
+        }
+    }
     /// Following the task gave up (the daemon stopped answering); it may
     /// still be running there.
     private(set) var linkNote: String?
@@ -70,9 +79,11 @@ final class AgentController {
     @ObservationIgnored private var answered: Set<String> = []
 
     private static let runningKey = "agent.running.v1"
+    private static let draftsKey = "agent.drafts.v1"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        drafts = defaults.dictionary(forKey: Self.draftsKey) as? [String: String] ?? [:]
         settings = ModelSettingsStore.load(from: defaults)
     }
 
@@ -114,16 +125,17 @@ final class AgentController {
     // MARK: running
 
     /// Hand `goal` to the target's daemon and follow it.
-    func start(goal typed: String) async {
+    @discardableResult
+    func start(goal typed: String) async -> Bool {
         let goal = typed.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !goal.isEmpty, pendingGoal == nil else { return }
+        guard !goal.isEmpty, !busyOnTarget else { return false }
         guard let session = target else {
             error = String(localized: "先选一台设备")
-            return
+            return false
         }
         guard let client = session.client, session.phase == .connected else {
             error = String(localized: "「\(session.name)」现在没有连上：\(session.shortState)")
-            return
+            return false
         }
         error = nil
         linkNote = nil
@@ -132,6 +144,7 @@ final class AgentController {
         let request = AgentTaskRequest(goal: goal, models: settings.payload(key: ModelSettingsStore.secret))
         let bundle = session.record.isThisPhone ? Bundle.main.bundleIdentifier : nil
         var id: String?
+        var accepted = true
         for attempt in 0..<2 {
             do {
                 id = try await client.startTask(request, returnBundle: bundle)
@@ -144,17 +157,27 @@ final class AgentController {
                 // Already one there (or this POST's own, whose answer was lost):
                 // show that one instead.
                 id = running
+                accepted = false
                 if running != live?.task.id { app?.show(String(localized: "那台手机上已经有一个任务在进行，正在显示它")) }
                 break
             } catch {
-                self.error = error.localizedDescription
+                self.error = Self.describe(error, onThisPhone: session.record.isThisPhone)
             }
             break
         }
         pendingGoal = nil
-        guard let id else { return }
+        guard let id else { return false }
         let first = AgentTaskSnapshot(id: id, goal: goal, state: .running)
         follow(AgentTaskTracker(first), on: session)
+        return accepted
+    }
+
+    static func describe(_ error: Error, onThisPhone: Bool) -> String {
+        if onThisPhone, case .unreachable = ConnectProblem(error),
+           error is DaemonError || error is URLError {
+            return String(localized: "本机 Agent 服务没有响应。请在 Mac 上启动这台 iPhone 的服务，再回来重试。")
+        }
+        return error.localizedDescription
     }
 
     /// Follow `tracker` on `session` until it ends, remembering it so a
@@ -325,6 +348,8 @@ final class AgentController {
 
     /// A device was forgotten: drop what was followed there.
     func forget(device id: UUID) {
+        drafts.removeValue(forKey: id.uuidString)
+        defaults.set(drafts, forKey: Self.draftsKey)
         if liveDeviceID == id {
             pollTask?.cancel()
             pollTask = nil
