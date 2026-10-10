@@ -74,7 +74,9 @@ The last 20 tasks, newest first, without `steps`.
 ## How a task runs
 
 1. **Saved flow first.** If the goal names an app and a saved flow (registry or local) matches the
-   goal, run it: one call, no model tokens. Its outputs feed the summary.
+   goal, the assist model selects it and its inputs, then the daemon runs the flow in one call.
+   Flow execution uses no model tokens; selection and the final summary still use the model.
+   Its outputs feed the summary.
 2. **Jev** picks each step from the element table (`/agent/elements` semantics: snapshot-bound
    taps, occlusion refusal, `set_value` for text). About 1.5 s per step from a Mac, less on the
    phone itself.

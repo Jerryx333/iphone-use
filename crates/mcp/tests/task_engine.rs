@@ -148,6 +148,78 @@ async fn wait_for(id: &str, status: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declining_a_flow_ends_the_task_without_step_by_step_fallback() {
+    let _serial = SERIAL.lock().await;
+    let flows = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
+    let file = flows.path().join("fixture.json");
+    std::fs::write(&file, json!({
+        "version": 1, "name": "Synthetic confirmation", "app": "com.apple.Preferences",
+        "risk": "side_effect", "steps": [{"kind": "shortcut", "name": "home"}]
+    }).to_string()).unwrap();
+    iphone_use_mcp::registry::add(&file, "fixture/confirm").unwrap();
+    let phone = Arc::new(Phone { paid: Mutex::new(false), inputs: Mutex::new(Vec::new()) });
+    let daemon_url = fake_daemon(phone.clone());
+    let decisions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = decisions.clone();
+    let model = serve(move |_, _, body| {
+        let body: Value = serde_json::from_str(body).unwrap();
+        let system = body["messages"][0]["content"].as_str().unwrap_or("");
+        let content = if system.contains("saved phone automation") {
+            r#"{"flow":"fixture/confirm","inputs":{}}"#
+        } else if system.contains("operate a real iPhone") {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            r#"{"operation":"CLICK","target":0}"#
+        } else { "用户没有批准，未执行。" };
+        (200, json!({"choices":[{"message":{"content":content}}]}).to_string())
+    });
+    let id = task::start(request(&model), |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
+    assert_eq!(wait_for(&id, "needs_confirm").await["confirm"]["action"], "RUN_FLOW");
+    task::answer(&id, false).unwrap();
+    wait_for(&id, "blocked").await;
+    assert_eq!(decisions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(phone.inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_cancels_a_waiting_model_without_a_late_phone_action() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serial = SERIAL.lock().await;
+    let flows = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
+    let phone = Arc::new(Phone { paid: Mutex::new(false), inputs: Mutex::new(Vec::new()) });
+    let daemon_url = fake_daemon(phone.clone());
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let model_entered = entered.clone();
+    let model_release = release.clone();
+    let model_url = serve(move |_, _, _| {
+        model_entered.store(true, Ordering::SeqCst);
+        while !model_release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (200, json!({"choices":[{"message":{"content":"{\"operation\":\"CLICK\",\"target\":0}"}}]}).to_string())
+    });
+    let id = task::start(request(&model_url), |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await;
+    if started.is_err() {
+        release.store(true, Ordering::SeqCst);
+    }
+    started.unwrap();
+    task::cancel(&id).unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), wait_for(&id, "cancelled")).await;
+    // Always unblock the fake server before asserting, even if cancellation failed.
+    release.store(true, Ordering::SeqCst);
+    let stopped = stopped.expect("Stop waited for the model to answer");
+    assert!(stopped["confirm"].is_null());
+    assert!(phone.inputs.lock().unwrap().is_empty(), "Stop must not tap a late answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_payment_waits_for_the_owner_then_runs_once_and_is_summarized() {
     let _serial = SERIAL.lock().await;
     // No saved flows anywhere.
@@ -205,8 +277,10 @@ async fn a_free_model_falls_through_the_gateways_free_list() {
     let gateway = serve(move |method, path, body| {
         if method == "GET" && path == "/models" {
             return (200, json!({"data": [
+                {"id": "meta/llama-guard:free", "architecture": {"input_modalities": ["text", "image"]}},
                 {"id": "gone/model:free", "architecture": {"input_modalities": ["text", "image"]}},
                 {"id": "busy/model:free", "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "invalid/model:free", "architecture": {"input_modalities": ["text", "image"]}},
                 {"id": "text-only/model:free", "architecture": {"input_modalities": ["text"]}},
                 {"id": "good/model:free", "architecture": {"input_modalities": ["text", "image"]}},
                 {"id": "paid/model", "architecture": {"input_modalities": ["text", "image"]}}
@@ -218,6 +292,7 @@ async fn a_free_model_falls_through_the_gateways_free_list() {
         match model.as_str() {
             "gone/model:free" => (404, json!({"error": "unavailable_model"}).to_string()),
             "busy/model:free" => (429, json!({"error": "rate limited"}).to_string()),
+            "invalid/model:free" => (200, json!({"choices": [{"message": {"content": "User Safety: unsafe"}}]}).to_string()),
             "good/model:free" => {
                 let system = request["messages"][0]["content"].as_str().unwrap_or("");
                 let content = if system.contains("operate a real iPhone") {
@@ -235,10 +310,12 @@ async fn a_free_model_falls_through_the_gateways_free_list() {
     let id = task::start(request, |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
     let done = wait_for(&id, "done").await;
     assert_eq!(done["summary"], "已经付好了。", "{done}");
+    assert_eq!(done["models_used"]["assist"], "good/model:free");
     let asked = asked.lock().unwrap().clone();
     assert!(!asked.iter().any(|m| m == "paid/model"), "never a paid model: {asked:?}");
+    assert!(!asked.iter().any(|m| m == "meta/llama-guard:free"), "a safety classifier cannot operate a phone: {asked:?}");
     assert!(!asked.iter().any(|m| m == "text-only/model:free"), "the screenshot step skips text-only models: {asked:?}");
     let first_good = asked.iter().position(|m| m == "good/model:free").unwrap();
-    assert_eq!(&asked[..first_good], ["gone/model:free", "busy/model:free"], "{asked:?}");
+    assert_eq!(&asked[..first_good], ["gone/model:free", "busy/model:free", "invalid/model:free"], "{asked:?}");
     assert!(asked[first_good..].iter().all(|m| m == "good/model:free"), "the one that answered is tried first afterwards: {asked:?}");
 }
