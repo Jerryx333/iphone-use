@@ -233,6 +233,7 @@ struct SaveFlowSheet: View {
 /// A device's flows (registry and its own) and its schedules.
 struct FlowsHubView: View {
     @ObservedObject var session: DeviceSession
+    @Environment(\.scenePhase) private var scenePhase
     enum Page: Hashable { case flows, schedules }
     @State var page: Page = .flows
     @State private var flows: [FlowEntry] = []
@@ -282,6 +283,9 @@ struct FlowsHubView: View {
                 ScheduleEditor(session: session, flows: flows, initial: nil) { Task { await load() } }
             }
             .task { await load() }
+            .appOnChange(of: scenePhase) { _, phase in
+                if phase == .active { Task { await load() } }
+            }
         }
     }
 
@@ -526,6 +530,9 @@ struct FlowDetailView: View {
 struct ScheduleDetailView: View {
     @ObservedObject var session: DeviceSession
     let schedule: FlowSchedule
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var refreshedSchedule: FlowSchedule?
+    private var current: FlowSchedule { refreshedSchedule ?? schedule }
     let onChange: () -> Void
     @State private var runs: [ScheduleRun] = []
     @State private var error: String?
@@ -538,7 +545,7 @@ struct ScheduleDetailView: View {
             Section {
                 AppLabeledContent("Flow", value: schedule.target)
                 AppLabeledContent("时间", value: CronSpec(cron: schedule.cron)?.summary ?? schedule.cron)
-                if let next = schedule.nextRunAt, schedule.enabled {
+                if let next = current.nextRunAt, current.enabled {
                     AppLabeledContent("下次", value: next.formatted(date: .abbreviated, time: .shortened))
                 }
                 ForEach(schedule.inputs.sorted { $0.key < $1.key }, id: \.key) { item in
@@ -569,6 +576,9 @@ struct ScheduleDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await loadRuns() }
         .task { await loadRuns() }
+        .appOnChange(of: scenePhase) { _, phase in
+            if phase == .active { Task { await loadRuns() } }
+        }
         .confirmationDialog("删除这个定时任务？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("删除", role: .destructive) { Task { await delete() } }
         }
@@ -576,7 +586,13 @@ struct ScheduleDetailView: View {
 
     private func loadRuns() async {
         guard let client = session.client else { return }
-        do { runs = try await client.scheduleRuns(schedule.id) } catch { self.error = error.localizedDescription }
+        do {
+            async let history = client.scheduleRuns(schedule.id)
+            async let list = client.schedules()
+            runs = try await history
+            refreshedSchedule = try await list.first { $0.id == schedule.id }
+            error = nil
+        } catch { self.error = error.localizedDescription }
     }
 
     private func runNow() async {
