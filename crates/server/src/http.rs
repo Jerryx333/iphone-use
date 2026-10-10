@@ -18741,6 +18741,9 @@ mod tests {
         assert!(!INDEX_HTML.contains("turn-creds"));
         assert!(!INDEX_HTML.contains("RTCPeerConnection"));
         assert!(INDEX_HTML.contains("id=\"flowPanel\""));
+        // Pairing the app with the daemon on its own phone.
+        assert!(INDEX_HTML.contains("id=\"pairSelf\""));
+        assert!(INDEX_HTML.contains("'/agent/phone-daemon/pair'"));
         // Lock readiness: the daemon's own hint for phones that will lock.
         assert!(INDEX_HTML.contains("id=\"lockNotice\""));
         assert!(INDEX_HTML.contains("status?.lock_readiness"));
