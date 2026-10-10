@@ -7875,6 +7875,69 @@ async fn wda_control_with_client(
 /// client must not show success unless it receives `{"ok":true}`.
 const DIRECT_CONTROL_MAX_TTL_MS: u64 = 2500;
 const AGENT_INPUT_WDA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const AGENT_TEXT_MAX_CHARS: usize = 1_000;
+const TEXT_LENGTH_HINT: &str = "text supports at most 1000 characters; split into multiple actions, using clear:false to append subsequent parts";
+const TEXT_PARTIAL_HINT: &str = "Read the actual input field first; append only the missing portion with clear:false. Do not clear and retype the whole text.";
+
+/// Count Unicode scalars, extending a chunk through the protected cluster boundaries.
+fn split_text_chunks(text: &str, max_chars: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut count = 0;
+    let mut previous = None;
+    let mut regional_run = 0;
+    for (offset, ch) in text.char_indices() {
+        let regional = matches!(ch, '\u{1F1E6}'..='\u{1F1FF}');
+        let attached = matches!(ch, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}'
+            | '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{20D0}'..='\u{20FF}' | '\u{1F3FB}'..='\u{1F3FF}')
+            || previous == Some('\u{200D}')
+            || (regional && regional_run % 2 == 1);
+        if count >= max_chars.max(1) && !attached {
+            chunks.push(&text[start..offset]);
+            start = offset;
+            count = 0;
+        }
+        count += 1;
+        regional_run = if regional { regional_run + 1 } else { 0 };
+        previous = Some(ch);
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
+fn agent_action_deadline(value: &serde_json::Value) -> std::time::Duration {
+    if value["type"] == "text" {
+        let count = value["text"].as_str().unwrap_or("").chars().count();
+        std::time::Duration::from_secs(15 + (count / 20).min(25) as u64)
+    } else {
+        AGENT_INPUT_WDA_DEADLINE
+    }
+}
+
+fn text_progress(total: usize, confirmed: usize) -> serde_json::Value {
+    serde_json::json!({
+        "characters_confirmed": confirmed,
+        "characters_total": total,
+        "hint": TEXT_PARTIAL_HINT,
+    })
+}
+
+async fn with_text_progress(response: Response, detail: Option<&serde_json::Value>) -> Response {
+    let Some(detail) = detail.filter(|d| d.get("characters_total").is_some()) else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+    let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    if let Some(object) = body.as_object_mut() {
+        object.extend(detail.as_object().unwrap().clone());
+    }
+    Response::from_parts(parts, Body::from(body.to_string()))
+}
+
 const AGENT_ACTIONS_MAX_BODY_BYTES: usize = 64 * 1024;
 const AGENT_ACTIONS_MAX_STEPS: usize = 24;
 /// Longest a single `wait_for` may be given.
@@ -8224,27 +8287,28 @@ async fn direct_agent_action(
                 .unwrap_or(0);
             Some(w.set_picker(column, target).await)
         }
-        "text"
-            if value
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false) =>
-        {
+        "text" => {
             let Some(text) = value.get("text").and_then(serde_json::Value::as_str) else {
                 return WdaControlOutcome::Unsupported;
             };
-            Some(
-                async {
-                    // Clearing and typing are one intentional compound action.
-                    // A clear error is best-effort, but the text insertion is
-                    // still dispatched at most once.
-                    if let Err(error) = w.clear_active().await {
-                        tracing::warn!("wda clear_active before text: {error:#}");
-                    }
-                    w.keys(text).await
+            let total = text.chars().count();
+            if total > AGENT_TEXT_MAX_CHARS {
+                return WdaControlOutcome::InvalidValue(TEXT_LENGTH_HINT);
+            }
+            *detail = Some(text_progress(total, 0));
+            Some(async {
+                if value.get("clear").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                    // A failed clear may already have changed the field: stop, never retype.
+                    w.clear_active().await?;
                 }
-                .await,
-            )
+                let mut confirmed = 0;
+                for chunk in split_text_chunks(text, 200) {
+                    w.keys(chunk).await?;
+                    confirmed += chunk.chars().count();
+                    *detail = Some(text_progress(total, confirmed));
+                }
+                Ok(())
+            }.await)
         }
         _ => None,
     };
@@ -8768,13 +8832,13 @@ fn validate_agent_action_value(
             if action
                 .get("text")
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|text| text.chars().count() > 1_000)
+                .is_none_or(|text| text.chars().count() > AGENT_TEXT_MAX_CHARS)
                 || action
                     .get("clear")
                     .is_some_and(|clear| clear.as_bool().is_none())
             {
                 return invalid(
-                    "text needs a string up to 1000 characters and optional bool clear",
+                    TEXT_LENGTH_HINT,
                 );
             }
         }
@@ -9542,16 +9606,22 @@ async fn agent_actions_inner(
                 // Dispatch exactly once. If the batch deadline wins after this
                 // point, the action outcome is unknown and the whole batch must
                 // not be replayed automatically.
+                let mut detail = None;
+                let step_deadline = if action["type"] == "text" {
+                    batch_deadline.min(tokio::time::Instant::now() + agent_action_deadline(action))
+                } else {
+                    batch_deadline
+                };
                 let outcome = match tokio::time::timeout_at(
-                    batch_deadline,
-                    direct_agent_action(&mut w, &state.wda_actionable, action, &mut None),
+                    step_deadline,
+                    direct_agent_action(&mut w, &state.wda_actionable, action, &mut detail),
                 )
                 .await
                 {
                     Ok(outcome) => outcome,
                     Err(_) => {
                         mark_wda_read_path_unactionable(&state);
-                        return agent_actions_failure(
+                        return with_text_progress(agent_actions_failure(
                             StatusCode::GATEWAY_TIMEOUT,
                             index,
                             completed,
@@ -9561,7 +9631,7 @@ async fn agent_actions_inner(
                             false,
                             &step_results,
                             None,
-                        );
+                        ), detail.as_ref()).await;
                     }
                 };
                 // An optional alert step ({"if_present":true}) that found no
@@ -9669,7 +9739,7 @@ async fn agent_actions_inner(
                     ) {
                         mark_wda_read_path_unactionable(&state);
                     }
-                    return agent_actions_failure(
+                    return with_text_progress(agent_actions_failure(
                         status,
                         index,
                         completed,
@@ -9679,7 +9749,7 @@ async fn agent_actions_inner(
                         current_retry_safe && applied_actions == 0,
                         &step_results,
                         None,
-                    );
+                    ), detail.as_ref()).await;
                 }
                 applied_actions += 1;
                 if *after_ms > 0
@@ -10482,10 +10552,14 @@ async fn agent_input_inner(
     if let Err(refused) = claim_phone_owner(&state, &headers) {
         return refused;
     }
-    // The MCP client waits 30 seconds. Keep the daemon's complete Direct WDA
-    // budget comfortably below that so the authoritative HTTP outcome arrives
-    // before the client can abandon a still-running action.
-    let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;
+    // Text receives a character-scaled budget, capped below the tool's 60s limit.
+    let input_value = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+    if input_value["type"] == "text"
+        && input_value["text"].as_str().is_some_and(|text| text.chars().count() > AGENT_TEXT_MAX_CHARS)
+    {
+        return hinted_control_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid_value", "not_sent", TEXT_LENGTH_HINT);
+    }
+    let agent_wda_deadline = tokio::time::Instant::now() + agent_action_deadline(&input_value);
     // App uninstall via CoreDevice (`devicectl`) — WDA can't remove apps and
     // UI-driven deletion is unreliable to automate, so this is the dependable
     // "Delete App (with data)" primitive (e.g. resetting a wedged app to its
@@ -10746,6 +10820,7 @@ async fn agent_input_inner(
     // follows gets its own, strictly shorter deadline, so a slow `/source`
     // or `/alert/text` can never turn an applied action into
     // `outcome_unknown` and can never cause the mutation to be re-sent.
+    let mut detail = None;
     let dispatch = tokio::time::timeout_at(agent_wda_deadline, async {
         let mut client = wda.lock().await;
         if tokio::time::Instant::now() >= agent_wda_deadline
@@ -10755,19 +10830,18 @@ async fn agent_input_inner(
             return None;
         }
         dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
-        let mut detail = None;
         let outcome =
             direct_agent_action(&mut client, &state.wda_actionable, &value, &mut detail).await;
-        Some((client, outcome, detail))
+        Some((client, outcome))
     })
     .await;
-    let (mut client, outcome, detail) = match dispatch {
+    let (mut client, outcome) = match dispatch {
         Ok(Some(dispatched)) => dispatched,
         Ok(None) => return wda_deadline_response(false),
         Err(_) => {
-            return wda_deadline_response(
+            return with_text_progress(wda_deadline_response(
                 dispatched.load(std::sync::atomic::Ordering::Acquire),
-            );
+            ), detail.as_ref()).await;
         }
     };
     // Post-action observation (`?return=delta`), still holding the SAME
@@ -10939,7 +11013,7 @@ async fn agent_input_inner(
         WdaControlOutcome::NoAlert => no_alert_response(),
         WdaControlOutcome::ForcePressUnsupported => force_press_unsupported_response(),
         WdaControlOutcome::NoPageScroller(hint) => no_page_scroller_response(hint),
-        WdaControlOutcome::Failed => wda_failed_after_dispatch_response(),
+        WdaControlOutcome::Failed => with_text_progress(wda_failed_after_dispatch_response(), detail.as_ref()).await,
     }
 }
 
@@ -13718,6 +13792,102 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_chunk_ascii_boundaries() {
+        let text = "a".repeat(401);
+        let chunks = split_text_chunks(&text, 200);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [200, 200, 1]);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn text_chunk_chinese_counts_characters() {
+        let text = "中文".repeat(201);
+        let chunks = split_text_chunks(&text, 200);
+        assert_eq!(chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>(), [200, 200, 2]);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn text_chunk_zwj_family() {
+        let text = format!("{}👨‍👩‍👧‍👦z", "a".repeat(199));
+        let chunks = split_text_chunks(&text, 200);
+        assert_eq!(chunks[0].chars().count(), 206);
+        assert!(chunks[0].ends_with("👨‍👩‍👧‍👦"));
+        assert_eq!(chunks[1], "z");
+    }
+
+    #[test]
+    fn text_chunk_combining_skin_flags_variants() {
+        for cluster in ["e\u{0301}", "a\u{1AB0}", "a\u{20D0}", "👍🏽", "🇨🇳", "✈️", "✈︎"] {
+            let text = format!("{}{cluster}z", "a".repeat(199));
+            let chunks = split_text_chunks(&text, 200);
+            assert!(chunks[0].ends_with(cluster), "{cluster:?}");
+            assert_eq!(chunks[1], "z");
+            assert_eq!(chunks.concat(), text);
+        }
+        assert_eq!(split_text_chunks("🇨🇳🇺🇸🇬🇧", 1), ["🇨🇳", "🇺🇸", "🇬🇧"]);
+    }
+
+    #[test]
+    fn text_chunk_empty_exact_and_zero_limit() {
+        assert!(split_text_chunks("", 200).is_empty());
+        let text = "a".repeat(200);
+        assert_eq!(split_text_chunks(&text, 200), [&text]);
+        assert_eq!(split_text_chunks("ab", 0), ["a", "b"]);
+    }
+
+    #[test]
+    fn text_chunk_deadline_scaling() {
+        for (count, seconds) in [(0, 15), (19, 15), (20, 16), (200, 25), (499, 39), (500, 40), (700, 40), (1000, 40)] {
+            let value = serde_json::json!({"type":"text", "text":"中".repeat(count)});
+            assert_eq!(agent_action_deadline(&value).as_secs(), seconds);
+        }
+        assert_eq!(agent_action_deadline(&serde_json::json!({"type":"tap"})).as_secs(), 15);
+    }
+
+    #[test]
+    fn text_chunk_length_rejection() {
+        assert!(validate_action(serde_json::json!({"type":"text", "text":"中".repeat(1000)})).is_ok());
+        let error = validate_action(serde_json::json!({"type":"text", "text":"中".repeat(1001), "clear":true})).unwrap_err();
+        assert!(error.contains("clear:false"));
+    }
+
+    #[test]
+    fn text_chunk_partial_failure_and_timeout_progress() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let refusal = hinted_control_response(StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value", "not_sent", TEXT_LENGTH_HINT);
+        let bytes = axum::body::to_bytes(refusal.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["outcome"], "not_sent");
+        let text = format!("{}👨‍👩‍👧‍👦{}", "a".repeat(199), "中".repeat(300));
+        let mut detail = None;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(1), async {
+            let first = split_text_chunks(&text, 200)[0];
+            detail = Some(text_progress(text.chars().count(), first.chars().count()));
+            std::future::pending::<()>().await;
+        }).await;
+        assert!(result.is_err());
+        for response in [
+            wda_deadline_response(true),
+            wda_failed_after_dispatch_response(),
+            agent_actions_failure(StatusCode::GATEWAY_TIMEOUT, 1, 1, 1,
+                "outcome_unknown", "unknown", false, &[], None),
+        ] {
+            let response = with_text_progress(response, detail.as_ref()).await;
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["characters_confirmed"], 206);
+            assert_eq!(body["characters_total"], 506);
+            assert_eq!(body["outcome"], "unknown");
+            assert_eq!(body["retry_safe"], false);
+            assert!(body["hint"].as_str().unwrap().contains("Do not clear"));
+        }
+        });
+    }
+
     #[test]
     fn launchctl_print_pid_is_the_jobs_own_line() {
         let running = "gui/501/com.leeguoo.iphone-use.wda = {\n\tactive count = 1\n\tstate = running\n\tpid = 72917\n\tresource coalition = {\n\t\tID = 42823\n\t}\n}\n";

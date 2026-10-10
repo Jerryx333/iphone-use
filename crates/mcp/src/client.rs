@@ -85,11 +85,24 @@ const ELEMENTS_TIMEOUT: Duration = Duration::from_secs(45);
 /// looking, plus the alert probe and serialising. The ordinary 30s would abandon
 /// the request while the daemon still held the phone — and abandoning it is
 /// precisely how a caller ends up not knowing what happened. Non-observing
-/// requests keep the shorter timeout.
+/// non-text requests keep the shorter timeout.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Server text cap 40s + settle/tree read < client 55s < Codex tool timeout 60s.
+/// Applies to single text inputs both with and without observation.
+const TEXT_INPUT_TIMEOUT: Duration = Duration::from_secs(55);
 const ACTIONS_TIMEOUT: Duration = Duration::from_secs(90);
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_BODY_CHARS: usize = 2_048;
+
+fn input_timeout(action_type: &str, observe: bool) -> Duration {
+    if action_type == "text" {
+        TEXT_INPUT_TIMEOUT
+    } else if observe {
+        OBSERVE_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
 
 /// Thin async wrapper over the daemon's `GET /agent/*` and
 /// `POST /agent/input` endpoints.
@@ -466,14 +479,19 @@ impl DaemonClient {
         } else {
             "/agent/input".to_string()
         };
-        let mut req = self
+        let req = self
             .auth(self.client.post(self.url(&path)))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(msg.to_json());
-        if observe {
-            req = req.timeout(OBSERVE_TIMEOUT);
-        }
+            .body(msg.to_json())
+            .timeout(input_timeout(
+                if matches!(msg, InputMsg::Text { .. }) {
+                    "text"
+                } else {
+                    ""
+                },
+                observe,
+            ));
         let response = read_response(req.send().await?).await?;
         self.remember_snapshot(response.json.as_ref());
         Ok(response)
@@ -487,7 +505,8 @@ impl DaemonClient {
             .auth(self.client.post(self.url("/agent/input")))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(action.to_string());
+            .body(action.to_string())
+            .timeout(input_timeout(action["type"].as_str().unwrap_or(""), false));
         read_response(req.send().await?).await
     }
 
@@ -972,6 +991,23 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn text_input_timeout_preserves_other_action_budgets() {
+        for observe in [false, true] {
+            assert_eq!(input_timeout("text", observe), Duration::from_secs(55));
+            for action_type in ["tap", "scroll", "key", ""] {
+                assert_eq!(
+                    input_timeout(action_type, observe),
+                    if observe {
+                        OBSERVE_TIMEOUT
+                    } else {
+                        REQUEST_TIMEOUT
+                    },
+                );
+            }
+        }
+    }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
         stream

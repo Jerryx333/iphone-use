@@ -175,6 +175,21 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 {"type":"perform","element":9,"snapshot":"…","action":"toggle"}  // increment|decrement|adjust(+value)|toggle|menu|double_tap|two_finger_tap|scroll_to_visible|pinch|rotate
 ```
 
+`text` sends sequential chunks of about 200 Unicode characters, preserving ZWJ,
+variation-selector, combining-mark, skin-tone and paired flag boundaries (a chunk
+may extend past 200 to keep these together). The existing limit is **1000 characters
+per action**; longer input is rejected before sending with `outcome:not_sent` and
+`retry_safe:true`. Split longer text into multiple actions and append subsequent
+parts with `clear:false`. `clear:true` clears once before the first chunk.
+The text deadline is 15 seconds plus one second per complete 20 characters,
+capped at 40 seconds; a batch still has its 75-second total deadline.
+On a chunk failure or timeout, `characters_confirmed` counts characters in fully
+acknowledged chunks and `characters_total` counts the whole requested text.
+The failed chunk may have partially landed: `outcome:unknown`, `retry_safe:false`.
+Read the actual field first and append only the missing portion; never clear and
+retype the entire text. MCP error text includes these numbers in its JSON preview.
+
+
 `force_press` answers `422 force_press_unsupported` (retry-safe, nothing sent)
 on every iPhone since XR/11; use `menu`. App uninstall: `{"type":"uninstall","bundle":…}`
 (destructive; HTTP only).
