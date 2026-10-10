@@ -200,6 +200,11 @@ fn outermost_match(elements: &[ElementSummary], matches: &[usize]) -> Option<usi
     }
 }
 
+/// A valid tree had zero or multiple exact label matches.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct LabelResolutionFailure(String);
+
 fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String)> {
     if label.trim().is_empty() {
         anyhow::bail!("label must not be empty");
@@ -229,7 +234,10 @@ fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String
             )
             .map(|hint| format!(" — {hint}"))
             .unwrap_or_default();
-            anyhow::bail!("no element matched the exact label '{label}'; no action was sent{hint}")
+            Err(LabelResolutionFailure(format!(
+                "no element matched the exact label '{label}'; no action was sent{hint}"
+            ))
+            .into())
         }
         [(index, _)] => Ok((*index, response.snapshot)),
         _ => {
@@ -246,12 +254,13 @@ fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            anyhow::bail!(
+            Err(LabelResolutionFailure(format!(
                 "ambiguous exact label '{label}' matched {} elements ({candidates}); \
                  no action was sent — choose an element index from phone_elements and \
                  call phone_tap_element with the same snapshot",
                 matches.len()
-            )
+            ))
+            .into())
         }
     }
 }
@@ -1596,6 +1605,23 @@ mod tests {
         })
         .to_string();
         assert!(unique_label_target(&siblings, "通用").is_err());
+    }
+
+    #[test]
+    fn selector_failure_screenshot_label_resolution_is_typed() {
+        for elements in [
+            serde_json::json!([]),
+            serde_json::json!([
+                {"label":"Target","kind":"Button"}, {"label":"Target","kind":"Button"}
+            ]),
+        ] {
+            let body = serde_json::json!({"snapshot":"s1","elements":elements}).to_string();
+            let error = unique_label_target(&body, "Target").unwrap_err();
+            assert!(error.is::<LabelResolutionFailure>());
+        }
+        assert!(!unique_label_target("invalid JSON", "Target")
+            .unwrap_err()
+            .is::<LabelResolutionFailure>());
     }
 
     #[test]

@@ -658,6 +658,17 @@ impl PhoneHandler {
         }
     }
 
+    async fn selector_failure_screenshot(
+        &self,
+        result: CallToolResult,
+        label_resolution_failed: bool,
+    ) -> CallToolResult {
+        attach_selector_failure_screenshot(result, label_resolution_failed, || {
+            self.daemon.screenshot(Some(800))
+        })
+        .await
+    }
+
     /// Start tracking an observed action: the screen and the action's key are
     /// fixed now. Dropping the guard unfinished (a cancelled call) resets.
     fn progress_guard(&self, action: &crate::hints::Action) -> crate::hints::ProgressGuard {
@@ -1203,7 +1214,7 @@ impl PhoneHandler {
         from the SAME phone_elements response. The daemon re-reads the tree and \
         refuses the action if the UI changed, so a stale element reference cannot \
         silently tap a different control. Use identifier/kind/label/state fields to \
-        choose the index. Snapshot refs are ephemeral: never persist them in a flow."
+        choose the index. Snapshot refs are ephemeral: never persist them in a flow. Selector failures attach a screenshot; inspect it before retrying."
     )]
     async fn phone_tap_element(
         &self,
@@ -1248,6 +1259,7 @@ impl PhoneHandler {
                 format!("tap_element #{element} failed: {e:#}."),
             ),
         };
+        let result = self.selector_failure_screenshot(result, false).await;
         self.note_progress(guard, result)
     }
 
@@ -1260,7 +1272,7 @@ impl PhoneHandler {
         phone_elements snapshot, requires exactly one match, then performs a \
         snapshot-bound tap. Zero or multiple matches return an error and send NO \
         action. For duplicate labels, choose by identifier/kind/state from \
-        phone_elements and call phone_tap_element with that response's snapshot.")]
+        phone_elements and call phone_tap_element with that response's snapshot. Selector failures attach a screenshot; inspect it before retrying.")]
     async fn phone_tap_label(
         &self,
         Parameters(TapLabelParams { label, observe }): Parameters<TapLabelParams>,
@@ -1269,6 +1281,7 @@ impl PhoneHandler {
         // The snapshot comes from the element read this call performs — never
         // a cached or borrowed baseline.
         let guard = self.progress_guard(&crate::hints::Action::TapLabel(&label));
+        let mut label_resolution_failed = false;
         let result = match self.daemon.tap_label_observed(&label, observe).await {
             Ok(response) => {
                 daemon_action_result(&response, observe, &format!("tapped element: {label}"))
@@ -1279,13 +1292,16 @@ impl PhoneHandler {
             // flattened into "unknown" for both. Note the read is itself a
             // request to the phone: what the first arm can claim is that no
             // MUTATION was dispatched, not that nothing was sent.
-            Err(crate::client::TapLabelFailure::BeforeDispatch(e)) => not_sent_result(
-                "label_lookup_failed",
-                format!(
-                    "tap_label '{label}' could not resolve a target: {e:#} No tap was \
+            Err(crate::client::TapLabelFailure::BeforeDispatch(e)) => {
+                label_resolution_failed = e.is::<crate::client::LabelResolutionFailure>();
+                not_sent_result(
+                    "label_lookup_failed",
+                    format!(
+                        "tap_label '{label}' could not resolve a target: {e:#} No tap was \
                      dispatched (only the element read), so retrying is safe."
-                ),
-            ),
+                    ),
+                )
+            }
             Err(crate::client::TapLabelFailure::AfterDispatch(e)) => unknown_action_result(
                 "transport_error",
                 format!(
@@ -1294,6 +1310,9 @@ impl PhoneHandler {
                 ),
             ),
         };
+        let result = self
+            .selector_failure_screenshot(result, label_resolution_failed)
+            .await;
         self.note_progress(guard, result)
     }
 
@@ -2005,6 +2024,53 @@ impl StructuredMode {
             _ => Self::Slim,
         }
     }
+}
+
+/// Enrich selector failures without changing the original verdict.
+async fn attach_selector_failure_screenshot<F, Fut>(
+    mut result: CallToolResult,
+    label_resolution_failed: bool,
+    capture: F,
+) -> CallToolResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let selector_refusal = result.structured_content.as_ref().is_some_and(|body| {
+        body["ok"] == false
+            && matches!(
+                body["error"].as_str(),
+                Some(
+                    "element_not_found"
+                        | "ambiguous_element_label"
+                        | "element_occluded"
+                        | "element_not_visible"
+                )
+            )
+    });
+    if result.is_error != Some(true) || !(selector_refusal || label_resolution_failed) {
+        return result;
+    }
+    // Same endpoint as phone_screenshot, including the daemon's redacted
+    // capture/wireframe handling. This budget is independent of the action.
+    match tokio::time::timeout(std::time::Duration::from_secs(3), capture()).await {
+        Ok(Ok(bytes)) if !bytes.is_empty() => {
+            result
+                .content
+                .push(Content::image(B64.encode(&bytes), "image/png"));
+        }
+        _ => {
+            result.content.push(Content::text("screenshot unavailable"));
+            return result;
+        }
+    }
+    result.content.push(Content::text(
+        "Inspect the screenshot first. If the target is visible, use phone_tap with \
+             normalized coordinates (x = pixel x / image width, y = pixel y / image height). \
+             If it is occluded, dismiss the covering UI first. Do not repeatedly retry \
+             label taps with different wording.",
+    ));
+    result
 }
 
 /// The longest top-level string a slim payload keeps; longer ones are bulk
@@ -2902,6 +2968,379 @@ mod tests {
             }
         });
         (format!("http://{address}"), task)
+    }
+
+    fn scripted_daemon_sequence(
+        responses: Vec<(String, Vec<u8>, Option<&'static str>)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let task = std::thread::spawn(move || {
+            for (status, body, expected_path) in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "missing daemon request"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("daemon accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 32_768);
+                }
+                if let Some(path) = expected_path {
+                    assert_eq!(
+                        String::from_utf8_lossy(&request).split_whitespace().nth(1),
+                        Some(path)
+                    );
+                }
+                let content_length = String::from_utf8_lossy(&request)
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                stream.read_exact(&mut vec![0; content_length]).unwrap();
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+            // Any second capture per failure would have connected by tool return.
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[test]
+    fn selector_failure_screenshot_not_found_has_image_and_hint() {
+        let (url, task) = scripted_daemon("200 OK", b"png fixture".to_vec());
+        let body = serde_json::json!({
+            "ok": false, "error": "element_not_found", "outcome": "not_sent",
+            "retry_safe": true, "hint": "original hint"
+        });
+        let mut original = CallToolResult::error(vec![Content::text("original error")]);
+        original.structured_content = Some(body.clone());
+        let result = block(handler_for(&url).selector_failure_screenshot(original, false));
+        task.join().unwrap();
+        assert_eq!(result.structured_content, Some(body));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content[0].as_text().unwrap().text, "original error");
+        assert_eq!(
+            result
+                .content
+                .iter()
+                .filter(|c| c.as_image().is_some())
+                .count(),
+            1
+        );
+        let hint = result
+            .content
+            .last()
+            .unwrap()
+            .as_text()
+            .unwrap()
+            .text
+            .as_str();
+        assert!(hint.contains("phone_tap"));
+        assert!(hint.contains("x = pixel x / image width"));
+        assert!(hint.contains("Do not repeatedly retry"));
+    }
+
+    #[test]
+    fn selector_failure_screenshot_unavailable_preserves_error() {
+        for (status, bytes) in [
+            ("503 Service Unavailable", b"capture failed".to_vec()),
+            ("200 OK", vec![]),
+        ] {
+            let (url, task) = scripted_daemon(status, bytes);
+            let mut original = CallToolResult::error(vec![Content::text("original error")]);
+            original.structured_content = Some(serde_json::json!({
+                "ok": false, "error": "element_occluded", "retry_safe": true
+            }));
+            let result =
+                block(handler_for(&url).selector_failure_screenshot(original.clone(), false));
+            task.join().unwrap();
+            assert_eq!(result.structured_content, original.structured_content);
+            assert_eq!(result.content[0], original.content[0]);
+            assert_eq!(
+                result.content[1].as_text().unwrap().text,
+                "screenshot unavailable"
+            );
+            assert!(!result.content.iter().any(|c| c.as_image().is_some()));
+        }
+    }
+
+    #[test]
+    fn selector_failure_screenshot_other_errors_do_not_capture() {
+        // A bound listener records any attempted capture without responding.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handler = handler_for(&format!("http://{}", listener.local_addr().unwrap()));
+        for code in [
+            "stale_element_snapshot",
+            "invalid_element_snapshot",
+            "unauthorized",
+            "released",
+            "not_sent",
+            "label_lookup_failed",
+            "transport_error",
+        ] {
+            let mut original = CallToolResult::error(vec![Content::text(code)]);
+            original.structured_content = Some(serde_json::json!({"ok": false, "error": code}));
+            let result = block(handler.selector_failure_screenshot(original.clone(), false));
+            assert_eq!(result, original);
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn selector_failure_screenshot_local_label_resolution_is_typed() {
+        let (url, task) = scripted_daemon("200 OK", b"png fixture".to_vec());
+        let original = not_sent_result("label_lookup_failed", "original lookup error".into());
+        let result = block(handler_for(&url).selector_failure_screenshot(original.clone(), true));
+        task.join().unwrap();
+        assert_eq!(result.structured_content, original.structured_content);
+        assert_eq!(result.content[0], original.content[0]);
+        assert!(result.content[1].as_image().is_some());
+    }
+
+    #[test]
+    fn selector_failure_screenshot_tap_label_local_failures() {
+        for elements in [
+            serde_json::json!([]),
+            serde_json::json!([
+                {"label": "Target", "kind": "Button"},
+                {"label": "Target", "kind": "Button"}
+            ]),
+        ] {
+            let (url, task) = scripted_daemon_sequence(vec![
+                (
+                    "200 OK".into(),
+                    serde_json::json!({"snapshot": "s1", "elements": elements})
+                        .to_string()
+                        .into_bytes(),
+                    Some("/agent/elements"),
+                ),
+                (
+                    "200 OK".into(),
+                    b"png fixture".to_vec(),
+                    Some("/agent/screenshot?max_side=800"),
+                ),
+            ]);
+            let result = block(
+                handler_for(&url).phone_tap_label(Parameters(TapLabelParams {
+                    label: "Target".into(),
+                    observe: Some(false),
+                })),
+            );
+            task.join().unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let body = result.structured_content.unwrap();
+            assert_eq!(body["error"], "label_lookup_failed");
+            assert_eq!(body["retry_safe"], true);
+            assert_eq!(
+                result
+                    .content
+                    .iter()
+                    .filter(|c| c.as_image().is_some())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn selector_failure_screenshot_tap_element_daemon_codes() {
+        for code in [
+            "element_not_found",
+            "ambiguous_element_label",
+            "element_occluded",
+            "element_not_visible",
+        ] {
+            let body = serde_json::json!({"ok": false, "error": code, "outcome": "not_sent", "retry_safe": true});
+            let (url, task) = scripted_daemon_sequence(vec![
+                (
+                    "422 Unprocessable Entity".into(),
+                    body.to_string().into_bytes(),
+                    None,
+                ),
+                (
+                    "200 OK".into(),
+                    b"png fixture".to_vec(),
+                    Some("/agent/screenshot?max_side=800"),
+                ),
+            ]);
+            let result = block(
+                handler_for(&url).phone_tap_element(Parameters(TapElementParams {
+                    element: 0,
+                    snapshot: "s1".into(),
+                    observe: Some(false),
+                })),
+            );
+            task.join().unwrap();
+            assert_eq!(result.structured_content, Some(body));
+            assert_eq!(
+                result
+                    .content
+                    .iter()
+                    .filter(|c| c.as_image().is_some())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn selector_failure_screenshot_survives_structured_modes() {
+        let original = not_sent_result("element_not_found", "original error".into());
+        let mut enriched = original.clone();
+        enriched
+            .content
+            .push(Content::image(B64.encode(b"png"), "image/png"));
+        for mode in [
+            StructuredMode::Full,
+            StructuredMode::Slim,
+            StructuredMode::Off,
+        ] {
+            let result = shape_structured(enriched.clone(), mode);
+            assert_eq!(result.is_error, original.is_error);
+            assert_eq!(result.content, enriched.content);
+            if let Some(body) = result.structured_content {
+                for key in ["ok", "error", "outcome", "retry_safe"] {
+                    assert_eq!(
+                        body[key],
+                        original.structured_content.as_ref().unwrap()[key]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selector_failure_screenshot_pure_not_found_image_and_hint() {
+        let original = not_sent_result("element_not_found", "original".into());
+        let result = block(attach_selector_failure_screenshot(
+            original.clone(),
+            false,
+            || async { Ok(b"png".to_vec()) },
+        ));
+        assert_eq!(result.structured_content, original.structured_content);
+        assert_eq!(result.content[0], original.content[0]);
+        assert!(result.content[1].as_image().is_some());
+        assert!(text_of(&result).contains("Do not repeatedly retry"));
+    }
+    #[test]
+    fn selector_failure_screenshot_pure_unavailable_preserves_error() {
+        let original = not_sent_result("element_occluded", "original".into());
+        let result = block(attach_selector_failure_screenshot(
+            original.clone(),
+            false,
+            || async { anyhow::bail!("unavailable") },
+        ));
+        assert_eq!(result.structured_content, original.structured_content);
+        assert_eq!(result.content[0], original.content[0]);
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(
+            result.content[1].as_text().unwrap().text,
+            "screenshot unavailable"
+        );
+    }
+    #[test]
+    fn selector_failure_screenshot_pure_other_errors_never_capture() {
+        for code in [
+            "transport_error",
+            "missing_snapshot",
+            "label_lookup_failed",
+            "stale_element_snapshot",
+        ] {
+            let original = not_sent_result(code, "original".into());
+            let result = block(attach_selector_failure_screenshot(
+                original.clone(),
+                false,
+                || async { panic!("must not capture") },
+            ));
+            assert_eq!(result, original);
+        }
+    }
+    #[test]
+    fn selector_failure_screenshot_pure_local_typed_failure() {
+        let original = not_sent_result("label_lookup_failed", "original".into());
+        let result = block(attach_selector_failure_screenshot(
+            original.clone(),
+            true,
+            || async { Ok(b"png".to_vec()) },
+        ));
+        assert_eq!(result.structured_content, original.structured_content);
+        assert!(result.content[1].as_image().is_some());
+    }
+    #[test]
+    fn selector_failure_screenshot_pure_daemon_error_codes() {
+        for code in [
+            "element_not_found",
+            "ambiguous_element_label",
+            "element_occluded",
+            "element_not_visible",
+        ] {
+            let body =
+                serde_json::json!({"ok":false,"error":code,"outcome":"not_sent","retry_safe":true});
+            let mut original = CallToolResult::error(vec![Content::text(code)]);
+            original.structured_content = Some(body.clone());
+            let result = block(attach_selector_failure_screenshot(
+                original,
+                false,
+                || async { Ok(b"png".to_vec()) },
+            ));
+            assert_eq!(result.structured_content, Some(body));
+            assert!(result.content[1].as_image().is_some());
+        }
+    }
+
+    #[test]
+    fn selector_failure_screenshot_timeout_preserves_original() {
+        let original = not_sent_result("element_not_visible", "original".into());
+        let result = block(attach_selector_failure_screenshot(
+            original.clone(),
+            false,
+            || std::future::pending(),
+        ));
+        assert_eq!(result.structured_content, original.structured_content);
+        assert_eq!(result.is_error, original.is_error);
+        assert_eq!(result.content[0], original.content[0]);
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(
+            result.content[1].as_text().unwrap().text,
+            "screenshot unavailable"
+        );
     }
 
     fn handler_for(url: &str) -> PhoneHandler {
