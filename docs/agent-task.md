@@ -120,3 +120,25 @@ The runner starts its daemon with `IPU_DAEMON_TOKEN` (agent bearer token), `IPU_
 and `IPU_DAEMON_HOST` (`127.0.0.1` by default; `0.0.0.0` lets other devices drive this phone, the
 third way above). Setup on the Mac generates and keeps them, and the Mac's web page offers a QR
 code that pairs the iPhone app with its own phone's daemon (`iphoneuse://pair?u=http://127.0.0.1:8787&c=…`).
+
+## Flows from the phone: record, save, schedule
+
+The person's own flows live in the daemon's local store (on the phone: inside the runner's
+container) next to the registry's; tasks and schedules on that daemon find both.
+
+- `POST /agent/flow/record {"action": "start"}` starts a recording. Every step applied through
+  `/control` (the app's remote view), `/agent/input` or `/agent/actions` (a task) lands in it,
+  across apps and pauses. A person's coordinate tap is recorded as the element under the finger
+  (`tap_locator` by label/identifier), read just before the tap; typed text becomes an input
+  (`text1`, …). `{"action": "stop"}` ends it and answers `{"draft": {"flow": …, "todo": […]}}`.
+- `GET /agent/flow/record` → `{"recording": bool, "steps": n, "draft": …}` (live preview).
+- `POST /agent/flow/save {"id": "myapp/daily-check", "name": "…", "description"?: "…", "flow"?: {…}}`
+  validates and installs it as a local flow. Without `flow`: the running/last recording, else the
+  current trail's draft (what the last task did). → `{"ok": true, "saved": {"id", "source": "local", …}}`;
+  `422 invalid_flow` with the reason.
+- Schedules: `GET/POST /agent/schedules` (`{"cron": "0 7 * * *", "kind": "flow", "target":
+  "myapp/daily-check", "inputs": {}, "confirm_side_effects": false, "name": "…"}`),
+  `DELETE/PATCH /agent/schedules/<id>`, `POST /agent/schedules/<id>/run` (run now),
+  `GET /agent/schedules/<id>/runs`, `GET /agent/schedules/runs`. On the phone the daemon runs them
+  in process; a flow that sends, pays or deletes needs `confirm_side_effects: true`.
+- `GET /agent/flows[?app=<bundle>]` lists the flows this daemon can run (registry + local), as `iphone-use-mcp flow list --json` prints them.

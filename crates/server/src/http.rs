@@ -965,6 +965,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/flow/draft", get(agent_flow_draft))
         .route("/agent/flow/record", get(agent_flow_record).post(agent_flow_record))
         .route("/agent/flow/save", post(agent_flow_save))
+        .route("/agent/flows", get(agent_flows))
         .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
@@ -13265,6 +13266,33 @@ async fn agent_flow_save(
         Err(error) => agent_json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             serde_json::json!({"ok": false, "error": "save_failed", "message": error.to_string()}),
+        ),
+    }
+}
+
+/// `GET /agent/flows[?app=<bundle or name>]` — the flows this daemon can run
+/// (registry and local), as `iphone-use-mcp flow list --json` prints them.
+async fn agent_flows(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    let filter = iphone_use_mcp::registry::ListFilter {
+        category: query.get("category").cloned(),
+        app: query.get("app").cloned(),
+        verified_only: false,
+    };
+    match iphone_use_mcp::registry::list(&filter) {
+        Ok((entries, index)) => agent_json_response(
+            StatusCode::OK,
+            iphone_use_mcp::registry::list_json(&entries, &index, None),
+        ),
+        Err(error) => agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok": true, "flows": [], "note": format!("{error:#}")}),
         ),
     }
 }
