@@ -7,8 +7,8 @@ import UIKit
 /// agent did as a collapsible card of steps, and its summary as the reply.
 /// The device that carries the goals out is picked in the title.
 struct AgentView: View {
-    @Bindable var app: AppModel
-    @Bindable var agent: AgentController
+    @ObservedObject var app: AppModel
+    @ObservedObject var agent: AgentController
     @State private var showSettings = false
     @State private var pairingThisPhone = false
     @State private var showFlows = false
@@ -17,7 +17,7 @@ struct AgentView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
+        AppNavigationStack {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.l) {
@@ -58,11 +58,11 @@ struct AgentView: View {
                     .padding(.horizontal, Theme.Space.l)
                     .padding(.vertical, Theme.Space.m)
                 }
-                .scrollDismissesKeyboard(.interactively)
+                .appDismissKeyboardOnScroll()
                 .refreshable { await agent.refreshHistory() }
-                .onChange(of: agent.thread.last?.steps.count) { _, _ in scrollDown(proxy) }
-                .onChange(of: agent.thread.count) { _, _ in scrollDown(proxy) }
-                .onChange(of: agent.pendingGoal) { _, _ in scrollDown(proxy) }
+                .appOnChange(of: agent.thread.last?.steps.count) { _, _ in scrollDown(proxy) }
+                .appOnChange(of: agent.thread.count) { _, _ in scrollDown(proxy) }
+                .appOnChange(of: agent.pendingGoal) { _, _ in scrollDown(proxy) }
                 .onAppear { scrollDown(proxy, animated: false) }
             }
             .background(Theme.canvas.ignoresSafeArea())
@@ -85,7 +85,7 @@ struct AgentView: View {
                 }
             }
             .sheet(isPresented: $showSettings) {
-                NavigationStack { ModelSettingsView(agent: agent) }
+                AppNavigationStack { ModelSettingsView(agent: agent) }
             }
             .sheet(isPresented: $showFlows) {
                 if let session = agent.target { FlowsHubView(session: session) }
@@ -170,8 +170,8 @@ struct AgentView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: Theme.Space.s) {
-            TextField("让 agent 做点什么…", text: $agent.draft, axis: .vertical)
-                .lineLimit(1...5)
+            AppTextField("让 agent 做点什么…", text: $agent.draft, axis: .vertical)
+                .appLineLimit(1...5)
                 .focused($composing)
                 .submitLabel(.send)
                 .onSubmit(send)
@@ -231,7 +231,7 @@ struct AgentView: View {
 
     private func scrollDown(_ proxy: ScrollViewProxy, animated: Bool = true) {
         if animated {
-            withAnimation(.snappy) { proxy.scrollTo("bottom", anchor: .bottom) }
+            withAnimation(.appSnappy) { proxy.scrollTo("bottom", anchor: .bottom) }
         } else {
             proxy.scrollTo("bottom", anchor: .bottom)
         }
@@ -241,7 +241,7 @@ struct AgentView: View {
 /// One task in the thread: the goal, the work, the answer.
 struct AgentTaskItem: View {
     let task: AgentTaskSnapshot
-    let agent: AgentController
+    @ObservedObject var agent: AgentController
     /// Offered on the last finished task: save what it did as a flow.
     var onSaveFlow: (() -> Void)?
 
@@ -330,7 +330,7 @@ struct WorkCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                withAnimation(.snappy) { open.toggle() }
+                withAnimation(.appSnappy) { open.toggle() }
                 if open { onOpen() }
             } label: {
                 HStack(spacing: Theme.Space.s) {
@@ -524,11 +524,12 @@ enum AgentFormat {
     /// `45s`, `2m 5s` (`45秒`, `2分5秒`), in the device language.
     static func duration(ms: Int, precise: Bool = false) -> String {
         if precise, ms < 10_000 {
-            return Duration.milliseconds(ms).formatted(.units(allowed: [.seconds], width: .narrow,
-                                                              fractionalPart: .show(length: 1)))
+            return String(format: "%.1f", Double(ms) / 1_000) + String(localized: "秒")
         }
-        let seconds = max(0, Int((Double(ms) / 1000).rounded()))
-        return Duration.seconds(seconds).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .narrow))
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.unitsStyle = .abbreviated
+        return formatter.string(from: max(0, Double(ms) / 1_000)) ?? "0"
     }
 }
 
@@ -588,8 +589,7 @@ struct ConfirmStepSheet: View {
         .disabled(answering)
         .overlay { if answering { ProgressView() } }
         .padding(Theme.Space.xl)
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
+        .appMediumLargeSheet()
         .interactiveDismissDisabled()
         .background(Theme.canvas.ignoresSafeArea())
     }
@@ -607,13 +607,13 @@ struct ConfirmStepSheet: View {
 /// How to pair this iPhone's own daemon: the Mac page shows a QR code for it
 /// (`iphoneuse://pair?u=http://127.0.0.1:8787&c=…`), scanned like any other.
 struct PairThisPhoneSheet: View {
-    let app: AppModel
+    @ObservedObject var app: AppModel
     @State private var scanning = false
     @State private var note: String?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
+        AppNavigationStack {
             VStack(alignment: .leading, spacing: Theme.Space.l) {
                 Image(systemName: "iphone.badge.plus")
                     .font(.title)
@@ -667,7 +667,7 @@ struct PairThisPhoneSheet: View {
 /// The models a task may use: the assist list (tried in order), Jev, and
 /// the text model. Keys go to the Keychain as they are typed.
 struct ModelSettingsView: View {
-    @Bindable var agent: AgentController
+    @ObservedObject var agent: AgentController
     @State private var jevKey = ""
     @State private var textKey = ""
     @Environment(\.dismiss) private var dismiss
@@ -709,7 +709,7 @@ struct ModelSettingsView: View {
                         .textContentType(.password)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                        .onChange(of: jevKey) { _, value in
+                        .appOnChange(of: jevKey) { _, value in
                             ModelSettingsStore.setSecret(value, for: ModelSettings.jevKeyAccount)
                         }
                     TextField("模型", text: $agent.settings.jevModel)
@@ -729,7 +729,7 @@ struct ModelSettingsView: View {
                         .textContentType(.password)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                        .onChange(of: textKey) { _, value in
+                        .appOnChange(of: textKey) { _, value in
                             ModelSettingsStore.setSecret(value, for: ModelSettings.textKeyAccount)
                         }
                     TextField("模型", text: $agent.settings.textModel)
@@ -746,8 +746,8 @@ struct ModelSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
-            if agent.settings.sendModels {
-                ToolbarItem(placement: .topBarLeading) { EditButton() }
+            ToolbarItem(placement: .navigationBarLeading) {
+                if agent.settings.sendModels { EditButton() }
             }
         }
         .onAppear {
@@ -814,14 +814,14 @@ struct ProviderEditView: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                 } else {
-                    LabeledContent("地址", value: provider.baseURL)
+                    AppLabeledContent("地址", value: provider.baseURL)
                 }
                 if provider.needsKey {
                     SecureField("密钥", text: $key)
                         .textContentType(.password)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                        .onChange(of: key) { _, value in
+                        .appOnChange(of: key) { _, value in
                             ModelSettingsStore.setSecret(value, for: provider.keyAccount)
                         }
                 }

@@ -393,8 +393,8 @@ enum AgentTaskPoller {
     static func follow(
         _ tracker: AgentTaskTracker,
         api: any AgentTaskAPI,
-        interval: Duration = .seconds(1),
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        interval: TimeInterval = .seconds(1),
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: $0) },
         relogin: @escaping @MainActor () async -> Bool = { false },
         onUpdate: @escaping @MainActor (AgentTaskTracker) -> Void
     ) async -> AgentPollEnd {

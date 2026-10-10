@@ -2,7 +2,7 @@ name: IPhoneUseRemote
 options:
   bundleIdPrefix: com.leeguoo
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "15.0"
   createIntermediateGroups: true
   developmentLanguage: zh-Hans
 settings:

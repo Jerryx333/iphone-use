@@ -184,7 +184,7 @@ enum DeviceStore {
     /// this iPhone's own daemon.
     static func defaultName(for address: String) -> String {
         if isThisPhone(address) { return String(localized: "本机") }
-        guard let url = URL(string: address), let host = url.host() else { return address }
+        guard let url = URL(string: address), let host = url.host else { return address }
         if let port = url.port { return "\(host):\(port)" }
         return host
     }

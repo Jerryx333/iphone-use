@@ -1,5 +1,5 @@
 import Foundation
-import Observation
+import Combine
 import UIKit
 import UserNotifications
 
@@ -11,12 +11,11 @@ import UserNotifications
 /// front for a confirmation and at the end (`X-Task-Return-Bundle`), so the
 /// task being followed is remembered and picked up again on every return.
 @MainActor
-@Observable
-final class AgentController {
-    @ObservationIgnored weak var app: AppModel?
+final class AgentController: ObservableObject {
+    weak var app: AppModel?
 
     /// The device that gets the goal.
-    var targetID: UUID? {
+    @Published var targetID: UUID? {
         didSet {
             guard targetID != oldValue else { return }
             history = []
@@ -27,16 +26,16 @@ final class AgentController {
     }
 
     /// `GET /agent/tasks` on the target, newest first, without steps.
-    private(set) var history: [AgentTaskSnapshot] = []
+    @Published private(set) var history: [AgentTaskSnapshot] = []
     /// The task followed live, and the device it runs on.
-    private(set) var live: AgentTaskTracker?
-    private(set) var liveDeviceID: UUID?
+    @Published private(set) var live: AgentTaskTracker?
+    @Published private(set) var liveDeviceID: UUID?
     /// Steps of past tasks, read when the person opens one.
-    private(set) var details: [String: AgentTaskSnapshot] = [:]
+    @Published private(set) var details: [String: AgentTaskSnapshot] = [:]
     /// A goal sent and not yet acknowledged.
-    private(set) var pendingGoal: String?
-    var error: String?
-    private var drafts: [String: String]
+    @Published private(set) var pendingGoal: String?
+    @Published var error: String?
+    @Published private var drafts: [String: String]
     /// Each device keeps its own unsent goal, including across app launches.
     var draft: String {
         get { drafts[targetID?.uuidString ?? "unselected"] ?? "" }
@@ -47,13 +46,13 @@ final class AgentController {
     }
     /// Following the task gave up (the daemon stopped answering); it may
     /// still be running there.
-    private(set) var linkNote: String?
+    @Published private(set) var linkNote: String?
     /// The question a paused task asks; drives the confirmation sheet.
-    var confirmPrompt: ConfirmPrompt?
-    private(set) var answering = false
-    private(set) var stopping = false
+    @Published var confirmPrompt: ConfirmPrompt?
+    @Published private(set) var answering = false
+    @Published private(set) var stopping = false
 
-    var settings: ModelSettings {
+    @Published var settings: ModelSettings {
         didSet {
             guard settings != oldValue else { return }
             ModelSettingsStore.save(settings, to: defaults)
@@ -68,15 +67,15 @@ final class AgentController {
         var id: String { "\(taskID)|\(confirm.action)|\(confirm.target ?? "")" }
     }
 
-    @ObservationIgnored private let defaults: UserDefaults
-    @ObservationIgnored private var pollTask: Task<Void, Never>?
-    @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private let defaults: UserDefaults
+    private var pollTask: Task<Void, Never>?
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// The confirmation already announced (sheet or notification), so a
     /// poll that repeats it does not announce it again.
-    @ObservationIgnored private var announced: String?
+    private var announced: String?
     /// A question the person dismissed by answering: never shown again for
     /// the same task and step, even if a poll still reports it.
-    @ObservationIgnored private var answered: Set<String> = []
+    private var answered: Set<String> = []
 
     private static let runningKey = "agent.running.v1"
     private static let draftsKey = "agent.drafts.v1"

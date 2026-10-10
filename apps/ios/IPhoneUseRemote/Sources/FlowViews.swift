@@ -1,4 +1,4 @@
-import Observation
+import Combine
 import SwiftUI
 
 // MARK: - Recording
@@ -8,17 +8,16 @@ import SwiftUI
 /// the save sheet. The daemon owns the recording; this only mirrors it, so
 /// a remote view opened later shows one still running.
 @MainActor
-@Observable
-final class FlowRecorder {
-    private(set) var recording = false
-    private(set) var steps = 0
-    private(set) var busy = false
+final class FlowRecorder: ObservableObject {
+    @Published private(set) var recording = false
+    @Published private(set) var steps = 0
+    @Published private(set) var busy = false
     /// Set when a recording stops with something in it: the save sheet.
-    var draft: FlowDraft?
-    var message: String?
+    @Published var draft: FlowDraft?
+    @Published var message: String?
 
-    @ObservationIgnored private weak var session: DeviceSession?
-    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    private weak var session: DeviceSession?
+    private var pollTask: Task<Void, Never>?
 
     init(session: DeviceSession) {
         self.session = session
@@ -94,7 +93,7 @@ final class FlowRecorder {
 
 /// The red pill over the remote view while recording: step count and Stop.
 struct RecordingPill: View {
-    let recorder: FlowRecorder
+    @ObservedObject var recorder: FlowRecorder
 
     var body: some View {
         if recorder.recording {
@@ -124,7 +123,7 @@ struct RecordingPill: View {
 /// Name a recording (or what the last task did) and save it as a local flow
 /// on that daemon. The id is made from the app and the name, and can be edited.
 struct SaveFlowSheet: View {
-    let session: DeviceSession
+    @ObservedObject var session: DeviceSession
     /// A stopped recording's draft; nil saves the daemon's last trail (a
     /// finished task), read here only to fill in the app and the checklist.
     let draft: FlowDraft?
@@ -139,12 +138,12 @@ struct SaveFlowSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
+        AppNavigationStack {
             Form {
                 Section {
                     TextField("名称，例如 查电量", text: $name)
-                    TextField("说明（可选）", text: $detail, axis: .vertical)
-                        .lineLimit(1...4)
+                    AppTextField("说明（可选）", text: $detail, axis: .vertical)
+                        .appLineLimit(1...4)
                 } footer: {
                     if let shown {
                         Text("\(shown.label ?? shown.bundle ?? String(localized: "未知 App")) · \(shown.steps) 步")
@@ -183,7 +182,7 @@ struct SaveFlowSheet: View {
                 }
             }
             .disabled(saving)
-            .onChange(of: name) { _, _ in deriveID() }
+            .appOnChange(of: name) { _, _ in deriveID() }
             .task {
                 if let draft {
                     shown = draft
@@ -224,7 +223,7 @@ struct SaveFlowSheet: View {
 
 /// A device's flows (registry and its own) and its schedules.
 struct FlowsHubView: View {
-    let session: DeviceSession
+    @ObservedObject var session: DeviceSession
     enum Page: Hashable { case flows, schedules }
     @State var page: Page = .flows
     @State private var flows: [FlowEntry] = []
@@ -236,7 +235,7 @@ struct FlowsHubView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
+        AppNavigationStack {
             List {
                 Section {
                     Picker("", selection: $page) {
@@ -261,10 +260,9 @@ struct FlowsHubView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } }
-                if page == .schedules {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button { creating = true } label: { Label("新建定时", systemImage: "plus") }
-                            .disabled(flows.isEmpty)
+                ToolbarItem(placement: .primaryAction) {
+                    if page == .schedules {
+                        Button { creating = true } label: { Label("新建定时", systemImage: "plus") }.disabled(flows.isEmpty)
                     }
                 }
             }
@@ -404,7 +402,7 @@ struct RunLine: View {
 
 /// One flow: what it does, its inputs, and 运行 / 定时.
 struct FlowDetailView: View {
-    let session: DeviceSession
+    @ObservedObject var session: DeviceSession
     let flow: FlowEntry
     let onSchedule: () -> Void
     @State private var inputs: [String: String] = [:]
@@ -464,7 +462,7 @@ struct FlowDetailView: View {
                           systemImage: result.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
                         .foregroundStyle(result.ok ? Theme.ok : Theme.down)
                     ForEach(result.outputs, id: \.key) { output in
-                        LabeledContent(output.key, value: output.value)
+                        AppLabeledContent(output.key, value: output.value)
                     }
                     if let error = result.error {
                         Text(result.failedStep.map { String(localized: "第 \($0) 步：\(error)") } ?? error)
@@ -517,7 +515,7 @@ struct FlowDetailView: View {
 
 /// A schedule: its runs, run now, delete.
 struct ScheduleDetailView: View {
-    let session: DeviceSession
+    @ObservedObject var session: DeviceSession
     let schedule: FlowSchedule
     let onChange: () -> Void
     @State private var runs: [ScheduleRun] = []
@@ -529,13 +527,13 @@ struct ScheduleDetailView: View {
     var body: some View {
         List {
             Section {
-                LabeledContent("Flow", value: schedule.target)
-                LabeledContent("时间", value: CronSpec(cron: schedule.cron)?.summary ?? schedule.cron)
+                AppLabeledContent("Flow", value: schedule.target)
+                AppLabeledContent("时间", value: CronSpec(cron: schedule.cron)?.summary ?? schedule.cron)
                 if let next = schedule.nextRunAt, schedule.enabled {
-                    LabeledContent("下次", value: next.formatted(date: .abbreviated, time: .shortened))
+                    AppLabeledContent("下次", value: next.formatted(date: .abbreviated, time: .shortened))
                 }
                 ForEach(schedule.inputs.sorted { $0.key < $1.key }, id: \.key) { item in
-                    LabeledContent(item.key, value: item.value)
+                    AppLabeledContent(item.key, value: item.value)
                 }
                 if schedule.confirmSideEffects {
                     Label("允许它发送、付款或删除", systemImage: "exclamationmark.triangle.fill")
@@ -603,7 +601,7 @@ struct ScheduleDetailView: View {
 /// A new schedule: which flow, when, its inputs, and (for a flow with side
 /// effects) the person's explicit OK.
 struct ScheduleEditor: View {
-    let session: DeviceSession
+    @ObservedObject var session: DeviceSession
     let flows: [FlowEntry]
     let initial: FlowEntry?
     let onCreated: () -> Void
@@ -625,14 +623,14 @@ struct ScheduleEditor: View {
     }
 
     var body: some View {
-        NavigationStack {
+        AppNavigationStack {
             Form {
                 Section("Flow") {
                     Picker("Flow", selection: $flowID) {
                         Text("选择").tag("")
                         ForEach(flows) { flow in Text(flow.name).tag(flow.id) }
                     }
-                    .pickerStyle(.navigationLink)
+                    .appFlowPickerStyle()
                     if let flow {
                         Text(flow.id).font(.caption.monospaced()).foregroundStyle(.secondary)
                     }
@@ -695,7 +693,7 @@ struct ScheduleEditor: View {
             }
             .disabled(saving)
             .onAppear { if flowID.isEmpty, let initial { flowID = initial.id } }
-            .onChange(of: flowID) { _, _ in confirmSideEffects = false }
+            .appOnChange(of: flowID) { _, _ in confirmSideEffects = false }
         }
     }
 

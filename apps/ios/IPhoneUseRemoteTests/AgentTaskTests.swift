@@ -289,8 +289,8 @@ final class AgentTaskPollerTests: XCTestCase {
 }
 
 private actor SleepLog {
-    private(set) var intervals: [Duration] = []
-    func add(_ duration: Duration) { intervals.append(duration) }
+    private(set) var intervals: [TimeInterval] = []
+    func add(_ duration: TimeInterval) { intervals.append(duration) }
 }
 
 final class ModelsPayloadTests: XCTestCase {

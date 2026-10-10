@@ -10,7 +10,7 @@ final class AgentUITests: XCTestCase {
     private var app: XCUIApplication!
 
     override func setUp() async throws {
-        var request = URLRequest(url: mock.appending(path: "mock/info"))
+        var request = URLRequest(url: mock.appendingPathComponent( "mock/info"))
         request.timeoutInterval = 3
         guard (try? await URLSession.shared.data(for: request)) != nil else {
             throw XCTSkip("mock daemon not running at \(mock)")
@@ -25,7 +25,7 @@ final class AgentUITests: XCTestCase {
         app = XCUIApplication()
         // `-agent YES` opens the Agent screen once the mock is added (and so on screen).
         app.launchArguments = ["-address", mock.absoluteString, "-password", "mock", "-observeOnly", "YES",
-                               "-agent", "YES"]
+                               "-agent", "YES", "-legacyUI", "YES"]
         app.launch()
 
         let field = app.textFields["agent-goal"].exists ? app.textFields["agent-goal"] : app.textViews["agent-goal"]
@@ -54,7 +54,7 @@ final class AgentUITests: XCTestCase {
     func testRefusedTaskKeepsTheDraft() throws {
         app = XCUIApplication()
         app.launchArguments = ["-address", mock.absoluteString, "-password", "mock", "-observeOnly", "YES",
-                               "-agent", "YES"]
+                               "-agent", "YES", "-legacyUI", "YES"]
         app.launch()
         let field = app.textFields["agent-goal"].exists ? app.textFields["agent-goal"] : app.textViews["agent-goal"]
         XCTAssertTrue(field.waitForExistence(timeout: 10))
@@ -82,7 +82,7 @@ final class AgentUITests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         if let dir = ProcessInfo.processInfo.environment["TEST_RUNNER_SHOT_DIR"] {
-            try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: dir).appending(path: "\(name).png"))
+            try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: dir).appendingPathComponent( "\(name).png"))
         }
     }
 }

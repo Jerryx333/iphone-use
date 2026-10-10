@@ -1,17 +1,16 @@
 import Foundation
 import Network
-import Observation
+import Combine
 
 /// The app: the saved devices (one session each), which one is on screen,
 /// sync mode, pairing, and the demo.
 @MainActor
-@Observable
-final class AppModel {
-    private(set) var devices: [DeviceRecord] = []
-    private(set) var sessions: [UUID: DeviceSession] = [:]
+final class AppModel: ObservableObject {
+    @Published private(set) var devices: [DeviceRecord] = []
+    @Published private(set) var sessions: [UUID: DeviceSession] = [:]
 
     /// The device shown full screen; nil shows the overview grid.
-    var focusedID: UUID? {
+    @Published var focusedID: UUID? {
         didSet {
             guard focusedID != oldValue else { return }
             updateAutoWake()
@@ -21,7 +20,7 @@ final class AppModel {
 
     /// Sync ("同步"): every gesture on the lead goes to the lead and each
     /// follower at once. Nil when off.
-    private(set) var sync: SyncGroup?
+    @Published private(set) var sync: SyncGroup?
 
     struct SyncGroup: Equatable {
         var lead: UUID
@@ -30,23 +29,23 @@ final class AppModel {
     }
 
     /// Adding a device (first launch, or from the device list).
-    var adding = false
-    var addError: String?
-    var toast: String?
+    @Published var adding = false
+    @Published var addError: String?
+    @Published var toast: String?
 
     /// The device whose address and password are being edited (a login
     /// prompt, or Settings › Edit).
-    var editing: EditTarget?
+    @Published var editing: EditTarget?
     /// The scanner is open (from a device's "scan again" button).
-    var scanning = false
+    @Published var scanning = false
 
     struct EditTarget: Identifiable, Equatable {
         let id: UUID
     }
 
     /// This iPhone has a network path at all.
-    private(set) var online = true
-    private var pathMonitor: NWPathMonitor?
+    @Published private(set) var online = true
+    @Published private var pathMonitor: NWPathMonitor?
 
     /// What became of adding or editing a device.
     enum AddOutcome: Equatable {
@@ -60,11 +59,11 @@ final class AppModel {
     }
 
     /// The recorded demo, while someone is trying the app without a Mac.
-    var demo: DemoSession?
+    @Published var demo: DemoSession?
 
     /// The person's viewing choice for the focused screen, remembered on this
     /// device. Tiles always stream in performance mode.
-    var videoPreference: VideoPreference = VideoPreference.load(from: .standard) {
+    @Published var videoPreference: VideoPreference = VideoPreference.load(from: .standard) {
         didSet {
             guard videoPreference != oldValue else { return }
             UserDefaults.standard.set(videoPreference.rawValue, forKey: VideoPreference.key)
@@ -72,16 +71,16 @@ final class AppModel {
         }
     }
     /// This iPhone is on cellular only (auto video picks performance).
-    private(set) var onCellular = false
+    @Published private(set) var onCellular = false
 
     /// A pairing link opened from outside the app (the camera's landing page,
     /// or any other app). It waits for the person to confirm, so a stray link
     /// cannot silently add a server.
-    var pendingLink: PairLink?
+    @Published var pendingLink: PairLink?
 
     /// The Agent screen (a goal typed here, carried out by a daemon).
-    var agentOpen = false
-    @ObservationIgnored let agent: AgentController
+    @Published var agentOpen = false
+    let agent: AgentController
 
     private let defaults: UserDefaults
 
