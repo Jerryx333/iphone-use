@@ -627,6 +627,9 @@
 "模型服务请求失败（%lld），请检查模型设置后重试" = "Model request failed (%lld). Check the model settings and retry.";
 
 /* Live task progress */
+"健康" = "Health";
+"信息" = "Messages";
+"微信" = "WeChat";
 "读取流程步骤…" = "Loading flow steps…";
 "这次没有可保存的步骤。先录制操作，或完成一个包含手机操作的任务。" = "There are no steps to save. Record some actions, or finish a task that operates the phone.";
 "查看任务结果" = "View task result";

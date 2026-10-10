@@ -34,7 +34,18 @@ struct AgentProgress: Equatable, Sendable {
     }
 
     static func action(_ operation: String, target: String?) -> String {
-        let label = target.map { "「\(String($0.prefix(36)))」" } ?? ""
+        let displayTarget: String?
+        if operation == "LAUNCH", let target, target.contains("."), !target.contains(" ") {
+            switch target {
+            case "com.apple.Preferences": displayTarget = String(localized: "设置")
+            case "com.apple.Health": displayTarget = String(localized: "健康")
+            case "com.apple.mobilesafari": displayTarget = "Safari"
+            case "com.apple.MobileSMS": displayTarget = String(localized: "信息")
+            case "com.tencent.xin": displayTarget = String(localized: "微信")
+            default: displayTarget = nil
+            }
+        } else { displayTarget = target }
+        let label = displayTarget.map { "「\(String($0.prefix(36)))」" } ?? ""
         switch operation {
         case "CLICK": return String(localized: "点击") + label
         case "TYPE_TEXT": return String(localized: "填写文本") + label
