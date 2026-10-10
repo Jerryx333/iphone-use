@@ -12978,8 +12978,12 @@ fn record_flow_action(state: &AppState, action: &serde_json::Value, now: Instant
     let mut trail = recover(state.flow_trail.lock());
     if let Some(bundle) = &bundle {
         trail.launched(bundle, now);
+        let mut step = serde_json::json!({"kind":"launch_app","bundle":bundle});
+        if let Some(fresh) = action.get("fresh").and_then(serde_json::Value::as_bool) {
+            step["fresh"] = serde_json::json!(fresh);
+        }
         trail.record(
-            crate::flows::Converted::Step(serde_json::json!({"kind":"launch_app","bundle":bundle})),
+            crate::flows::Converted::Step(step),
             now,
         );
     } else {
@@ -19442,6 +19446,19 @@ mod tests {
             let draft: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(draft["flow"]["app"], "com.apple.Preferences");
         });
+    }
+
+    #[test]
+    fn recorded_launch_keeps_its_reset_choice_for_later_replay() {
+        for fresh in [Some(true), Some(false), None] {
+            let state = fixture_app_state(None);
+            let mut action = serde_json::json!({"type":"launch_app","bundle":"com.apple.Preferences"});
+            if let Some(fresh) = fresh { action["fresh"] = serde_json::json!(fresh); }
+            record_flow_action(&state, &action, Instant::now());
+            record_flow_action(&state, &serde_json::json!({"type":"tap","label":"电池"}), Instant::now());
+            let draft = recover(state.flow_trail.lock()).draft().unwrap();
+            assert_eq!(draft["flow"]["steps"][0].get("fresh"), action.get("fresh"));
+        }
     }
 
     /// A synthetic WDA on loopback that the test owns and shuts down.
