@@ -602,6 +602,7 @@ pub(crate) async fn execute_operation(
     history: &[Value],
     entry: &mut Value,
     text_ms: &mut u128,
+    provided_text: Option<String>,
 ) -> Result<Executed> {
     let result: Result<()> = match operation {
         "DONE" => return Ok(Executed::Done),
@@ -615,14 +616,20 @@ pub(crate) async fn execute_operation(
         "TYPE_TEXT" => {
             let t = target.expect("TYPE_TEXT has a target");
             let tt = Instant::now();
-            let text = models
-                .field_text(json!({
-                    "goal": goal,
-                    "field": {"label": t.label, "role": t.kind, "current_value": t.value},
-                    "screen": {"app": screen.app, "text": screen.text.chars().take(1500).collect::<String>()},
-                    "history": history,
-                }))
-                .await;
+            let text = match provided_text {
+                // The deciding model already said what to type.
+                Some(text) => Ok(Some(text)),
+                None => {
+                    models
+                        .field_text(json!({
+                            "goal": goal,
+                            "field": {"label": t.label, "role": t.kind, "current_value": t.value},
+                            "screen": {"app": screen.app, "text": screen.text.chars().take(1500).collect::<String>()},
+                            "history": history,
+                        }))
+                        .await
+                }
+            };
             *text_ms += tt.elapsed().as_millis();
             match text {
                 Ok(Some(text)) => {
@@ -752,6 +759,7 @@ pub async fn run(daemon: &DaemonClient, opts: Options) -> Result<Value> {
             &history,
             &mut entry,
             &mut text_ms,
+            None,
         )
         .await?
         {

@@ -967,6 +967,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/flow/save", post(agent_flow_save))
         .route("/agent/flows", get(agent_flows))
         .route("/agent/flow/run", post(agent_flow_run))
+        .route("/agent/task", post(agent_task_start))
+        .route("/agent/task/:id", get(agent_task_get))
+        .route("/agent/task/:id/:verb", post(agent_task_act))
+        .route("/agent/tasks", get(agent_tasks))
         .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
@@ -13354,6 +13358,114 @@ async fn agent_flow_run(
             serde_json::json!({"ok": false, "error": "flow_not_run", "message": format!("{error:#}")}),
         ),
     }
+}
+
+/// `POST /agent/task` — hand the daemon a goal (docs/agent-task.md). 202 with
+/// the task id; 409 `task_running` while another task runs.
+async fn agent_task_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let mut request: iphone_use_mcp::task::TaskRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return agent_json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok": false, "error": "invalid_request", "message": error.to_string()}),
+            )
+        }
+    };
+    request.return_bundle = headers
+        .get("x-task-return-bundle")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 200 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .map(str::to_string);
+    let Some(scheduler) = crate::schedules::current() else {
+        return agent_json_response(StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({"ok": false, "error": "not_ready"}));
+    };
+    match iphone_use_mcp::task::start(request, |owner| scheduler.self_client(owner)) {
+        Ok(id) => agent_json_response(StatusCode::ACCEPTED, serde_json::json!({"ok": true, "id": id, "status": "running"})),
+        Err(iphone_use_mcp::task::StartError::Busy(id)) => agent_json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"ok": false, "error": "task_running", "id": id}),
+        ),
+        Err(iphone_use_mcp::task::StartError::Invalid(message)) => agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "invalid_request", "message": message}),
+        ),
+    }
+}
+
+/// `GET /agent/task/<id>[?since=n]` (`current` for the running or last task).
+async fn agent_task_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    let since = query.get("since").and_then(|v| v.parse().ok());
+    match iphone_use_mcp::task::get(&id, since) {
+        Some(mut task) => {
+            task["ok"] = serde_json::json!(true);
+            agent_json_response(StatusCode::OK, task)
+        }
+        None => agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+    }
+}
+
+/// `POST /agent/task/<id>/confirm {"approve": bool}` and `POST /agent/task/<id>/cancel`.
+async fn agent_task_act(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, verb)): axum::extract::Path<(String, String)>,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let result = match verb.as_str() {
+        "confirm" => {
+            let approve = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("approve").and_then(serde_json::Value::as_bool));
+            let Some(approve) = approve else {
+                return agent_json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "invalid_request", "message": "send {\"approve\": true|false}"}),
+                );
+            };
+            iphone_use_mcp::task::answer(&id, approve)
+        }
+        "cancel" => iphone_use_mcp::task::cancel(&id),
+        _ => return agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+    };
+    match result {
+        Ok(()) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true})),
+        Err("not_found") => agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+        Err(error) => agent_json_response(StatusCode::CONFLICT, serde_json::json!({"ok": false, "error": error})),
+    }
+}
+
+/// `GET /agent/tasks` — the running task and the last ones, newest first.
+async fn agent_tasks(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    agent_json_response(StatusCode::OK, iphone_use_mcp::task::list())
 }
 
 /// Validate and install `flow` as local flow `id` (the same check and store as
