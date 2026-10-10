@@ -302,7 +302,14 @@ pub fn observed(json: &Value) -> Option<String> {
     if json.get("no_visible_change") == Some(&Value::Bool(true)) {
         head.push_str(" · NO VISIBLE CHANGE");
     }
+    let no_scroll_progress = json.get("no_scroll_progress") == Some(&Value::Bool(true));
+    if no_scroll_progress {
+        head.push_str(" · NO SCROLL PROGRESS");
+    }
     let mut out = vec![head];
+    if no_scroll_progress {
+        out.push("Content did not move in the scroll direction (only values changed). The gesture may have reached a boundary, landed in another region, or been blocked by an overlay. Check a screenshot before deciding; do not keep scrolling blindly. This does not mean the list has been fully read.".to_string());
+    }
     if let Some(delta) = json.get("delta") {
         let indexed = |key: &str| -> Vec<(u64, Value)> {
             delta
@@ -463,6 +470,32 @@ mod tests {
              + #5 [Cell] \"关于本机\"\n\
              - 2 removed · = 12 unchanged"
         );
+    }
+
+    #[test]
+    fn no_scroll_progress_is_prominent_and_does_not_imply_completion() {
+        let mut body = json!({
+            "ok": true,
+            "snapshot": "S2",
+            "no_scroll_progress": true,
+            "delta": {"added": [], "changed": [], "removed": [], "unchanged": 3},
+        });
+        let output = observed(&body).unwrap();
+        assert!(output
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(" · NO SCROLL PROGRESS"));
+        assert!(output
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("Check a screenshot"));
+        assert!(output.contains("does not mean the list has been fully read"));
+        body["no_scroll_progress"] = json!(false);
+        assert!(!observed(&body).unwrap().contains("NO SCROLL PROGRESS"));
+        body.as_object_mut().unwrap().remove("no_scroll_progress");
+        assert!(!observed(&body).unwrap().contains("NO SCROLL PROGRESS"));
     }
 
     #[test]

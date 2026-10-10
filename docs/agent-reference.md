@@ -251,6 +251,11 @@ is no longer cached). The action result and the observation are separate facts:
 - `no_visible_change:true`: a readable, settled tree with no row changed — the
   gesture hit nothing (touch landed on an input or nested scroller, target
   moved). Re-read and retarget; its absence does not prove success.
+- `no_scroll_progress:true`: a settled, readable, fresh tree has common unique
+  anchors but none moved in the scroll direction, despite other changes. The
+  gesture may be at a boundary, in another region, or blocked by an overlay.
+  Check a screenshot before scrolling again; this does not mean the list is
+  fully read. Absent when there are no common anchors or the app changed.
 - `settle_ms` default 15000, max 20000; it is a ceiling, reading stops when two
   reads match. One large-tree read was measured at 6–7s.
 - `app_changed:{from,to}`: the frontmost app changed — usually a banner swallowed

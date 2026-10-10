@@ -5638,6 +5638,38 @@ fn delta_shows_no_visible_change(delta: &ElementRowsDelta, report: &SettleReport
         && delta.removed.is_empty()
 }
 
+/// Attach a progress hint only when a fresh, readable observation supports it.
+fn mark_no_scroll_progress(
+    body: &mut serde_json::Value,
+    action: &serde_json::Value,
+    baseline: &[crate::wda::ElementRow],
+    current: &[crate::wda::ElementRow],
+    report: &SettleReport,
+) {
+    if !report.settled
+        || report.sparse
+        || report.stale
+        || body.get("app_changed").is_some()
+        || body.get("no_visible_change") == Some(&serde_json::Value::Bool(true))
+    {
+        return;
+    }
+    let number = |key: &str| action.get(key).and_then(serde_json::Value::as_f64);
+    let direction = match action.get("type").and_then(serde_json::Value::as_str) {
+        Some("scroll") => Some((number("dx").unwrap_or(0.0), number("dy").unwrap_or(0.0))),
+        Some("swipe" | "drag") => match (number("x1"), number("y1"), number("x2"), number("y2")) {
+            (Some(x1), Some(y1), Some(x2), Some(y2)) => Some((x1 - x2, y1 - y2)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if direction.is_some_and(|(dx, dy)| {
+        crate::scroll_progress::scroll_anchor_moved(baseline, current, dx, dy) == Some(false)
+    }) {
+        body["no_scroll_progress"] = serde_json::Value::Bool(true);
+    }
+}
+
 /// Serialize a computed delta for the wire: `added`/`changed` carry the full
 /// current rows with their indexes (so a follow-up snapshot-bound action needs
 /// no re-read), `removed` is baseline indexes only.
@@ -10830,6 +10862,9 @@ async fn agent_input_inner(
                                         body["no_visible_change"] =
                                             serde_json::Value::Bool(true);
                                     }
+                                    mark_no_scroll_progress(
+                                        &mut body, &value, &baseline_rows, &rows, &report,
+                                    );
                                     body
                                 }
                                 None => serde_json::json!({
@@ -14784,6 +14819,68 @@ mod tests {
         let unknown = vec![delta_row("Cell", "通用", 80.0)];
         assert_eq!(app_changed_json(&known, &unknown), None);
         assert_eq!(app_changed_json(&unknown, &known), None);
+    }
+
+    #[test]
+    fn scroll_progress_body_gates_and_gesture_directions() {
+        let baseline = vec![delta_row("Cell", "item", 100.0)];
+        let mut current = baseline.clone();
+        current[0].value = Some("updated".into());
+        let mut report = SettleReport::new(1000);
+        report.settled = true;
+        let actions = [
+            serde_json::json!({"type":"scroll", "dy":100}),
+            serde_json::json!({"type":"scroll", "page":true, "dy":100}),
+            serde_json::json!({"type":"scroll", "element":0, "snapshot":"S1", "dy":100}),
+            serde_json::json!({"type":"swipe", "x1":0.5,"x2":0.5,"y1":0.8,"y2":0.2}),
+            serde_json::json!({"type":"drag", "x1":0.5,"x2":0.5,"y1":0.8,"y2":0.2}),
+        ];
+        for action in &actions {
+            let mut body = serde_json::json!({});
+            mark_no_scroll_progress(&mut body, action, &baseline, &current, &report);
+            assert_eq!(body["no_scroll_progress"], true);
+            let mut moved = current.clone();
+            moved[0].rect[1] -= 20.0;
+            let mut body = serde_json::json!({});
+            mark_no_scroll_progress(&mut body, action, &baseline, &moved, &report);
+            assert!(body.get("no_scroll_progress").is_none());
+        }
+        for gate in [
+            "unsettled",
+            "sparse",
+            "stale",
+            "app_changed",
+            "no_visible_change",
+            "no_anchor",
+            "tap",
+            "zero",
+            "missing_endpoint",
+        ] {
+            let mut report = SettleReport::new(1000);
+            report.settled = gate != "unsettled";
+            report.sparse = gate == "sparse";
+            report.stale = gate == "stale";
+            let mut body = serde_json::json!({});
+            if gate == "app_changed" {
+                body[gate] = serde_json::json!({"from":"a","to":"b"});
+            }
+            if gate == "no_visible_change" {
+                body[gate] = serde_json::json!(true);
+            }
+            let action = match gate {
+                "tap" => serde_json::json!({"type":"tap", "dy":100}),
+                "zero" => serde_json::json!({"type":"scroll"}),
+                "missing_endpoint" => serde_json::json!({"type":"swipe", "y1":0.8,"y2":0.2}),
+                _ => actions[0].clone(),
+            };
+            let rows = if gate == "no_anchor" {
+                &[][..]
+            } else {
+                &current
+            };
+            mark_no_scroll_progress(&mut body, &action, &baseline, rows, &report);
+            assert!(body.get("no_scroll_progress").is_none(), "{gate}");
+        }
     }
 
     #[test]
