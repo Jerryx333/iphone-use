@@ -119,13 +119,22 @@ final class AppModel {
         }
         if defaults.bool(forKey: "edit"), let id = focusedID { editing = .init(id: id) }
         if defaults.bool(forKey: "scan") { scanning = true }
-        // `-agent YES`: the Agent screen.
-        if defaults.bool(forKey: "agent") { openAgent() }
+        // `-agent YES`: the Agent screen, aimed at the device just added
+        // (if any).
+        let agentScreen = defaults.bool(forKey: "agent")
         if let scanned = defaults.string(forKey: "pair"), let link = PairLink.parse(scanned) {
-            Task { await pair(link) }
+            Task {
+                await pair(link)
+                if agentScreen { openAgent() }
+            }
         } else if let address = defaults.string(forKey: "address"),
                   let password = defaults.string(forKey: "password"), !password.isEmpty {
-            Task { await add(address: address, password: password) }
+            Task {
+                await add(address: address, password: password)
+                if agentScreen { openAgent() }
+            }
+        } else if agentScreen {
+            openAgent()
         }
         #endif
     }

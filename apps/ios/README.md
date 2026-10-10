@@ -62,6 +62,21 @@ them at once with the same normalized coordinates, each through its own daemon a
 failed). Nothing is replayed: `outcome_unknown` may have landed; a phone held by another owner
 (409 `phone_owned`, or `owner` on its status) is skipped.
 
+Agent (`Sources/Agent*.swift`, contract in `docs/agent-task.md`): type a goal and a daemon carries
+it out — 本机 (this iPhone's own daemon at `http://127.0.0.1:8787`, paired with the usual
+`iphoneuse://pair?u=…&c=…` link and kept off the overview), a Mac's, or another phone's; the title
+picks the device (default: the one on screen, else 本机). The thread shows the goal, a collapsible
+"worked for 45 s · 13 steps" card, the summary and a status chip; Stop cancels. A task that pauses
+before paying, sending or deleting brings up a sheet (and a notification when the app is away);
+nothing answers it but the person. On 本机 the daemon brings the app back for that question, and
+the followed task is picked up on every return. Models (⋯ › 模型): an ordered assist list (free
+Kilo tier with no key, OpenRouter, Anthropic, any OpenAI-compatible endpoint), optional Jev and a
+text model; keys in the Keychain, sent per task as `models`, or nothing when "use these models" is
+off so a Mac uses its own. Flows: 录制 flow in the remote's ⋯ menu records what you do there
+(live step count) and saves it as a local flow on that daemon; a finished task offers 保存为
+flow; ⋯ › Flow 与定时 lists the device's flows (run now, with an explicit OK for side effects) and
+its schedules (time + weekdays → cron, inputs, enable, run now, delete, recent runs).
+
 Tests: `xcodebuild -scheme IPhoneUseRemote -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test`
 (device-list migration, `/control` outcome classification, address parsing, error mapping,
 retry backoff, and the state → screen mapping). Build signed for the simulator (not
@@ -75,6 +90,7 @@ uses), `-grid YES` opens the overview, `-edit YES` the focused device's address/
 `-scan YES` the scanner: `xcrun simctl launch booted
 com.leeguoo.iphone-use.remote -pair 'http://127.0.0.1:44321/pair?c=…'`.
 
+`-agent YES` opens the Agent screen (after `-address`/`-pair` connects, aimed at that device).
 More Debug switches for screenshots: `-demo YES`, `-immersive YES`, `-typing YES`, `-settings YES`,
 `-zoom 2.5`, `-sync YES`, `-orientation landscape`. Metrics (time to first frame, touch → feedback
 on screen, stream reopen) are logged under `com.leeguoo.iphone-use.remote` / `metrics`.

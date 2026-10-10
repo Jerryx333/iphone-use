@@ -103,7 +103,10 @@ struct AgentView: View {
                 }
             }
         }
-        .task { await agent.refreshHistory() }
+        // Again once the target connects (at launch it is still connecting).
+        .task(id: "\(agent.targetID?.uuidString ?? "")|\(agent.target?.phase == .connected)") {
+            await agent.refreshHistory()
+        }
     }
 
     // MARK: pieces
@@ -137,6 +140,7 @@ struct AgentView: View {
                 }
                 Image(systemName: "chevron.down").font(.caption.weight(.bold)).foregroundStyle(.secondary)
             }
+            .frame(maxWidth: 210)
             .foregroundStyle(.primary)
         }
         .accessibilityLabel(Text("执行任务的设备"))
