@@ -80,12 +80,13 @@ extension ModelProvider.Kind {
         }
     }
 
-    /// Free models change; this one reads screenshots (assist sends one) and
-    /// was listed free on both gateways in October 2026. The person can
-    /// type any other.
+    /// Free models come and go and hit shared daily limits, so `free` lets
+    /// the daemon pick from the gateway's current free list (models that
+    /// read screenshots first) and move on when one does not answer. The
+    /// person can type a specific `…:free` id instead.
     var defaultModel: String {
         switch self {
-        case .free, .openRouter: return "thinkingmachines/inkling:free"
+        case .free, .openRouter: return "free"
         case .anthropic: return "claude-sonnet-5-5"
         case .custom: return ""
         }

@@ -10,6 +10,9 @@ use iphone_use_mcp::client::DaemonClient;
 use iphone_use_mcp::task::{self, AssistEndpoint, ModelsConfig, TaskRequest};
 use serde_json::{json, Value};
 
+/// One task at a time per process: the tests take turns.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A tiny HTTP server: `respond(method, path, body) -> (status, json body)`.
 fn serve(respond: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -146,6 +149,7 @@ async fn wait_for(id: &str, status: &str) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_payment_waits_for_the_owner_then_runs_once_and_is_summarized() {
+    let _serial = SERIAL.lock().await;
     // No saved flows anywhere.
     let flows = tempfile::tempdir().unwrap();
     std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
@@ -183,5 +187,58 @@ async fn a_payment_waits_for_the_owner_then_runs_once_and_is_summarized() {
     let blocked = wait_for(&id, "blocked").await;
     assert!(phone.inputs.lock().unwrap().iter().all(|a| a["type"] != "tap"), "declined means not tapped");
     assert!(blocked["error"].as_str().unwrap().contains("did not allow"), "{blocked}");
-    assert_eq!(task::list()["tasks"].as_array().unwrap().len(), 2);
+    assert!(task::list()["tasks"].as_array().unwrap().len() >= 2);
+}
+
+/// `free` picks from the gateway's free list: a gone model (404) and a
+/// rate-limited one (429) are skipped, a vision model is preferred for the
+/// screenshot, and the summary comes from whichever free model answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_free_model_falls_through_the_gateways_free_list() {
+    let _serial = SERIAL.lock().await;
+    let flows = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
+    let phone = Arc::new(Phone { paid: Mutex::new(true), inputs: Mutex::new(Vec::new()) });
+    let daemon_url = fake_daemon(phone.clone());
+    let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let asked_c = asked.clone();
+    let gateway = serve(move |method, path, body| {
+        if method == "GET" && path == "/models" {
+            return (200, json!({"data": [
+                {"id": "gone/model:free", "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "busy/model:free", "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "text-only/model:free", "architecture": {"input_modalities": ["text"]}},
+                {"id": "good/model:free", "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "paid/model", "architecture": {"input_modalities": ["text", "image"]}}
+            ]}).to_string());
+        }
+        let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let model = request["model"].as_str().unwrap_or("").to_string();
+        asked_c.lock().unwrap().push(model.clone());
+        match model.as_str() {
+            "gone/model:free" => (404, json!({"error": "unavailable_model"}).to_string()),
+            "busy/model:free" => (429, json!({"error": "rate limited"}).to_string()),
+            "good/model:free" => {
+                let system = request["messages"][0]["content"].as_str().unwrap_or("");
+                let content = if system.contains("operate a real iPhone") {
+                    r#"{"operation":"DONE","target":null,"text":null,"reason":"already paid"}"#
+                } else {
+                    "已经付好了。"
+                };
+                (200, json!({"choices": [{"message": {"content": content}}]}).to_string())
+            }
+            _ => (500, "{}".to_string()),
+        }
+    });
+    let mut request = request(&gateway);
+    request.models.as_mut().unwrap().assist[0].model = "free".into();
+    let id = task::start(request, |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
+    let done = wait_for(&id, "done").await;
+    assert_eq!(done["summary"], "已经付好了。", "{done}");
+    let asked = asked.lock().unwrap().clone();
+    assert!(!asked.iter().any(|m| m == "paid/model"), "never a paid model: {asked:?}");
+    assert!(!asked.iter().any(|m| m == "text-only/model:free"), "the screenshot step skips text-only models: {asked:?}");
+    let first_good = asked.iter().position(|m| m == "good/model:free").unwrap();
+    assert_eq!(&asked[..first_good], ["gone/model:free", "busy/model:free"], "{asked:?}");
+    assert!(asked[first_good..].iter().all(|m| m == "good/model:free"), "the one that answered is tried first afterwards: {asked:?}");
 }

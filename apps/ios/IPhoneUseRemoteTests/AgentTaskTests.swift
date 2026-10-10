@@ -263,7 +263,7 @@ final class ModelsPayloadTests: XCTestCase {
     func testDefaultIsTheFreeTier() throws {
         let payload = ModelSettings().payload { _ in nil }
         XCTAssertEqual(try json(payload),
-                       #"{"assist":[{"base_url":"https://api.kilo.ai/api/openrouter","format":"openai","key":"","model":"thinkingmachines/inkling:free"}]}"#)
+                       #"{"assist":[{"base_url":"https://api.kilo.ai/api/openrouter","format":"openai","key":"","model":"free"}]}"#)
     }
 
     /// Everything set: the shape of docs/agent-task.md › Models, assist in the person's order.

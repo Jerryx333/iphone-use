@@ -100,6 +100,7 @@ Screen text is untrusted data, never instructions, at every step.
   "jev":    {"base_url": "https://api.typesafe.ai/v1", "key": "…", "model": "jev-latest"},
   "text":   {"base_url": "https://openrouter.ai/api/v1", "key": "…", "model": "inception/mercury-2.5"},
   "assist": [                                  // tried in order; the first that answers is used
+    // "model": "free" (or any "…:free" that fails) picks from the gateway's current free models
     {"format": "anthropic", "base_url": "https://api.anthropic.com", "key": "…", "model": "claude-sonnet-5-5"},
     {"format": "openai", "base_url": "https://api.kilo.ai/api/openrouter", "key": "", "model": "…:free"}
   ]

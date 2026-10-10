@@ -466,7 +466,7 @@
 "使用" = "Use";
 "接口" = "Endpoint";
 "格式" = "Format";
-"名字以 :free 结尾的模型不收费。要选能看图的模型：助手会看屏幕截图。" = "Models ending in :free cost nothing. Pick one that reads images: the assist model sees screenshots.";
+"填 free 会自动挑一个能用的免费模型（能看截图的优先），不能用就换下一个；也可以填某个以 :free 结尾的模型。" = "Leave it as free to have a working free model picked for you (ones that read screenshots first), moving on when one does not answer; or type a specific :free model.";
 "免费试用" = "Free tier";
 "自定义（OpenAI 兼容）" = "Custom (OpenAI-compatible)";
 "Kilo Gateway 的免费模型，不用密钥；有频率限制" = "Free models through Kilo Gateway, no key; rate limited";

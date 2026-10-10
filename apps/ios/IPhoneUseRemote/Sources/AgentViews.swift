@@ -826,7 +826,7 @@ struct ProviderEditView: View {
                 Text("模型")
             } footer: {
                 if provider.kind == .free || provider.kind == .openRouter {
-                    Text("名字以 :free 结尾的模型不收费。要选能看图的模型：助手会看屏幕截图。")
+                    Text("填 free 会自动挑一个能用的免费模型（能看截图的优先），不能用就换下一个；也可以填某个以 :free 结尾的模型。")
                 }
             }
         }

@@ -433,6 +433,17 @@ pub fn list() -> Value {
 struct Chat {
     http: reqwest::Client,
     chain: Vec<AssistEndpoint>,
+    /// A gateway's current free models (`<base>/models`, ids ending in
+    /// `:free`), vision-capable first, fetched once per task.
+    free_models: tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// The free model that last answered, per gateway: tried first next time.
+    free_pick: Mutex<std::collections::HashMap<String, String>>,
+}
+
+/// `free` (pick one) or a `…:free` model id: free models come and go and hit
+/// shared rate limits, so a failure moves on to the gateway's next free model.
+fn is_free(model: &str) -> bool {
+    model == "free" || model.ends_with(":free")
 }
 
 impl Chat {
@@ -450,7 +461,91 @@ impl Chat {
                 });
             }
         }
-        Chat { http, chain }
+        Chat {
+            http,
+            chain,
+            free_models: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            free_pick: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    async fn free_list(&self, base: &str, want_image: bool) -> Vec<String> {
+        let mut cache = self.free_models.lock().await;
+        if !cache.contains_key(base) {
+            let url = format!("{}/models", base.trim_end_matches('/'));
+            let listed = async {
+                let value: Value = self.http.get(&url).timeout(Duration::from_secs(15)).send().await.ok()?.json().await.ok()?;
+                let mut models: Vec<(bool, String)> = value["data"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|m| {
+                        let id = m["id"].as_str()?;
+                        let vision = m["architecture"]["input_modalities"]
+                            .as_array()
+                            .is_some_and(|ms| ms.iter().any(|x| x == "image"));
+                        id.ends_with(":free").then(|| (vision, id.to_string()))
+                    })
+                    .collect();
+                models.sort_by_key(|(vision, _)| !vision);
+                Some(models)
+            }
+            .await
+            .unwrap_or_default();
+            // Remember vision support in the order: vision first.
+            cache.insert(base.to_string(), listed.into_iter().map(|(vision, id)| if vision { format!("v|{id}") } else { format!("t|{id}") }).collect());
+        }
+        let all = cache.get(base).cloned().unwrap_or_default();
+        all.into_iter()
+            .filter(|tagged| !want_image || tagged.starts_with("v|"))
+            .map(|tagged| tagged[2..].to_string())
+            .collect()
+    }
+
+    /// One endpoint; a free one falls through the gateway's free models.
+    async fn ask_endpoint(
+        &self,
+        endpoint: &AssistEndpoint,
+        system: &str,
+        user: &str,
+        image: Option<&[u8]>,
+        max_tokens: u32,
+    ) -> Result<(String, String)> {
+        if !is_free(&endpoint.model) {
+            return self.ask_one(endpoint, system, user, image, max_tokens).await.map(|t| (t, endpoint.model.clone()));
+        }
+        let base = endpoint.base_url.trim_end_matches('/').to_string();
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(pick) = self.free_pick.lock().unwrap_or_else(|e| e.into_inner()).get(&base).cloned() {
+            candidates.push(pick);
+        }
+        if endpoint.model != "free" {
+            candidates.push(endpoint.model.clone());
+        }
+        // Prefer models that can see the screenshot; without one, any.
+        let mut listed = self.free_list(&base, image.is_some()).await;
+        if listed.is_empty() && image.is_some() {
+            listed = self.free_list(&base, false).await;
+        }
+        for model in listed {
+            if !candidates.contains(&model) {
+                candidates.push(model);
+            }
+        }
+        let mut last = None;
+        for model in candidates.into_iter().take(5) {
+            let attempt = AssistEndpoint { model: model.clone(), ..endpoint.clone() };
+            match self.ask_one(&attempt, system, user, image, max_tokens).await {
+                Ok(text) => {
+                    self.free_pick.lock().unwrap_or_else(|e| e.into_inner()).insert(base.clone(), model.clone());
+                    return Ok((text, model));
+                }
+                Err(error) => {
+                    tracing::info!("free model {model} did not answer: {error:#}");
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("{base} lists no free model right now")))
     }
 
     fn available(&self) -> bool {
@@ -462,8 +557,8 @@ impl Chat {
     async fn ask(&self, system: &str, user: &str, image: Option<&[u8]>, max_tokens: u32) -> Result<(String, String)> {
         let mut last = None;
         for endpoint in &self.chain {
-            match self.ask_one(endpoint, system, user, image, max_tokens).await {
-                Ok(text) => return Ok((text, endpoint.model.clone())),
+            match self.ask_endpoint(endpoint, system, user, image, max_tokens).await {
+                Ok(answer) => return Ok(answer),
                 Err(error) => {
                     tracing::warn!("assist model {} failed: {error:#}", endpoint.model);
                     last = Some(error);
@@ -961,7 +1056,7 @@ async fn assist_decide(
     history: &[Value],
 ) -> Result<(String, Option<usize>, Option<String>, Option<String>)> {
     let image = daemon.screenshot(Some(900)).await.ok();
-    let (answer, _) = chat.ask(ASSIST_SYSTEM, &screen_prompt(screen, goal, history), image.as_deref(), 400).await?;
+    let (answer, _) = chat.ask(ASSIST_SYSTEM, &screen_prompt(screen, goal, history), image.as_deref(), 2_000).await?;
     parse_assist(&answer, screen.targets.len())
 }
 
@@ -1010,7 +1105,7 @@ async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request:
         })
         .collect();
     let prompt = format!("Goal: {}\n\nSaved flows:\n{}", request.goal, serde_json::to_string(&catalog)?);
-    let Ok((answer, _)) = chat.ask(FLOW_SYSTEM, &prompt, None, 300).await else {
+    let Ok((answer, _)) = chat.ask(FLOW_SYSTEM, &prompt, None, 1_500).await else {
         return Ok(None);
     };
     let Some(choice) = first_json_object(&answer) else {
@@ -1108,7 +1203,7 @@ async fn finish(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &
             serde_json::to_string(&steps.iter().map(|s| json!({"action": s["action"], "target": s["target"], "ok": s["ok"]})).collect::<Vec<_>>()).unwrap_or_default(),
             screen_text.chars().take(SUMMARY_TEXT_CHARS).collect::<String>(),
         );
-        chat.ask(SUMMARY_SYSTEM, &prompt, None, 300).await.ok().map(|(text, _)| text.trim().to_string())
+        chat.ask(SUMMARY_SYSTEM, &prompt, None, 1_500).await.ok().map(|(text, _)| text.trim().to_string())
     } else {
         None
     };
@@ -1208,6 +1303,13 @@ mod tests {
         assert!(plain_summary(Status::Failed, 0, Some("no model")).contains("no model"));
         assert!(new_id().starts_with("t-") && new_id().len() == 12);
         assert_ne!(new_id(), new_id());
+    }
+
+    #[test]
+    fn free_models_are_recognised() {
+        assert!(is_free("free"));
+        assert!(is_free("nvidia/nemotron-3-ultra-550b-a55b:free"));
+        assert!(!is_free("anthropic/claude-sonnet-5.5"));
     }
 
     #[test]
