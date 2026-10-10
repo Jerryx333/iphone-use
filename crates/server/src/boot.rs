@@ -134,8 +134,7 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     crate::timing::set_log_path(instance.state_dir.join("agent-timing.jsonl"));
     crate::metrics::set_runs_log(instance.state_dir.join("agent-runs.jsonl"));
 
-    let mut secret = vec![0_u8; 32];
-    getrandom::fill(&mut secret).map_err(|error| anyhow::anyhow!("CSPRNG failed: {error}"))?;
+    let secret = embedded_secret(&instance.state_dir)?;
     let wda_url = format!("http://127.0.0.1:{}", options.runner_port);
     let state = app_state(StateInputs {
         cfg: &cfg,
@@ -234,4 +233,39 @@ fn spawn_registry_refresh_in_process() {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     });
+}
+
+/// The session secret the embedded daemon signs cookies and device tokens
+/// with, kept in its state dir (0600). A new secret on every runner start
+/// would silently unpair every app that paired with this phone's daemon.
+fn embedded_secret(state_dir: &std::path::Path) -> Result<Vec<u8>> {
+    const FILE: &str = "session-secret";
+    match crate::runtime_dir::read_secret(state_dir, FILE) {
+        Ok(secret) if secret.len() == 32 => return Ok(secret),
+        Ok(secret) => anyhow::bail!(
+            "{}/{FILE} holds {} bytes, not 32; remove it to pair again",
+            state_dir.display(),
+            secret.len()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read the session secret"),
+    }
+    let mut secret = vec![0_u8; 32];
+    getrandom::fill(&mut secret).map_err(|error| anyhow::anyhow!("CSPRNG failed: {error}"))?;
+    crate::runtime_dir::write_secret(state_dir, FILE, &secret).context("save the session secret")?;
+    Ok(secret)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_embedded_secret_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = super::embedded_secret(dir.path()).unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(super::embedded_secret(dir.path()).unwrap(), first, "same secret after a restart");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dir.path().join("session-secret")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }
