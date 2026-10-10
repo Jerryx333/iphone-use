@@ -5,6 +5,9 @@ It logs in with the daemon's control password, shows the screen as H.264 from
 `GET /agent/h264` (decoded by VideoToolbox), and sends taps, long presses, swipes,
 drags, text and Home through `POST /control` — the same contract the web page uses.
 
+Build with Xcode containing the iOS 26 SDK or newer. This is a build-time
+requirement for continued processing; the app's deployment target remains iOS 15.
+
 ```bash
 cd apps/ios
 xcodegen generate          # writes IPhoneUseRemote.xcodeproj from project.yml
