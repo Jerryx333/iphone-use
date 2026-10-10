@@ -87,7 +87,9 @@ apps and displays the system Live Activity; the system's Stop action cancels the
 daemon task. On iOS 16.1–25, the widget extension supplies a Live Activity on the
 Lock Screen and Dynamic Island where supported. These older systems may suspend
 polling in the background: the activity shows its last update time and, from iOS
-16.2, marks updates stale after 20 seconds. Open it to refresh. iOS 15 and 16.0
+16.2, sets a stale date 20 seconds ahead. The system controls when it redraws
+the stale indication, so the compatibility activity always identifies its
+content as the last reported state and plan. Open it to refresh. iOS 15 and 16.0
 retain the in-app progress and confirmation notification without ActivityKit.
 The app's minimum deployment target is 15.0; the optional activity extension's is
 16.1. Installation and operation on actual iOS 15/16 hardware still need validation.

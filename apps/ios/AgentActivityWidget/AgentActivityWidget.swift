@@ -54,8 +54,11 @@ struct AgentLiveActivity: Widget {
 
   private func progress(_ state: AgentActivityAttributes.ContentState, stale: Bool) -> some View {
     VStack(alignment: .leading, spacing: 5) {
+      if !state.terminal {
+        Text("上次收到的状态").font(.caption2).foregroundStyle(.secondary)
+      }
       Text(stale && !state.terminal ? "进度暂未更新，点开查看" : state.current).font(.headline).lineLimit(2)
-      Text(stale && !state.terminal ? "上次计划：\(state.next)" : "下一步：\(state.next)")
+      Text(state.terminal ? "下一步：\(state.next)" : "上次计划：\(state.next)")
         .font(.caption).foregroundStyle(.secondary).lineLimit(2)
       if !state.terminal {
         HStack(spacing: 4) {

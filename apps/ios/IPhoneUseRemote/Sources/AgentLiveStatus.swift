@@ -30,7 +30,7 @@ final class AgentLiveStatus {
   }
 
   func begin(goal: String, device: String, onCancel: @escaping @MainActor () async -> Void) {
-    finish(success: false)
+    finish(success: false, dismissImmediately: true)
     cancel = onCancel
     latest = AgentProgress(task: AgentTaskSnapshot(id: "pending", goal: goal, state: .running))
     if #available(iOS 26, *), useContinuedProcessing {
@@ -132,6 +132,12 @@ final class AgentLiveStatus {
     onCancel: @escaping @MainActor () async -> Void
   ) {
     let key = "agent.activity.\(deviceID.uuidString)|\(task.id)"
+    if legacyKey == key && (systemTask != nil || requestID != nil) {
+      cancel = onCancel
+      update(AgentProgress(task: task))
+      if task.state.isTerminal { finish(success: task.state == .done) }
+      return
+    }
     let savedID = UserDefaults.standard.string(forKey: key)
     if #available(iOS 16.1, *),
       let activity = Activity<AgentActivityAttributes>.activities.first(where: { $0.id == savedID })
@@ -188,7 +194,7 @@ final class AgentLiveStatus {
     }
   }
 
-  func finish(success: Bool) {
+  func finish(success: Bool, dismissImmediately: Bool = false) {
     if !latest.terminal {
       latest.current = String(localized: "进度跟随暂停")
       latest.next = String(localized: "点开任务刷新")
@@ -216,9 +222,9 @@ final class AgentLiveStatus {
         if #available(iOS 16.2, *) {
           await activity.end(
             ActivityContent(state: state, staleDate: nil),
-            dismissalPolicy: .after(Date().addingTimeInterval(120)))
+            dismissalPolicy: dismissImmediately ? .immediate : .after(Date().addingTimeInterval(120)))
         } else {
-          await activity.end(using: state, dismissalPolicy: .after(Date().addingTimeInterval(120)))
+          await activity.end(using: state, dismissalPolicy: dismissImmediately ? .immediate : .after(Date().addingTimeInterval(120)))
         }
       }
     }

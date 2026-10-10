@@ -72,6 +72,7 @@ final class AgentController: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private let liveStatus = AgentLiveStatus.shared
     private var stopBeforeAcknowledgement = false
+    private var progressNeedsRecovery = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// The confirmation already announced (sheet or notification), so a
     /// poll that repeats it does not announce it again.
@@ -85,6 +86,13 @@ final class AgentController: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        #if DEBUG
+        // Isolate UI fixtures without deleting pairing or model credentials.
+        if UserDefaults.standard.bool(forKey: "clearAgentTestState") {
+            defaults.removeObject(forKey: Self.runningKey)
+            defaults.removeObject(forKey: Self.draftsKey)
+        }
+        #endif
         drafts = defaults.dictionary(forKey: Self.draftsKey) as? [String: String] ?? [:]
         settings = ModelSettingsStore.load(from: defaults)
     }
@@ -169,11 +177,25 @@ final class AgentController: ObservableObject {
             }
             break
         }
+        guard let id else {
+            pendingGoal = nil
+            liveStatus.finish(success: false, dismissImmediately: true)
+            return false
+        }
+        var first = AgentTaskSnapshot(id: id, goal: accepted ? goal : "", state: .running)
+        progressNeedsRecovery = !accepted
+        if !accepted {
+            // The refused goal belongs in the draft, never on another task's activity.
+            liveStatus.finish(success: false, dismissImmediately: true)
+            if let snapshot = try? await client.task(id: id, since: 0) {
+                first = snapshot
+                progressNeedsRecovery = false
+                liveStatus.recover(task: snapshot, device: session.name, deviceID: session.id) { [weak self] in await self?.stop() }
+            }
+        }
         pendingGoal = nil
-        guard let id else { liveStatus.finish(success: false); return false }
-        let first = AgentTaskSnapshot(id: id, goal: goal, state: .running)
         follow(AgentTaskTracker(first), on: session)
-        if stopBeforeAcknowledgement { await stop() }
+        if accepted && stopBeforeAcknowledgement { await stop() }
         return accepted
     }
 
@@ -210,6 +232,11 @@ final class AgentController: ObservableObject {
         let previous = live?.task.state
         live = tracker
         let task = tracker.task
+        if progressNeedsRecovery, !task.goal.isEmpty, let deviceID = liveDeviceID,
+           let session = app?.session(deviceID) {
+            progressNeedsRecovery = false
+            liveStatus.recover(task: task, device: session.name, deviceID: deviceID) { [weak self] in await self?.stop() }
+        }
         liveStatus.update(AgentProgress(task: task))
         if let confirm = task.pendingConfirm, let deviceID = liveDeviceID {
             let prompt = ConfirmPrompt(taskID: task.id, deviceID: deviceID, goal: task.goal, confirm: confirm)
@@ -330,7 +357,13 @@ final class AgentController: ObservableObject {
     /// task up where it is, so a pending question shows at once.
     func resume() {
         guard pollTask == nil, let saved = defaults.string(forKey: Self.runningKey) else {
-            if pollTask != nil { holdBackgroundTime() }
+            if pollTask != nil {
+                holdBackgroundTime()
+                if pendingGoal == nil, let task = live?.task, let deviceID = liveDeviceID,
+                   let session = app?.session(deviceID) {
+                    liveStatus.recover(task: task, device: session.name, deviceID: deviceID) { [weak self] in await self?.stop() }
+                }
+            }
             return
         }
         let parts = saved.split(separator: "|", maxSplits: 1).map(String.init)

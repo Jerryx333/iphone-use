@@ -211,7 +211,7 @@ class Agent:
 
     def run(self, task):
         targets = ["设置", "电池", "电池健康", "确认", "返回"]
-        long_progress = task["goal"] == "__mock_long_progress__"
+        long_progress = task["goal"] in ("__mock_long_progress__", "__mock_task_conflict_existing__")
         for n in range(1, 101 if long_progress else 6):
             time.sleep(3 if long_progress else 1)
             with self.lock:
@@ -506,6 +506,8 @@ def handler(mock):
                     task = a.find(parts[2])
                     if task is None:
                         return self.json(404, {"ok": False, "error": "task_not_found"})
+                    if task["goal"] == "__mock_task_conflict_existing__":
+                        time.sleep(2)
                     since = int((query.get("since") or ["0"])[0] or 0)
                     return self.json(200, Agent.public(task, since))
                 if path == "/agent/flow/record":
