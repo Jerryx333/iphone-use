@@ -8,7 +8,6 @@ struct IPhoneUseRemoteApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(app: app)
-                .preferredColorScheme(.dark)
                 // The landing page a scanned QR opens hands off here.
                 .onOpenURL { app.handle(url: $0) }
                 .onChange(of: scenePhase) { _, phase in
@@ -51,26 +50,8 @@ struct RootView: View {
             if let demo = app.demo {
                 DemoView(session: demo) { app.demo = nil }
                     .transition(.opacity)
-            } else if app.devices.isEmpty {
-                WelcomeView(app: app)
-                    .transition(.opacity)
-            } else if let session = app.focused {
-                Group {
-                    if let group = app.sync, group.lead == session.id {
-                        SyncView(app: app, lead: session, group: group)
-                    } else {
-                        RemoteView(app: app, session: session)
-                    }
-                }
-                // A different phone is a different screen (its own zoom,
-                // keyboard queue).
-                .id(session.id)
-                .transition(.asymmetric(insertion: .scale(scale: 0.94).combined(with: .opacity),
-                                        removal: .opacity))
             } else {
-                DeviceGridView(app: app)
-                    .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 1.03)),
-                                            removal: .opacity))
+                MainTabsView(app: app)
             }
         }
         .animation(.snappy(duration: 0.32), value: app.focusedID)
