@@ -176,6 +176,34 @@ async fn done_without_the_requested_result_is_not_reported_as_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicitly_opened_app_can_start_fresh_without_changing_the_default() {
+    let _serial = SERIAL.lock().await;
+    let flows = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
+    for fresh in [false, true] {
+        let phone = Arc::new(Phone { paid: Mutex::new(false), inputs: Mutex::new(Vec::new()) });
+        let daemon_url = fake_daemon(phone.clone());
+        let model = serve(|_, _, body| {
+            let body: Value = serde_json::from_str(body).unwrap();
+            let system = body["messages"][0]["content"].as_str().unwrap_or("");
+            let content = if system.contains("operate a real iPhone") {
+                r#"{"operation":"DONE","target":null}"#
+            } else {
+                r#"{"goal_achieved":false,"summary":"Fixture did not achieve the goal."}"#
+            };
+            (200, json!({"choices":[{"message":{"content":content}}]}).to_string())
+        });
+        let mut req = request(&model);
+        req.app = Some("com.apple.Preferences".into());
+        req.app_fresh = fresh;
+        let id = task::start(req, |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
+        wait_for(&id, "blocked").await;
+        let inputs = phone.inputs.lock().unwrap();
+        assert_eq!(inputs.as_slice(), &[json!({"type":"launch_app","bundle":"com.apple.Preferences","fresh":fresh})]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declining_a_flow_ends_the_task_without_step_by_step_fallback() {
     let _serial = SERIAL.lock().await;
     let flows = tempfile::tempdir().unwrap();

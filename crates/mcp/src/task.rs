@@ -134,6 +134,9 @@ pub struct TaskRequest {
     pub goal: String,
     #[serde(default)]
     pub app: Option<String>,
+    /// Start an explicitly opened app at its first screen, rather than a stale subpage.
+    #[serde(default)]
+    pub app_fresh: bool,
     #[serde(default)]
     pub max_steps: Option<usize>,
     #[serde(default)]
@@ -838,9 +841,9 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             s.planned_action = Some(json!({"action":"LAUNCH", "target": app}));
         });
         let action = if app.contains('.') && !app.contains(' ') {
-            json!({"type": "launch_app", "bundle": app})
+            json!({"type": "launch_app", "bundle": app, "fresh": request.app_fresh})
         } else {
-            json!({"type": "launch_app", "app": app})
+            json!({"type": "launch_app", "app": app, "fresh": request.app_fresh})
         };
         let ok = jev::act(daemon, action).await;
         task.push_step(json!({"action": "LAUNCH", "target": app, "by": "task", "ok": ok.is_ok(),

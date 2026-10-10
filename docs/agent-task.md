@@ -25,6 +25,7 @@ other callers get `409 phone_owned` instead of fighting it.
 {
   "goal": "打开设置查看电池电量",
   "app": "设置",                      // optional: app name or bundle id to start in
+  "app_fresh": false,                 // optional: reopen at the app's first screen
   "max_steps": 30,                    // optional, 1–60
   "models": { ... },                  // optional, see Models; else the daemon's configured ones
   "confirm": "risky"                  // "risky" (default): pause before pay/send/delete/share;
@@ -35,6 +36,10 @@ other callers get `409 phone_owned` instead of fighting it.
 → `202 {"id": "t-…", "status": "running"}`. One task at a time: a second POST while one runs is
 `409 {"error": "task_running", "id": "<running id>"}`.
 
+When `app` is omitted, an explicit opening instruction such as “打开设置…” selects
+the app and starts it fresh, so a previous subpage does not become the starting
+screen. Callers supplying `app` keep its current screen unless `app_fresh` is true.
+
 ### `GET /agent/task/<id>` (and `GET /agent/task/current`)
 
 ```json
@@ -42,7 +47,8 @@ other callers get `409 phone_owned` instead of fighting it.
   "id": "t-…",
   "goal": "…",
   "status": "running | needs_confirm | done | blocked | failed | cancelled | max_steps",
-  "phase": "flow | jev | assist | summary",       // what is deciding right now
+  "phase": "flow | jev | assist | acting | observing | summary",
+  "planned_action": {"action": "CLICK", "target": "电池"} | null, // selected action, no typed text
   "flow": {"id": "settings/battery", "outcome": "ok"} | null,   // when a saved flow did it
   "steps": [
     {"n": 1, "action": "CLICK", "target": "电池", "text": null, "app": "设置",

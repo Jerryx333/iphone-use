@@ -106,7 +106,16 @@ PROGRAM=""
 if [ -f "$DAEMON_PLIST" ]; then
     PROGRAM="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$DAEMON_PLIST" 2>/dev/null || true)"
 fi
-for CANDIDATE in "${IPHONE_USE_SETUP_BIN:-}" "$PROGRAM" \
+# An explicit engine is a pin: silently falling back can replace an embedded
+# runner with an older product that has no on-phone daemon.
+if [ -n "${IPHONE_USE_SETUP_BIN:-}" ]; then
+    if [ ! -x "$IPHONE_USE_SETUP_BIN" ] || ! "$IPHONE_USE_SETUP_BIN" setup-native --supports "$COMMAND" >/dev/null 2>&1; then
+        printf 'The explicitly selected setup engine is missing or does not support %s: %s\n' "$COMMAND" "$IPHONE_USE_SETUP_BIN" >&2
+        exit 1
+    fi
+    IPHONE_USE_SETUP_SCRIPT="$SELF" exec "$IPHONE_USE_SETUP_BIN" setup-native "$COMMAND"
+fi
+for CANDIDATE in "$PROGRAM" \
     "$HOME/Applications/iPhoneUse.app/Contents/MacOS/iphone-use" \
     "/Applications/iPhoneUse.app/Contents/MacOS/iphone-use"; do
     [ -n "$CANDIDATE" ] && [ -x "$CANDIDATE" ] || continue
