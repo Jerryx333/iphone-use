@@ -1069,6 +1069,7 @@ fn run_server(cfg: Config, state: Arc<AppState>, runtime_dir: std::path::PathBuf
             cfg.port,
             cfg.agent_token.clone().or_else(|| cfg.password.clone()),
             &server::instance::current().state_dir,
+            false,
         );
 
         // Idle auto-release owns only the local supervisor. Remote WDA

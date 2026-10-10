@@ -161,9 +161,11 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
             cfg.port,
             cfg.agent_token.clone().or_else(|| cfg.password.clone()),
             &instance.state_dir,
+            true,
         );
         crate::keep_awake::spawn(state.clone());
         crate::lock_readiness::spawn(state.clone());
+        spawn_registry_refresh_in_process();
         axum::serve(listener, http::router(state))
             .await
             .context("axum serve")
@@ -188,4 +190,32 @@ fn sandbox_dirs() -> Result<()> {
         std::env::set_var(key, &dir);
     }
     Ok(())
+}
+
+/// The flow registry on the phone: fetched in this process (an app cannot run
+/// `iphone-use-mcp flow update`), soon after start and then whenever the store
+/// is older than a day. Opt out with `IPHONE_USE_FLOWS_NO_AUTO_UPDATE=1`.
+fn spawn_registry_refresh_in_process() {
+    if crate::flows::auto_update_disabled() {
+        tracing::info!("flow registry auto-update disabled");
+        return;
+    }
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        loop {
+            if crate::flows::store_is_stale() {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    iphone_use_mcp::registry::update(),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => tracing::info!("flow registry refreshed"),
+                    Ok(Err(error)) => tracing::warn!("flow registry refresh failed: {error:#}"),
+                    Err(_) => tracing::warn!("flow registry refresh timed out"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
 }

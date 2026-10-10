@@ -269,6 +269,12 @@ impl DaemonClient {
         Self::new(base_url, token)
     }
 
+    /// The same client acting for another owner (a scheduled run, a task).
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = owner.into();
+        self
+    }
+
     /// Construct with explicit values (useful for tests).
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
         Self::with_timeouts(base_url, token, CONNECT_TIMEOUT, REQUEST_TIMEOUT)
