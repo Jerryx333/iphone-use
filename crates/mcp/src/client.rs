@@ -201,7 +201,10 @@ fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String
             )
             .map(|hint| format!(" — {hint}"))
             .unwrap_or_default();
-            return Err(LabelResolutionFailure(format!("no element matched the exact label '{label}'; no action was sent{hint}")).into());
+            Err(LabelResolutionFailure(format!(
+                "no element matched the exact label '{label}'; no action was sent{hint}"
+            ))
+            .into())
         }
         [(index, _)] => Ok((*index, response.snapshot)),
         _ => {
@@ -218,12 +221,13 @@ fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(LabelResolutionFailure(format!(
+            Err(LabelResolutionFailure(format!(
                 "ambiguous exact label '{label}' matched {} elements ({candidates}); \
                  no action was sent — choose an element index from phone_elements and \
                  call phone_tap_element with the same snapshot",
                 matches.len()
-            )).into());
+            ))
+            .into())
         }
     }
 }

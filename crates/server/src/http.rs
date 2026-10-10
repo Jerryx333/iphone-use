@@ -6929,6 +6929,7 @@ fn element_swipe_endpoints(
 async fn scroll_snapshot_element(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
+    detail: &mut Option<serde_json::Value>,
 ) -> Result<(), SnapshotElementTapError> {
     let dx = value
         .get("dx")
@@ -6981,6 +6982,9 @@ async fn scroll_snapshot_element(
     let (x1, y1, x2, y2) = element_swipe_endpoints(row.rect, [x, y, width, height], screen, dx, dy);
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
+    if guard_scroll_dispatch(w, value, detail).await {
+        return Err(SnapshotElementTapError::Refused("alert_present", SCROLL_ALERT_HINT));
+    }
     w.swipe(x1, y1, x2, y2, duration)
         .await
         .map_err(SnapshotElementTapError::AfterDispatch)
@@ -7704,12 +7708,15 @@ async fn wda_control_with_client(
                     tracing::info!("scroll page: drag ({x1:.0},{y1:.0}) -> ({x2:.0},{y2:.0})");
                     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
                     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
+                    if guard_scroll_dispatch(w, v, detail).await {
+                        return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+                    }
                     w.swipe(x1, y1, x2, y2, duration).await
                 }
             }
         }
         "scroll" if v.get("element").is_some() => {
-            let result = scroll_snapshot_element(w, v).await;
+            let result = scroll_snapshot_element(w, v, detail).await;
             match snapshot_element_outcome(result, w, "control element scroll") {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
@@ -7768,6 +7775,9 @@ async fn wda_control_with_client(
             {
                 return WdaControlOutcome::Unsupported;
             }
+            if guard_scroll_dispatch(w, v, detail).await {
+                return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+            }
             wda_swipe(w, nx, ny, dx, dy).await
         }
         "text" => match v.get("text").and_then(|t| t.as_str()) {
@@ -7810,6 +7820,9 @@ async fn wda_control_with_client(
                         .into_iter()
                         .all(|n| (0.0..=1.0).contains(&n)) =>
                 {
+                    if guard_scroll_dispatch(w, v, detail).await {
+                        return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+                    }
                     async {
                         let (sw, sh) = w.window_size().await?;
                         let (ax, ay, bx, by) = (
@@ -8185,7 +8198,11 @@ fn scroll_alert_guard<E>(
     if !needs_scroll_alert_probe(value) {
         return None;
     }
-    let alert = alert_json(probe.ok().flatten())?;
+    let (text, buttons) = probe.ok().flatten()?;
+    if text.is_empty() && buttons.is_empty() {
+        return None;
+    }
+    let alert = alert_json(Some((text, buttons)))?;
     Some(serde_json::json!({
         "ok": false,
         "error": "alert_present",
@@ -8194,6 +8211,23 @@ fn scroll_alert_guard<E>(
         "alert": alert,
         "hint": SCROLL_ALERT_HINT,
     }))
+}
+
+/// Called only after the gesture branch has validated and prepared dispatch.
+async fn guard_scroll_dispatch(
+    w: &mut crate::wda::WdaClient,
+    value: &serde_json::Value,
+    detail: &mut Option<serde_json::Value>,
+) -> bool {
+    let probe = tokio::time::timeout(SCROLL_ALERT_PROBE_TIMEOUT, probe_alert(w)).await;
+    if let Some(block) = scroll_alert_guard(value, probe) {
+        *detail = Some(serde_json::json!({
+            "alert": block["alert"],
+            "hint": block["hint"],
+        }));
+        return true;
+    }
+    false
 }
 
 /// Execute one Direct agent action exactly once.
@@ -8214,16 +8248,6 @@ async fn direct_agent_action(
         .get("type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    if needs_scroll_alert_probe(value) {
-        let probe = tokio::time::timeout(SCROLL_ALERT_PROBE_TIMEOUT, probe_alert(w)).await;
-        if let Some(block) = scroll_alert_guard(value, probe) {
-            *detail = Some(serde_json::json!({
-                "alert": block["alert"],
-                "hint": block["hint"],
-            }));
-            return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
-        }
-    }
     let custom_result: Option<anyhow::Result<()>> = match typ {
         "launch_app" => {
             let bundle = value
@@ -15251,6 +15275,39 @@ mod tests {
     #[test]
     fn scroll_alert_absent_allows_dispatch() {
         assert!(scroll_alert_guard::<()>(&serde_json::json!({"type":"scroll"}), Ok(None)).is_none());
+    }
+
+    #[test]
+    fn scroll_alert_empty_allows_dispatch() {
+        let action = serde_json::json!({"type":"scroll"});
+        assert!(scroll_alert_guard::<()>(&action, Ok(Some((String::new(), vec![])))).is_none());
+        // Either text or buttons alone is sufficient evidence of an alert.
+        assert!(scroll_alert_guard::<()>(&action, Ok(Some(("Alert".into(), vec![])))).is_some());
+        assert!(scroll_alert_guard::<()>(&action, Ok(Some((String::new(), vec!["OK".into()])))).is_some());
+    }
+
+    #[test]
+    fn scroll_alert_invalid_coordinates_do_not_probe() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for action in [
+                serde_json::json!({"type":"scroll","x":200,"y":0.5,"dy":100}),
+                serde_json::json!({"type":"swipe","x1":0.5,"y1":0.8,"x2":195,"y2":100}),
+                serde_json::json!({"type":"drag","x1":0.5,"y1":0.8,"x2":195,"y2":100}),
+            ] {
+                let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                let actionable = std::sync::atomic::AtomicBool::new(true);
+                let mut detail = None;
+                {
+                    let mut action = std::pin::pin!(direct_agent_action(&mut w, &actionable, &action, &mut detail));
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    // Validation must finish on the first poll; a WDA probe would
+                    // yield on network I/O, so this also verifies no probe starts.
+                    assert_eq!(std::future::Future::poll(action.as_mut(), &mut cx),
+                        std::task::Poll::Ready(WdaControlOutcome::InvalidValue(COORDINATES_HINT)));
+                }
+                assert!(detail.is_none());
+            }
+        });
     }
 
     #[test]
