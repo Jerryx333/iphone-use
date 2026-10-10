@@ -113,7 +113,7 @@ fn fake_model(phone: Arc<Phone>) -> String {
                 r#"{"operation": "CLICK", "target": 0, "text": null, "reason": "pay as asked"}"#.to_string()
             }
         } else {
-            "已用免密支付付款 55.51 元，显示支付成功。".to_string()
+            json!({"goal_achieved": *phone.paid.lock().unwrap(), "summary": "已用免密支付付款 55.51 元，显示支付成功。"}).to_string()
         };
         (200, json!({"choices": [{"message": {"content": content}}]}).to_string())
     })
@@ -148,6 +148,29 @@ async fn wait_for(id: &str, status: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_without_the_requested_result_is_not_reported_as_success() {
+    let _serial = SERIAL.lock().await;
+    let flows = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
+    let phone = Arc::new(Phone { paid: Mutex::new(false), inputs: Mutex::new(Vec::new()) });
+    let daemon_url = fake_daemon(phone.clone());
+    let model = serve(move |_, _, body| {
+        let body: Value = serde_json::from_str(body).unwrap();
+        let system = body["messages"][0]["content"].as_str().unwrap_or("");
+        let content = if system.contains("operate a real iPhone") {
+            r#"{"operation":"DONE","target":null}"#
+        } else {
+            r#"{"goal_achieved":false,"summary":"没有显示付款结果，任务未完成。"}"#
+        };
+        (200, json!({"choices":[{"message":{"content":content}}]}).to_string())
+    });
+    let id = task::start(request(&model), |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
+    let blocked = wait_for(&id, "blocked").await;
+    assert_eq!(blocked["summary"], "没有显示付款结果，任务未完成。");
+    assert!(phone.inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declining_a_flow_ends_the_task_without_step_by_step_fallback() {
     let _serial = SERIAL.lock().await;
     let flows = tempfile::tempdir().unwrap();
@@ -170,7 +193,7 @@ async fn declining_a_flow_ends_the_task_without_step_by_step_fallback() {
         } else if system.contains("operate a real iPhone") {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             r#"{"operation":"CLICK","target":0}"#
-        } else { "用户没有批准，未执行。" };
+        } else { r#"{"goal_achieved":false,"summary":"用户没有批准，未执行。"}"# };
         (200, json!({"choices":[{"message":{"content":content}}]}).to_string())
     });
     let id = task::start(request(&model), |owner| DaemonClient::new(daemon_url.clone(), None).with_owner(owner)).ok().unwrap();
@@ -298,7 +321,7 @@ async fn a_free_model_falls_through_the_gateways_free_list() {
                 let content = if system.contains("operate a real iPhone") {
                     r#"{"operation":"DONE","target":null,"text":null,"reason":"already paid"}"#
                 } else {
-                    "已经付好了。"
+                    r#"{"goal_achieved":true,"summary":"已经付好了。"}"#
                 };
                 (200, json!({"choices": [{"message": {"content": content}}]}).to_string())
             }

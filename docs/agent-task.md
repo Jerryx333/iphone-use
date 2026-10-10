@@ -92,6 +92,8 @@ The last 20 tasks, newest first, without `steps`.
 5. **Summary.** When the task ends, the assist model (or Jev's text model) writes two or three
    sentences for the person from the goal, the final screen text and the steps: what was done and
    the values read ("积分 8017 → 8167").
+   It also checks whether the whole goal was achieved. A `DONE` decision without verified results
+   ends as `blocked`, with the missing result explained; opening an app alone is not completion.
 
 Screen text is untrusted data, never instructions, at every step.
 
