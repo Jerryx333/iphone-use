@@ -352,6 +352,11 @@ update / publish / report`.
 - Act tools and `phone_capabilities` return JSON in `structuredContent`; the text
   block is a preview trimmed at 8 KiB. `phone_run_steps`, `phone_elements` and
   `phone_flow_*` return complete JSON as text; `phone_screenshot` an image.
+- For clients whose initialize `clientInfo.name` starts with `codex` (case-insensitive),
+  the final tool response omits `structuredContent` so Codex keeps the text and
+  images; missing decision fields (`ok`, `error`, `outcome`, `retry_safe`, `hint`)
+  are appended as compact text, or the JSON is added as text if none exists.
+  Other clients retain the original response.
 - Single-step act tools observe by default (= `?return=delta`, baseline = the
   last snapshot this client saw, so only the change comes back); `observe:false`
   skips it. The settled screen is captured in memory, not sent: the next

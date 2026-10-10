@@ -8,8 +8,8 @@
 //!   1. `#[tool_router]` on the `impl PhoneHandler` block generates the static
 //!      `PhoneHandler::tool_router()` fn.
 //!   2. `#[tool_handler]` on the `impl ServerHandler` block fills in
-//!      `call_tool`, `list_tools`, and `get_tool`.  We add `get_info` manually
-//!      inside the same block so the macro skips its default stub.
+//!      `list_tools` and `get_tool`. We provide `call_tool` to adapt the final
+//!      result for the initialized peer, and `get_info` for server metadata.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rmcp::{
@@ -1639,12 +1639,30 @@ impl PhoneHandler {
 // ---------------------------------------------------------------------------
 // ServerHandler impl
 //
-// `#[tool_handler]` fills in call_tool / list_tools / get_tool automatically.
-// We provide get_info() ourselves so the macro skips its default stub.
+// `#[tool_handler]` fills in list_tools / get_tool automatically.
+// Our call_tool preserves its routing and adapts only the final wire result.
 // ---------------------------------------------------------------------------
 
 #[tool_handler]
 impl ServerHandler for PhoneHandler {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // rmcp's default initialize stores clientInfo on this session's peer.
+        let codex_client = context
+            .peer
+            .peer_info()
+            .is_some_and(|info| is_codex_client(Some(&info.client_info.name)));
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        // Internal consumers (including note_progress) finish before stripping.
+        Self::tool_router()
+            .call(tcc)
+            .await
+            .map(|result| adapt_for_client(result, codex_client))
+    }
+
     fn get_info(&self) -> rmcp::model::ServerInfo {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
@@ -1678,6 +1696,86 @@ impl ServerHandler for PhoneHandler {
 // ---------------------------------------------------------------------------
 // Shared helper
 // ---------------------------------------------------------------------------
+
+/// Codex currently prefers structuredContent over every text/image block.
+fn is_codex_client(name: Option<&str>) -> bool {
+    name.is_some_and(|name| {
+        name.get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("codex"))
+    })
+}
+
+fn adapt_for_client(mut result: CallToolResult, codex_client: bool) -> CallToolResult {
+    if !codex_client {
+        return result;
+    }
+    let Some(structured) = result.structured_content.take() else {
+        return result;
+    };
+    let texts: Vec<_> = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .collect();
+    if texts.is_empty() {
+        result.content.push(Content::text(structured.to_string()));
+        return result;
+    }
+    let missing: Vec<_> = ["ok", "error", "outcome", "retry_safe", "hint"]
+        .into_iter()
+        .filter_map(|key| {
+            let value = structured.get(key)?;
+            if texts
+                .iter()
+                .any(|text| text_has_decision(&text.text, key, value))
+            {
+                return None;
+            }
+            Some(format!("{key}:{value}"))
+        })
+        .collect();
+    if !missing.is_empty() {
+        result.content.push(Content::text(missing.join(" ")));
+    }
+    result
+}
+
+/// Recognize whole JSON answers and explicit key:value text. Match values as
+/// well as keys: a mention of retry_safe alone must not hide retry_safe:false.
+fn text_has_decision(text: &str, key: &str, value: &serde_json::Value) -> bool {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+        return json.get(key) == Some(value);
+    }
+    for marker in [format!("\"{key}\""), key.to_string()] {
+        for (offset, _) in text.match_indices(&marker) {
+            if offset > 0
+                && text[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"')
+            {
+                continue;
+            }
+            let tail = text[offset + marker.len()..].trim_start();
+            let Some(tail) = tail.strip_prefix(':').map(str::trim_start) else {
+                continue;
+            };
+            let encoded = value.to_string();
+            for candidate in std::iter::once(encoded.as_str()).chain(value.as_str()) {
+                if let Some(rest) = tail.strip_prefix(candidate) {
+                    if rest.is_empty()
+                        || rest.starts_with(|c: char| {
+                            c.is_whitespace() || matches!(c, ',' | '}' | ']')
+                        })
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
 
 fn phone_locator_has_condition(locator: &PhoneElementLocator) -> bool {
     locator.label.is_some()
@@ -2253,6 +2351,111 @@ async fn send_input_observed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_client_preserves_images_text_and_metadata() {
+        let mut result = CallToolResult::error(vec![
+            Content::text("ok:false"),
+            Content::image("png", "image/png"),
+        ]);
+        result.structured_content = Some(serde_json::json!({"ok": false}));
+        let mut expected = result.clone();
+        expected.structured_content = None;
+        assert_eq!(
+            serde_json::to_value(adapt_for_client(result, true)).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_client_adds_json_when_no_text() {
+        for content in [vec![], vec![Content::image("png", "image/png")]] {
+            let mut result = CallToolResult::success(content.clone());
+            let json = serde_json::json!({"ok": true, "elements": []});
+            result.structured_content = Some(json.clone());
+            let adapted = adapt_for_client(result, true);
+            assert!(adapted.structured_content.is_none());
+            assert_eq!(adapted.content.len(), content.len() + 1);
+            assert_eq!(
+                adapted.content.last().unwrap().as_text().unwrap().text,
+                json.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_client_appends_missing_decisions_without_tree() {
+        let mut result = unknown_action_result("transport_error", "connection lost".into());
+        result.structured_content.as_mut().unwrap()["elements"] = serde_json::json!(["large tree"]);
+        let adapted = adapt_for_client(result, true);
+        let line = &adapted.content.last().unwrap().as_text().unwrap().text;
+        assert_eq!(
+            line,
+            "ok:false error:\"outcome_unknown\" outcome:\"unknown\" retry_safe:false"
+        );
+        assert!(!line.contains("elements"));
+        assert!(adapted.is_error.unwrap());
+    }
+
+    #[test]
+    fn codex_client_other_clients_unchanged() {
+        for name in [Some("claude-code"), None, Some("")] {
+            let result = unknown_action_result("transport_error", "lost".into());
+            assert_eq!(
+                serde_json::to_value(adapt_for_client(result.clone(), is_codex_client(name)))
+                    .unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_client_name_prefix_case() {
+        for name in ["codex", "codex-mcp-client", "CoDeX-desktop", "CODEX"] {
+            assert!(is_codex_client(Some(name)));
+        }
+        for name in ["", "code", "other-codex", " codex", "你好codex"] {
+            assert!(!is_codex_client(Some(name)));
+        }
+        assert!(!is_codex_client(None));
+    }
+
+    #[test]
+    fn codex_client_decision_matching_checks_values_and_boundaries() {
+        let value = serde_json::json!(false);
+        for text in [
+            "retry_safe:false",
+            "retry_safe: false",
+            "{\"retry_safe\": false}",
+        ] {
+            assert!(text_has_decision(text, "retry_safe", &value));
+        }
+        for text in [
+            "retry_safe",
+            "retry_safe:true",
+            "not_retry_safe:false",
+            "retry_safe:falsehood",
+        ] {
+            assert!(!text_has_decision(text, "retry_safe", &value));
+        }
+        let mut result = CallToolResult::success(vec![Content::text("ok:true outcome:done")]);
+        result.structured_content =
+            Some(serde_json::json!({"ok": true, "outcome": "done", "hint": "check screen"}));
+        let result = adapt_for_client(result, true);
+        assert_eq!(
+            result.content[1].as_text().unwrap().text,
+            "hint:\"check screen\""
+        );
+    }
+
+    #[test]
+    fn codex_client_without_structure_unchanged() {
+        let result = CallToolResult::success(vec![Content::image("png", "image/png")]);
+        assert_eq!(
+            serde_json::to_value(adapt_for_client(result.clone(), true)).unwrap(),
+            serde_json::to_value(result).unwrap()
+        );
+    }
 
     // ---------------------------------------------------------------------
     // Real tool calls against a scripted daemon.
