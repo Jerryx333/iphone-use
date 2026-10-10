@@ -77,6 +77,10 @@ off so a Mac uses its own. Flows: 录制 flow in the remote's ⋯ menu records w
 flow; ⋯ › Flow 与定时 lists the device's flows (run now, with an explicit OK for side effects) and
 its schedules (time + weekdays → cron, inputs, enable, run now, delete, recent runs).
 
+Unsent goals stay with their selected device across closing the screen or restarting the app.
+A refused request keeps the goal available to retry; a task already running is shown without
+discarding the new goal. A local pairing that needs renewal offers the pairing screen directly.
+
 Tests: `xcodebuild -scheme IPhoneUseRemote -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test`
 (device-list migration, `/control` outcome classification, address parsing, error mapping,
 retry backoff, and the state → screen mapping). Build signed for the simulator (not

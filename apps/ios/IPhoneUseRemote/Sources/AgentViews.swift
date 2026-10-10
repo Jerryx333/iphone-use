@@ -155,6 +155,10 @@ struct AgentView: View {
                     "iphone.badge.plus", (String(localized: "配对本机"), { pairingThisPhone = true }))
         }
         if session.phase != .connected {
+            if session.record.isThisPhone, case .failed(let problem) = session.phase, problem.needsLogin {
+                return (String(localized: "本机还没有有效配对。请扫描 Mac 上这台 iPhone 的「配对本机 Agent」二维码。"),
+                        "iphone.badge.plus", (String(localized: "重新配对本机"), { pairingThisPhone = true }))
+            }
             return (String(localized: "「\(session.name)」现在没有连上：\(session.shortState)"), "bolt.horizontal.circle",
                     (String(localized: "重试"), { Task { await session.connect(password: nil) } }))
         }

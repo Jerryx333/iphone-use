@@ -287,8 +287,12 @@ final class AgentController {
             let list = try await client.recentTasks()
             guard targetID == id else { return }
             history = list
+            if confirmPrompt == nil { error = nil }
         } catch DaemonError.sessionExpired {
-            if await session.relogin(), targetID == id, let list = try? await client.recentTasks() { history = list }
+            if await session.relogin(), targetID == id, let list = try? await client.recentTasks() {
+                history = list
+                if confirmPrompt == nil { error = nil }
+            }
         } catch {
             // No history (an older daemon) is not worth a message.
         }

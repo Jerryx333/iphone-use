@@ -550,3 +550,5 @@
 "稍后再说" = "Not now";
 "关掉这一页，不回答；任务继续等你" = "Closes this without answering; the task keeps waiting for you";
 "本机 Agent 服务没有响应。请在 Mac 上启动这台 iPhone 的服务，再回来重试。" = "This iPhone's Agent service isn't responding. Start its service from your Mac, then try again.";
+"本机还没有有效配对。请扫描 Mac 上这台 iPhone 的「配对本机 Agent」二维码。" = "This iPhone needs pairing. Scan its \"Pair this iPhone's Agent\" code on your Mac.";
+"重新配对本机" = "Pair this iPhone again";
