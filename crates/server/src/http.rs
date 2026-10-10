@@ -13401,6 +13401,9 @@ async fn agent_task_start(
             )
         }
     };
+    if request.app.is_none() {
+        request.app = crate::app_lookup::starting_app(&request.goal);
+    }
     request.return_bundle = headers
         .get("x-task-return-bundle")
         .and_then(|v| v.to_str().ok())

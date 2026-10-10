@@ -3323,8 +3323,40 @@ impl ProbeCount {
     }
 }
 
+/// A plain runner is enough only when this setup did not link the daemon.
+/// A supervisor that launched a different product must not pass handoff.
+fn handoff_daemon_ready(body: &[u8], expected: bool) -> bool {
+    if !expected {
+        return true;
+    }
+    let Ok(status) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let daemon = &status["value"]["daemon"];
+    daemon["linked"] == true && daemon["state"] == "serving"
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handoff_requires_the_linked_daemon_to_be_serving() {
+        use super::handoff_daemon_ready as ready;
+        assert!(ready(
+            br#"{"value":{"daemon":{"linked":true,"state":"serving"}}}"#,
+            true
+        ));
+        for body in [
+            br#"{"value":{"daemon":{"linked":false}}}"#.as_slice(),
+            br#"{"value":{"daemon":{"linked":true,"state":"failed"}}}"#,
+            br#"{"value":{"daemon":{"linked":true,"state":"not_started"}}}"#,
+            br#"{"value":{"ready":true}}"#,
+            b"invalid",
+        ] {
+            assert!(!ready(body, true), "unexpectedly accepted {body:?}");
+            assert!(ready(body, false), "plain runner setup stays compatible");
+        }
+    }
+
     #[test]
     fn an_ios_below_the_coredevice_floor_is_ios_too_old() {
         // Hardware: iPhone 12 mini, lockdownd ProductVersion 15.4.1, Xcode
@@ -3895,6 +3927,14 @@ impl Setup {
             ("WDA_TEAM_ID", ctx.team_id.clone()),
             ("WDA_BUNDLE_ID", ctx.bundle_id.clone()),
         ];
+        // A checkout/custom setup must keep using the explicitly selected
+        // engine after launchd takes over, rather than an older installed app.
+        if let Ok(binary) = std::env::var("IPHONE_USE_SETUP_BIN") {
+            if !binary.is_empty() {
+                let path = std::fs::canonicalize(&binary).unwrap_or_else(|_| PathBuf::from(binary));
+                pairs.push(("IPHONE_USE_SETUP_BIN", path.to_string_lossy().into_owned()));
+            }
+        }
         if ctx.runner_src != ctx.runner_default_src {
             pairs.push((
                 "IPU_RUNNER_SRC",
@@ -4064,11 +4104,14 @@ impl Setup {
                     mjpeg_port,
                 )
                 && status::phase_is(&ctx.status_file, "ready")
-                && sys::runner_ok(
+                && sys::runner_get(
                     &format!("{target_url}/status"),
                     Duration::from_secs(4),
                     &self.ctx.runner_auth(),
                 )
+                .is_some_and(|(status, body)| {
+                    status < 400 && handoff_daemon_ready(&body, self.embed.is_some())
+                })
             {
                 ok("launchd replacement verified: runner identity, both loopback relays, and runner /status");
                 return Ok(());
