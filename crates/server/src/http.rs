@@ -963,6 +963,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/collect", post(agent_collect))
         .route("/agent/scroll_find", post(agent_scroll_find))
         .route("/agent/flow/draft", get(agent_flow_draft))
+        .route("/agent/flow/record", get(agent_flow_record).post(agent_flow_record))
+        .route("/agent/flow/save", post(agent_flow_save))
         .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
@@ -9334,12 +9336,25 @@ async fn direct_control(
         {
             return None;
         }
+        // A recording turns a person's coordinate tap into the element under
+        // the finger, read before the tap changes the screen.
+        let recorded_locator = if recording_tap(&state, &value) {
+            locate_tap(&mut client, &value).await
+        } else {
+            None
+        };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        Some(wda_control_with_client(&mut client, &state.wda_actionable, &value, &mut detail).await)
+        let outcome = wda_control_with_client(&mut client, &state.wda_actionable, &value, &mut detail).await;
+        Some((outcome, recorded_locator))
     })
     .await;
     let outcome = match outcome {
-        Ok(Some(outcome)) => outcome,
+        Ok(Some((outcome, recorded_locator))) => {
+            if outcome == WdaControlOutcome::Applied {
+                record_control_step(&state, &value, recorded_locator);
+            }
+            outcome
+        }
         Ok(None) => return wda_deadline_response(false),
         Err(_) => {
             let mark = *recover(dispatched.lock());
@@ -13092,6 +13107,179 @@ async fn agent_reference(State(state): State<Arc<AppState>>, headers: HeaderMap)
 /// flow v1 document plus a `todo` list. Typed text is never included; each
 /// typing step references a named input instead. 404 `no_trail` when nothing
 /// worth drafting has been recorded since the daemon started.
+/// Recording and a coordinate tap a person sent (not an element/label tap,
+/// which converts by itself).
+fn recording_tap(state: &AppState, value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("tap")
+        && value.get("element").is_none()
+        && value.get("label").is_none()
+        && recover(state.flow_trail.lock()).is_recording()
+}
+
+/// The locator of what a normalized `(x, y)` tap hits on the current screen.
+async fn locate_tap(client: &mut crate::wda::WdaClient, value: &serde_json::Value) -> Option<serde_json::Value> {
+    let x = value.get("x").and_then(serde_json::Value::as_f64)?;
+    let y = value.get("y").and_then(serde_json::Value::as_f64)?;
+    let (width, height) = client.window_size().await.ok()?;
+    let rows = client.elements().await.ok()?;
+    crate::flows::locator_at(&rows, x * width, y * height)
+}
+
+/// A person's applied control message, into an active recording.
+fn record_control_step(state: &AppState, value: &serde_json::Value, locator: Option<serde_json::Value>) {
+    let mut trail = recover(state.flow_trail.lock());
+    if !trail.is_recording() {
+        return;
+    }
+    let converted = match locator {
+        Some(locator) => crate::flows::Converted::Step(serde_json::json!({"kind": "tap_locator", "locator": locator})),
+        None => crate::flows::convert_action(value, None),
+    };
+    trail.record(converted, Instant::now());
+}
+
+fn agent_json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+fn agent_auth_refusal(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    match agent_auth(state, headers) {
+        AgentAuth::Locked => Some(with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        )),
+        AgentAuth::Denied => Some(with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        )),
+        AgentAuth::Ok => None,
+    }
+}
+
+/// `GET /agent/flow/record` — whether a recording runs and its draft so far.
+/// `POST /agent/flow/record {"action": "start" | "stop"}` — start one (every
+/// step applied through `/control`, `/agent/input` or `/agent/actions` lands
+/// in it, a person's coordinate taps as the element under the finger), or
+/// stop it and answer its draft.
+async fn agent_flow_record(
+    State(state): State<Arc<AppState>>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if method == axum::http::Method::GET {
+        let trail = recover(state.flow_trail.lock());
+        return agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "recording": trail.is_recording(),
+                "steps": trail.recording_steps(),
+                "draft": trail.recording_draft(),
+            }),
+        );
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let action = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("action").and_then(serde_json::Value::as_str).map(str::to_string));
+    let mut trail = recover(state.flow_trail.lock());
+    match action.as_deref() {
+        Some("start") => {
+            trail.start_recording();
+            agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "recording": true}))
+        }
+        Some("stop") => {
+            let draft = trail.stop_recording();
+            agent_json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "recording": false, "draft": draft}),
+            )
+        }
+        _ => agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "invalid_action", "hint": "send {\"action\": \"start\"} or {\"action\": \"stop\"}"}),
+        ),
+    }
+}
+
+/// `POST /agent/flow/save {"id": "app/name", "name": …, "description"?: …,
+/// "flow"?: {…}}` — install a flow into this daemon's local store, where
+/// schedules and tasks find it. Without `flow`, the running or last recording,
+/// else the current trail's draft, is saved. Never publishes anywhere.
+async fn agent_flow_save(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return agent_json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok": false, "error": "invalid_json"}));
+    };
+    let Some(id) = request.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+        return agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "id_required", "hint": "an id like \"myapp/daily-check\""}),
+        );
+    };
+    let flow = match request.get("flow") {
+        Some(flow) => Some(flow.clone()),
+        None => {
+            let mut trail = recover(state.flow_trail.lock());
+            let draft = trail.stop_recording().or_else(|| trail.draft());
+            draft.and_then(|draft| draft.get("flow").cloned())
+        }
+    };
+    let Some(mut flow) = flow else {
+        return agent_json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "no_trail", "hint": "record first (POST /agent/flow/record {\"action\":\"start\"}) or send \"flow\""}),
+        );
+    };
+    for key in ["name", "description"] {
+        if let Some(value) = request.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
+            flow[key] = value.clone();
+        }
+    }
+    let result = tokio::task::spawn_blocking(move || save_local_flow(&id, &flow)).await;
+    match result {
+        Ok(Ok(saved)) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "saved": saved})),
+        Ok(Err(error)) => agent_json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"ok": false, "error": "invalid_flow", "message": format!("{error:#}")}),
+        ),
+        Err(error) => agent_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"ok": false, "error": "save_failed", "message": error.to_string()}),
+        ),
+    }
+}
+
+/// Validate and install `flow` as local flow `id` (the same check and store as
+/// `iphone-use-mcp flow add`).
+fn save_local_flow(id: &str, flow: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let bytes = serde_json::to_vec_pretty(flow)?;
+    iphone_use_mcp::flow::parse_flow(&bytes, id)?;
+    let dir = tempfile::Builder::new().prefix("flow-save").tempdir()?;
+    let file = dir.path().join("flow.json");
+    std::fs::write(&file, &bytes)?;
+    iphone_use_mcp::registry::add(&file, id)
+}
+
 async fn agent_flow_draft(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match agent_auth(&state, &headers) {
         AgentAuth::Locked => {
