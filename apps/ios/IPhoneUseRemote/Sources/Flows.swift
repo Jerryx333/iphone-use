@@ -420,9 +420,10 @@ extension DaemonClient {
 
     /// `GET /agent/flow/draft`: what the last task did, as a draft; nil when
     /// there is none.
-    func lastDraft() async -> FlowDraft? {
-        guard let (data, response) = try? await send(request("agent/flow/draft")),
-              response.statusCode == 200 else { return nil }
+    func lastDraft() async throws -> FlowDraft? {
+        let (data, response) = try await send(request("agent/flow/draft"))
+        if response.statusCode == 404 { return nil }
+        try Self.checkAgent(response, data)
         return FlowDraft(json: try? JSONSerialization.jsonObject(with: data))
     }
 

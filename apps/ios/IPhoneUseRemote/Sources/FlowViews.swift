@@ -133,6 +133,7 @@ struct SaveFlowSheet: View {
     @State private var id = ""
     @State private var idEdited = false
     @State private var shown: FlowDraft?
+    @State private var loading = false
     @State private var saving = false
     @State private var error: String?
     @Environment(\.dismiss) private var dismiss
@@ -170,6 +171,11 @@ struct SaveFlowSheet: View {
                 }
                 if let error {
                     Section { Text(error).foregroundStyle(Theme.down).font(.footnote) }
+                } else if loading {
+                    Section { ProgressView("读取流程步骤…") }
+                } else if shown?.flow == nil {
+                    Section { Text("这次没有可保存的步骤。先录制操作，或完成一个包含手机操作的任务。")
+                        .font(.footnote).foregroundStyle(.secondary) }
                 }
             }
             .navigationTitle("保存为 flow")
@@ -178,16 +184,19 @@ struct SaveFlowSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { Task { await save() } }
-                        .disabled(saving || !FlowID.isValid(id) || name.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(loading || shown?.flow == nil || saving || !FlowID.isValid(id) || name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
             .disabled(saving)
             .appOnChange(of: name) { _, _ in deriveID() }
             .task {
-                if let draft {
-                    shown = draft
-                } else {
-                    shown = await session.client?.lastDraft()
+                loading = true
+                defer { loading = false }
+                do {
+                    if let draft { shown = draft }
+                    else { shown = try await session.client?.lastDraft() }
+                } catch {
+                    self.error = error.localizedDescription
                 }
                 deriveID()
             }
@@ -209,7 +218,7 @@ struct SaveFlowSheet: View {
         do {
             let saved = try await client.saveFlow(id: id, name: name.trimmingCharacters(in: .whitespaces),
                                                   description: detail.trimmingCharacters(in: .whitespacesAndNewlines),
-                                                  flow: draft?.flow)
+                                                  flow: shown?.flow)
             session.show(String(localized: "已保存 flow \(saved)"))
             onSaved(saved)
             dismiss()

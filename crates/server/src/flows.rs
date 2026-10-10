@@ -386,7 +386,7 @@ pub fn locator_for_row(row: &crate::wda::ElementRow) -> Option<Value> {
 impl FlowTrail {
     fn rotate(&mut self) {
         let finished = std::mem::take(&mut self.current);
-        if finished.worth_a_flow() {
+        if finished.steps.len() >= 2 {
             self.previous = Some(finished);
         }
     }
@@ -584,7 +584,7 @@ impl FlowTrail {
             &mut self.current
         } else {
             match self.previous.as_mut() {
-                Some(previous) if !previous.suggested => previous,
+                Some(previous) if previous.worth_a_flow() && !previous.suggested => previous,
                 _ => return None,
             }
         };
@@ -980,6 +980,24 @@ mod tests {
             later.record(Converted::Step(json!({"kind":"back"})), now);
         }
         assert!(later.suggestion(&cooldown, 100 + SUGGEST_COOLDOWN_DAYS).is_some());
+    }
+
+    #[test]
+    fn short_task_draft_survives_returning_to_the_app_without_a_suggestion() {
+        let now = Instant::now();
+        let dir = tempfile::tempdir().unwrap();
+        let mut trail = FlowTrail::default();
+        trail.launched("com.apple.Preferences", now);
+        trail.record(convert_action(&json!({"type":"launch_app","bundle":"com.apple.Preferences"}), None), now);
+        trail.saw_app(Some("设置"), now);
+        trail.record(Converted::Step(json!({"kind":"tap_locator","locator":{"label":"电池","kind":"Cell"}})), now);
+        trail.launched("com.leeguoo.iphone-use.remote", now);
+        trail.record(convert_action(&json!({"type":"launch_app","bundle":"com.leeguoo.iphone-use.remote"}), None), now);
+        trail.saw_app(Some("Phone Use Remote"), now);
+        let draft = trail.draft().expect("explicit Save as flow retains a short finished task");
+        assert_eq!(draft["flow"]["app"], "com.apple.Preferences");
+        assert_eq!(draft["flow"]["steps"].as_array().unwrap().len(), 3);
+        assert!(trail.suggestion(&dir.path().join("cooldown.json"), 100).is_none(), "short drafts must not trigger automatic suggestions");
     }
 
     #[test]
