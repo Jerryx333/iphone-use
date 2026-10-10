@@ -182,7 +182,7 @@ per action**; longer input is rejected before sending with `outcome:not_sent` an
 `retry_safe:true`. Split longer text into multiple actions and append subsequent
 parts with `clear:false`. `clear:true` clears once before the first chunk.
 The text deadline is 15 seconds plus one second per complete 20 characters,
-capped at 40 seconds; a batch still has its 75-second total deadline.
+capped at 35 seconds; a batch still has its 75-second total deadline.
 On a chunk failure or timeout, `characters_confirmed` counts characters in fully
 acknowledged chunks and `characters_total` counts the whole requested text.
 The failed chunk may have partially landed: `outcome:unknown`, `retry_safe:false`.

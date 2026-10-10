@@ -5350,6 +5350,94 @@ enum WdaControlOutcome {
     Failed,
 }
 
+/// Shared agent failure classification; Applied is handled by the caller.
+fn agent_control_failure(outcome: WdaControlOutcome) -> (StatusCode, &'static str, &'static str, bool) {
+    match outcome {
+        WdaControlOutcome::NotSent => (
+            StatusCode::BAD_GATEWAY,
+            "wda_pre_dispatch_failed",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::Unsupported => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_control",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::UnsupportedPerformAction => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_perform_action",
+            "not_sent",
+            false,
+        ),
+        WdaControlOutcome::InvalidElementSnapshot => (
+            StatusCode::BAD_REQUEST,
+            "invalid_element_snapshot",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::StaleElementSnapshot => (
+            StatusCode::CONFLICT,
+            "stale_element_snapshot",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::ElementNotFound => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "element_not_found",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::AmbiguousElement => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ambiguous_element_label",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::NoAlert => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no_alert",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::InvalidElementTarget => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_element_target",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::InvalidValue(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::NoEffect(error, _) => {
+            (StatusCode::CONFLICT, error, "no_effect", true)
+        }
+        WdaControlOutcome::Refused(error, _) => {
+            (StatusCode::CONFLICT, error, "not_sent", true)
+        }
+        WdaControlOutcome::ForcePressUnsupported => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "force_press_unsupported",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::NoPageScroller(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no_page_scroller",
+            "not_sent",
+            true,
+        ),
+        WdaControlOutcome::Failed => {
+            (StatusCode::BAD_GATEWAY, "outcome_unknown", "unknown", false)
+        }
+        WdaControlOutcome::Applied => unreachable!(),
+    }
+}
+
 fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String> {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
@@ -6930,6 +7018,7 @@ async fn scroll_snapshot_element(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
+    guard_alert: bool,
 ) -> Result<(), SnapshotElementTapError> {
     let dx = value
         .get("dx")
@@ -6982,7 +7071,7 @@ async fn scroll_snapshot_element(
     let (x1, y1, x2, y2) = element_swipe_endpoints(row.rect, [x, y, width, height], screen, dx, dy);
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
-    if guard_scroll_dispatch(w, value, detail).await {
+    if should_guard_scroll(guard_alert, value) && guard_scroll_dispatch(w, value, detail).await {
         return Err(SnapshotElementTapError::Refused("alert_present", SCROLL_ALERT_HINT));
     }
     w.swipe(x1, y1, x2, y2, duration)
@@ -7579,6 +7668,7 @@ async fn wda_control_with_client(
     actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
+    guard_alert: bool,
 ) -> WdaControlOutcome {
     use std::sync::atomic::Ordering;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -7708,7 +7798,7 @@ async fn wda_control_with_client(
                     tracing::info!("scroll page: drag ({x1:.0},{y1:.0}) -> ({x2:.0},{y2:.0})");
                     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
                     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
-                    if guard_scroll_dispatch(w, v, detail).await {
+                    if should_guard_scroll(guard_alert, v) && guard_scroll_dispatch(w, v, detail).await {
                         return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
                     }
                     w.swipe(x1, y1, x2, y2, duration).await
@@ -7716,7 +7806,7 @@ async fn wda_control_with_client(
             }
         }
         "scroll" if v.get("element").is_some() => {
-            let result = scroll_snapshot_element(w, v, detail).await;
+            let result = scroll_snapshot_element(w, v, detail, guard_alert).await;
             match snapshot_element_outcome(result, w, "control element scroll") {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
@@ -7775,7 +7865,7 @@ async fn wda_control_with_client(
             {
                 return WdaControlOutcome::Unsupported;
             }
-            if guard_scroll_dispatch(w, v, detail).await {
+            if should_guard_scroll(guard_alert, v) && guard_scroll_dispatch(w, v, detail).await {
                 return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
             }
             wda_swipe(w, nx, ny, dx, dy).await
@@ -7820,7 +7910,7 @@ async fn wda_control_with_client(
                         .into_iter()
                         .all(|n| (0.0..=1.0).contains(&n)) =>
                 {
-                    if guard_scroll_dispatch(w, v, detail).await {
+                    if should_guard_scroll(guard_alert, v) && guard_scroll_dispatch(w, v, detail).await {
                         return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
                     }
                     async {
@@ -7924,7 +8014,7 @@ fn split_text_chunks(text: &str, max_chars: usize) -> Vec<&str> {
 fn agent_action_deadline(value: &serde_json::Value) -> std::time::Duration {
     if value["type"] == "text" {
         let count = value["text"].as_str().unwrap_or("").chars().count();
-        std::time::Duration::from_secs(15 + (count / 20).min(25) as u64)
+        std::time::Duration::from_secs(15 + (count / 20).min(20) as u64)
     } else {
         AGENT_INPUT_WDA_DEADLINE
     }
@@ -8190,6 +8280,15 @@ fn needs_scroll_alert_probe(value: &serde_json::Value) -> bool {
     matches!(value["type"].as_str(), Some("scroll" | "swipe" | "drag"))
 }
 
+fn should_guard_scroll(guard_alert: bool, value: &serde_json::Value) -> bool {
+    guard_alert && needs_scroll_alert_probe(value)
+}
+
+/// WDA may return an empty alert placeholder; it does not block gestures.
+fn blocking_alert_json(probe: Option<(String, Vec<String>)>) -> Option<serde_json::Value> {
+    alert_json(probe.filter(|(text, buttons)| !text.is_empty() || !buttons.is_empty()))
+}
+
 /// Pure dispatch gate. Probe errors (including timeout) fail open.
 fn scroll_alert_guard<E>(
     value: &serde_json::Value,
@@ -8198,11 +8297,7 @@ fn scroll_alert_guard<E>(
     if !needs_scroll_alert_probe(value) {
         return None;
     }
-    let (text, buttons) = probe.ok().flatten()?;
-    if text.is_empty() && buttons.is_empty() {
-        return None;
-    }
-    let alert = alert_json(Some((text, buttons)))?;
+    let alert = blocking_alert_json(probe.ok().flatten())?;
     Some(serde_json::json!({
         "ok": false,
         "error": "alert_present",
@@ -8375,7 +8470,7 @@ async fn direct_agent_action(
     };
 
     let Some(result) = custom_result else {
-        return wda_control_with_client(w, actionable, value, detail).await;
+        return wda_control_with_client(w, actionable, value, detail, true).await;
     };
     match result {
         Ok(()) => {
@@ -8519,7 +8614,7 @@ async fn direct_control(
             return None;
         }
         dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
-        Some(wda_control_with_client(&mut client, &state.wda_actionable, &value, &mut detail).await)
+        Some(wda_control_with_client(&mut client, &state.wda_actionable, &value, &mut detail, false).await)
     })
     .await;
     let outcome = match outcome {
@@ -9710,90 +9805,7 @@ async fn agent_actions_inner(
                     continue;
                 }
                 if outcome != WdaControlOutcome::Applied {
-                    let (status, error, outcome_name, current_retry_safe) = match outcome {
-                        WdaControlOutcome::NotSent => (
-                            StatusCode::BAD_GATEWAY,
-                            "wda_pre_dispatch_failed",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::Unsupported => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "unsupported_control",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::UnsupportedPerformAction => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "unsupported_perform_action",
-                            "not_sent",
-                            false,
-                        ),
-                        WdaControlOutcome::InvalidElementSnapshot => (
-                            StatusCode::BAD_REQUEST,
-                            "invalid_element_snapshot",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::StaleElementSnapshot => (
-                            StatusCode::CONFLICT,
-                            "stale_element_snapshot",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::ElementNotFound => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "element_not_found",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::AmbiguousElement => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "ambiguous_element_label",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::NoAlert => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "no_alert",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::InvalidElementTarget => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "invalid_element_target",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::InvalidValue(_) => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "invalid_value",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::NoEffect(error, _) => {
-                            (StatusCode::CONFLICT, error, "no_effect", true)
-                        }
-                        WdaControlOutcome::Refused(error, _) => {
-                            (StatusCode::CONFLICT, error, "not_sent", true)
-                        }
-                        WdaControlOutcome::ForcePressUnsupported => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "force_press_unsupported",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::NoPageScroller(_) => (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "no_page_scroller",
-                            "not_sent",
-                            true,
-                        ),
-                        WdaControlOutcome::Failed => {
-                            (StatusCode::BAD_GATEWAY, "outcome_unknown", "unknown", false)
-                        }
-                        WdaControlOutcome::Applied => unreachable!(),
-                    };
+                    let (status, error, outcome_name, current_retry_safe) = agent_control_failure(outcome);
                     if matches!(
                         outcome,
                         WdaControlOutcome::Failed | WdaControlOutcome::NotSent
@@ -11056,15 +11068,18 @@ async fn agent_input_inner(
         WdaControlOutcome::ElementNotFound => element_not_found_response(),
         WdaControlOutcome::AmbiguousElement => ambiguous_element_response(detail.as_ref()),
         WdaControlOutcome::InvalidElementTarget => invalid_element_target_response(),
-        WdaControlOutcome::InvalidValue(hint) => hinted_control_response(
-            StatusCode::UNPROCESSABLE_ENTITY, "invalid_value", "not_sent", hint,
-        ),
-        WdaControlOutcome::NoEffect(error, hint) => {
-            hinted_control_response(StatusCode::CONFLICT, error, "no_effect", hint)
+        WdaControlOutcome::InvalidValue(hint) => {
+            let (status, error, outcome_name, _) = agent_control_failure(outcome);
+            hinted_control_response(status, error, outcome_name, hint)
+        },
+        WdaControlOutcome::NoEffect(_, hint) => {
+            let (status, error, outcome_name, _) = agent_control_failure(outcome);
+            hinted_control_response(status, error, outcome_name, hint)
         }
-        WdaControlOutcome::Refused(error, hint) => {
+        WdaControlOutcome::Refused(_, hint) => {
+            let (status, error, outcome_name, _) = agent_control_failure(outcome);
             with_action_detail(
-                hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint),
+                hinted_control_response(status, error, outcome_name, hint),
                 detail.as_ref(),
             ).await
         }
@@ -13903,7 +13918,7 @@ mod tests {
 
     #[test]
     fn text_chunk_deadline_scaling() {
-        for (count, seconds) in [(0, 15), (19, 15), (20, 16), (200, 25), (499, 39), (500, 40), (700, 40), (1000, 40)] {
+        for (count, seconds) in [(0, 15), (19, 15), (20, 16), (200, 25), (399, 34), (400, 35), (499, 35), (500, 35), (700, 35), (1000, 35)] {
             let value = serde_json::json!({"type":"text", "text":"中".repeat(count)});
             assert_eq!(agent_action_deadline(&value).as_secs(), seconds);
         }
@@ -15248,6 +15263,25 @@ mod tests {
             validate_action(serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dy":80.0})).is_ok()
         );
         assert!(validate_action(serde_json::json!({"type":"scroll","x":0.5,"y":0.5})).is_err());
+    }
+
+    #[test]
+    fn scroll_alert_browser_control_never_probes() {
+        for kind in ["scroll", "swipe", "drag"] {
+            let action = serde_json::json!({"type":kind});
+            assert!(!should_guard_scroll(false, &action));
+            assert!(should_guard_scroll(true, &action));
+        }
+        // Check the actual call sites as well as the pure policy.
+        let source = include_str!("http.rs");
+        let browser = source.split("async fn direct_control(").nth(1).unwrap().split("struct AgentActionsRequest").next().unwrap();
+        assert!(browser.contains("&mut detail, false)"));
+        let shared = source.split("async fn wda_control_with_client(").nth(1).unwrap().split("fn split_text_chunks").next().unwrap();
+        assert!(shared.contains("scroll_snapshot_element(w, v, detail, guard_alert)"));
+        let element = source.split("async fn scroll_snapshot_element(").nth(1).unwrap().split("#[derive(Debug)]").next().unwrap();
+        assert!(element.contains("should_guard_scroll(guard_alert, value) && guard_scroll_dispatch"));
+        let agent = source.split("async fn direct_agent_action(").nth(1).unwrap().split("async fn direct_control(").next().unwrap();
+        assert!(agent.contains("value, detail, true)"));
     }
 
     #[test]

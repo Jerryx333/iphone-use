@@ -87,7 +87,7 @@ const ELEMENTS_TIMEOUT: Duration = Duration::from_secs(45);
 /// precisely how a caller ends up not knowing what happened. Non-observing
 /// non-text requests keep the shorter timeout.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
-/// Server text cap 40s + settle/tree read < client 55s < Codex tool timeout 60s.
+/// Server text cap 35s + settle/tree read 15s + alert probe 1.5s < client 55s < tool 60s.
 /// Applies to single text inputs both with and without observation.
 const TEXT_INPUT_TIMEOUT: Duration = Duration::from_secs(55);
 const ACTIONS_TIMEOUT: Duration = Duration::from_secs(90);

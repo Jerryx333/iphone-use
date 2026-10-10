@@ -128,7 +128,7 @@ impl Collection {
             "new_rows": self.rows.len()-before, "settled": settled}));
         if self.end_marker_seen {
             Some("end_marker")
-        } else if moved == Some(false) {
+        } else if settled && moved == Some(false) {
             Some("no_scroll_progress")
         } else if repeated {
             Some("repeated_page")
@@ -138,6 +138,54 @@ impl Collection {
             None
         }
     }
+    fn scroll_result(
+        &mut self,
+        outcome: WdaControlOutcome,
+        detail: Option<Value>,
+    ) -> Option<&'static str> {
+        if outcome == WdaControlOutcome::Applied {
+            self.scrolls_attempted += 1;
+            self.scrolls_applied += 1;
+            return None;
+        }
+        let (_, error, outcome_name, _) = agent_control_failure(outcome);
+        let sent = outcome_name != "not_sent";
+        self.scrolls_attempted += usize::from(sent);
+        self.extra.insert("error".into(), json!(error));
+        // Even an acknowledged no-effect scroll was sent: never invite replay.
+        self.extra.insert(
+            "outcome".into(),
+            json!(if sent { "unknown" } else { "not_sent" }),
+        );
+        self.extra.insert(
+            "retry_safe".into(),
+            json!(!sent && self.scrolls_applied == 0),
+        );
+        if let Some(detail) = detail {
+            if let Some(alert) = detail.get("alert") {
+                self.extra.insert("alert".into(), alert.clone());
+            }
+            self.extra.insert("detail".into(), detail);
+        }
+        Some(if error == "alert_present" {
+            "alert"
+        } else {
+            "error"
+        })
+    }
+
+    fn scroll_timeout(&mut self, sent: bool) {
+        self.scrolls_attempted += usize::from(sent);
+        self.extra.insert(
+            "outcome".into(),
+            json!(if sent { "unknown" } else { "not_sent" }),
+        );
+        self.extra.insert(
+            "retry_safe".into(),
+            json!(!sent && self.scrolls_applied == 0),
+        );
+    }
+
     fn response(&self, reason: &str) -> Value {
         let mut body = json!({"ok": !["error", "app_changed", "alert"].contains(&reason)
                 && self.extra.get("outcome").and_then(Value::as_str) != Some("unknown"),
@@ -196,19 +244,19 @@ pub(super) async fn agent_collect(
     }
     let mut collection = Collection::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
-    let result = tokio::time::timeout_at(deadline, async {
+    let result = async {
         let Some(wda) = &state.wda else {
             anyhow::bail!("wda_not_configured");
         };
         state.touch_activity();
         let _priority = state.begin_wda_control();
-        let mut w = wda.lock().await;
+        let mut w = tokio::time::timeout_at(deadline, wda.lock()).await?;
         if state.released.load(std::sync::atomic::Ordering::Acquire)
             || state.wda_lifecycle.is_transitioning()
         {
             anyhow::bail!("device_not_drivable");
         }
-        let focus = engage_agent_focus(&state, &mut w).await;
+        let focus = tokio::time::timeout_at(deadline, engage_agent_focus(&state, &mut w)).await?;
         if focus_permission_pending(focus.as_ref()).is_some() {
             anyhow::bail!("focus_permission_pending");
         }
@@ -226,19 +274,26 @@ pub(super) async fn agent_collect(
             {
                 anyhow::bail!("device_not_drivable");
             }
-            w.forget_alert_probe();
-            if let Some(alert) = alert_json(probe_alert(&mut w).await) {
-                collection.extra.insert("alert".into(), alert);
-                return Ok("alert");
+            if previous.is_none() {
+                w.forget_alert_probe();
+                if let Some(alert) = blocking_alert_json(
+                    tokio::time::timeout_at(deadline, probe_alert(&mut w)).await?,
+                ) {
+                    collection.extra.insert("alert".into(), alert);
+                    return Ok("alert");
+                }
             }
             let budget = deadline
                 .saturating_duration_since(tokio::time::Instant::now())
                 .min(std::time::Duration::from_millis(
                     AGENT_INPUT_SETTLE_DEFAULT_MS,
                 ));
-            let (observed, report) = settle_and_read_elements(&mut w, budget).await;
+            let (observed, report) =
+                tokio::time::timeout_at(deadline, settle_and_read_elements(&mut w, budget)).await?;
             w.forget_alert_probe();
-            if let Some(alert) = alert_json(probe_alert(&mut w).await) {
+            if let Some(alert) =
+                blocking_alert_json(tokio::time::timeout_at(deadline, probe_alert(&mut w)).await?)
+            {
                 collection.extra.insert("alert".into(), alert);
                 return Ok("alert");
             }
@@ -314,41 +369,50 @@ pub(super) async fn agent_collect(
             {
                 anyhow::bail!("device_not_drivable");
             }
-            collection.scrolls_attempted += 1;
             let mut detail = None;
-            let outcome =
-                direct_agent_action(&mut w, &state.wda_actionable, &action, &mut detail).await;
-            if outcome != WdaControlOutcome::Applied {
-                collection
-                    .extra
-                    .insert("action_detail".into(), json!(format!("{outcome:?}")));
-                anyhow::bail!("scroll_failed");
+            let before = w.last_post();
+            // Finish this timeout while still holding WDA, so pre-dispatch
+            // reads cannot be mistaken for a possibly sent scroll.
+            let outcome = tokio::time::timeout_at(
+                deadline,
+                direct_agent_action(&mut w, &state.wda_actionable, &action, &mut detail),
+            )
+            .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    collection.scroll_timeout(w.last_post() != before);
+                    return Ok("deadline");
+                }
+            };
+            if let Some(reason) = collection.scroll_result(outcome, detail) {
+                return Ok(reason);
             }
-            collection.scrolls_applied += 1;
             previous = Some(rows);
         }
-    })
+    }
     .await;
     let reason = match result {
-        Ok(Ok(reason)) => reason,
-        Ok(Err(error)) => {
-            collection
-                .extra
-                .insert("error".into(), json!(error.to_string()));
-            "error"
-        }
-        Err(_) => {
-            collection.extra.insert(
-                "outcome".into(),
-                json!(
-                    if collection.scrolls_attempted > collection.scrolls_applied {
-                        "unknown"
+        Ok(reason) => reason,
+        Err(error) => {
+            let error: anyhow::Error = error;
+            if error.is::<tokio::time::error::Elapsed>() {
+                collection.extra.insert(
+                    "outcome".into(),
+                    json!(if collection.scrolls_applied == 0 {
+                        "not_sent"
                     } else {
                         "observed"
-                    }
-                ),
-            );
-            "deadline"
+                    }),
+                );
+                "deadline"
+            } else {
+                collection
+                    .extra
+                    .insert("error".into(), json!(error.to_string()));
+                collection.extra.insert("outcome".into(), json!("not_sent"));
+                "error"
+            }
         }
     };
     agent_actions_json(
@@ -372,6 +436,117 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn collect_list_alert_refusal_preserves_detail() {
+        let mut c = Collection::new();
+        let detail =
+            json!({"alert":{"text":"Allow?","buttons":["Allow","Cancel"]},"hint":"handle first"});
+        let reason = c
+            .scroll_result(
+                WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT),
+                Some(detail.clone()),
+            )
+            .unwrap();
+        let body = c.response(reason);
+        assert_eq!(body["stop_reason"], "alert");
+        assert_eq!(body["alert"], detail["alert"]);
+        assert_eq!(body["detail"], detail);
+        assert_eq!(body["error"], "alert_present");
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["scrolls_attempted"], 0);
+    }
+
+    #[test]
+    fn collect_list_not_sent_retry_depends_on_prior_scrolls() {
+        for outcome in [
+            WdaControlOutcome::NotSent,
+            WdaControlOutcome::Unsupported,
+            WdaControlOutcome::UnsupportedPerformAction,
+            WdaControlOutcome::InvalidValue("bad"),
+            WdaControlOutcome::ElementNotFound,
+            WdaControlOutcome::AmbiguousElement,
+            WdaControlOutcome::InvalidElementSnapshot,
+            WdaControlOutcome::StaleElementSnapshot,
+            WdaControlOutcome::InvalidElementTarget,
+            WdaControlOutcome::NoPageScroller("none"),
+            WdaControlOutcome::Refused("element_occluded", "blocked"),
+            WdaControlOutcome::NoAlert,
+            WdaControlOutcome::ForcePressUnsupported,
+        ] {
+            for prior in [false, true] {
+                let mut c = Collection::new();
+                if prior {
+                    assert_eq!(c.scroll_result(WdaControlOutcome::Applied, None), None);
+                }
+                assert_eq!(c.scroll_result(outcome, None), Some("error"));
+                let body = c.response("error");
+                assert_eq!(body["outcome"], "not_sent");
+                assert_eq!(body["retry_safe"], !prior);
+                assert_eq!(body["scrolls_attempted"], usize::from(prior));
+                assert_eq!(body["error"], agent_control_failure(outcome).1);
+            }
+        }
+    }
+
+    #[test]
+    fn collect_list_sent_failure_is_unknown() {
+        for outcome in [
+            WdaControlOutcome::Failed,
+            WdaControlOutcome::NoEffect("no_change", "hint"),
+        ] {
+            let mut c = Collection::new();
+            c.scroll_result(outcome, Some(json!({"original":"detail"})));
+            let body = c.response("error");
+            assert_eq!(body["outcome"], "unknown");
+            assert_eq!(body["retry_safe"], false);
+            assert_eq!(body["scrolls_attempted"], 1);
+            assert_eq!(body["scrolls_applied"], 0);
+            assert_eq!(body["detail"], json!({"original":"detail"}));
+        }
+    }
+
+    #[test]
+    fn collect_list_timeout_counts_only_possible_dispatch() {
+        for sent in [false, true] {
+            for prior in [false, true] {
+                let mut c = Collection::new();
+                if prior {
+                    c.scroll_result(WdaControlOutcome::Applied, None);
+                }
+                c.scroll_timeout(sent);
+                let body = c.response("deadline");
+                assert_eq!(body["outcome"], if sent { "unknown" } else { "not_sent" });
+                assert_eq!(body["retry_safe"], !sent && !prior);
+                assert_eq!(
+                    body["scrolls_attempted"],
+                    usize::from(sent) + usize::from(prior)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collect_list_unsettled_page_ignores_no_movement() {
+        let mut c = Collection::new();
+        assert_eq!(
+            c.page(&Request::default(), &[row("a")], false, Some(false)),
+            None
+        );
+        assert_eq!(
+            c.page(&Request::default(), &[row("a")], false, Some(false)),
+            Some("repeated_page")
+        );
+    }
+
+    #[test]
+    fn collect_list_empty_alert_does_not_stop() {
+        assert!(blocking_alert_json(Some((String::new(), vec![]))).is_none());
+        assert!(blocking_alert_json(None).is_none());
+        assert!(blocking_alert_json(Some(("Alert".into(), vec![]))).is_some());
+        assert!(blocking_alert_json(Some((String::new(), vec!["OK".into()]))).is_some());
+    }
+
     #[test]
     fn collect_list_dedup_order() {
         let mut c = Collection::new();
