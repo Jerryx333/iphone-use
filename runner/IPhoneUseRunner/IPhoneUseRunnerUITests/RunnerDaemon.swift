@@ -17,6 +17,7 @@ enum RunnerDaemon {
   ) -> Int32
   private typealias State = @convention(c) () -> Int32
   private typealias ErrorText = @convention(c) () -> UnsafePointer<CChar>?
+  private typealias PairCode = @convention(c) (UnsafeMutablePointer<CChar>?, Int) -> Int32
 
   private static func symbol<T>(_ name: String, as: T.Type) -> T? {
     guard let pointer = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }  // RTLD_DEFAULT
@@ -66,6 +67,22 @@ enum RunnerDaemon {
       value["error"] = String(cString: text)
     }
     return value
+  }
+
+  /// `POST /daemon/pair-code`: a one-time code from the daemon's own pairing, for the iPhone app
+  /// on this phone (the Mac turns it into `iphoneuse://pair?u=http://127.0.0.1:<port>&c=<code>`).
+  /// Signed like every runner request, so only whoever drives this runner can mint one.
+  static func pairCodeResponse() -> HTTPResponse {
+    guard let pairCode = symbol("ipu_daemon_pair_code", as: PairCode.self) else {
+      return .error(503, "daemon not linked", "this runner was built without the on-phone daemon")
+    }
+    var buffer = [CChar](repeating: 0, count: 128)
+    let length = buffer.withUnsafeMutableBufferPointer { pairCode($0.baseAddress, $0.count) }
+    guard length > 0 else {
+      return .error(503, "daemon not serving", "the on-phone daemon is not serving (see daemon in /status)")
+    }
+    let code = String(cString: buffer)
+    return .value(["code": code, "port": Int(port ?? defaultPort)])
   }
 
   private static func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {

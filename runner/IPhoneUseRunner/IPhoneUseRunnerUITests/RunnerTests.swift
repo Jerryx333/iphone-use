@@ -163,6 +163,10 @@ final class RunnerTests: XCTestCase {
       || (request.path.hasPrefix("/session/") && request.path.hasSuffix("/wda/keepawake")) {
       return keepAwakeResponse(request)
     }
+    // Minting a pairing code is a lock and a random number in the daemon; never queue it.
+    if request.method == "POST", request.path == "/daemon/pair-code" {
+      return RunnerDaemon.pairCodeResponse()
+    }
     guard request.method == "GET" else { return nil }
     if request.path == "/status" {
       return .value(statusValue(), sessionId: Self.sessionID)

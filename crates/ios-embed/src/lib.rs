@@ -94,6 +94,32 @@ pub extern "C" fn ipu_daemon_state() -> i32 {
     STATE.load(Ordering::SeqCst)
 }
 
+/// Mints a one-time pairing code for the iPhone app on this phone, writing it
+/// NUL-terminated into `out` (capacity `capacity` bytes). Returns the code's
+/// length, -1 while the daemon is not serving, -2 when `out` is NULL or too
+/// small. The code is valid for five minutes and redeems once at
+/// `POST /pair` on the daemon (`{"code"}`).
+#[no_mangle]
+pub extern "C" fn ipu_daemon_pair_code(out: *mut c_char, capacity: usize) -> i32 {
+    if STATE.load(Ordering::SeqCst) != 1 {
+        return -1;
+    }
+    let Ok(Some(code)) = std::panic::catch_unwind(server::boot::embedded_pair_code) else {
+        return -1;
+    };
+    let bytes = code.as_bytes();
+    if out.is_null() || bytes.len() + 1 > capacity {
+        return -2;
+    }
+    // SAFETY: `out` holds `capacity` writable bytes (checked above to fit the
+    // code and its NUL), per this function's contract.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), bytes.len());
+        *out.add(bytes.len()) = 0;
+    }
+    bytes.len() as i32
+}
+
 /// Why the daemon stopped, or NULL. Valid for the life of the process.
 #[no_mangle]
 pub extern "C" fn ipu_daemon_error() -> *const c_char {
