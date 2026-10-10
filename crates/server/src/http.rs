@@ -966,6 +966,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/flow/record", get(agent_flow_record).post(agent_flow_record))
         .route("/agent/flow/save", post(agent_flow_save))
         .route("/agent/flows", get(agent_flows))
+        .route("/agent/flow/run", post(agent_flow_run))
         .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
@@ -13293,6 +13294,61 @@ async fn agent_flows(
         Err(error) => agent_json_response(
             StatusCode::OK,
             serde_json::json!({"ok": true, "flows": [], "note": format!("{error:#}")}),
+        ),
+    }
+}
+
+/// `POST /agent/flow/run {"id": "app/flow", "inputs"?: {"k": "v"}, "confirm"?: bool}`
+/// — run a flow this daemon can see (registry or local) in this process, as
+/// the caller's owner (`X-Phone-Owner`, else `flow-run`), and answer its
+/// result. `confirm` is required for a flow that sends, pays or deletes.
+async fn agent_flow_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return agent_json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok": false, "error": "invalid_json"}));
+    };
+    let Some(id) = request.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+        return agent_json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok": false, "error": "id_required"}));
+    };
+    let Some(scheduler) = crate::schedules::current() else {
+        return agent_json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok": false, "error": "not_ready"}),
+        );
+    };
+    let owner = headers
+        .get("x-phone-owner")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("flow-run")
+        .to_string();
+    let inputs: Vec<String> = request
+        .get("inputs")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+        .collect();
+    let confirm = request.get("confirm").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let daemon = scheduler.self_client(&owner);
+    match iphone_use_mcp::flow::run_for_task(&daemon, &id, &inputs, confirm).await {
+        Ok((succeeded, value)) => agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok": succeeded, "result": value}),
+        ),
+        Err(error) => agent_json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"ok": false, "error": "flow_not_run", "message": format!("{error:#}")}),
         ),
     }
 }

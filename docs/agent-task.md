@@ -141,4 +141,5 @@ container) next to the registry's; tasks and schedules on that daemon find both.
   `DELETE/PATCH /agent/schedules/<id>`, `POST /agent/schedules/<id>/run` (run now),
   `GET /agent/schedules/<id>/runs`, `GET /agent/schedules/runs`. On the phone the daemon runs them
   in process; a flow that sends, pays or deletes needs `confirm_side_effects: true`.
+- `POST /agent/flow/run {"id": "app/flow", "inputs"?: {…}, "confirm"?: bool}` runs a flow now, in process, as the caller's owner, and answers `{"ok", "result"}`.
 - `GET /agent/flows[?app=<bundle>]` lists the flows this daemon can run (registry + local), as `iphone-use-mcp flow list --json` prints them.

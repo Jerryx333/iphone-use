@@ -1405,6 +1405,16 @@ pub fn current() -> Option<Arc<Scheduler>> {
     SCHEDULER.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+impl Scheduler {
+    /// A client for this daemon's own API acting as `owner`: how in-process
+    /// flow runs (schedules, `/agent/flow/run`, tasks) drive the phone through
+    /// the same checks and owner lease as any other caller.
+    pub fn self_client(&self, owner: &str) -> iphone_use_mcp::client::DaemonClient {
+        iphone_use_mcp::client::DaemonClient::new(self.config.self_url.clone(), self.config.credential.clone())
+            .with_owner(owner)
+    }
+}
+
 /// Start the scheduler for this daemon. `host`/`port` are the listen address.
 pub fn start(
     host: &str,
