@@ -442,6 +442,18 @@ mod tests {
     }
 
     #[test]
+    fn scroll_alert_error_keeps_full_json_and_buttons() {
+        let body = json!({
+            "ok":false,"error":"alert_present","outcome":"not_sent","retry_safe":true,
+            "alert":{"text":"Allow?","buttons":["Allow","Don’t Allow"]},
+            "elements":[],"snapshot":"s"
+        });
+        // None selects the caller's original JSON, preserving exact button labels.
+        assert!(elements(&body).is_none());
+        assert!(observed(&body).is_none());
+    }
+
+    #[test]
     fn an_error_answer_keeps_its_json() {
         assert_eq!(
             elements(&json!({"elements": [], "error": "wda_source_failed"})),

@@ -248,6 +248,17 @@ the locator is still proven unique, then the centre of the element's live
 frame is tapped. Keep the default (`element`) otherwise — coordinate taps on
 `/source` frames miss in system sheets.
 
+### Gesture errors
+
+| Error code | HTTP | Meaning / next step |
+|---|---|---|
+| `alert_present` | 409 | A system alert blocks `scroll` (coordinates, `page:true`, or `element`), `swipe`, or `drag`. The gesture was not sent (`outcome:"not_sent"`, `retry_safe:true` for a single action). Read `alert.text` and `alert.buttons`; handle it with `{"type":"alert","button":"<exact>"}` first, asking the user before granting authorization, then retry the gesture. |
+
+Both `/agent/input` and `/agent/actions` probe before these gestures, with an
+800ms cap. Probe failures/timeouts allow the gesture through; read-path probes
+keep their 1500ms cap. A batch stops at `failed_step` and retains earlier step
+results; if an earlier action ran, the **batch** remains `retry_safe:false`.
+
 ## Reading results: settle, delta, wait_for
 
 **`?return=delta`** (MCP act tools: on by default, `observe:false` to skip) settles after an applied action and
