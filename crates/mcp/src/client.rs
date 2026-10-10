@@ -532,8 +532,24 @@ impl DaemonClient {
         self.post_actions(body, false).await
     }
 
+    fn collect_request_body(&self, body: &serde_json::Value) -> serde_json::Value {
+        let mut body = body.clone();
+        if body.get("snapshot").is_none() && body.get("element").is_none() {
+            if let Some(snapshot) = self
+                .last_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                body["snapshot"] = serde_json::json!(snapshot);
+            }
+        }
+        body
+    }
+
     /// Bounded collection: longer than the normal read timeout, no retries.
     pub async fn collect_list(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
+        let body = self.collect_request_body(body);
         let req = self.auth(self.client.post(self.url("/agent/collect")))
             .timeout(std::time::Duration::from_secs(50))
             .header("x-phone-control", "1")
@@ -1000,6 +1016,19 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn collect_auto_snapshot_request_body() {
+        let client = DaemonClient::new("http://127.0.0.1:44321", None);
+        let empty = serde_json::json!({"kind":"Cell"});
+        assert_eq!(client.collect_request_body(&empty), empty);
+        client.remember_snapshot(Some(&serde_json::json!({"snapshot":"last-read"})));
+        assert_eq!(client.collect_request_body(&empty)["snapshot"], "last-read");
+        let explicit = serde_json::json!({"snapshot":"explicit"});
+        assert_eq!(client.collect_request_body(&explicit), explicit);
+        let element = serde_json::json!({"element":2});
+        assert_eq!(client.collect_request_body(&element), element);
+    }
 
     #[test]
     fn text_input_timeout_preserves_other_action_budgets() {

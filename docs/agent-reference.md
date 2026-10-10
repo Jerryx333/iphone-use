@@ -281,7 +281,10 @@ is no longer cached). The action result and the observation are separate facts:
   anchors but none moved in the scroll direction, despite other changes. The
   gesture may be at a boundary, in another region, or blocked by an overlay.
   Check a screenshot before scrolling again; this does not mean the list is
-  fully read. Absent when there are no common anchors or the app changed.
+  fully read. The flag can also appear when the screen never settled, but only
+  with at least 3 anchors whose position did not change, and no other common anchor changed position.
+  It stays absent when several labelled rows change their text between reads (for example a running stopwatch whose times are labels): new labels are treated as possibly new content, so a page that may have been flung past is never reported as stuck.
+  Absent when there are no common anchors or the app changed.
 - `settle_ms` default 15000, max 20000; it is a ceiling, reading stops when two
   reads match. One large-tree read was measured at 6–7s.
 - `app_changed:{from,to}`: the frontmost app changed — usually a banner swallowed
@@ -378,12 +381,20 @@ scrolls only, never clicks. It requires the same bearer, owner lease and
 
 All fields are optional: `kind` defaults to `Cell`, `direction` to `down`
 (`up` also supported), `max_pages` to 6 (1–10). `end_label` must be nonempty
-and stops on any on-screen row whose label contains it. Optional `element`
-and `snapshot` must be supplied together, from the same current tree, to
-scroll inside a container. Later pages re-identify that container uniquely
+and stops on any on-screen row whose label contains it. Optional `element` requires a nonempty `snapshot` from the same current tree
+to scroll inside a container. A nonempty `snapshot` alone is also allowed. Later pages re-identify that container uniquely
 by kind plus identifier, or kind/label/rect; a stale or ambiguous target
 fails closed. Without a target, the existing page-scroll container selection
 is used.
+
+Before the first scroll, collect compares the cached snapshot's app with the
+app just observed. If both are known and differ, it returns HTTP 409 with
+`ok:false`, `error:"app_changed"`, `outcome:"not_sent"`, `retry_safe:true`,
+`expected_app`, `app`, the current `snapshot`, and `scrolls_attempted:0`.
+This check precedes the element freshness check. Missing cached snapshots or
+unknown apps do not refuse collection. When neither `snapshot` nor `element`
+is supplied, MCP automatically fills in its last remembered snapshot. After an
+app-change refusal, read the screen again and confirm the target app is in front.
 
 Each page uses a full settled-tree observation. On-screen rows of `kind`
 contribute their label plus descendant StaticText labels (unique labels,
@@ -392,7 +403,7 @@ joined with ` · `), optional `value` and `identifier`. Deduplication uses
 
 The response includes `ok`, `rows`, `pages` (`page`, `rows_seen`, `new_rows`,
 `settled`), `stop_reason`, `end_marker_seen`, `coverage_verified`,
-`limitations`, and the last observed `snapshot`. Stop reasons are
+`limitations`, the last observed `snapshot`, and `app` when known. Stop reasons are
 `end_marker`, `no_scroll_progress`, `repeated_page`, `page_budget`,
 `deadline`, `app_changed`, `alert` (with an `alert` block), or `error`.
 `coverage_verified` is true only for an observed end marker with every page

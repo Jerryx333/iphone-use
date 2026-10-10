@@ -35,12 +35,23 @@ impl Request {
             || !["up", "down"].contains(&self.direction.as_str())
             || self.kind.trim().is_empty()
             || self.end_label.as_ref().is_some_and(|s| s.trim().is_empty())
-            || self.element.is_some() != self.snapshot.is_some()
+            || (self.element.is_some() && self.snapshot.is_none())
             || self.snapshot.as_ref().is_some_and(|s| s.is_empty())
         {
-            return Err("max_pages must be 1..=10; direction up/down; kind/end_label nonempty; element and nonempty snapshot must be paired".into());
+            return Err("max_pages must be 1..=10; direction up/down; kind/end_label nonempty; element requires a nonempty snapshot; snapshot alone is allowed".into());
         }
         Ok(())
+    }
+}
+
+// Missing application information must never refuse a collect.
+fn collect_app_guard(expected: Option<&str>, current: Option<&str>) -> Option<Value> {
+    match (expected, current) {
+        (Some(expected), Some(current)) if expected != current => Some(json!({
+            "error": "app_changed", "outcome": "not_sent", "retry_safe": true,
+            "expected_app": expected, "app": current
+        })),
+        _ => None,
     }
 }
 
@@ -242,6 +253,12 @@ pub(super) async fn agent_collect(
     if let Some(owner) = trusted_bearer_owner(&state, &headers) {
         crate::advice::reset(&owner);
     }
+    let expected_app = request
+        .snapshot
+        .as_deref()
+        .and_then(|snap| lookup_element_snapshot(&state, snap))
+        .and_then(|rows| active_application(&rows))
+        .filter(|app| !app.is_empty());
     let mut collection = Collection::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
     let result = async {
@@ -290,6 +307,12 @@ pub(super) async fn agent_collect(
                 ));
             let (observed, report) =
                 tokio::time::timeout_at(deadline, settle_and_read_elements(&mut w, budget)).await?;
+            if let Some((_, rows)) = &observed {
+                collection.extra.remove("app");
+                if let Some(app) = active_application(rows).filter(|app| !app.is_empty()) {
+                    collection.extra.insert("app".into(), json!(app));
+                }
+            }
             w.forget_alert_probe();
             if let Some(alert) =
                 blocking_alert_json(tokio::time::timeout_at(deadline, probe_alert(&mut w)).await?)
@@ -306,7 +329,18 @@ pub(super) async fn agent_collect(
             remember_element_snapshot(&state, &snapshot, &Arc::new(rows.clone()));
             note_owner_snapshot(&state, &headers, &snapshot);
             collection.snapshot = Some(snapshot.clone());
-            if let Some(current) = active_application(&rows) {
+            let current_app = active_application(&rows).filter(|app| !app.is_empty());
+            if previous.is_none() {
+                if let Some(refusal) =
+                    collect_app_guard(expected_app.as_deref(), current_app.as_deref())
+                {
+                    collection
+                        .extra
+                        .extend(refusal.as_object().unwrap().clone());
+                    return Ok("app_changed");
+                }
+            }
+            if let Some(current) = current_app {
                 if application.as_ref().is_some_and(|old| old != &current) {
                     return Ok("app_changed");
                 }
@@ -416,7 +450,7 @@ pub(super) async fn agent_collect(
         }
     };
     agent_actions_json(
-        if reason == "error" {
+        if reason == "error" || (reason == "app_changed" && collection.scrolls_attempted == 0) {
             StatusCode::CONFLICT
         } else {
             StatusCode::OK
@@ -436,6 +470,62 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn collect_app_guard_mismatch_not_sent() {
+        let mut c = Collection::new();
+        c.snapshot = Some("fresh".into());
+        c.extra.extend(
+            collect_app_guard(Some("Settings"), Some("Clock"))
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let body = c.response("app_changed");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "app_changed");
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["scrolls_attempted"], 0);
+        assert_eq!(body["expected_app"], "Settings");
+        assert_eq!(body["app"], "Clock");
+        assert_eq!(body["snapshot"], "fresh");
+    }
+
+    #[test]
+    fn collect_app_guard_same_or_unknown_passes() {
+        for (expected, current) in [
+            (Some("Clock"), Some("Clock")),
+            (None, Some("Clock")),
+            (Some("Clock"), None),
+            (None, None),
+        ] {
+            assert!(collect_app_guard(expected, current).is_none());
+        }
+    }
+
+    #[test]
+    fn collect_app_guard_validate_snapshot_only() {
+        assert!(Request {
+            snapshot: Some("cached".into()),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(Request {
+            element: Some(0),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(Request {
+            snapshot: Some(String::new()),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
     #[test]
     fn collect_list_alert_refusal_preserves_detail() {
         let mut c = Collection::new();

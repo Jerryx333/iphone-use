@@ -101,10 +101,10 @@ fn collect_list_request(p: CollectListParams) -> Result<serde_json::Value, Strin
         || !["up", "down"].contains(&p.direction.as_str())
         || p.kind.trim().is_empty()
         || p.end_label.as_ref().is_some_and(|s| s.trim().is_empty())
-        || p.element.is_some() != p.snapshot.is_some()
+        || (p.element.is_some() && p.snapshot.is_none())
         || p.snapshot.as_ref().is_some_and(|s| s.is_empty())
     {
-        return Err("invalid collect parameters: max_pages 1..=10, direction up/down, nonempty kind/end_label, paired element/snapshot; no action sent".into());
+        return Err("invalid collect parameters: max_pages 1..=10, direction up/down, nonempty kind/end_label, element requires nonempty snapshot; snapshot alone allowed; no action sent".into());
     }
     serde_json::to_value(p).map_err(|e| e.to_string())
 }
@@ -118,6 +118,12 @@ fn collect_list_text(body: &serde_json::Value) -> String {
         body["stop_reason"].as_str().unwrap_or("error"),
         body["coverage_verified"].as_bool().unwrap_or(false)
     );
+    if let Some(app) = body["app"].as_str() {
+        out.push_str(&format!("in {}\n", app.replace(['\n', '\r'], " ")));
+    }
+    if body["error"] == "app_changed" && body["outcome"] == "not_sent" {
+        out.push_str("App changed: no swipe was sent. Read the screen again and confirm the target app is in front.\n");
+    }
     let tail = format!(
         "snapshot {} · scrolls_applied {} · scrolls_attempted {} · retry_safe {}\nlimitations: {}",
         body["snapshot"],
@@ -846,7 +852,7 @@ impl PhoneHandler {
     }
 
     #[tool(
-        description = "Collect a multi-page list of accessibility text. Scrolls only; never clicks. Results do not establish business completeness."
+        description = "Collect a multi-page list of accessibility text. Scrolls only; never clicks. Snapshot alone is allowed for a foreground-app check before the first swipe; element requires snapshot. If neither is supplied, MCP automatically fills in the last remembered snapshot. A known app mismatch refuses without swiping; unknown app information does not refuse. Results do not establish business completeness."
     )]
     async fn phone_collect_list(
         &self,
@@ -3417,10 +3423,12 @@ mod collect_list_tests {
             r#"{"max_pages":0}"#,
             r#"{"max_pages":11}"#,
             r#"{"direction":"sideways"}"#,
-            r#"{"snapshot":"x"}"#,
+            r#"{"element":1}"#,
+            r#"{"snapshot":""}"#,
         ] {
             assert!(collect_list_request(serde_json::from_str(bad).unwrap()).is_err());
         }
+        assert!(collect_list_request(serde_json::from_str(r#"{"snapshot":"x"}"#).unwrap()).is_ok());
         let p = CollectListParams {
             element: Some(4),
             snapshot: Some("abc".into()),
@@ -3428,6 +3436,16 @@ mod collect_list_tests {
         };
         assert_eq!(collect_list_request(p).unwrap()["element"], 4);
     }
+    #[test]
+    fn collect_list_app_changed_rendering() {
+        let text = collect_list_text(
+            &serde_json::json!({"app":"Clock", "error":"app_changed", "outcome":"not_sent"}),
+        );
+        assert!(text.contains("in Clock"));
+        assert!(text.contains("no swipe was sent"));
+        assert!(text.contains("Read the screen again and confirm the target app is in front"));
+    }
+
     #[test]
     fn collect_list_compact_rendering() {
         let mut b = serde_json::json!({"rows":[{"text":"你好","value":"42"}],"pages":[{}],"stop_reason":"page_budget","coverage_verified":false,"limitations":"AX only"});

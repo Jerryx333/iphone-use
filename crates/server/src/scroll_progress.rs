@@ -24,6 +24,17 @@ pub fn scroll_anchor_moved(
     dx: f64,
     dy: f64,
 ) -> Option<bool> {
+    scroll_anchor_progress(baseline, current, dx, dy).map(|(moved, _, _)| moved)
+}
+
+/// Scroll motion evidence, still anchor count, and common unique anchor count.
+/// A still anchor has its origin (x, y) within 2.0pt of baseline, ignoring size.
+pub fn scroll_anchor_progress(
+    baseline: &[ElementRow],
+    current: &[ElementRow],
+    dx: f64,
+    dy: f64,
+) -> Option<(bool, usize, usize)> {
     if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
         return None;
     }
@@ -51,18 +62,32 @@ pub fn scroll_anchor_moved(
     let before = anchors(baseline);
     let after = anchors(current);
     let mut common_anchor_count = 0;
+    let mut still_anchor_count = 0;
+    let mut moved = false;
     for (key, row) in &before {
         let (Some(row), Some(Some(next))) = (row, after.get(key)) else {
             continue;
         };
         common_anchor_count += 1;
+        if next
+            .rect
+            .iter()
+            .take(2)
+            .zip(row.rect.iter())
+            .all(|(next, before)| (next - before).abs() <= 2.0)
+        {
+            still_anchor_count += 1;
+        }
         if (next.rect[axis] - row.rect[axis]) * direction > 2.0
             && (next.rect[1 - axis] - row.rect[1 - axis]).abs() <= 3.0
             && (next.rect[2] - row.rect[2]).abs() <= 2.0
             && (next.rect[3] - row.rect[3]).abs() <= 2.0
         {
-            return Some(true);
+            moved = true;
         }
+    }
+    if moved {
+        return Some((true, still_anchor_count, common_anchor_count));
     }
     let appeared = current
         .iter()
@@ -79,7 +104,7 @@ pub fn scroll_anchor_moved(
     if appeared > 2 && appeared * 5 > common_anchor_count {
         return None;
     }
-    (common_anchor_count > 0).then_some(false)
+    (common_anchor_count > 0).then_some((false, still_anchor_count, common_anchor_count))
 }
 
 #[cfg(test)]

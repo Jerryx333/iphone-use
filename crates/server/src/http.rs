@@ -5730,6 +5730,8 @@ fn delta_shows_no_visible_change(delta: &ElementRowsDelta, report: &SettleReport
         && delta.removed.is_empty()
 }
 
+const UNSETTLED_SCROLL_MIN_STILL_ANCHORS: usize = 3;
+
 /// Attach a progress hint only when a fresh, readable observation supports it.
 fn mark_no_scroll_progress(
     body: &mut serde_json::Value,
@@ -5738,8 +5740,7 @@ fn mark_no_scroll_progress(
     current: &[crate::wda::ElementRow],
     report: &SettleReport,
 ) {
-    if !report.settled
-        || report.sparse
+    if report.sparse
         || report.stale
         || body.get("app_changed").is_some()
         || body.get("no_visible_change") == Some(&serde_json::Value::Bool(true))
@@ -5756,7 +5757,18 @@ fn mark_no_scroll_progress(
         _ => None,
     };
     if direction.is_some_and(|(dx, dy)| {
-        crate::scroll_progress::scroll_anchor_moved(baseline, current, dx, dy) == Some(false)
+        crate::scroll_progress::scroll_anchor_progress(baseline, current, dx, dy).is_some_and(
+            |(moved, still, common)| {
+                !moved
+                    && match report.reason {
+                        SettleReason::Stable => report.settled,
+                        SettleReason::BudgetExhausted => {
+                            still >= UNSETTLED_SCROLL_MIN_STILL_ANCHORS && still == common
+                        }
+                        SettleReason::ObservationFailed => false,
+                    }
+            },
+        )
     }) {
         body["no_scroll_progress"] = serde_json::Value::Bool(true);
     }
@@ -15074,6 +15086,148 @@ mod tests {
         assert_eq!(app_changed_json(&unknown, &known), None);
     }
 
+    fn unsettled_scroll_body(count: usize, reason: SettleReason, gate: &str) -> serde_json::Value {
+        let baseline: Vec<_> = (0..count)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut current = baseline.clone();
+        current[0].value = Some("00:42.13".into());
+        if gate == "moved" {
+            current[0].rect[1] -= 20.0;
+        }
+        let mut report = SettleReport::new(1000);
+        report.reason = reason;
+        report.sparse = gate == "sparse";
+        report.stale = gate == "stale";
+        let mut body = serde_json::json!({});
+        if gate == "app_changed" {
+            body[gate] = serde_json::json!({"from":"a","to":"b"});
+        }
+        if gate == "no_visible_change" {
+            body[gate] = serde_json::json!(true);
+        }
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        body
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_three_anchors_changing_value() {
+        for count in [3, 5] {
+            assert_eq!(
+                unsettled_scroll_body(count, SettleReason::BudgetExhausted, "")
+                    ["no_scroll_progress"],
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_two_anchors() {
+        assert!(unsettled_scroll_body(2, SettleReason::BudgetExhausted, "")
+            .get("no_scroll_progress")
+            .is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_moving_and_resizing_anchors() {
+        let baseline: Vec<_> = (0..3)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut current = baseline.clone();
+        for row in &mut current {
+            row.rect[1] -= 20.0;
+            row.rect[2] += 5.0;
+        }
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::BudgetExhausted;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert!(body.get("no_scroll_progress").is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_three_still_and_one_moving_resizing_anchor() {
+        let baseline: Vec<_> = (0..4)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut current = baseline.clone();
+        current[3].rect[1] -= 5.0;
+        current[3].rect[2] += 5.0;
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::BudgetExhausted;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert!(body.get("no_scroll_progress").is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_three_still_and_one_growing_anchor() {
+        let mut baseline: Vec<_> = (0..3)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut container = delta_row("Other", "主要", 59.0);
+        container.rect = [0.0, 59.0, 393.0, 289.0];
+        baseline.push(container);
+        let mut current = baseline.clone();
+        current[3].rect[3] += 41.0;
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::BudgetExhausted;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert_eq!(body["no_scroll_progress"], true);
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_observation_failed() {
+        assert!(
+            unsettled_scroll_body(3, SettleReason::ObservationFailed, "")
+                .get("no_scroll_progress")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_suppression_gates() {
+        for gate in [
+            "sparse",
+            "stale",
+            "app_changed",
+            "no_visible_change",
+            "moved",
+        ] {
+            assert!(
+                unsettled_scroll_body(3, SettleReason::BudgetExhausted, gate)
+                    .get("no_scroll_progress")
+                    .is_none(),
+                "{gate}"
+            );
+        }
+    }
+
     #[test]
     fn scroll_progress_body_gates_and_gesture_directions() {
         let baseline = vec![delta_row("Cell", "item", 100.0)];
@@ -15081,6 +15235,7 @@ mod tests {
         current[0].value = Some("updated".into());
         let mut report = SettleReport::new(1000);
         report.settled = true;
+        report.reason = SettleReason::Stable;
         let actions = [
             serde_json::json!({"type":"scroll", "dy":100}),
             serde_json::json!({"type":"scroll", "page":true, "dy":100}),
@@ -15111,6 +15266,7 @@ mod tests {
         ] {
             let mut report = SettleReport::new(1000);
             report.settled = gate != "unsettled";
+            report.reason = SettleReason::Stable;
             report.sparse = gate == "sparse";
             report.stale = gate == "stale";
             let mut body = serde_json::json!({});
