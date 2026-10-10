@@ -244,17 +244,54 @@ struct Decision {
     /// Index into `screen.targets` for CLICK / TYPE_TEXT.
     target: Option<usize>,
     latency_ms: u128,
+    confidence: Option<f64>,
 }
 
 fn valid_choice(answer: &Value, ids: &[String]) -> Result<String> {
     let choice = answer["choice"].as_str().unwrap_or("");
-    if ids.iter().any(|id| id == choice) {
-        Ok(choice.to_string())
-    } else {
-        let mut shown = answer.to_string();
-        shown.truncate(400);
-        bail!("Jev answered outside the offered choices; no action executed. Got {shown}")
+    let reject = |reason: &str| {
+        let shown: String = answer.to_string().chars().take(400).collect();
+        anyhow::anyhow!("Jev {reason}; no action executed. Got {shown}")
+    };
+    if !ids.iter().any(|id| id == choice) {
+        return Err(reject("answered outside the offered choices"));
     }
+    if let Some(probabilities) = answer.get("probabilities").filter(|v| !v.is_null()) {
+        let probabilities = probabilities
+            .as_object()
+            .ok_or_else(|| reject("probabilities must be an object"))?;
+        if probabilities.len() != ids.len() || !ids.iter().all(|id| probabilities.contains_key(id))
+        {
+            return Err(reject(
+                "probabilities keys must exactly match the offered choices",
+            ));
+        }
+        let mut sum = 0.0;
+        let mut maximum: f64 = 0.0;
+        for value in probabilities.values() {
+            let p = value
+                .as_f64()
+                .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                .ok_or_else(|| reject("probabilities must be finite numbers in [0,1]"))?;
+            sum += p;
+            maximum = maximum.max(p);
+        }
+        if (sum - 1.0).abs() >= 0.02 {
+            return Err(reject("probabilities must sum to 1 within 0.02"));
+        }
+        if probabilities[choice].as_f64().unwrap() < maximum - 1e-6 {
+            return Err(reject("choice probability must be maximal within 1e-6"));
+        }
+    }
+    if let Some(confidence) = answer.get("confidence").filter(|v| !v.is_null()) {
+        if !confidence
+            .as_f64()
+            .is_some_and(|c| c.is_finite() && (0.0..=1.0).contains(&c))
+        {
+            return Err(reject("confidence must be a finite number in [0,1]"));
+        }
+    }
+    Ok(choice.to_string())
 }
 
 struct Models {
@@ -459,7 +496,14 @@ impl Models {
             }
             _ => None,
         };
-        Ok(Decision { operation, target, latency_ms: started.elapsed().as_millis() })
+        Ok(Decision {
+            operation,
+            target,
+            latency_ms: started.elapsed().as_millis(),
+            confidence: answers["operation"]
+                .get("confidence")
+                .and_then(Value::as_f64),
+        })
     }
 
     /// `Ok(None)` when the helper answers `{"text": null}`: the goal does not
@@ -585,6 +629,9 @@ pub async fn run(daemon: &DaemonClient, opts: Options) -> Result<Value> {
             "text": Value::Null,
             "page_changed": Value::Null,
         });
+        if let Some(confidence) = decision.confidence {
+            entry["confidence"] = json!(confidence);
+        }
         let t = Instant::now();
         let result: Result<()> = match decision.operation.as_str() {
             "DONE" => {
@@ -821,5 +868,78 @@ mod tests {
         let ids = vec!["1".to_string(), "2".to_string()];
         assert_eq!(valid_choice(&json!({"choice": "2"}), &ids).unwrap(), "2");
         assert!(valid_choice(&json!({"choice": "9"}), &ids).is_err());
+    }
+
+    #[test]
+    fn valid_distributions_and_legacy_answers_are_accepted() {
+        let ids = vec!["1".into(), "2".into()];
+        for answer in [
+            json!({"choice": "1"}),
+            json!({"choice": "1", "probabilities": null}),
+            json!({"choice": "1", "confidence": null}),
+            // serde_json converts NaN/infinity to null, so top-level confidence is absent.
+            json!({"choice": "1", "confidence": f64::NAN}),
+            json!({"choice": "1", "confidence": f64::INFINITY}),
+            json!({"choice": "1", "confidence": 0.0}),
+            json!({"choice": "1", "probabilities": {"1": 0.7, "2": 0.3}, "confidence": 1.0}),
+            json!({"choice": "1", "probabilities": {"1": 0.4999999, "2": 0.5000001}}),
+        ] {
+            assert_eq!(valid_choice(&answer, &ids).unwrap(), "1");
+        }
+    }
+
+    #[test]
+    fn invalid_distributions_are_refused() {
+        let ids = vec!["1".into(), "2".into()];
+        for (probabilities, reason) in [
+            (json!([]), "object"),
+            (json!({"1": 1.0}), "keys"),
+            (json!({"1": 1.0, "2": 0.0, "3": 0.0}), "keys"),
+            (json!({"1": 1.0, "3": 0.0}), "keys"),
+            // JSON cannot represent NaN/infinity; serde_json converts them to null.
+            (json!({"1": f64::NAN, "2": 0.0}), "finite"),
+            (json!({"1": f64::INFINITY, "2": 0.0}), "finite"),
+            (json!({"1": -0.1, "2": 1.0}), "finite"),
+            (json!({"1": 1.1, "2": 0.0}), "finite"),
+            (json!({"1": "0.7", "2": 0.3}), "finite"),
+            (json!({"1": 0.7, "2": 0.1}), "sum"),
+            (json!({"1": 0.3, "2": 0.7}), "maximal"),
+        ] {
+            let err = valid_choice(
+                &json!({"choice": "1", "probabilities": probabilities}),
+                &ids,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(reason) && err.contains("no action executed"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_confidence_is_refused() {
+        let ids = vec!["1".into()];
+        for confidence in [json!(-0.1), json!(1.1), json!("0.5")] {
+            let err = valid_choice(&json!({"choice": "1", "confidence": confidence}), &ids)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("confidence") && err.contains("no action executed"));
+        }
+    }
+
+    #[test]
+    fn invalid_unicode_answer_is_truncated_without_panicking() {
+        let err = valid_choice(&json!({"choice": "界".repeat(500)}), &["1".into()]).unwrap_err();
+        assert_eq!(
+            err.to_string()
+                .split("Got ")
+                .nth(1)
+                .unwrap()
+                .chars()
+                .count(),
+            400
+        );
     }
 }

@@ -503,18 +503,28 @@
   </style>
 </head>
 <body>
+  <div class="page">
+    <aside class="note">
+      <strong>历史设计记录 · Phase 1</strong>
+      <p>本页保留 Phase 1 的历史设计。v0.14.0 起，设备端由 iphone-use 自己的
+        <a href="../runner/README.md">XCTest runner</a> 提供，对外仍是 WDA 兼容 API；
+        文中“WDA”现在指该 runner 的兼容接口。当前行为以
+        <a href="../runner/README.md">runner/README.md</a> 和
+        <a href="agent-reference.md">docs/agent-reference.md</a> 为准。</p>
+    </aside>
+  </div>
   <header class="hero">
     <div class="page">
       <p class="eyebrow">iphone-use / Architecture &amp; Acceptance</p>
       <h1>Direct Device 架构与真机验收</h1>
       <p class="lede">
-        链路只有一条：WebDriverAgent 输入加 WDA MJPEG 画面。浏览器通过守护进程控制手机，
+        链路只有一条：WebDriverAgent 输入加 WDA MJPEG 画面（当前均由自研 XCTest runner 提供）。浏览器通过守护进程控制手机，
         不读取 Mac 屏幕，也不向 Mac 注入事件。本文记录现有实现、接入顺序和可执行的验收条件。
       </p>
       <div class="meta" aria-label="文档状态">
         <span class="badge primary">Phase 1 · 已实现，待逐机验收</span>
         <span class="badge">Phase 2 · 研究闸门，未实现</span>
-        <span class="badge">工作树基线 · 2026-07-28</span>
+        <span class="badge">历史基线 · 2026-07-28</span>
         <span class="badge">backend · direct</span>
       </div>
     </div>

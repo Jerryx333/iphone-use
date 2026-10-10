@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "name": "Calculator: 12 × 3",
+  "description": "Read-only demo used in the README video: launch Calculator, clear it, press 1 2 × 3 = by the keys' stable identifiers (locale independent), and require the display to read 36.",
+  "app": "com.apple.calculator",
+  "category": "demo",
+  "risk": "read_only",
+  "steps": [
+    {
+      "kind": "launch_app",
+      "bundle": "com.apple.calculator",
+      "after_ms": 600
+    },
+    {
+      "kind": "wait_for",
+      "expect": {
+        "present": [
+          {
+            "identifier": "Equals"
+          }
+        ]
+      },
+      "timeout_ms": 5000,
+      "poll_ms": 200
+    },
+    {
+      "kind": "tap_locator",
+      "locator": {
+        "identifier": "AllClear"
+      },
+      "after_ms": 400
+    },
+    {
+      "kind": "tap_locator",
+      "locator": {
+        "identifier": "One"
+      },
+      "after_ms": 250
+    },
+    {
+      "kind": "tap_locator",
+      "locator": {
+        "identifier": "Two"
+      },
+      "after_ms": 250
+    },
+    {
+      "kind": "tap_locator",
+      "locator": {
+        "identifier": "Multiply"
+      },
+      "after_ms": 250
+    },
+    {
+      "kind": "tap_locator",
+      "locator": {
+        "identifier": "Three"
+      },
+      "after_ms": 250
+    },
+    {
+      "kind": "tap_locator",
+      "locator": {
+        "identifier": "Equals"
+      },
+      "after_ms": 800
+    },
+    {
+      "kind": "wait_for",
+      "expect": {
+        "present": [
+          {
+            "kind": "StaticText",
+            "value": "36"
+          }
+        ]
+      },
+      "timeout_ms": 3000,
+      "poll_ms": 150
+    }
+  ],
+  "verified_on": [
+    {
+      "device": "iPhone 14 Pro",
+      "ios": "27.0.1",
+      "date": "2026-10-10",
+      "app_version": "27.0.1"
+    }
+  ]
+}

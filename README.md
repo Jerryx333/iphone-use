@@ -31,6 +31,31 @@ https://github.com/user-attachments/assets/f1e6574d-3134-4c23-9092-4b51bc79af2c
 
 <sub>2-minute demo · [中文版](https://github.com/user-attachments/assets/a9947152-6655-4509-ac1e-49953a3cea70)</sub>
 
+## Try these first
+
+For these commands, set
+`MCP=~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp`. Flow replay calls no
+model and costs no tokens; asking an agent to interpret a fresh screen still uses a
+model.
+
+**1. Read the screen** — Tell your agent: “What iOS version is my iPhone on? Read it
+from Settings and don't change anything.”
+Expect: it opens Settings → General → About and answers from the screen text, not by
+guessing from a screenshot.
+
+**2. Export Health data** — Tell your agent: “Export all my Apple Health data and stop
+at the share sheet; do not send it to anyone.”
+Expect a ZIP share sheet after the phone finishes packing, not a saved file yet. Next
+time: `$MCP flow run health/export-all` for English (labels still await hardware
+verification), or `$MCP flow run health/export-all-zh-cn` for Chinese; neither needs
+input parameters.
+
+**3. Save your own multi-step task** — Tell your agent: “Do my specified multi-step task
+in an app that has no flow yet, then ask whether to save it as a flow.”
+Expect the completed task and a save suggestion; the daemon already recorded a draft.
+Export and review it with `$MCP flow draft --out my-task.json`; next time,
+`$MCP flow run ./my-task.json` replays it without a model.
+
 **What you need**
 
 - A Mac (macOS 15+) with Xcode, signed in to an Apple ID — a free one works.
@@ -38,9 +63,9 @@ https://github.com/user-attachments/assets/f1e6574d-3134-4c23-9092-4b51bc79af2c
 - A USB cable. Plug the iPhone in and unlock it before you install.
 
 The installer then sets the phone up, shows an agent opening Settings and reading it,
-registers the MCP server with Claude Code, and opens the control page in your browser
-with a one-time sign-in — there is no password to copy. If anything is missing it says
-what and how to fix it.
+automatically registers the MCP server with installed Claude Code and Codex clients, and
+opens the control page in your browser with a one-time sign-in — there is no password to
+copy. If anything is missing it says what and how to fix it.
 
 ```bash
 iphone-use status    # is the phone ready for agents?
@@ -68,9 +93,9 @@ Nothing touches the Mac's own screen, cursor or focus.
 
 ## Use it from an agent
 
-The installer installs the agent skill and, when Claude Code is present, registers the
-MCP server. Any other MCP client needs only the command; on this Mac the server finds
-the daemon and its token by itself:
+The installer installs the agent skill and, when Claude Code or Codex is present,
+registers the MCP server with each installed client. Any other MCP client needs only the
+command; on this Mac the server finds the daemon and its token by itself:
 
 ```json
 {
@@ -80,6 +105,20 @@ the daemon and its token by itself:
     }
   }
 }
+```
+
+To register Codex manually, run this and start a **new Codex session** to load MCP:
+
+```bash
+codex mcp add iphone-use -- ~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp
+```
+
+Or paste this into Claude Code or Codex to have your agent help install it:
+
+```text
+Run the official installer: curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+When needed, remind me to connect and unlock my iPhone, trust the computer, and enable Developer Mode; tell me when Apple ID login or signing needs my input.
+After installation, run iphone-use try, then remind me to start a new agent session and read the phone screen once through MCP in that new session.
 ```
 
 Or call the HTTP API directly:

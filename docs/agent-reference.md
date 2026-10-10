@@ -190,7 +190,10 @@ DONE, BLOCKED — and its target in one request. A small OpenAI-compatible model
 writes a field's text only for TYPE_TEXT (entered with `set_value`, so a
 Chinese keyboard cannot swallow it). Every step is an ordinary daemon action
 with your owner lease, so the daemon's trail — and `phone_flow_draft` — works
-on a Jev run too.
+on a Jev run too. Optional probabilities are validated before execution (exact
+candidate keys, finite values in [0,1], sum within 0.02 of 1, and a maximal
+choice within 1e-6); optional confidence must be finite and in [0,1], and
+operation confidence is recorded in each history entry when present.
 
 Keys: `TYPESAFE_API_KEY` or `~/.config/typesafe/key`; for typing
 `TEXT_MODEL_API_KEY` or `~/.config/openrouter/key` (`TEXT_MODEL`, default

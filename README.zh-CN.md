@@ -30,13 +30,26 @@ https://github.com/user-attachments/assets/a9947152-6655-4509-ac1e-49953a3cea70
 
 <sub>2 分钟演示 · [English](https://github.com/user-attachments/assets/f1e6574d-3134-4c23-9092-4b51bc79af2c)</sub>
 
+## 先试这三件事
+
+下面的命令先设 `MCP=~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp`。Flow 回放不调用模型、不花 token；让 agent 新读屏解释仍会调用模型。
+
+**1. 读屏** — 发给 agent：「我的 iPhone 是哪个 iOS 版本？去设置里读，什么都别改。」
+预期：它打开 设置 → 通用 → 关于本机，从屏幕文字里读出答案，而不是看截图猜。
+
+**2. 导出健康数据** — 发给 agent：「帮我在 Apple 健康里导出全部数据，到共享面板停下，不发送给任何人。」
+预期：手机打包后显示 ZIP 的共享面板，尚未保存到文件。第二次：中文界面用 `$MCP flow run health/export-all-zh-cn`，英文界面用 `$MCP flow run health/export-all`（英文标签尚待真机验证）；均无需输入参数。
+
+**3. 保存自己的多步任务** — 发给 agent：「在一个还没有 flow 的 App 里完成我指定的多步任务，做完问我要不要保存成 flow。」
+预期：任务完成并收到保存提示，daemon 已录好草稿。用 `$MCP flow draft --out my-task.json` 导出、检查草稿；第二次用 `$MCP flow run ./my-task.json` 零模型回放。
+
 **需要准备**
 
 - 一台 Mac（macOS 15 以上），装好 Xcode 并登录 Apple ID，免费账号就行。
 - iPhone 打开开发者模式（设置 → 隐私与安全性 → 开发者模式）。
 - 一根数据线。安装前把 iPhone 插上并解锁。
 
-安装脚本接着会把手机配好，让 agent 打开「设置」读一遍屏幕给你看，在 Claude Code 里注册好 MCP server，再用一次性链接在浏览器里打开控制页，不用抄密码。缺什么会直接告诉你缺什么、怎么补。
+安装脚本接着会把手机配好，让 agent 打开「设置」读一遍屏幕给你看，在已安装的 Claude Code 和 Codex 里自动注册好 MCP server，再用一次性链接在浏览器里打开控制页，不用抄密码。缺什么会直接告诉你缺什么、怎么补。
 
 ```bash
 iphone-use status    # 手机现在能不能给 agent 用
@@ -61,7 +74,7 @@ iphone-use upgrade   # 升级全部组件
 
 ## 接到 agent 上
 
-安装时会装好 agent 的 skill；装了 Claude Code 的话，还会自动注册 MCP server。其他 MCP 客户端只要填命令，在这台 Mac 上 server 会自己找到守护进程和令牌：
+安装时会装好 agent 的 skill；装了 Claude Code 或 Codex 的话，还会为它们自动注册 MCP server。其他 MCP 客户端只要填命令，在这台 Mac 上 server 会自己找到守护进程和令牌：
 
 ```json
 {
@@ -71,6 +84,20 @@ iphone-use upgrade   # 升级全部组件
     }
   }
 }
+```
+
+Codex 也可手动注册，之后打开**新的 Codex 会话**加载 MCP：
+
+```bash
+codex mcp add iphone-use -- ~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp
+```
+
+也可以把这段发给 Claude Code 或 Codex，让 agent 帮你装：
+
+```text
+请运行官方安装命令：curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+需要时提醒我插线、解锁 iPhone、信任电脑和打开开发者模式；Apple ID 登录或签名需要我操作时请告诉我。
+装好后运行 iphone-use try，再提醒我打开新的 agent 会话，在新会话里通过 MCP 读一次手机屏幕。
 ```
 
 也可以直接调 HTTP 接口：
