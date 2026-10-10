@@ -128,6 +128,9 @@ final class RunnerTests: XCTestCase {
       }
     }
 
+    // The agent API on the phone itself, when the daemon library is linked (RunnerDaemon.swift).
+    RunnerDaemon.start(environment: environment, runnerPort: port, mjpegPort: mjpegPort)
+
     // Block this test (and keep the main run loop spinning for the request handlers) for a year,
     // or until POST /shutdown.
     let result = XCTWaiter.wait(for: [expectation], timeout: 365 * 24 * 60 * 60)
@@ -261,6 +264,7 @@ final class RunnerTests: XCTestCase {
       value["busyMs"] = Int(Date().timeIntervalSince(busySince) * 1000)
     }
     value["keepAwake"] = keepAwake.statusValue()
+    value["daemon"] = RunnerDaemon.statusValue()
     return value
   }
 

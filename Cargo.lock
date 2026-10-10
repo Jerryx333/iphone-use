@@ -1063,6 +1063,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ios-embed"
+version = "0.1.0"
+dependencies = [
+ "server",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iphone-use-mcp"
 version = "0.17.15"
 dependencies = [

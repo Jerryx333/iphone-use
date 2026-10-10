@@ -1,5 +1,6 @@
 pub mod advice;
 pub mod app_lookup;
+pub mod boot;
 pub mod apps;
 pub mod collect;
 pub mod config;
