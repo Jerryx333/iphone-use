@@ -401,6 +401,16 @@ is no longer cached). The action result and the observation are separate facts:
 
 - `sparse:true`: tree was empty or containers only — evidence you cannot see, not
   that nothing changed. `stale:true`: the tree is the last good read, not fresh.
+- `no_scroll_progress:true`: a readable, fresh tree has common unique anchors
+  that all kept their origin (within 2 pt on both axes), with at least 1 anchor
+  when settled, or at least 3 when the screen never settled. Size changes alone
+  do not suppress the flag. The gesture may be at a boundary, in another region,
+  or blocked by an overlay. Check a screenshot before scrolling again; this
+  does not mean the list is fully read.
+  No flag when newly appearing labelled rows outnumber the common anchors, or
+  are more than 2 and over 20% of them: several labels changing text can suppress
+  it because new labels may be new content. Also absent when there are no common
+  anchors, observation failed, or the app changed.
 - `no_visible_change:true`: a readable, settled tree with no row changed — the
   gesture hit nothing (touch landed on an input or nested scroller, target
   moved). Re-read and retarget; its absence does not prove success.
@@ -464,6 +474,14 @@ rest stays as overlap, so no row is skipped), the next read, and so on.
  "direction":"down"}           // or "up"
 ```
 
+Optional `snapshot` must be a non-empty string. After reading the first page,
+before any swipe, its foreground app is compared with the cached snapshot's
+app. A known mismatch returns HTTP 409 with `ok:false`, `error:"app_changed"`,
+`outcome:"not_sent"`, `retry_safe:true`, `expected_app`, `app`, the current
+`snapshot`, and `swipes:0`. Missing cached snapshots or unknown apps never
+refuse. Responses include `app` when known. The MCP tool fills in the client's
+last remembered snapshot when none is supplied; explicit snapshots are kept.
+
 A row without a label (most Cells) is named by its texts, joined with ` · `.
 Rows are deduplicated on `(kind, label, value)`, so identical-looking rows
 collapse into one. `stop_reason`:
@@ -491,6 +509,14 @@ swiped toward. It stops AT ONCE, without swiping, when the label is ambiguous
 (`element_not_visible`). Not found after the budget: `element_not_found` with
 on-screen labels containing the text as `candidates`. No screenshot is taken;
 look at the screen before swiping further.
+
+Optional `snapshot` must be a non-empty string. After reading the first page,
+before any swipe, its foreground app is compared with the cached snapshot's
+app. A known mismatch returns HTTP 409 with `ok:false`, `error:"app_changed"`,
+`outcome:"not_sent"`, `retry_safe:true`, `expected_app`, `app`, the current
+`snapshot`, and `swipes:0`. Missing cached snapshots or unknown apps never
+refuse. Responses include `app` when known. The MCP tool fills in the client's
+last remembered snapshot when none is supplied; explicit snapshots are kept.
 
 Both need `X-Phone-Control: 1`, take the owner lease, and leave the screen
 where they stopped.

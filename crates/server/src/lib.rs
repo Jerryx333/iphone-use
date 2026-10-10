@@ -27,6 +27,7 @@ pub mod runner_token;
 pub mod runtime_dir;
 pub mod schedules;
 pub mod scope;
+pub mod scroll_progress;
 pub mod setup;
 pub mod telemetry;
 pub mod text_input;

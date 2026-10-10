@@ -596,6 +596,9 @@ pub struct RunEndParams {
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CollectListParams {
+    /// Expected app from this read; defaults to the client's last snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     /// Element kind of one list row (default `Cell`; e.g. `StaticText`,
     /// `Button`, `Link`). A row without a label is named by its texts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -620,6 +623,9 @@ pub struct CollectListParams {
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScrollFindParams {
+    /// Expected app from this read; defaults to the client's last snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     /// Exact label to find.
     pub label: String,
     /// Narrow to one element kind (e.g. `Button`) when a text shares the label.
@@ -1370,6 +1376,8 @@ impl PhoneHandler {
         end_label was seen; no_progress or duplicate_page is not proof the list ended. Only \
         what the accessibility tree exposes is collected. It swipes the live list, so the \
         screen is left where the last page was; `snapshot` is that last page. \
+        Optional non-empty snapshot defaults to the last read: a known foreground app mismatch \
+        refuses before any swipe (app_changed, not_sent, retry_safe). Results name the app. \
         Requires phone_status drivable=true."
     )]
     async fn phone_collect_list(
@@ -1391,7 +1399,9 @@ impl PhoneHandler {
         by another control, or not drawn. Found: `target` (index, kind, frame) plus a \
         `snapshot` for phone_tap_element. Not found: on-screen labels containing the text \
         as `candidates`. No screenshot is taken; absence after the budget is not proof — \
-        look at the screen before swiping further. Requires phone_status drivable=true."
+        look at the screen before swiping further. Optional non-empty snapshot defaults to the \
+        last read: a known foreground app mismatch refuses before any swipe (app_changed, \
+        not_sent, retry_safe). Results name the app. Requires phone_status drivable=true."
     )]
     async fn phone_scroll_find(
         &self,
@@ -2799,7 +2809,15 @@ fn list_result(
 ) -> CallToolResult {
     let text = response.json.as_ref().and_then(compact);
     match text {
-        Some(text) if response.status.is_success() => {
+        Some(text)
+            if response.status.is_success()
+                || response
+                    .json
+                    .as_ref()
+                    .and_then(|body| body.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("app_changed") =>
+        {
             let result = if response.ok() {
                 CallToolResult::success(vec![Content::text(text)])
             } else {
