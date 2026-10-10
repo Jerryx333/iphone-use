@@ -13169,7 +13169,14 @@ fn agent_json_response(status: StatusCode, body: serde_json::Value) -> Response 
     )
 }
 
+/// The agent bearer token, or the session cookie the iPhone app holds (it
+/// pairs and renews a session, like the web page). Writes still need
+/// `X-Phone-Control`, which a cross-site form cannot send.
 fn agent_auth_refusal(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    if is_authed(state, headers) && !state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
+        crate::timing::authenticated();
+        return None;
+    }
     match agent_auth(state, headers) {
         AgentAuth::Locked => Some(with_security_headers(
             (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),

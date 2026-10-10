@@ -11,6 +11,8 @@
 "用密码连接" = "Connect with password";
 "正在连接…" = "Connecting…";
 "连接到这台 Mac？" = "Connect to this Mac?";
+"让 agent 在这台 iPhone 上做事？" = "Let the agent work on this iPhone?";
+"配对这台 iPhone 自己的 agent。只在你刚刚在自己 Mac 上点了「配对本机 Agent」时才点「连接」。" = "Pairs this iPhone’s own agent. Tap Connect only if you just chose “Pair this phone’s agent” on your own Mac.";
 "连接" = "Connect";
 "取消" = "Cancel";
 "%@\n只在你刚刚扫了自己 Mac 上的二维码时才点「连接」。" = "%@\nTap Connect only if you just scanned the code on your own Mac.";
