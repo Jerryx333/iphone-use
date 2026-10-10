@@ -81,6 +81,11 @@ struct RootView: View {
             }
             #endif
         }
+        // The Agent screen, from the overview or the remote's menu (and
+        // brought up by a task that waits on the person).
+        .sheet(isPresented: $app.agentOpen) {
+            AgentView(app: app, agent: app.agent)
+        }
         // A device's "enter password" and "scan again" buttons, from any screen.
         .sheet(item: $app.editing) { target in
             NavigationStack {
@@ -483,11 +488,14 @@ struct RemoteView: View {
     @State private var zoom: CGFloat = 1
     @State private var resetZoom = 0
     @State private var queue: TypingQueue
+    @State private var recorder: FlowRecorder
+    @State private var showFlows = false
 
     init(app: AppModel, session: DeviceSession) {
         self.app = app
         self.session = session
         _queue = State(initialValue: TypingQueue { [weak session] action in await session?.perform(action) })
+        _recorder = State(initialValue: FlowRecorder(session: session))
     }
 
     var body: some View {
@@ -506,7 +514,10 @@ struct RemoteView: View {
         } accessory: { _ in
             OfflineBanner(online: app.online)
         } banner: {
-            StatusBanner(app: app, session: session)
+            VStack(spacing: 0) {
+                StatusBanner(app: app, session: session)
+                RecordingPill(recorder: recorder)
+            }
         } keys: { axis in
             KeyBar(axis: axis,
                    onBack: { session.send(.back) },
@@ -514,12 +525,17 @@ struct RemoteView: View {
                    onSearch: { session.send(.spotlight) },
                    onKeyboard: { typing = true },
                    keysEnabled: session.phase == .connected) {
-                RemoteMenu(app: app, session: session, immersive: $immersive, showSettings: $showSettings)
+                RemoteMenu(app: app, session: session, immersive: $immersive, showSettings: $showSettings,
+                           recorder: recorder, showFlows: $showFlows)
             }
         } keyboard: {
             LiveKeyboardBar(queue: queue, onDone: { typing = false })
         }
         .sheet(isPresented: $showSettings) { SettingsSheet(app: app, session: session) }
+        .sheet(isPresented: $showFlows) { FlowsHubView(session: session) }
+        .sheet(item: $recorder.draft) { draft in SaveFlowSheet(session: session, draft: draft) }
+        .task(id: session.phase == .connected) { await recorder.sync() }
+        .onDisappear { recorder.leave() }
         .onAppear {
             #if DEBUG
             // Screenshots: `-immersive YES`, `-typing YES`, `-settings YES`.
@@ -594,8 +610,20 @@ struct RemoteMenu: View {
     let session: DeviceSession
     @Binding var immersive: Bool
     @Binding var showSettings: Bool
+    let recorder: FlowRecorder
+    @Binding var showFlows: Bool
 
     var body: some View {
+        Button { app.openAgent() } label: { Label("让 agent 做", systemImage: "sparkles") }
+        Button { Task { await recorder.toggle() } } label: {
+            recorder.recording
+                ? Label("停止录制（\(recorder.steps) 步）", systemImage: "stop.circle")
+                : Label("录制 flow", systemImage: "record.circle")
+        }
+        .disabled(session.phase != .connected || recorder.busy)
+        Button { showFlows = true } label: { Label("Flow 与定时", systemImage: "alarm") }
+            .disabled(session.phase != .connected)
+        Divider()
         Picker(selection: $app.videoPreference) {
             ForEach(VideoPreference.allCases, id: \.self) { choice in
                 Label(choice.title, systemImage: choice.symbol).tag(choice)

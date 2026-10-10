@@ -26,6 +26,10 @@ struct DeviceGridView: View {
                     } actions: {
                         Button("打开设备列表") { showDevices = true }
                             .buttonStyle(.borderedProminent)
+                        if app.devices.contains(where: \.isThisPhone) {
+                            Button { app.openAgent() } label: { Label("让 agent 做事", systemImage: "sparkles") }
+                                .buttonStyle(.bordered)
+                        }
                     }
                     .padding(.top, 80)
                 } else {
@@ -50,6 +54,8 @@ struct DeviceGridView: View {
                     Button { showDevices = true } label: { Label("设备", systemImage: "list.bullet") }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { app.openAgent() } label: { Label("Agent", systemImage: "sparkles") }
+                        .accessibilityIdentifier("open-agent")
                     Button { showSync = true } label: { Label("同步操作", systemImage: "square.on.square.dashed") }
                         .disabled(app.devices.count < 2)
                     Menu {
