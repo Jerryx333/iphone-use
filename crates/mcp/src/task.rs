@@ -184,6 +184,7 @@ struct State {
     goal: String,
     status: Status,
     phase: &'static str,
+    planned_action: Option<Value>,
     flow: Option<Value>,
     steps: Vec<Value>,
     confirm: Option<Value>,
@@ -203,6 +204,7 @@ impl State {
             "goal": self.goal,
             "status": self.status.as_str(),
             "phase": self.phase,
+            "planned_action": self.planned_action,
             "flow": self.flow,
             "confirm": self.confirm,
             "summary": self.summary,
@@ -340,6 +342,7 @@ pub fn start(
             goal: goal.clone(),
             status: Status::Running,
             phase: "starting",
+            planned_action: None,
             flow: None,
             steps: Vec::new(),
             confirm: None,
@@ -385,6 +388,7 @@ pub fn start(
         task.with(|s| {
             s.finished_ms.get_or_insert(s.started.elapsed().as_millis() as u64);
             s.confirm = None;
+            s.planned_action = None;
         });
         // Hand the phone back.
         let _ = daemon.release_owner().await;
@@ -829,6 +833,10 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
     }
 
     if let Some(app) = request.app.as_deref().filter(|a| !a.trim().is_empty()) {
+        task.with(|s| {
+            s.phase = "acting";
+            s.planned_action = Some(json!({"action":"LAUNCH", "target": app}));
+        });
         let action = if app.contains('.') && !app.contains(' ') {
             json!({"type": "launch_app", "bundle": app})
         } else {
@@ -850,7 +858,7 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
 
     // 1. A saved flow that does the whole goal.
     if chat.available() && !task.cancelled() {
-        task.with(|s| s.phase = "flow");
+        task.with(|s| { s.phase = "flow"; s.planned_action = None; });
         if let Some(outcome) = try_flow(task, daemon, &chat, request).await? {
             if matches!(outcome, FlowAttempt::Done) {
                 finish(task, daemon, &chat, request, Status::Done, None).await;
@@ -871,6 +879,7 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
     let mut jev_misses = 0u32;
     let mut text_ms = 0u128;
     for _ in 0..max_steps {
+        task.with(|s| s.planned_action = None);
         if task.cancelled() {
             finish(task, daemon, &chat, request, Status::Cancelled, None).await;
             return Ok(());
@@ -980,7 +989,7 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
                             return Ok(());
                         }
                         None => {
-                            screen = after_step(daemon, &screen, &mut history).await?;
+                            screen = after_step(task, daemon, &screen, &mut history).await?;
                             continue;
                         }
                     }
@@ -997,7 +1006,7 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             finish(task, daemon, &chat, request, stop, why).await;
             return Ok(());
         }
-        screen = after_step(daemon, &screen, &mut history).await?;
+        screen = after_step(task, daemon, &screen, &mut history).await?;
         // A step that changed nothing, twice: let the assist model look.
         if history.iter().rev().take(2).filter(|h| h["page_changed"] == json!(false)).count() >= 2 {
             jev_misses = jev_misses.max(JEV_MISSES_BEFORE_ASSIST);
@@ -1031,6 +1040,10 @@ async fn execute(
     reason: Option<String>,
     confirmed: bool,
 ) -> Result<Option<Stop>> {
+    task.with(|s| {
+        s.phase = "acting";
+        s.planned_action = Some(json!({"action": operation, "target": target.as_ref().map(|t| t.label.clone())}));
+    });
     let mut entry = json!({
         "action": operation,
         "kind": match operation { "CLICK" => "click", "TYPE_TEXT" => "fill", _ => "control" },
@@ -1094,7 +1107,8 @@ async fn execute(
 }
 
 /// Read the screen after a step, noting in the history whether it changed.
-async fn after_step(daemon: &DaemonClient, before: &Screen, history: &mut [Value]) -> Result<Screen> {
+async fn after_step(task: &Arc<Task>, daemon: &DaemonClient, before: &Screen, history: &mut [Value]) -> Result<Screen> {
+    task.with(|s| { s.phase = "observing"; s.planned_action = None; });
     tokio::time::sleep(Duration::from_millis(300)).await;
     let next = jev::read_screen(daemon).await?;
     if let Some(last) = history.last_mut() {
@@ -1275,6 +1289,7 @@ async fn fail(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &Ta
 async fn finish(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &TaskRequest, mut status: Status, why: Option<String>) {
     task.with(|s| {
         s.phase = "summary";
+        s.planned_action = None;
         if let Some(why) = &why {
             if status != Status::Done {
                 s.error.get_or_insert_with(|| why.clone());

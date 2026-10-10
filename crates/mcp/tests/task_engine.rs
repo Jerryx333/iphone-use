@@ -85,6 +85,11 @@ fn fake_daemon(phone: Arc<Phone>) -> String {
             ("POST", "/agent/input") => {
                 let action: Value = serde_json::from_str(body).unwrap_or(Value::Null);
                 if action["type"] == "tap" {
+                    let progress = task::get("current", None).unwrap();
+                    assert_eq!(progress["phase"], "acting");
+                    assert_eq!(progress["planned_action"]["action"], "CLICK");
+                    assert!(progress["planned_action"]["target"].as_str().unwrap().contains("确认支付"));
+                    assert!(progress["planned_action"].get("text").is_none(), "live progress must not expose typed content");
                     *phone.paid.lock().unwrap() = true;
                 }
                 phone.inputs.lock().unwrap().push(action);
