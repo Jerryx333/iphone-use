@@ -208,6 +208,8 @@ final class AgentController {
             Task { await refreshHistory() }
         case .lostLink(let message):
             linkNote = message
+            // Its answer could not be sent now; the thread offers it again.
+            if confirmPrompt?.taskID == taskID { confirmPrompt = nil }
         case .stopped:
             break
         }

@@ -98,7 +98,8 @@ struct AgentView: View {
                 PairThisPhoneSheet(app: app)
             }
             .sheet(item: $agent.confirmPrompt) { prompt in
-                ConfirmStepSheet(prompt: prompt, answering: agent.answering) { approve in
+                ConfirmStepSheet(prompt: prompt, answering: agent.answering, error: agent.error,
+                                 onLater: { agent.confirmPrompt = nil }) { approve in
                     Task { await agent.answer(prompt, approve: approve) }
                 }
             }
@@ -530,6 +531,10 @@ enum AgentFormat {
 struct ConfirmStepSheet: View {
     let prompt: AgentController.ConfirmPrompt
     let answering: Bool
+    /// Why the last answer did not go out.
+    var error: String?
+    /// Close without answering (the thread offers it again); never an answer.
+    var onLater: () -> Void = {}
     let onAnswer: (Bool) -> Void
 
     var body: some View {
@@ -556,6 +561,10 @@ struct ConfirmStepSheet: View {
             .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
             Text("允许只执行这一步一次。5 分钟内不回答，任务会停下。")
                 .font(.footnote).foregroundStyle(.secondary)
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote).foregroundStyle(Theme.down)
+            }
             Spacer(minLength: 0)
             Button { onAnswer(true) } label: { Text("允许这一步") }
                 .buttonStyle(ProminentButtonStyle())
@@ -563,6 +572,10 @@ struct ConfirmStepSheet: View {
             Button { onAnswer(false) } label: { Text("不允许") }
                 .buttonStyle(ProminentButtonStyle(filled: false))
                 .accessibilityIdentifier("agent-decline")
+            Button("稍后再说", action: onLater)
+                .font(.subheadline)
+                .frame(maxWidth: .infinity)
+                .accessibilityHint(Text("关掉这一页，不回答；任务继续等你"))
         }
         .disabled(answering)
         .overlay { if answering { ProgressView() } }
