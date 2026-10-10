@@ -21,6 +21,9 @@
 //! Security headers (v1 parity): `Cache-Control: no-store`, `X-Frame-Options:
 //! DENY`, `Referrer-Policy: no-referrer` on every response.
 
+#[path = "collect.rs"]
+mod collect;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -911,6 +914,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/mode", post(agent_mode))
         .route("/agent/input", post(agent_input))
         .route("/agent/actions", post(agent_actions))
+        .route("/agent/collect", post(collect::agent_collect))
         .route("/agent/screenshot", get(agent_screenshot))
         .route("/agent/mjpeg", get(agent_mjpeg))
         .route("/agent/h264", get(agent_h264))

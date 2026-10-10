@@ -340,11 +340,62 @@ always read `••••••••`.
 Existing-account login only: never sign-up, password changes or payment, and a
 push approval on another device needs the user.
 
+## Multi-page list collection
+
+`POST /agent/collect` (MCP: `phone_collect_list`) reads a long list with
+scrolls only, never clicks. It requires the same bearer, owner lease and
+`X-Phone-Control: 1` header as `/agent/actions`.
+
+```json
+{"kind":"Cell","direction":"down","max_pages":6,"end_label":"No more items"}
+```
+
+All fields are optional: `kind` defaults to `Cell`, `direction` to `down`
+(`up` also supported), `max_pages` to 6 (1–10). `end_label` must be nonempty
+and stops on any on-screen row whose label contains it. Optional `element`
+and `snapshot` must be supplied together, from the same current tree, to
+scroll inside a container. Later pages re-identify that container uniquely
+by kind plus identifier, or kind/label/rect; a stale or ambiguous target
+fails closed. Without a target, the existing page-scroll container selection
+is used.
+
+Each page uses a full settled-tree observation. On-screen rows of `kind`
+contribute their label plus descendant StaticText labels (unique labels,
+joined with ` · `), optional `value` and `identifier`. Deduplication uses
+(kind, text, identifier, value), preserving first appearance order.
+
+The response includes `ok`, `rows`, `pages` (`page`, `rows_seen`, `new_rows`,
+`settled`), `stop_reason`, `end_marker_seen`, `coverage_verified`,
+`limitations`, and the last observed `snapshot`. Stop reasons are
+`end_marker`, `no_scroll_progress`, `repeated_page`, `page_budget`,
+`deadline`, `app_changed`, `alert` (with an `alert` block), or `error`.
+`coverage_verified` is true only for an observed end marker with every page
+settled; it does not establish business completeness. Changed applications
+and alert screens are not added to the list. There is no extra scroll after
+the page budget is consumed.
+
+`scrolls_applied` counts acknowledged scrolls; `scrolls_attempted` also
+includes the final dispatch attempt whose result may be unknown. Partial
+results survive failures. After any dispatch attempt `retry_safe` is false;
+do not replay automatically. A timed-out in-flight action reports
+`outcome:"unknown"`. The 40-second total deadline bounds lock acquisition,
+focus, reads, alert probes and actions, with checks between pages; the MCP
+HTTP timeout is 50 seconds, leaving margin below the 60-second tool timeout.
+An individual settle observation uses at most 15 seconds of the remaining
+budget. No-device and lifecycle failures are reported before scrolling.
+
+Limitations: accessibility text only; identical text rows may be merged;
+screenshot-only fields and totals need separate verification; this does
+not establish business completeness. MCP returns one compact line per row,
+retains stop/coverage/snapshot and scroll counts, and marks omitted rows at
+the existing 8 KiB text preview budget (full rows in structured content for
+clients that support it).
+
 ## MCP specifics
 
-26 tools: `phone_status`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
+27 tools: `phone_status`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
 `phone_release_owner`, `phone_login`, `phone_screenshot`, `phone_elements`, `phone_tap`,
-`phone_tap_element`, `phone_tap_label`, `phone_scroll`, `phone_type`,
+`phone_tap_element`, `phone_tap_label`, `phone_scroll`, `phone_collect_list`, `phone_type`,
 `phone_key`, `phone_shortcut`, `phone_run_steps`, `phone_jev_run`,
 `phone_run_start`, `phone_run_end`, and `phone_flow_list / info / run / draft /
 update / publish / report`.

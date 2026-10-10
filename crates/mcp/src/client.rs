@@ -504,6 +504,16 @@ impl DaemonClient {
         self.post_actions(body, false).await
     }
 
+    /// Bounded collection: longer than the normal read timeout, no retries.
+    pub async fn collect_list(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
+        let req = self.auth(self.client.post(self.url("/agent/collect")))
+            .timeout(std::time::Duration::from_secs(50))
+            .header("x-phone-control", "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        read_response(req.send().await?).await
+    }
+
     /// [`Self::actions_outcome`] for a flow run: `X-Phone-Flow-Run` tells the
     /// daemon these steps are already a flow, so they never become a
     /// `flow_suggestion` or a draft of themselves.

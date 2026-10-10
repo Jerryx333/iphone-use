@@ -68,6 +68,96 @@ pub struct ScrollParams {
     pub observe: Option<bool>,
 }
 
+/// Collect a bounded multi-page list without clicking.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectListParams {
+    pub kind: String,
+    /// down (default) or up.
+    pub direction: String,
+    /// 1..=10, default 6.
+    pub max_pages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+}
+impl Default for CollectListParams {
+    fn default() -> Self {
+        Self {
+            kind: "Cell".into(),
+            direction: "down".into(),
+            max_pages: 6,
+            end_label: None,
+            element: None,
+            snapshot: None,
+        }
+    }
+}
+fn collect_list_request(p: CollectListParams) -> Result<serde_json::Value, String> {
+    if !(1..=10).contains(&p.max_pages)
+        || !["up", "down"].contains(&p.direction.as_str())
+        || p.kind.trim().is_empty()
+        || p.end_label.as_ref().is_some_and(|s| s.trim().is_empty())
+        || p.element.is_some() != p.snapshot.is_some()
+        || p.snapshot.as_ref().is_some_and(|s| s.is_empty())
+    {
+        return Err("invalid collect parameters: max_pages 1..=10, direction up/down, nonempty kind/end_label, paired element/snapshot; no action sent".into());
+    }
+    serde_json::to_value(p).map_err(|e| e.to_string())
+}
+fn collect_list_text(body: &serde_json::Value) -> String {
+    let rows = body["rows"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let pages = body["pages"].as_array().map_or(0, Vec::len);
+    let mut out = format!(
+        "collected {} rows over {} pages · stop {} · coverage_verified {}\n",
+        rows.len(),
+        pages,
+        body["stop_reason"].as_str().unwrap_or("error"),
+        body["coverage_verified"].as_bool().unwrap_or(false)
+    );
+    let tail = format!(
+        "snapshot {} · scrolls_applied {} · scrolls_attempted {} · retry_safe {}\nlimitations: {}",
+        body["snapshot"],
+        body["scrolls_applied"],
+        body["scrolls_attempted"],
+        body["retry_safe"],
+        body["limitations"].as_str().unwrap_or("unknown")
+    );
+    for key in ["error", "alert", "action_detail", "outcome"] {
+        if let Some(value) = body.get(key) {
+            out.push_str(&format!("{key}: {value}\n"));
+        }
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let mut line = format!(
+            "- {}",
+            row["text"]
+                .as_str()
+                .unwrap_or("")
+                .replace(['\n', '\r'], " ")
+        );
+        if let Some(value) = row["value"].as_str() {
+            line.push_str(&format!(" [{}]", value.replace(['\n', '\r'], " ")));
+        }
+        line.push('\n');
+        // Match the existing 8 KiB mutation text preview budget, retaining the
+        // safety/coverage tail and reporting omitted rows explicitly.
+        if out.len() + line.len() + tail.len() + 100 > 8192 {
+            out.push_str(&format!(
+                "… truncated: {} rows omitted from text\n",
+                rows.len() - i
+            ));
+            break;
+        }
+        out.push_str(&line);
+    }
+    out.push_str(&tail);
+    out
+}
+
 /// Parameters for [`phone_type`].
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeParams {
@@ -710,6 +800,46 @@ impl PhoneHandler {
         let result =
             send_input_observed(&self.daemon, &InputMsg::Scroll { x, y, dx, dy }, observe).await;
         self.note_progress(guard, result)
+    }
+
+    #[tool(
+        description = "Collect a multi-page list of accessibility text. Scrolls only; never clicks. Results do not establish business completeness."
+    )]
+    async fn phone_collect_list(
+        &self,
+        Parameters(params): Parameters<CollectListParams>,
+    ) -> CallToolResult {
+        let request = match collect_list_request(params) {
+            Ok(request) => request,
+            Err(error) => return CallToolResult::error(vec![Content::text(error)]),
+        };
+        self.progress_reset();
+        let response = match self.daemon.collect_list(&request).await {
+            Ok(response) => response,
+            Err(error) => return unknown_action_result("transport_error", format!("{error:#}")),
+        };
+        let Some(body) = response
+            .json
+            .as_ref()
+            .filter(|b| b["rows"].is_array() && b["stop_reason"].is_string())
+        else {
+            if response.explicit_refusal() {
+                return with_structure(
+                    CallToolResult::error(vec![Content::text(response.body().to_string())]),
+                    &response,
+                );
+            }
+            return unknown_action_result("invalid_response", "collect result missing".into());
+        };
+        let text = Content::text(collect_list_text(body));
+        with_structure(
+            if response.ok() {
+                CallToolResult::success(vec![text])
+            } else {
+                CallToolResult::error(vec![text])
+            },
+            &response,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -2767,7 +2897,7 @@ mod tests {
 
         assert_eq!(
             names.len(),
-            26,
+            27,
             "tool count changed; update README, the skill, and the CI assertion: {names:?}"
         );
         for required in [
@@ -2777,6 +2907,7 @@ mod tests {
             "phone_capabilities",
             "phone_status",
             "phone_run_steps",
+            "phone_collect_list",
             "phone_hold",
             "phone_release_owner",
         ] {
@@ -3099,5 +3230,47 @@ mod tests {
         let error = phone_steps_request(steps).unwrap_err();
         assert!(error.contains("batch maximum of 60000ms"));
         assert!(error.contains("no action was sent"));
+    }
+}
+
+#[cfg(test)]
+mod collect_list_tests {
+    use super::*;
+    #[test]
+    fn collect_list_request_encoding_validation() {
+        let p: CollectListParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            collect_list_request(p).unwrap(),
+            serde_json::json!({"kind":"Cell","direction":"down","max_pages":6})
+        );
+        for bad in [
+            r#"{"max_pages":0}"#,
+            r#"{"max_pages":11}"#,
+            r#"{"direction":"sideways"}"#,
+            r#"{"snapshot":"x"}"#,
+        ] {
+            assert!(collect_list_request(serde_json::from_str(bad).unwrap()).is_err());
+        }
+        let p = CollectListParams {
+            element: Some(4),
+            snapshot: Some("abc".into()),
+            ..Default::default()
+        };
+        assert_eq!(collect_list_request(p).unwrap()["element"], 4);
+    }
+    #[test]
+    fn collect_list_compact_rendering() {
+        let mut b = serde_json::json!({"rows":[{"text":"你好","value":"42"}],"pages":[{}],"stop_reason":"page_budget","coverage_verified":false,"limitations":"AX only"});
+        let text = collect_list_text(&b);
+        assert!(text.starts_with(
+            "collected 1 rows over 1 pages · stop page_budget · coverage_verified false"
+        ));
+        assert!(text.contains("- 你好 [42]"));
+        assert!(text.ends_with("limitations: AX only"));
+        b["rows"] = serde_json::json!(vec![serde_json::json!({"text":"长".repeat(200)}); 100]);
+        let text = collect_list_text(&b);
+        assert!(text.len() < 8192);
+        assert!(text.contains("truncated"));
+        assert!(text.ends_with("limitations: AX only"));
     }
 }

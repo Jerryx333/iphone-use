@@ -184,3 +184,5 @@ phone), stop and re-read before continuing the old plan. If the skill
 disagrees with the live API, it is probably stale; see
 reference: *Upgrade*. If something in iphone-use itself is broken or
 confusing, offer to file an issue (reference: *Filing issues*).
+
+For multi-page lists, use `phone_collect_list` (`POST /agent/collect`, default `kind:"Cell"`, `max_pages:6`); it scrolls without clicking, reports its stop reason and coverage, and does not prove business completeness.
