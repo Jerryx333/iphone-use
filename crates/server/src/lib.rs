@@ -18,6 +18,7 @@ pub mod logcap;
 pub mod login;
 pub mod metrics;
 pub mod pairing;
+pub mod phone_daemon;
 pub mod prewarm;
 pub mod protocol;
 pub mod redaction;

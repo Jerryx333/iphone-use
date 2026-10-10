@@ -146,6 +146,11 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
         managed_wda_pending: false,
     });
 
+    // The runner mints pairing codes for the iPhone app on this same phone
+    // through `embedded_pair_code`, in-process: the app is a loopback client,
+    // so this works although the daemon is not LAN-reachable.
+    let _ = EMBEDDED_PAIRING.set(state.pairing.clone());
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -170,6 +175,17 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
             .await
             .context("axum serve")
     })
+}
+
+/// The embedded daemon's pairing, once it is built.
+static EMBEDDED_PAIRING: std::sync::OnceLock<Arc<crate::pairing::Pairing>> =
+    std::sync::OnceLock::new();
+
+/// A fresh one-time pairing code from the daemon the runner hosts, for the
+/// iPhone app on the same phone (`iphoneuse://pair?u=http://127.0.0.1:<port>&c=<code>`).
+/// `None` until [`serve_embedded`] has built its state.
+pub fn embedded_pair_code() -> Option<String> {
+    EMBEDDED_PAIRING.get().map(|pairing| pairing.issue())
 }
 
 /// An iOS app container's root is not writable, so `~/.iphone-use` cannot be

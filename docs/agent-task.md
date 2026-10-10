@@ -120,6 +120,11 @@ The runner starts its daemon with `IPU_DAEMON_TOKEN` (agent bearer token), `IPU_
 and `IPU_DAEMON_HOST` (`127.0.0.1` by default; `0.0.0.0` lets other devices drive this phone, the
 third way above). Setup on the Mac generates and keeps them, and the Mac's web page offers a QR
 code that pairs the iPhone app with its own phone's daemon (`iphoneuse://pair?u=http://127.0.0.1:8787&c=…`).
+Setup keeps the token and password in the instance state dir (`phone-daemon-token`,
+`phone-daemon-password`, 0600) and passes them at every launch; the QR comes from the Mac's
+`POST /agent/phone-daemon/pair`, which asks the runner (`POST /daemon/pair-code`) for a code the
+embedded daemon mints in-process. `/agent/status` reports the runner's daemon as `phone_daemon`.
+Details: `runner/README.md`, "The on-phone daemon".
 
 ## Flows from the phone: record, save, schedule
 
