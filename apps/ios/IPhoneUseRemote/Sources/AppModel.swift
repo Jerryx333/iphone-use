@@ -79,10 +79,16 @@ final class AppModel {
     /// cannot silently add a server.
     var pendingLink: PairLink?
 
+    /// The Agent screen (a goal typed here, carried out by a daemon).
+    var agentOpen = false
+    @ObservationIgnored let agent: AgentController
+
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        agent = AgentController(defaults: defaults)
+        agent.app = self
         #if DEBUG
         // Screenshots: `-demo YES [-demoScreen <id>]` opens the demo directly.
         if defaults.bool(forKey: "demo") {
@@ -100,6 +106,9 @@ final class AppModel {
         for session in sessions.values {
             Task { await session.connect(password: nil) }
         }
+        // A task followed before a relaunch (on 本机 the daemon may have
+        // launched this app to ask a question).
+        agent.resume()
         #if DEBUG
         // UI checks on the simulator: `-address <url> -password <pw>`, or
         // `-pair <QR text>` standing in for a scan (the simulator has no camera).
@@ -110,11 +119,22 @@ final class AppModel {
         }
         if defaults.bool(forKey: "edit"), let id = focusedID { editing = .init(id: id) }
         if defaults.bool(forKey: "scan") { scanning = true }
+        // `-agent YES`: the Agent screen, aimed at the device just added
+        // (if any).
+        let agentScreen = defaults.bool(forKey: "agent")
         if let scanned = defaults.string(forKey: "pair"), let link = PairLink.parse(scanned) {
-            Task { await pair(link) }
+            Task {
+                await pair(link)
+                if agentScreen { openAgent() }
+            }
         } else if let address = defaults.string(forKey: "address"),
                   let password = defaults.string(forKey: "password"), !password.isEmpty {
-            Task { await add(address: address, password: password) }
+            Task {
+                await add(address: address, password: password)
+                if agentScreen { openAgent() }
+            }
+        } else if agentScreen {
+            openAgent()
         }
         #endif
     }
@@ -183,7 +203,13 @@ final class AppModel {
             sessions[record.id] = session
             persist()
         }
-        focusedID = record.id
+        if record.isThisPhone {
+            // 本机 is not driven from a screen of itself: it gets goals on
+            // the Agent screen.
+            agent.targetID = record.id
+        } else {
+            focusedID = record.id
+        }
         if session.phase != .connected { session.phase = .connecting }
         do {
             let token = try await client.pair(code: link.code)
@@ -191,6 +217,11 @@ final class AppModel {
             Keychain.save(password: token, for: DeviceSession.deviceAccount(address))
             session.pendingPair = nil
             try await session.adopt(client)
+            if record.isThisPhone {
+                show(String(localized: "本机已配对，可以让 agent 在这台 iPhone 上做事了"))
+                await agent.refreshHistory()
+                return .connected(record.id)
+            }
             if existing != nil { show(String(localized: "已更新「\(session.name)」的配对")) }
             return .connected(record.id)
         } catch {
@@ -379,6 +410,7 @@ final class AppModel {
 
     /// Forget a device: its credentials, its session and its place in sync.
     func remove(_ id: UUID) {
+        agent.forget(device: id)
         sessions[id]?.forget()
         sessions[id] = nil
         devices.removeAll { $0.id == id }
@@ -400,6 +432,13 @@ final class AppModel {
             // A device whose session died while away is retried on return.
             Task { await session.retryIfWaiting() }
         }
+        agent.resume()
+    }
+
+    /// Open the Agent screen, aimed at the device on screen (else 本机).
+    func openAgent() {
+        agent.chooseDefaultTarget()
+        agentOpen = true
     }
 
     /// Pull to refresh: every waiting device tries again now, every

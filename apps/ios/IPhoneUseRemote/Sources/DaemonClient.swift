@@ -510,9 +510,11 @@ final class DaemonClient: @unchecked Sendable {
 
     /// Send `request`. When it went to a LAN address and never got an
     /// answer, the client falls back to the paired address; a request that is
-    /// safe to repeat (anything but a gesture or a mode change) is retried
-    /// there at once, a gesture is not, since it may have landed.
-    private func send(_ request: URLRequest, followRedirects: Bool = true) async throws -> (Data, HTTPURLResponse) {
+    /// safe to repeat (anything but a gesture, a mode change or `repeatable:
+    /// false`) is retried there at once, a gesture is not, since it may have
+    /// landed.
+    func send(_ request: URLRequest, followRedirects: Bool = true,
+              repeatable: Bool = true) async throws -> (Data, HTTPURLResponse) {
         var request = request
         if let cookie, request.value(forHTTPHeaderField: "Cookie") == nil {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
@@ -533,7 +535,7 @@ final class DaemonClient: @unchecked Sendable {
             }) {
                 onFallback?()
             }
-            guard request.value(forHTTPHeaderField: "X-Phone-Owner") == nil,
+            guard repeatable, request.value(forHTTPHeaderField: "X-Phone-Owner") == nil,
                   let retry = onPublic(request, from: lan) else {
                 throw Self.wrap(error)
             }
