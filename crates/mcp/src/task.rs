@@ -1287,6 +1287,18 @@ async fn fail(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &Ta
     Ok(())
 }
 
+fn summary_evidence(s: &Screen) -> String {
+    // Settings and similar apps express state through controls, not only
+    // StaticText. Preserve both within the summary budget, without field values.
+    let controls: Vec<Value> = s.targets.iter().map(|t| json!({
+        "kind": t.kind, "label": t.label, "checked": t.checked,
+        "value": if matches!(t.kind.as_str(), "Switch" | "Toggle") { t.value.as_str() } else { "" }
+    })).collect();
+    format!("App: {}\nPage: {}\nVisible text: {}\nControls: {}", s.app, s.page,
+        s.text.chars().take(1_400).collect::<String>(),
+        serde_json::to_string(&controls).unwrap_or_default().chars().take(1_400).collect::<String>())
+}
+
 /// End the task: status, a summary for the person, and the app that started
 /// it back in front.
 async fn finish(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &TaskRequest, mut status: Status, why: Option<String>) {
@@ -1302,7 +1314,7 @@ async fn finish(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request: &
     let screen_text = if status == Status::Cancelled {
         String::new()
     } else {
-        jev::read_screen(daemon).await.map(|s| s.text).unwrap_or_default()
+        jev::read_screen(daemon).await.map(|s| summary_evidence(&s)).unwrap_or_default()
     };
     let (goal, steps, error, flow) = task.with(|s| (s.goal.clone(), s.steps.clone(), s.error.clone(), s.flow.clone()));
     let summary = if chat.available() && status != Status::Cancelled {
@@ -1352,6 +1364,25 @@ pub fn plain_summary(status: Status, steps: usize, error: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_keeps_control_state_and_static_values_without_field_contents() {
+        let screen = jev::observe_screen(&json!({"snapshot":"s", "elements":[
+            {"kind":"Application", "label":"设置"},
+            {"kind":"NavigationBar", "label":"电池"},
+            {"kind":"StaticText", "label":"18%"},
+            {"kind":"StaticText", "label":"x".repeat(4000)},
+            {"kind":"Button", "label":"启用低电量模式"},
+            {"kind":"Switch", "label":"电池百分比", "value":"1"},
+            {"kind":"TextField", "label":"搜索", "value":"synthetic-private-text"}
+        ]}));
+        let evidence = summary_evidence(&screen);
+        assert!(evidence.contains("18%"));
+        assert!(evidence.contains("启用低电量模式"), "long static text must not crowd out control evidence");
+        assert!(evidence.contains("电池百分比"));
+        assert!(!evidence.contains("synthetic-private-text"));
+        assert!(evidence.chars().count() <= SUMMARY_TEXT_CHARS);
+    }
 
     #[test]
     fn risky_steps_are_the_ones_that_pay_send_or_delete() {
