@@ -7,7 +7,8 @@ import UserNotifications
 /// being followed, recent tasks there, and the question a paused task asks.
 ///
 /// On 本机 the agent works in other apps while this one sits in the
-/// background, where polling stops; the daemon brings this app back to the
+/// background. Continued processing keeps polling alive on iOS 26+; older
+/// systems can suspend it. The daemon brings this app back to the
 /// front for a confirmation and at the end (`X-Task-Return-Bundle`), so the
 /// task being followed is remembered and picked up again on every return.
 @MainActor
@@ -69,6 +70,8 @@ final class AgentController: ObservableObject {
 
     private let defaults: UserDefaults
     private var pollTask: Task<Void, Never>?
+    private let liveStatus = AgentLiveStatus.shared
+    private var stopBeforeAcknowledgement = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// The confirmation already announced (sheet or notification), so a
     /// poll that repeats it does not announce it again.
@@ -139,6 +142,8 @@ final class AgentController: ObservableObject {
         error = nil
         linkNote = nil
         pendingGoal = goal
+        stopBeforeAcknowledgement = false
+        liveStatus.begin(goal: goal, device: session.name) { [weak self] in await self?.stop() }
         askNotificationPermission()
         let request = AgentTaskRequest(goal: goal, models: settings.payload(key: ModelSettingsStore.secret))
         let bundle = session.record.isThisPhone ? Bundle.main.bundleIdentifier : nil
@@ -165,9 +170,10 @@ final class AgentController: ObservableObject {
             break
         }
         pendingGoal = nil
-        guard let id else { return false }
+        guard let id else { liveStatus.finish(success: false); return false }
         let first = AgentTaskSnapshot(id: id, goal: goal, state: .running)
         follow(AgentTaskTracker(first), on: session)
+        if stopBeforeAcknowledgement { await stop() }
         return accepted
     }
 
@@ -186,6 +192,7 @@ final class AgentController: ObservableObject {
         pollTask?.cancel()
         live = tracker
         liveDeviceID = session.id
+        liveStatus.bind(taskID: tracker.task.id, deviceID: session.id)
         linkNote = nil
         remember(task: tracker.task.id, device: session.id)
         holdBackgroundTime()
@@ -203,6 +210,7 @@ final class AgentController: ObservableObject {
         let previous = live?.task.state
         live = tracker
         let task = tracker.task
+        liveStatus.update(AgentProgress(task: task))
         if let confirm = task.pendingConfirm, let deviceID = liveDeviceID {
             let prompt = ConfirmPrompt(taskID: task.id, deviceID: deviceID, goal: task.goal, confirm: confirm)
             if !answered.contains(prompt.id), announced != prompt.id {
@@ -226,12 +234,24 @@ final class AgentController: ObservableObject {
         guard live?.task.id == taskID else { return }
         switch end {
         case .finished:
+            liveStatus.finish(success: live?.task.state == .done)
             forgetRunning()
             Task { await refreshHistory() }
         case .lostLink(let message):
+            liveStatus.finish(success: false)
             linkNote = message
             // Its answer could not be sent now; the thread offers it again.
             if confirmPrompt?.taskID == taskID { confirmPrompt = nil }
+        case .forgotten:
+            forgetRunning()
+            liveStatus.finish(success: false)
+            if var task = live?.task {
+                task.state = .unavailable
+                task.error = String(localized: "服务已不保存这个任务，结果无法确认。检查手机后，可以发起新任务。")
+                live = AgentTaskTracker(task)
+            }
+            linkNote = nil
+            confirmPrompt = nil
         case .stopped:
             break
         }
@@ -242,6 +262,7 @@ final class AgentController: ObservableObject {
     /// Stop: the daemon stops after the current step; following goes on
     /// until it reports `cancelled`.
     func stop() async {
+        if pendingGoal != nil { stopBeforeAcknowledgement = true; return }
         guard let live, let deviceID = liveDeviceID, let client = app?.session(deviceID)?.client else { return }
         stopping = true
         defer { stopping = false }
@@ -323,9 +344,14 @@ final class AgentController: ObservableObject {
             for _ in 0..<20 {
                 guard let self else { return }
                 if let session = self.app?.session(deviceID), session.client != nil, session.phase == .connected {
-                    self.pollTask = nil
-                    let seed = self.live?.task.id == taskID
+                    var seed = self.live?.task.id == taskID
                         ? self.live! : AgentTaskTracker(AgentTaskSnapshot(id: taskID, goal: "", state: .running))
+                    if let snapshot = try? await session.client?.task(id: taskID, since: 0) {
+                        seed = AgentTaskTracker(snapshot)
+                        self.liveStatus.recover(task: snapshot, device: session.name, deviceID: session.id) { [weak self] in await self?.stop() }
+                    }
+                    guard !Task.isCancelled else { return }
+                    self.pollTask = nil
                     if self.targetID == nil { self.targetID = deviceID }
                     self.follow(seed, on: session)
                     return

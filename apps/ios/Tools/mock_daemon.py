@@ -211,8 +211,9 @@ class Agent:
 
     def run(self, task):
         targets = ["设置", "电池", "电池健康", "确认", "返回"]
-        for n in range(1, 6):
-            time.sleep(1)
+        long_progress = task["goal"] == "__mock_long_progress__"
+        for n in range(1, 101 if long_progress else 6):
+            time.sleep(3 if long_progress else 1)
             with self.lock:
                 if task["cancel"]:
                     task["status"] = "cancelled"
@@ -235,8 +236,10 @@ class Agent:
                         break
                     task["status"] = "running"
                 by = "assist" if n == 4 else "jev"
-                task["phase"] = by
-                task["steps"].append({"n": n, "action": "CLICK", "target": targets[n - 1], "text": None,
+                target = f"进度测试 {n}" if long_progress else targets[n - 1]
+                task["phase"] = "acting" if long_progress else by
+                task["planned_action"] = {"action": "WAIT", "target": target} if long_progress else None
+                task["steps"].append({"n": n, "action": "WAIT" if long_progress else "CLICK", "target": target, "text": None,
                                       "app": "设置", "ok": True, "error": None, "page_changed": True,
                                       "by": by, "ms": 600 + 50 * n})
         with self.lock:
@@ -246,7 +249,7 @@ class Agent:
         with self.lock:
             if task["status"] == "running":
                 task["status"] = "done"
-                task["summary"] = "电池电量 87%，低电量模式关闭。"
+                task["summary"] = "进度显示测试完成，未操作手机。" if long_progress else "电池电量 87%，低电量模式关闭。"
             task["elapsed_ms"] = int(time.time() * 1000) - task["started_at_ms"]
 
     @staticmethod

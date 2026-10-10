@@ -272,7 +272,7 @@ final class AgentTaskPollerTests: XCTestCase {
     func testAForgottenTaskEndsFollowing() async {
         let api = ScriptedAPI([.fail(AgentTaskError.notFound)])
         let end = await AgentTaskPoller.follow(start, api: api, sleep: { _ in }, onUpdate: { _ in })
-        guard case .lostLink = end else { return XCTFail("expected lostLink") }
+        XCTAssertEqual(end, .forgotten)
     }
 
     func testCancellingStops() async {

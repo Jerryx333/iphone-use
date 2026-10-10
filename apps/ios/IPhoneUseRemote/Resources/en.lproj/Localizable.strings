@@ -625,3 +625,29 @@
 "模型服务地址需要使用 HTTPS" = "The model service must use HTTPS.";
 "正在执行，第 %lld 步" = "Running step %lld";
 "模型服务请求失败（%lld），请检查模型设置后重试" = "Model request failed (%lld). Check the model settings and retry.";
+
+/* Live task progress */
+"查看任务结果" = "View task result";
+"批准后：" = "After approval: ";
+"读取新页面" = "Read the new page";
+"查找或执行流程" = "Find or run a flow";
+"检查流程结果" = "Check flow result";
+"核验任务结果" = "Verify task result";
+"返回任务结果" = "Return the result";
+"读取当前页面" = "Read the current page";
+"选择下一步" = "Choose the next step";
+"分析当前页面" = "Analyze the current page";
+"准备开始" = "Getting ready";
+"填写文本" = "Enter text";
+"打开应用" = "Open app";
+"执行流程" = "Run flow";
+"滚动页面" = "Scroll the page";
+"返回上一页" = "Go back";
+"回到主屏幕" = "Go Home";
+"打开系统搜索" = "Open system search";
+"按回车" = "Press Return";
+"等待页面" = "Wait for the page";
+"执行下一步" = "Run the next step";
+"进度跟随暂停" = "Progress tracking paused";
+"点开任务刷新" = "Open the task to refresh";
+"服务已不保存这个任务，结果无法确认。检查手机后，可以发起新任务。" = "The service no longer has this task, so its result cannot be confirmed. Check the phone before starting another task.";

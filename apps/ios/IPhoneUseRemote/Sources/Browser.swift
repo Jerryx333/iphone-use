@@ -165,6 +165,11 @@ struct BrowserView: View {
     @State private var dialogText = ""
     @FocusState private var addressing: Bool
 
+    private var legacyPrompt: Bool {
+        if #available(iOS 16, *), !AppCompatibility.forceLegacyUI { return false }
+        return session.dialog?.kind == .prompt
+    }
+
     var body: some View {
         AppNavigationStack {
             VStack(spacing: 0) {
@@ -234,12 +239,35 @@ struct BrowserView: View {
                 if id != nil { dialogText = session.dialog?.initialText ?? ""; agent.pause() }
             }
             .alert(session.dialog?.origin ?? String(localized: "网页消息"),
-                   isPresented: Binding(get: { session.dialog != nil }, set: { _ in }),
+                   isPresented: Binding(get: { session.dialog != nil && !legacyPrompt }, set: { _ in }),
                    presenting: session.dialog) { dialog in
                 if dialog.kind == .prompt { TextField("输入内容", text: $dialogText) }
                 if dialog.kind != .alert { Button("取消", role: .cancel) { session.answerDialog(false) } }
                 Button("确认") { session.answerDialog(true, text: dialogText) }
             } message: { dialog in Text(dialog.message) }
+            .sheet(isPresented: Binding(get: { legacyPrompt }, set: {
+                if !$0 && legacyPrompt { session.answerDialog(false) }
+            })) {
+                AppNavigationStack {
+                    Form {
+                        if let dialog = session.dialog {
+                            Text(dialog.message)
+                            TextField("输入内容", text: $dialogText)
+                                .accessibilityIdentifier("browser-dialog-input")
+                        }
+                    }
+                    .navigationTitle(session.dialog?.origin ?? String(localized: "网页消息"))
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("取消") { session.answerDialog(false) }
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("确认") { session.answerDialog(true, text: dialogText) }
+                        }
+                    }
+                }
+            }
             .sheet(isPresented: Binding(get: { pageText != nil }, set: { if !$0 { pageText = nil } })) {
                 AppNavigationStack {
                     ScrollView { Text(pageText ?? "").textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding() }

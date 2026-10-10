@@ -445,7 +445,7 @@ struct AgentStateChip: View {
         switch state {
         case .done: return Theme.ok
         case .running, .other: return Theme.accent
-        case .needsConfirm, .maxSteps: return Theme.attention
+        case .needsConfirm, .maxSteps, .unavailable: return Theme.attention
         case .blocked, .failed: return Theme.down
         case .cancelled: return .secondary
         }
@@ -459,6 +459,7 @@ struct AgentStateChip: View {
         case .failed: return "exclamationmark.triangle.fill"
         case .cancelled: return "stop.fill"
         case .maxSteps: return "flag.checkered"
+        case .unavailable: return "questionmark.circle"
         case .running, .other: return nil
         }
     }

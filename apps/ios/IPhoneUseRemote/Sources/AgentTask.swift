@@ -19,6 +19,8 @@ enum AgentTaskState: Equatable, Sendable {
     case cancelled
     /// Out of steps (`max_steps`) before the goal was reached.
     case maxSteps
+    /// The daemon forgot the id; the app cannot confirm the operation's result.
+    case unavailable
     /// A status this app does not know (a newer daemon): followed like a
     /// running task, since stopping early would hide how it ends.
     case other(String)
@@ -32,6 +34,7 @@ enum AgentTaskState: Equatable, Sendable {
         case "failed": self = .failed
         case "cancelled": self = .cancelled
         case "max_steps": self = .maxSteps
+        case "unavailable": self = .unavailable
         default: self = .other(raw)
         }
     }
@@ -39,7 +42,7 @@ enum AgentTaskState: Equatable, Sendable {
     var isTerminal: Bool {
         switch self {
         case .running, .needsConfirm, .other: return false
-        case .done, .blocked, .failed, .cancelled, .maxSteps: return true
+        case .done, .blocked, .failed, .cancelled, .maxSteps, .unavailable: return true
         }
     }
 
@@ -53,6 +56,7 @@ enum AgentTaskState: Equatable, Sendable {
         case .failed: return String(localized: "失败")
         case .cancelled: return String(localized: "已停止")
         case .maxSteps: return String(localized: "步数用完")
+        case .unavailable: return String(localized: "结果未知")
         case .other(let raw): return raw
         }
     }
@@ -383,8 +387,9 @@ struct AgentTaskTracker: Equatable, Sendable {
 enum AgentPollEnd: Equatable, Sendable {
     /// It reached a terminal status.
     case finished
-    /// The daemon stopped answering (or forgot the task); polling gave up.
+    /// The daemon stopped answering; polling gave up.
     case lostLink(String)
+    case forgotten
     /// The caller stopped following (the screen closed, another task began).
     case stopped
 }
@@ -423,7 +428,7 @@ enum AgentTaskPoller {
                 lastError = DaemonError.sessionExpired.localizedDescription
                 if !(await relogin()) { return .lostLink(lastError) }
             } catch AgentTaskError.notFound {
-                return .lostLink(AgentTaskError.notFound.localizedDescription)
+                return .forgotten
             } catch {
                 if Task.isCancelled { return .stopped }
                 failures += 1

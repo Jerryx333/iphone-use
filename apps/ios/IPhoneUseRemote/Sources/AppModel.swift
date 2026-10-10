@@ -377,6 +377,11 @@ final class AppModel: ObservableObject {
     }
 
     func handle(url: URL) {
+        if url.scheme == "iphoneuse", url.host == "agent" {
+            openAgent()
+            agent.resume()
+            return
+        }
         guard let link = PairLink.parse(url.absoluteString) else { return }
         pendingLink = link
     }

@@ -1,6 +1,6 @@
 # Phone Use Remote — iOS remote
 
-Native iOS app (SwiftUI, iOS 17+) for driving a phone that the iphone-use daemon serves.
+Native iOS app (SwiftUI, iOS 15+) for driving a phone that the iphone-use daemon serves.
 It logs in with the daemon's control password, shows the screen as H.264 from
 `GET /agent/h264` (decoded by VideoToolbox), and sends taps, long presses, swipes,
 drags, text and Home through `POST /control` — the same contract the web page uses.
@@ -80,6 +80,23 @@ its schedules (time + weekdays → cron, inputs, enable, run now, delete, recent
 Unsent goals stay with their selected device across closing the screen or restarting the app.
 A refused request keeps the goal available to retry; a task already running is shown without
 discarding the new goal. A local pairing that needs renewal offers the pairing screen directly.
+
+Task progress shows the current operation and the next known step. On iOS 26+, a
+continued-processing task keeps progress polling alive while the Agent opens other
+apps and displays the system Live Activity; the system's Stop action cancels the
+daemon task. On iOS 16.1–25, the widget extension supplies a Live Activity on the
+Lock Screen and Dynamic Island where supported. These older systems may suspend
+polling in the background: the activity shows its last update time and, from iOS
+16.2, marks updates stale after 20 seconds. Open it to refresh. iOS 15 and 16.0
+retain the in-app progress and confirmation notification without ActivityKit.
+The app's minimum deployment target is 15.0; the optional activity extension's is
+16.1. Installation and operation on actual iOS 15/16 hardware still need validation.
+
+Debug `-legacyUI YES` forces older UI adapters on a modern simulator;
+`-legacyActivity YES` uses the ActivityKit path instead of continued processing.
+With the mock daemon, `__mock_long_progress__` runs a five-minute progress fixture
+that never performs phone actions. This validates display and cancellation, not
+whether an Agent can complete a real goal.
 
 Tests: `xcodebuild -scheme IPhoneUseRemote -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test`
 (device-list migration, `/control` outcome classification, address parsing, error mapping,

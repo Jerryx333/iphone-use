@@ -6,4 +6,5 @@
 <p>A local page for navigation, page reading and input acceptance.</p>
 <label>Name <input placeholder="Your name"></label>
 <button onclick="document.querySelector('p').textContent='Form updated'">Continue</button>
+<button onclick="document.querySelector('p').textContent=prompt('Enter fixture text', 'initial') ?? 'Prompt cancelled'">Prompt fixture</button>
 </html>

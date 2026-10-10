@@ -44,6 +44,30 @@ final class MainTabsUITests: XCTestCase {
         XCTAssertTrue(app.webViews.staticTexts["Browser fixture"].exists, "Switching tabs must preserve the page")
     }
 
+    func testLegacyBrowserPromptAcceptsTextAndCancel() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-tab", "browser", "-legacyUI", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+        defer { app.terminate() }
+        let address = app.textFields["browser-address"]
+        XCTAssertTrue(address.waitForExistence(timeout: 10))
+        address.tap()
+        address.typeText(fixture + "\n")
+        let prompt = app.webViews.buttons["Prompt fixture"]
+        XCTAssertTrue(prompt.waitForExistence(timeout: 20))
+        prompt.tap()
+        let input = app.textFields["browser-dialog-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        input.tap()
+        input.typeText(" fixture")
+        app.buttons["确认"].tap()
+        XCTAssertTrue(app.webViews.staticTexts["initial fixture"].waitForExistence(timeout: 10))
+        prompt.tap()
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        app.buttons["取消"].tap()
+        XCTAssertTrue(app.webViews.staticTexts["Prompt cancelled"].waitForExistence(timeout: 10))
+    }
+
     func testLiveBrowserTaskFromTheComposer() throws {
         guard ProcessInfo.processInfo.environment["BROWSER_LIVE_MODEL"] == "1" else {
             throw XCTSkip("Set TEST_RUNNER_BROWSER_LIVE_MODEL=1 for the live browser task")

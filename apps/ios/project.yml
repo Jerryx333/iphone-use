@@ -19,6 +19,9 @@ targets:
     sources:
       - IPhoneUseRemote/Sources
       - IPhoneUseRemote/Resources
+      - Shared
+    dependencies:
+      - target: AgentActivityWidget
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.leeguoo.iphone-use.remote
@@ -27,6 +30,20 @@ targets:
         INFOPLIST_FILE: IPhoneUseRemote/Info.plist
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_STRICT_CONCURRENCY: complete
+  AgentActivityWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.1"
+    sources:
+      - AgentActivityWidget
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.leeguoo.iphone-use.remote.activity
+        INFOPLIST_FILE: AgentActivityWidget/Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
         SWIFT_STRICT_CONCURRENCY: complete
   IPhoneUseRemoteTests:
     type: bundle.unit-test
