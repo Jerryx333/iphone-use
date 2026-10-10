@@ -9072,6 +9072,16 @@ async fn direct_agent_action(
             let Some(bundle) = bundle else {
                 return WdaControlOutcome::Unsupported;
             };
+            // `fresh`: quit it first, so it opens on its first screen and not
+            // the page it was left on (recorded flows start there).
+            let fresh = value.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
+            if fresh {
+                if let Err(error) = w.terminate_app(&bundle).await {
+                    tracing::warn!("fresh launch: terminate {bundle} failed, launching as is: {error:#}");
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
             Some(w.launch_app(&bundle).await)
         }
         "tap" if value.get("label").is_some() => {
@@ -10656,6 +10666,7 @@ async fn agent_actions_inner(
     // a name that does not resolve refuses the whole batch with nothing sent.
     for step in &mut request.steps {
         if let AgentActionStep::Action { action, .. } = step {
+            fresh_launch_while_recording(&state, action);
             if let Err(refusal) = resolve_launch_app_action(&state, action).await {
                 return refusal;
             }
@@ -12316,6 +12327,7 @@ async fn agent_input_inner(
         return response;
     }
     let mut value = value;
+    fresh_launch_while_recording(&state, &mut value);
     if let Err(refusal) = resolve_launch_app_action(&state, &mut value).await {
         return refusal;
     }
@@ -16097,6 +16109,16 @@ async fn resolve_launch_app_action(
         );
     }
     Ok(())
+}
+
+/// While recording, an app launch starts the app fresh (on its first screen),
+/// as the recorded flow will when it replays.
+fn fresh_launch_while_recording(state: &AppState, action: &mut serde_json::Value) {
+    if action.get("type").and_then(serde_json::Value::as_str) == Some("launch_app")
+        && recover(state.flow_trail.lock()).is_recording()
+    {
+        action["fresh"] = serde_json::json!(true);
+    }
 }
 
 fn agent_apps_json(status: StatusCode, body: serde_json::Value) -> Response {

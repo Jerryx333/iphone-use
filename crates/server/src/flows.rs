@@ -349,7 +349,7 @@ pub fn convert_action(action: &Value, rows: Option<&[crate::wda::ElementRow]>) -
         "shortcut" => copy("shortcut", &["name"]),
         "home" => Converted::Step(json!({ "kind": "shortcut", "name": "home" })),
         "back" => Converted::Step(json!({ "kind": "back" })),
-        "launch_app" if action.get("bundle").is_some() => copy("launch_app", &["bundle"]),
+        "launch_app" if action.get("bundle").is_some() => copy("launch_app", &["bundle", "fresh"]),
         "scroll" if action.get("element").is_none() => copy("scroll", &["x", "y", "dx", "dy"]),
         "swipe" => copy("swipe", &["x1", "y1", "x2", "y2", "duration_ms"]),
         "drag" => copy("drag", &["x1", "y1", "x2", "y2", "hold_ms", "duration_ms"]),
@@ -521,10 +521,16 @@ impl FlowTrail {
         recording.last = Some(now);
         match converted {
             Converted::Step(step) => {
-                if recording.bundle.is_none() && step.get("kind").and_then(Value::as_str) == Some("launch_app") {
-                    recording.bundle = step.get("bundle").and_then(Value::as_str).map(str::to_string);
+                let mut step = step.clone();
+                if step.get("kind").and_then(Value::as_str) == Some("launch_app") {
+                    if recording.bundle.is_none() {
+                        recording.bundle = step.get("bundle").and_then(Value::as_str).map(str::to_string);
+                    }
+                    // A recording starts its apps fresh, and so does its replay:
+                    // an app reopened where it was left would miss the steps.
+                    step["fresh"] = json!(true);
                 }
-                recording.steps.push(step.clone());
+                recording.steps.push(step);
             }
             Converted::Typed { clear } => {
                 recording.inputs += 1;
@@ -831,6 +837,10 @@ mod tests {
         let steps = draft["flow"]["steps"].as_array().unwrap();
         assert_eq!(draft["flow"]["app"], "com.apple.Preferences", "{draft}");
         assert!(steps.iter().any(|s| s["kind"] == "type" && s["input"] == "text1" && s["clear"] == true), "{draft}");
+        assert!(
+            steps.iter().filter(|s| s["kind"] == "launch_app").all(|s| s["fresh"] == true),
+            "a recording replays its apps from their first screen: {draft}"
+        );
         assert!(draft.to_string().contains("a pinch"), "unsupported steps become todo: {draft}");
         assert!(!trail.is_recording());
         assert!(trail.stop_recording().is_none());

@@ -1551,6 +1551,21 @@ impl WdaClient {
         Ok(())
     }
 
+    /// Quit an app (`POST /wda/apps/terminate`), so its next launch starts on
+    /// its first screen rather than the page it was left on. Answers whether
+    /// it was running.
+    pub async fn terminate_app(&mut self, bundle_id: &str) -> Result<bool> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .post_req(format!("{}/session/{}/wda/apps/terminate", self.base, sid))
+            .json(&serde_json::json!({ "bundleId": bundle_id }))
+            .send_signed(&self.auth)
+            .await
+            .context("POST /wda/apps/terminate")?;
+        let value = ensure_wda_success(response, "POST /wda/apps/terminate").await?;
+        Ok(value.get("value").and_then(serde_json::Value::as_bool).unwrap_or(true))
+    }
+
     /// Bundle id of the foreground app (`GET /session/:sid/wda/apps/list`,
     /// which lists only the active app and never walks its element tree —
     /// unlike `wda/activeAppInfo`, see `probe_health`).
