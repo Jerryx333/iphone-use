@@ -85,6 +85,10 @@ final class AgentController: ObservableObject {
     private static let draftsKey = "agent.drafts.v1"
 
     init(defaults: UserDefaults = .standard) {
+        #if DEBUG
+        let defaults = UserDefaults.standard.bool(forKey: "modelSettingsFixture")
+            ? UserDefaults(suiteName: "model-settings-ui.\(UUID().uuidString)")! : defaults
+        #endif
         self.defaults = defaults
         #if DEBUG
         // Isolate UI fixtures without deleting pairing or model credentials.

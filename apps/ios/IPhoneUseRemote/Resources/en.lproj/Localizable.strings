@@ -473,6 +473,20 @@
 "用你自己的 OpenRouter 密钥；:free 模型不扣费" = "Your own OpenRouter key; :free models cost nothing";
 "用你自己的 Anthropic 密钥" = "Your own Anthropic key";
 "任何兼容 OpenAI 接口的服务：地址、密钥、模型" = "Any OpenAI-compatible service: address, key, model";
+"自动使用 public，无需个人密钥。Zen 可能限制第三方客户端，请先检测连接。" = "Uses public automatically, without a personal key. Zen may restrict third-party clients; check the connection first.";
+"自动选择免费模型" = "Choose a free model automatically";
+"无需密钥" = "No key needed";
+"从服务选择模型" = "Choose a model from the service";
+"检测连接" = "Check connection";
+"连接正常，模型已返回有效工具调用" = "Connected; the model returned a valid tool call";
+"只发送一条测试请求，不包含手机画面。模型列表能读取不代表任务能执行；收费模型会产生少量费用。" = "Sends a test request without phone screenshots. Reading the model list does not prove tasks can run. Paid models incur a small charge.";
+"正在读取模型" = "Loading models";
+"支持截图" = "Supports screenshots";
+"选择模型" = "Choose model";
+"搜索模型" = "Search models";
+"服务没有返回可用的模型，可以手动填写模型 ID" = "The service returned no usable models. You can enter a model ID manually.";
+"请先填写密钥" = "Enter a key first";
+"Zen 免费层限制了第三方客户端（403）。请选择 Kilo 免费模型或其他服务。" = "Zen restricts third-party clients on its free tier (403). Choose Kilo free models or another service.";
 
 /* Flows and schedules */
 "录制 flow" = "Record flow";

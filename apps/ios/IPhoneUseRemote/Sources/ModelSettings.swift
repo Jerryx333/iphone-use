@@ -12,6 +12,8 @@ struct ModelProvider: Codable, Equatable, Identifiable, Sendable {
     enum Kind: String, Codable, CaseIterable, Sendable {
         /// Kilo Gateway's `:free` models: no key at all.
         case free
+        /// Zen's public free-tier credential is not a personal API key.
+        case zen
         case openRouter
         case anthropic
         /// Any OpenAI-compatible (or Anthropic-format) endpoint.
@@ -45,7 +47,12 @@ struct ModelProvider: Codable, Equatable, Identifiable, Sendable {
     /// The Keychain account of its key.
     var keyAccount: String { "model:" + id.uuidString }
     /// The free tier is sent without a key; every other one needs one.
-    var needsKey: Bool { kind != .free }
+    var needsKey: Bool { kind != .free && kind != .zen }
+    var isFree: Bool { kind == .free || kind == .zen }
+    func requestKey(_ secret: String?) -> String {
+        if kind == .zen { return "public" }
+        return needsKey ? (secret ?? "").trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    }
     /// The person may change where it points (presets keep theirs).
     var editableEndpoint: Bool { kind == .custom }
 }
@@ -54,6 +61,7 @@ extension ModelProvider.Kind {
     var title: String {
         switch self {
         case .free: return String(localized: "免费试用")
+        case .zen: return "OpenCode Zen · Free"
         case .openRouter: return "OpenRouter"
         case .anthropic: return "Anthropic"
         case .custom: return String(localized: "自定义（OpenAI 兼容）")
@@ -63,6 +71,7 @@ extension ModelProvider.Kind {
     var detail: String {
         switch self {
         case .free: return String(localized: "Kilo Gateway 的免费模型，不用密钥；有频率限制")
+        case .zen: return String(localized: "自动使用 public，无需个人密钥。Zen 可能限制第三方客户端，请先检测连接。")
         case .openRouter: return String(localized: "用你自己的 OpenRouter 密钥；:free 模型不扣费")
         case .anthropic: return String(localized: "用你自己的 Anthropic 密钥")
         case .custom: return String(localized: "任何兼容 OpenAI 接口的服务：地址、密钥、模型")
@@ -74,6 +83,7 @@ extension ModelProvider.Kind {
     var defaultBaseURL: String {
         switch self {
         case .free: return "https://api.kilo.ai/api/openrouter"
+        case .zen: return "https://opencode.ai/zen/v1"
         case .openRouter: return "https://openrouter.ai/api/v1"
         case .anthropic: return "https://api.anthropic.com"
         case .custom: return ""
@@ -87,6 +97,7 @@ extension ModelProvider.Kind {
     var defaultModel: String {
         switch self {
         case .free, .openRouter: return "free"
+        case .zen: return "big-pickle"
         case .anthropic: return "claude-sonnet-5-5"
         case .custom: return ""
         }
@@ -98,7 +109,7 @@ struct ModelSettings: Codable, Equatable, Sendable {
     /// Off: send no `models`, so the daemon uses its own (a Mac's environment).
     var sendModels = true
     /// Tried in this order; the first that answers is used.
-    var assist: [ModelProvider] = [ModelProvider(kind: .free)]
+    var assist: [ModelProvider] = [ModelProvider(kind: .free), ModelProvider(kind: .zen, enabled: false)]
     var jevModel = "jev-latest"
     var textBaseURL = "https://openrouter.ai/api/v1"
     var textModel = "inception/mercury-2.5"
@@ -135,7 +146,7 @@ struct ModelSettings: Codable, Equatable, Sendable {
         let assist: [ModelsPayload.Assist] = self.assist.compactMap { provider in
             let base = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let model = provider.model.trimmingCharacters(in: .whitespacesAndNewlines)
-            let key = provider.needsKey ? secret(provider.keyAccount) : ""
+            let key = provider.requestKey(provider.needsKey ? secret(provider.keyAccount) : nil)
             guard provider.enabled, !base.isEmpty, !model.isEmpty, !provider.needsKey || !key.isEmpty else {
                 return nil
             }
@@ -207,15 +218,28 @@ struct ModelsPayload: Encodable, Equatable, Sendable {
 /// Where the settings are kept: the list in UserDefaults, keys in the Keychain.
 enum ModelSettingsStore {
     static let key = "agent.models.v1"
+    private static let zenPresetKey = "agent.models.zen-preset.v1"
 
     /// The saved settings; the first time, the defaults, saved at once so
     /// the free tier keeps one id (and a key added to it later stays put).
     static func load(from defaults: UserDefaults) -> ModelSettings {
         guard let data = defaults.data(forKey: key),
-              let settings = try? JSONDecoder().decode(ModelSettings.self, from: data) else {
+              var settings = try? JSONDecoder().decode(ModelSettings.self, from: data) else {
             let fresh = ModelSettings()
             save(fresh, to: defaults)
+            defaults.set(true, forKey: zenPresetKey)
             return fresh
+        }
+        if !defaults.bool(forKey: zenPresetKey) {
+            // Upgrade only the untouched free preset. Never replace a person's
+            // chosen providers, keys, IDs, order, or enabled state.
+            if settings.assist.count == 1, let first = settings.assist.first,
+               first.kind == .free, first.baseURL == ModelProvider.Kind.free.defaultBaseURL,
+               first.model == "free", first.enabled {
+                settings.assist.append(ModelProvider(kind: .zen, enabled: false))
+                save(settings, to: defaults)
+            }
+            defaults.set(true, forKey: zenPresetKey)
         }
         return settings
     }

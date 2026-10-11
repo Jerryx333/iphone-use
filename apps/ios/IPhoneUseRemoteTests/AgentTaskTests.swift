@@ -368,7 +368,7 @@ final class ModelsPayloadTests: XCTestCase {
         // The defaults are saved on first load: the same list comes back.
         let first = ModelSettingsStore.load(from: defaults)
         XCTAssertEqual(ModelSettingsStore.load(from: defaults), first)
-        XCTAssertEqual(first.assist.map(\.kind), [.free])
+        XCTAssertEqual(first.assist.map(\.kind), [.free, .zen])
         var settings = first
         settings.assist.append(ModelProvider(kind: .anthropic))
         settings.jevModel = "jev-2"
@@ -378,10 +378,40 @@ final class ModelsPayloadTests: XCTestCase {
         XCTAssertFalse(stored.contains("key\""), "no key field is ever written to UserDefaults")
     }
 
-    func testNoPresetPresentsItselfAsOpenCode() {
-        for kind in ModelProvider.Kind.allCases {
-            XCTAssertFalse(kind.defaultBaseURL.lowercased().contains("opencode"))
+    func testZenUsesPublicWithoutReadingAPersonalKey() throws {
+        var settings = ModelSettings()
+        settings.assist = [ModelProvider(kind: .zen)]
+        let payload = settings.payload { account in
+            XCTAssertNotEqual(account, settings.assist[0].keyAccount)
+            return nil
         }
+        XCTAssertEqual(try json(payload), #"{"assist":[{"base_url":"https://opencode.ai/zen/v1","format":"openai","key":"public","model":"big-pickle"}]}"#)
+        XCTAssertFalse(settings.assist[0].needsKey)
+    }
+
+    func testUpgradeAddsDisabledZenOnceAndPreservesDeletion() throws {
+        let suite = "test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var old = ModelSettings()
+        old.assist = [ModelProvider(kind: .free)]
+        ModelSettingsStore.save(old, to: defaults)
+        let upgraded = ModelSettingsStore.load(from: defaults)
+        XCTAssertEqual(upgraded.assist[0], old.assist[0])
+        XCTAssertEqual(upgraded.assist.last?.kind, .zen)
+        XCTAssertEqual(upgraded.assist.last?.enabled, false)
+        ModelSettingsStore.save(old, to: defaults)
+        XCTAssertEqual(ModelSettingsStore.load(from: defaults), old)
+    }
+
+    func testUpgradeLeavesCustomProviderOrderUntouched() {
+        let suite = "test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var chosen = ModelSettings()
+        chosen.assist = [ModelProvider(kind: .anthropic), ModelProvider(kind: .custom, baseURL: "https://custom.example/v1", model: "chosen")]
+        ModelSettingsStore.save(chosen, to: defaults)
+        XCTAssertEqual(ModelSettingsStore.load(from: defaults), chosen)
     }
 }
 

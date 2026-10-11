@@ -777,11 +777,11 @@ struct ProviderRow: View {
                     Chip(text: String(localized: "已关闭"))
                 } else if missing {
                     Chip(text: String(localized: "缺密钥"), color: Theme.attention)
-                } else if provider.kind == .free {
+                } else if provider.isFree {
                     Chip(text: String(localized: "免费"), color: Theme.ok)
                 }
             }
-            Text(provider.model.isEmpty ? String(localized: "未填模型") : provider.model)
+            Text(provider.model == "free" ? String(localized: "自动选择免费模型") : (provider.model.isEmpty ? String(localized: "未填模型") : provider.model))
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
         }
     }
@@ -795,6 +795,10 @@ struct ProviderRow: View {
 struct ProviderEditView: View {
     @Binding var provider: ModelProvider
     @State private var key = ""
+    @State private var checking = false
+    @State private var checkResult: String?
+    @State private var checkPassed = false
+    @State private var checkTask: Task<Void, Never>?
 
     var body: some View {
         Form {
@@ -825,9 +829,16 @@ struct ProviderEditView: View {
                         .appOnChange(of: key) { _, value in
                             ModelSettingsStore.setSecret(value, for: provider.keyAccount)
                         }
+                } else {
+                    AppLabeledContent("密钥", value: provider.kind == .zen ? "public" : String(localized: "无需密钥"))
                 }
             }
             Section {
+                NavigationLink {
+                    ModelPickerView(provider: $provider)
+                } label: {
+                    Label("从服务选择模型", systemImage: "list.bullet")
+                }
                 TextField("模型", text: $provider.model)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
@@ -838,9 +849,114 @@ struct ProviderEditView: View {
                     Text("填 free 会自动挑一个能用的免费模型（能看截图的优先），不能用就换下一个；也可以填某个以 :free 结尾的模型。")
                 }
             }
+            Section {
+                Button {
+                    checking = true
+                    checkResult = nil
+                    let tested = provider
+                    let testedKey = key
+                    checkTask = Task { @MainActor in
+                        do {
+                            try await ModelCatalog.check(tested)
+                            guard provider == tested, key == testedKey else { checking = false; return }
+                            checkPassed = true
+                            checkResult = String(localized: "连接正常，模型已返回有效工具调用")
+                        } catch {
+                            guard !Task.isCancelled else { checking = false; return }
+                            guard provider == tested, key == testedKey else { checking = false; return }
+                            checkPassed = false
+                            checkResult = error.localizedDescription
+                        }
+                        checking = false
+                    }
+                } label: {
+                    HStack {
+                        Text("检测连接")
+                        Spacer()
+                        if checking { ProgressView() }
+                    }
+                }
+                .disabled(checking || provider.model.isEmpty || provider.baseURL.isEmpty)
+                if let checkResult {
+                    Text(checkResult).font(.footnote).foregroundStyle(checkPassed ? Theme.ok : Theme.attention)
+                }
+            } footer: {
+                Text("只发送一条测试请求，不包含手机画面。模型列表能读取不代表任务能执行；收费模型会产生少量费用。")
+            }
         }
         .navigationTitle(provider.name)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { key = ModelSettingsStore.secret(provider.keyAccount) ?? "" }
+        .onDisappear { checkTask?.cancel(); checking = false }
+        .appOnChange(of: provider) { _, _ in checkResult = nil }
+        .appOnChange(of: key) { _, _ in checkResult = nil }
+    }
+}
+
+struct ModelPickerView: View {
+    @Binding var provider: ModelProvider
+    @State private var models: [CatalogModel] = []
+    @State private var loading = false
+    @State private var error: String?
+    @State private var search = ""
+    @Environment(\.dismiss) private var dismiss
+
+    private var filtered: [CatalogModel] {
+        models.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.id.localizedCaseInsensitiveContains(search) }
+    }
+
+    var body: some View {
+        List {
+            if provider.kind == .free || provider.kind == .openRouter {
+                Button {
+                    provider.model = "free"
+                    dismiss()
+                } label: {
+                    HStack {
+                        Text("自动选择免费模型")
+                        Spacer()
+                        if provider.model == "free" { Image(systemName: "checkmark") }
+                    }
+                }
+            }
+            if loading { ProgressView("正在读取模型") }
+            if let error { Text(error).font(.footnote).foregroundStyle(Theme.attention) }
+            ForEach(filtered) { model in
+                Button {
+                    provider.model = model.id
+                    dismiss()
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(model.name)
+                            if model.name != model.id { Text(model.id).font(.caption).foregroundStyle(.secondary) }
+                            if model.readsImages { Text("支持截图").font(.caption).foregroundStyle(.secondary) }
+                        }
+                        Spacer()
+                        if provider.model == model.id { Image(systemName: "checkmark") }
+                    }
+                }
+            }
+        }
+        .navigationTitle("选择模型")
+        .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索模型")
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("刷新") { Task { await refresh() } }.disabled(loading)
+            }
+        }
+        .task { await refresh() }
+    }
+
+    @MainActor private func refresh() async {
+        loading = true
+        error = nil
+        defer { loading = false }
+        do {
+            models = try await ModelCatalog.fetch(provider)
+        } catch is CancellationError {
+        } catch {
+            self.error = error.localizedDescription
+        }
     }
 }

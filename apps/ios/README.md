@@ -157,8 +157,17 @@ OpenAI-compatible and Anthropic-format services receive a native `browser_action
 Each round reads the current page, executes one validated action, then reads the result.
 Supported actions: open/search, numbered-control click, text entry, dropdown selection,
 scroll, back, wait, finish, and human handoff. A retired free model falls back to currently
-listed free models on the same service. Discovery only selects models tagged `:free`; other
+listed free models on the same service. Kilo discovery only selects models tagged `:free`; other
 enabled providers are tried in the configured order.
+
+Model settings include a searchable list fetched from the service and a connection check that
+requests a real tool call using synthetic data, without phone screenshots. Kilo's automatic
+free-model selection remains enabled by default. OpenCode Zen is preconfigured with
+`https://opencode.ai/zen/v1`, the public credential `public`, and `big-pickle`, but starts disabled:
+on 2026-10-11 its model list was accessible while inference returned HTTP 403 `FreeTierError`
+(free tier restricted to OpenCode). Check the connection before enabling it. A successful model
+listing alone does not establish task availability. The Zen picker shows free Chat Completions
+models; SystemOne and Responses models are excluded. Existing custom providers are preserved.
 
 Take Over pauses execution and lets you use the page; Continue reads the page again. Stop
 cancels the pending model request and rejects late answers. Backgrounding the app pauses
