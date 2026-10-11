@@ -11,7 +11,8 @@
 //!
 //! The process speaks the Model Context Protocol over stdin/stdout.  Add it to
 //! your MCP client (Claude Desktop, Claude Code, etc.) as a stdio server — see
-//! `crates/mcp/README.md` for the exact config snippet.
+//! `crates/mcp/README.md` for the exact config snippet. `--listen ADDR` serves
+//! the same tools over MCP streamable HTTP at `http://ADDR/mcp` instead.
 
 use clap::{Parser, Subcommand};
 use rmcp::{transport::stdio, ServiceExt};
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 
-use iphone_use_mcp::{client, compat, contrib, flow, jev, registry, schedule, server, suite};
+use iphone_use_mcp::{client, compat, contrib, flow, http, jev, registry, schedule, server, suite};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +34,12 @@ struct Cli {
     /// `iphone-use-mcp` processes attributable to its session/project.
     #[arg(long, value_name = "TAG")]
     label: Option<String>,
+    /// Serve MCP over streamable HTTP at http://ADDR/mcp instead of stdio,
+    /// e.g. `--listen 127.0.0.1:8765`. Clients must send `Authorization:
+    /// Bearer $IPHONE_USE_MCP_TOKEN` when it is set; a non-loopback address
+    /// is refused without it.
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<std::net::SocketAddr>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -69,6 +76,15 @@ enum Command {
         /// Only parse and validate; never contacts the daemon.
         #[arg(long)]
         validate: bool,
+        /// Resume at case N (1-based), or at step M of case N with N:M
+        /// (skips setup: the phone must already be on that screen). A failed
+        /// case prints its own resume point.
+        #[arg(long, value_name = "N[:M]")]
+        from: Option<String>,
+        /// Run a failed case again up to N times (at most 10); the report
+        /// says which attempt passed.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        retries: u32,
     },
     /// Scheduled flows and test suites, run by the daemon.
     Schedule {
@@ -311,7 +327,7 @@ async fn run() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    if let Some(Command::Test { suite, json, junit, confirm, artifacts_dir, owner, validate }) = &cli.command {
+    if let Some(Command::Test { suite, json, junit, confirm, artifacts_dir, owner, validate, from, retries }) = &cli.command {
         if let Some(owner) = owner {
             std::env::set_var("IPHONE_USE_OWNER", owner);
         }
@@ -323,6 +339,8 @@ async fn run() -> anyhow::Result<()> {
                 confirm: *confirm,
                 artifacts_dir: artifacts_dir.clone(),
                 validate_only: *validate,
+                from: from.clone(),
+                retries: *retries,
             },
         )
         .await;
@@ -528,6 +546,13 @@ async fn run() -> anyhow::Result<()> {
         "iphone-use-mcp starting"
     );
 
+    // Refused before binding (and before the pre-warm), so a mistake never
+    // opens the port or wakes the phone.
+    let mcp_token = http::token_from_env();
+    if let Some(addr) = &cli.listen {
+        http::check_bind(addr, mcp_token.as_deref())?;
+    }
+
     // A session that drove the phone recently is likely to again: let the
     // daemon start bringing a released phone back now, in the background.
     // `IPHONE_USE_MCP_PREWARM=0` turns this off for this server.
@@ -539,6 +564,23 @@ async fn run() -> anyhow::Result<()> {
                 Err(e) => tracing::debug!("pre-warm request failed: {e:#}"),
             }
         });
+    }
+
+    if let Some(addr) = cli.listen {
+        let token = mcp_token;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(
+            addr = %listener.local_addr()?,
+            path = http::MCP_PATH,
+            token = token.is_some(),
+            "serving MCP over streamable HTTP"
+        );
+        let shutdown = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        http::serve(listener, daemon, token, shutdown).await?;
+        tracing::info!("iphone-use-mcp exiting");
+        return Ok(());
     }
 
     // Run until the MCP client closes the pipe.

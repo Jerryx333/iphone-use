@@ -235,6 +235,26 @@ pub fn describe(action: &Value, rows: Option<&[ElementRow]>) -> Line {
                 None => line("Opened an app", "打开一个 App"),
             }
         }
+        // A web link's host only: a path or query can carry tokens or
+        // personal data. Any other scheme is named by its scheme alone.
+        "open_url" => match action
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|url| crate::guard::parse_url(url).ok())
+        {
+            Some(crate::guard::ParsedUrl {
+                host: Some(host),
+                scheme,
+            }) if scheme == "http" || scheme == "https" => line(
+                format!("Opened a link to {host}"),
+                format!("打开链接 {host}"),
+            ),
+            Some(parsed) => line(
+                format!("Opened a {}: link", parsed.scheme),
+                format!("打开 {}: 链接", parsed.scheme),
+            ),
+            None => line("Opened a link", "打开链接"),
+        },
         "scroll" if action.get("element").is_some() => on("Scrolled", "滚动"),
         "scroll" => line("Scrolled", "滚动"),
         "swipe" => swipe_line(action),
@@ -278,6 +298,38 @@ pub fn describe(action: &Value, rows: Option<&[ElementRow]>) -> Line {
             let other = other.replace('_', " ");
             line(format!("Did {other}"), format!("执行 {other}"))
         }
+    }
+}
+
+/// A screen recording started.
+pub fn recording_started() -> Line {
+    line("Started recording", "开始录屏")
+}
+
+/// A recording saved, with its length in whole seconds.
+pub fn recording_saved(seconds: f64) -> Line {
+    let n = seconds.max(0.0).round() as u64;
+    line(
+        format!("Saved a recording ({n} s)"),
+        format!("保存录屏（{n} 秒）"),
+    )
+}
+
+/// The simulated location set or cleared. Never the coordinates: where a
+/// person is (or pretends to be) is not for the feed.
+pub fn location(cleared: bool) -> Line {
+    if cleared {
+        line("Cleared the simulated location", "取消模拟定位")
+    } else {
+        line("Set a simulated location", "设置模拟定位")
+    }
+}
+
+/// An app installed (`None`: its bundle id was not read).
+pub fn installed(bundle: Option<&str>) -> Line {
+    match bundle.map(app_name) {
+        Some(app) => line(format!("Installed {app}"), format!("安装 {app}")),
+        None => line("Installed an app", "安装一个 App"),
     }
 }
 
@@ -404,5 +456,38 @@ mod tests {
         assert!(recent(next, 10)["items"].as_array().unwrap().is_empty());
         assert_eq!(recent(next - 2, 10)["items"].as_array().unwrap().len(), 2);
         assert_eq!(recent(0, 3)["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_link_shows_only_its_host() {
+        let line = describe(
+            &json!({"type":"open_url","url":"https://user:pw@Example.com/reset?token=SECRET"}),
+            None,
+        );
+        assert_eq!(line.en, "Opened a link to example.com");
+        assert_eq!(line.zh, "打开链接 example.com");
+        assert!(!line.en.contains("SECRET") && !line.zh.contains("SECRET"));
+        assert_eq!(
+            en(json!({"type":"open_url","url":"tel:10086"}), None),
+            "Opened a tel: link"
+        );
+        assert_eq!(
+            en(json!({"type":"open_url","url":"weixin://dl/scan"}), None),
+            "Opened a weixin: link"
+        );
+        assert_eq!(en(json!({"type":"open_url"}), None), "Opened a link");
+    }
+
+    #[test]
+    fn recording_location_and_install_lines() {
+        assert_eq!(recording_started().zh, "开始录屏");
+        assert_eq!(
+            recording_saved(11.6),
+            line("Saved a recording (12 s)", "保存录屏（12 秒）")
+        );
+        assert_eq!(location(false).en, "Set a simulated location");
+        assert_eq!(location(true).zh, "取消模拟定位");
+        assert_eq!(installed(Some("com.example.x")).en, "Installed com.example.x");
+        assert_eq!(installed(None).en, "Installed an app");
     }
 }

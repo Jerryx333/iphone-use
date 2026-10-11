@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/leeguooooo/iphone-use",
   "repository": "https://github.com/leeguooooo/iphone-use",
-  "license": "MIT",
+  "license": "PolyForm-Shield-1.0.0",
   "keywords": ["iphone", "ios", "mobile", "automation", "xctest", "mcp"],
   "skills": "./skills/",
   "mcpServers": "./.codex-plugin/mcp.json",

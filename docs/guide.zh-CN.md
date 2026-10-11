@@ -299,6 +299,45 @@ agent 不靠记性去查源，而是被推着走：`phone_elements` 直接列出
 
 ## 运维
 
+### 模拟器（预览）
+
+设备 runner 也能跑在 iOS 模拟器上：不需要手机、Apple ID 和签名，只需要一台装了 Xcode 和至少一个 iOS 模拟器运行时的 Mac。`iphone-use simulators` 列出模拟器（也可加 `--json`）。`iphone-use simulator start "iPhone 16 Pro"`（也可传 UDID，`--port N` 指定端口）会依次完成以下步骤：
+
+1. 启动模拟器。
+2. 为模拟器构建 runner，不签名，使用独立的 derived data：在仓库里用 `runner/build.sh --simulator`，否则直接对安装程序放在 `~/.iphone-use/runner` 的 Xcode 工程执行 `xcodebuild build-for-testing`。也可以用 `IPU_RUNNER_SRC` 指向仓库的 `runner/`，或用 `--xctestrun` 传入现成的模拟器构建。
+3. 用 `xcodebuild test-without-building -destination id=<udid>` 启动 runner。
+4. 等 runner 在 `127.0.0.1:<端口>` 上应答。默认端口从 8200 起取第一个空闲的，视频端口是该端口加 1000。
+5. 在后台为这台模拟器启动 daemon（端口从 44331 起取第一个空闲的），等它开始监听。日志在实例目录的 `simulator-daemon.log`。加 `--no-serve` 则只打印 daemon 的启动命令（`IPHONE_USE_INSTANCE=sim IPHONE_USE_SIMULATOR=<udid> IPHONE_USE_WDA_URL=http://127.0.0.1:<端口> … iphone-use serve`）。
+
+开发时整个流程就是：
+
+```bash
+iphone-use simulator start "iPhone 16 Pro"
+claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp   # 只需一次
+```
+
+一条命令之后 agent 就能操作模拟器，实时画面在 `http://127.0.0.1:<daemon 端口>/phone`。其他 MCP 客户端同理：用 `IPHONE_USE_INSTANCE=sim` 运行 `iphone-use-mcp` 即可。
+
+第一台模拟器使用实例 `sim`（`~/.iphone-use/instances/sim`），所以 `IPHONE_USE_INSTANCE=sim` 总能找到你启动的模拟器：`iphone-use-mcp` 会从该目录的 `simulator.json` 读取 daemon 端口。`sim` 被占用时再启动第二台，会用 `sim-<UDID 前 8 位>`；`--instance 名字` 可以指定任意名字。runner 和 daemon 都不注册 launchd。设置 `IPHONE_USE_SIMULATOR` 后，daemon 的处理方式有以下变化：
+
+- 设备日志、崩溃报告、模拟定位、安装和卸载 app、已安装 app 清单都改走 `xcrun simctl`。
+- 崩溃报告取自 `~/Library/Logs/DiagnosticReports`，只包含这台模拟器的报告。
+- 安装只接受模拟器构建的 `.app`，不接受 `.ipa`。
+- 录屏（`POST /agent/record`、`phone_record`）改用 `simctl io recordVideo`，不依赖 H.264 实时画面。结果里有 `"via":"simctl"`，没有帧数。
+- 模拟器启动中时 `device_state` 是 `booting`，关机时是 `shutdown`。
+- 保持唤醒和勿扰模式不启用。
+- `/agent/status` 里会给出 `"target":"simulator"`，`lock_readiness.verdict` 为 `"ready"`，`device` 是模拟器的名字和运行时。
+
+`iphone-use simulator stop <名字|udid>` 会停止 daemon 和 runner，并释放 `sim` 实例。它只停止自己记录并核实过的进程，加 `--shutdown` 会同时关闭模拟器。
+
+`iphone-use setup --simulator <名字|udid>` 等同于 `simulator start`，跳过真机配置。安装器也支持 `--simulator <名字>`（`curl … install.sh | sh -s -- --simulator "iPhone 16 Pro"`）：装完后启动这台模拟器，并在 Claude Code 里注册名为 `iphone-sim` 的 MCP 服务；模拟器启动失败时安装也算失败。没插手机时，安装器的首次运行会提示可以改用 `simulator start`。`iphone-use doctor` 会多一行，列出可用和已启动的模拟器。
+
+预览版还不支持以下内容：
+
+- `IPHONE_USE_TARGET` 不写进实例 plist：模拟器实例不走 launchd，重启 Mac 后不会自动恢复（再执行一次 `simulator start` 即可）。
+- 模拟器上 runner 的 H.264 实时画面尚未验证（MJPEG 和录屏不依赖它）。
+- 模拟器没有相机、App Store app、真实推送和 Face ID，依赖这些的任务只能在真机上做。
+
 ### 生命周期与恢复
 
 `/agent/status` 是唯一事实来源。`recovery_owner` 在托管 loopback WDA 下是 `daemon`，首次接入尚未持久化目标时是 `unconfigured`，不托管的端点是 `external`。启动 WDA 之前，daemon 会先问手机是否锁屏：锁着的手机在连接后几秒内就显示 `setup_blocked_on:"locked"`（以前要等 Xcode 约 70 秒超时），连续两次读到解锁才启动。仍然因锁屏失败的，从 5 秒到 1 分钟安静重试；其他失败从 5 秒退避到 5 分钟；一次成功恢复清零两种退避。交互式 setup 最多等 5 分钟解锁。

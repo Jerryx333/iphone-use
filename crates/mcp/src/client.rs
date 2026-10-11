@@ -59,6 +59,29 @@ fn launch_agent_env(label: &str, key: &str) -> Option<String> {
     })
 }
 
+/// A named instance with no LaunchAgent may be a simulator that
+/// `iphone-use simulator start` runs: its record names the daemon port.
+fn instance_env(label: &str, key: &str) -> Option<String> {
+    launch_agent_env(label, key).or_else(|| {
+        let name = label.strip_prefix(&format!("{DAEMON_LABEL}."))?;
+        if key != "IPHONE_USE_PORT" {
+            return None;
+        }
+        let home = std::env::var_os("HOME")?;
+        let record = std::path::Path::new(&home)
+            .join(".iphone-use/instances")
+            .join(name)
+            .join("simulator.json");
+        simulator_record_port(&std::fs::read_to_string(record).ok()?).map(|port| port.to_string())
+    })
+}
+
+/// `daemon_port` from a simulator record (`simulator.json`).
+fn simulator_record_port(text: &str) -> Option<u16> {
+    let port = serde_json::from_str::<serde_json::Value>(text).ok()?.get("daemon_port")?.as_u64()?;
+    u16::try_from(port).ok().filter(|port| *port > 0)
+}
+
 fn launch_agent_env_as(label: &str, key: &str) -> Option<String> {
     let home = std::env::var_os("HOME")?;
     let plist = std::path::Path::new(&home).join(format!("Library/LaunchAgents/{label}.plist"));
@@ -102,6 +125,9 @@ const SCREEN_FRAME_TIMEOUT: Duration = Duration::from_secs(6);
 /// App lookup by name may read the phone's inventory cold: two devicectl
 /// calls with 30 s deadlines each, then (rarely) a 5 s store search.
 const APPS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(75);
+/// `install` downloads up to 2 GB and runs devicectl; the daemon answers
+/// when the phone has the app or has refused it.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_ERROR_BODY_CHARS: usize = 2_048;
 
 /// Characters the daemon types in one runner request; longer text is chunked.
@@ -272,7 +298,7 @@ impl DaemonClient {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         };
-        let (base_url, token) = daemon_target(env, launch_agent_env);
+        let (base_url, token) = daemon_target(env, instance_env);
         Self::new(base_url, token)
     }
 
@@ -371,6 +397,27 @@ impl DaemonClient {
         match &self.token {
             Some(t) => req.header(header::AUTHORIZATION, format!("Bearer {t}")),
             None => req,
+        }
+    }
+
+    /// A client for one more MCP session of this process (`--listen`): same
+    /// daemon and token, its own owner name (`<owner>-<n>`, so two remote
+    /// agents never share one phone lease), snapshot baseline and run id.
+    pub fn for_session(&self, n: u64) -> Self {
+        let suffix = format!("-{n}");
+        let mut owner = self.owner.clone();
+        // Cut on a char boundary: IPHONE_USE_OWNER may be non-ASCII.
+        let mut cut = (64 - suffix.len()).min(owner.len());
+        while !owner.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        owner.truncate(cut);
+        owner.push_str(&suffix);
+        Self {
+            owner,
+            last_snapshot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            run_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            ..self.clone()
         }
     }
 
@@ -623,8 +670,37 @@ impl DaemonClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> anyhow::Result<DaemonResponse> {
+        self.request_json_within(method, path, body, REQUEST_TIMEOUT).await
+    }
+
+    /// `POST /agent/input {"type":"install",…}`: [`Self::request_json`] with
+    /// the install deadline.
+    pub async fn install(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
+        self.request_json_within(reqwest::Method::POST, "/agent/input", Some(body), INSTALL_TIMEOUT)
+            .await
+    }
+
+    /// `PUT <path>` with a Markdown body (app notes), keeping the answer.
+    pub async fn put_markdown(&self, path: &str, text: &str) -> anyhow::Result<DaemonResponse> {
+        let req = self
+            .auth(self.client.put(self.url(path)))
+            .header("x-phone-control", "1")
+            .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
+            .body(text.to_string());
+        read_response(req.send().await?).await
+    }
+
+    async fn request_json_within(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        timeout: Duration,
+    ) -> anyhow::Result<DaemonResponse> {
         let mutation = method != reqwest::Method::GET;
-        let mut req = self.auth(self.client.request(method, self.url(path)));
+        let mut req = self
+            .auth(self.client.request(method, self.url(path)))
+            .timeout(timeout);
         if mutation {
             req = req
                 .header("x-phone-control", "1");
@@ -666,10 +742,24 @@ impl DaemonClient {
     /// `GET /agent/screenshot` — returns raw PNG bytes, shrunk to `max_side`
     /// on the long side when given.
     pub async fn screenshot(&self, max_side: Option<u32>) -> anyhow::Result<Vec<u8>> {
-        let path = match max_side {
-            Some(side) => format!("/agent/screenshot?max_side={side}"),
-            None => "/agent/screenshot".to_string(),
-        };
+        self.screenshot_with(max_side, false).await
+    }
+
+    /// [`Self::screenshot`], with each interactive element's frame and index
+    /// drawn on it when `overlay` (`overlay=elements`).
+    pub async fn screenshot_with(
+        &self,
+        max_side: Option<u32>,
+        overlay: bool,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut params = Vec::new();
+        if let Some(side) = max_side {
+            params.push(("max_side", side.to_string()));
+        }
+        if overlay {
+            params.push(("overlay", "elements".to_string()));
+        }
+        let path = query_path("/agent/screenshot", &params);
         let req = self.auth(self.client.get(self.url(&path)));
         let resp = req.send().await?;
         let resp = check_status(resp).await?;
@@ -710,8 +800,21 @@ impl DaemonClient {
     /// is unusable the answer carries a fresh, budget-bounded screenshot
     /// taken after the read (never a cached frame). For the model-facing
     /// read only; flow and lookup reads stay text.
-    pub async fn elements_with_image(&self) -> anyhow::Result<String> {
-        self.elements_at("/agent/elements?image=auto").await
+    ///
+    /// Narrowed by the daemon when asked: `query` keeps
+    /// rows whose label, identifier, value or placeholder contain the text,
+    /// `limit` caps the rows returned. Kept rows carry their original index
+    /// and the snapshot is the full read's, so taps by element stay valid.
+    ///
+    /// `ocr` (`1` or `force`) asks for text read from a fresh screenshot when
+    /// the tree is unusable (or always, with `force`).
+    pub async fn elements_with_image(
+        &self,
+        query: Option<&str>,
+        limit: Option<usize>,
+        ocr: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.elements_at(&elements_path(query, limit, ocr)).await
     }
 
     async fn elements_at(&self, path: &str) -> anyhow::Result<String> {
@@ -1077,6 +1180,37 @@ fn url_query_escape(value: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// The model-facing `/agent/elements` path: `image=auto`, plus `query` and
+/// `limit` when given (a blank query is no filter), percent-encoded.
+pub(crate) fn elements_path(
+    query: Option<&str>,
+    limit: Option<usize>,
+    ocr: Option<&str>,
+) -> String {
+    let mut params = vec![("image", "auto".to_string())];
+    if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+        params.push(("query", query.to_string()));
+    }
+    if let Some(limit) = limit {
+        params.push(("limit", limit.to_string()));
+    }
+    if let Some(ocr) = ocr {
+        params.push(("ocr", ocr.to_string()));
+    }
+    query_path("/agent/elements", &params)
+}
+
+/// `path?k=v&…` with each value form-encoded; `path` alone without params.
+pub(crate) fn query_path(path: &str, params: &[(&str, String)]) -> String {
+    if params.is_empty() {
+        return path.to_string();
+    }
+    let mut url = reqwest::Url::parse("http://daemon/").expect("static URL");
+    url.set_path(path);
+    url.query_pairs_mut().extend_pairs(params);
+    format!("{}?{}", url.path(), url.query().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -1471,6 +1605,29 @@ mod tests {
             daemon_target(none, nothing),
             (DEFAULT_URL.to_string(), None)
         );
+    }
+
+    #[test]
+    fn a_session_owner_is_cut_on_a_char_boundary() {
+        let client = DaemonClient::new("http://127.0.0.1:1".to_string(), None);
+        let mut long = client.clone();
+        long.owner = "代理".repeat(40);
+        for n in [1, 7, 42, 12345] {
+            let owner = long.for_session(n).owner;
+            assert!(owner.len() <= 64, "{owner}");
+            assert!(owner.ends_with(&format!("-{n}")), "{owner}");
+        }
+    }
+
+    #[test]
+    fn a_simulator_record_names_the_daemon_port() {
+        let record = r#"{"udid":"8A1BC3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D","port":8200,"daemon_port":44331}"#;
+        assert_eq!(simulator_record_port(record), Some(44331));
+        for bad in ["", "{}", r#"{"daemon_port":0}"#, r#"{"daemon_port":70000}"#, r#"{"daemon_port":"44331"}"#] {
+            assert_eq!(simulator_record_port(bad), None, "{bad}");
+        }
+        // Only the port comes from the record; never a secret.
+        assert_eq!(instance_env("com.leeguoo.iphone-use.no-such-instance-xyz", "IPHONE_USE_PASSWORD"), None);
     }
 
     #[test]

@@ -41,8 +41,10 @@ jobs:
           bash -n scripts/test-install-release-transaction.sh
           bash scripts/test-install-release-transaction.sh
           bash scripts/test-install-runner-sources.sh
+          bash scripts/test-install-client-config.sh
           bash scripts/test-setup-wda-shim.sh
           python3 scripts/test-auto-update.py
+          python3 -I scripts/test-agent-bench.py
 
           skill_file_count="$(
             find skills/iphone-use -type f -print | wc -l | tr -d '[:space:]'
@@ -212,7 +214,7 @@ jobs:
           listing = next(item for item in responses if item.get("id") == 2)
           tools = listing["result"]["tools"]
           names = [tool["name"] for tool in tools]
-          assert len(names) == 31, names
+          assert len(names) == 37, names
           for required in (
               "phone_run_steps",
               "phone_hold",
@@ -461,3 +463,35 @@ jobs:
             browser-use-bridge-macos-universal.tar.gz
             browser-use-bridge-macos-universal.tar.gz.sha256
           retention-days: 7
+
+  # List the release in the official MCP Registry (registry.modelcontextprotocol.io).
+  # GitHub OIDC proves the io.github.leeguooooo namespace, so no secret is
+  # needed. server.json carries the version release.sh bumped. A registry
+  # outage must not fail a release that already shipped, hence continue-on-error.
+  publish-mcp-registry:
+    name: Publish to the MCP Registry
+    needs: build-macos
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-14
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check server.json matches the tag
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          have="$(python3 -c 'import json; print(json.load(open("server.json"))["version"])')"
+          test "$have" = "$want" || { echo "server.json is $have, tag is $want" >&2; exit 1; }
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          brew install mcp-publisher
+          mcp-publisher login github-oidc
+          mcp-publisher publish
+          mcp-publisher logout

@@ -583,6 +583,84 @@ with `IPHONE_USE_URL=http://127.0.0.1:<port>` and that instance's
 Remove only that instance with `uninstall.sh --instance lab`. The default uninstall
 refuses while named instances remain.
 
+### Simulators (preview)
+
+The device runner also runs on an iOS Simulator, which needs no phone, no Apple ID and
+no signing. You need a Mac with Xcode and at least one iOS simulator runtime. The runner
+is built from the sources the installer keeps in `~/.iphone-use/runner` (or a checkout's
+`runner/` via `IPU_RUNNER_SRC`); `--xctestrun` reuses a ready simulator build.
+
+```bash
+iphone-use simulators                       # name, runtime, state, UDID (--json too)
+iphone-use simulator start "iPhone 16 Pro"  # or a UDID; --port N picks the runner port
+claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp   # once
+```
+
+That is the whole development loop: one command and the agent drives the simulator, and
+the live view is at `http://127.0.0.1:<daemon port>/phone`. Any MCP client works the same
+way: run `iphone-use-mcp` with `IPHONE_USE_INSTANCE=sim`.
+
+`start` does the following:
+
+1. Boots the simulator and waits for `simctl bootstatus`.
+2. Builds the runner for the simulator (unsigned, with its own derived data): with
+   `runner/build.sh --simulator` in a checkout, else `xcodebuild build-for-testing` on
+   the installed Xcode project.
+3. Starts the runner with
+   `xcodebuild test-without-building -destination id=<udid>` under a fresh runner token.
+4. Waits until the runner answers on `127.0.0.1:<port>`. The default port is the first
+   free one from 8200, and the MJPEG video port is that port + 1000.
+5. Starts a daemon for the simulator in the background (the first free port from 44331)
+   and waits until it listens. Its log is `simulator-daemon.log` in the instance dir.
+   With `--no-serve`, it prints the daemon command instead:
+
+```bash
+IPHONE_USE_INSTANCE=sim IPHONE_USE_SIMULATOR=<udid> \
+  IPHONE_USE_WDA_URL=http://127.0.0.1:8200 IPHONE_USE_WDA_MJPEG_URL=http://127.0.0.1:9200 \
+  IPHONE_USE_PORT=44331 iphone-use serve
+```
+
+The first simulator uses the instance `sim` (`~/.iphone-use/instances/sim`), so
+`IPHONE_USE_INSTANCE=sim` always reaches the simulator you started: `iphone-use-mcp` reads
+the daemon port from that dir's `simulator.json`. A second simulator started while `sim`
+is taken gets `sim-<first 8 of the UDID>`, and `--instance NAME` picks any name. The dir
+holds the runner token, logs and PID records. Neither process gets a launchd job. With
+`IPHONE_USE_SIMULATOR` set, the daemon changes how it handles these services:
+
+- Device logs, crash reports, simulated location, app install and uninstall, and the
+  installed-app inventory (`GET /agent/apps`, `launch_app` by name) go through `xcrun
+  simctl` instead of lockdown and devicectl.
+- Crash reports come from `~/Library/Logs/DiagnosticReports`. Only reports from that
+  simulator are included.
+- Install takes a simulator `.app` build. It refuses an `.ipa`.
+- Recording (`POST /agent/record`, `phone_record`) uses `simctl io recordVideo`, so it
+  needs no live H.264 stream. The summary says `"via":"simctl"` and has no frame count.
+- `device_state` is `booting` while the simulator boots and `shutdown` when it is off.
+- The daemon never manages the runner: `recovery_owner` is `external`.
+- Keep-awake and agent Do Not Disturb are off.
+- `/agent/status` says `"target":"simulator"`, `lock_readiness.verdict` is `"ready"`, and
+  `device` names the simulator and its runtime.
+
+`iphone-use simulator stop <name|udid>` stops the daemon and the runner, and frees the
+`sim` instance. It signals only the PIDs it recorded, after it checks the user, the start
+time and the exact command line. Add `--shutdown` to shut the simulator down too.
+
+`iphone-use setup --simulator <name|udid>` does the same as `simulator start` and skips
+the phone setup. The installer takes `--simulator <name>` too (`curl … install.sh | sh -s --
+--simulator "iPhone 16 Pro"`): after installing, it starts that simulator and registers an
+`iphone-sim` MCP server with Claude Code, and a failure fails the install. Without a phone
+plugged in, the installer's first run points at `simulator start`. `iphone-use doctor` adds one line with the available and booted
+simulators.
+
+The preview doesn't cover these yet:
+
+- `IPHONE_USE_TARGET` isn't stored in an instance plist: the simulator instance runs
+  without launchd, so it doesn't come back after a reboot (run `simulator start` again).
+- Live H.264 video from the runner hasn't been verified on a simulator (MJPEG and
+  recordings don't depend on it).
+- Simulators have no camera, App Store apps, real push notifications or Face ID (unless
+  you use `simctl` enrollment), so tasks that need those only work on a phone.
+
 ### Lifecycle and recovery
 
 `/agent/status` is the source of truth. `recovery_owner` is `daemon` for managed

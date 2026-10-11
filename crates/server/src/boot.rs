@@ -17,6 +17,8 @@ pub struct StateInputs<'a> {
     pub mjpeg_url: String,
     pub managed_wda: bool,
     pub managed_wda_pending: bool,
+    /// `IPHONE_USE_SIMULATOR`: the simulator this daemon drives (preview).
+    pub simulator: Option<Arc<crate::simulator::Simulator>>,
 }
 
 /// The daemon's state, as `iphone-use serve` and the embedded daemon build it.
@@ -35,6 +37,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
         auth_limiter: Arc::new(Mutex::new(http::AuthLimiter::new())),
         agent_token: inputs.cfg.agent_token.clone(),
         device_udid: inputs.cfg.device_udid.clone(),
+        simulator: inputs.simulator,
         inbox: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         wda: match crate::wda::WdaClient::new(inputs.wda_url) {
             Ok(c) => {
@@ -147,6 +150,7 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
         mjpeg_url: format!("http://127.0.0.1:{}", options.runner_mjpeg_port),
         managed_wda: false,
         managed_wda_pending: false,
+        simulator: None,
     });
 
     // The runner mints pairing codes for the iPhone app on this same phone
