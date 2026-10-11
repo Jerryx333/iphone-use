@@ -308,7 +308,7 @@ pub fn observed(json: &Value) -> Option<String> {
     }
     let mut out = vec![head];
     if no_scroll_progress {
-        out.push("Content did not move in the scroll direction (only values changed). The gesture may have reached a boundary, landed in another region, or been blocked by an overlay. Check a screenshot before deciding; do not keep scrolling blindly. This does not mean the list has been fully read.".to_string());
+        out.push("No element in the accessibility tree moved, appeared or disappeared; the only changes were values or numbers redrawn in place (a clock, a counter). The gesture may have reached a boundary, landed in another region, or been blocked by an overlay. Check a screenshot before deciding; do not keep scrolling blindly. This does not mean the list has been fully read.".to_string());
     }
     if let Some(delta) = json.get("delta") {
         let indexed = |key: &str| -> Vec<(u64, Value)> {
@@ -767,9 +767,8 @@ mod tests {
             .next()
             .unwrap()
             .contains(" · NO SCROLL PROGRESS"));
-        assert!(
-            text.contains("Content did not move in the scroll direction (only values changed).")
-        );
+        assert!(text.contains("No element in the accessibility tree moved, appeared or disappeared;"));
+        assert!(!text.contains("only values changed"));
         assert!(text.contains("Check a screenshot before deciding; do not keep scrolling blindly."));
         assert!(text.contains("This does not mean the list has been fully read."));
     }

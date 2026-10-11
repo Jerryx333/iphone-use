@@ -6371,16 +6371,11 @@ fn mark_no_scroll_progress(
         _ => None,
     };
     if direction.is_some_and(|(dx, dy)| {
-        crate::scroll_progress::scroll_anchor_progress(baseline, current, dx, dy).is_some_and(
-            |(moved, still, common)| {
-                !moved
-                    && match report.reason {
-                        SettleReason::Stable => report.settled && still == common && still >= 1,
-                        SettleReason::BudgetExhausted => {
-                            still >= UNSETTLED_SCROLL_MIN_STILL_ANCHORS && still == common
-                        }
-                        SettleReason::ObservationFailed => false,
-                    }
+        crate::scroll_progress::scroll_without_progress(baseline, current, dx, dy).is_some_and(
+            |still| match report.reason {
+                SettleReason::Stable => report.settled && still >= 1,
+                SettleReason::BudgetExhausted => still >= UNSETTLED_SCROLL_MIN_STILL_ANCHORS,
+                SettleReason::ObservationFailed => false,
             },
         )
     }) {
@@ -17825,6 +17820,46 @@ mod tests {
             &report,
         );
         assert!(body.get("no_scroll_progress").is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_not_flagged_for_moved_buttons_or_paged_swap() {
+        // Button rows scrolled under a fixed title, and a paged feed whose
+        // author/caption were replaced in place while chrome stayed.
+        let title = delta_row("StaticText", "Settings", 50.0);
+        let mut baseline = vec![title.clone()];
+        let mut current = vec![title];
+        for i in 0..5 {
+            baseline.push(delta_row("Button", &format!("Row {i}"), 100.0 + i as f64 * 44.0));
+            current.push(delta_row("Button", &format!("Row {i}"), 56.0 + i as f64 * 44.0));
+        }
+        let chrome = vec![
+            delta_row("StaticText", "For You", 60.0),
+            delta_row("Button", "Like", 500.0),
+            delta_row("Button", "Share", 580.0),
+        ];
+        let mut feed_before = chrome.clone();
+        feed_before.push(delta_row("StaticText", "@alice", 700.0));
+        feed_before.push(delta_row("StaticText", "Sunset at the beach", 740.0));
+        let mut feed_after = chrome;
+        feed_after.push(delta_row("StaticText", "@bob", 700.0));
+        feed_after.push(delta_row("StaticText", "Three-minute noodles", 740.0));
+        for (before, after) in [(&baseline, &current), (&feed_before, &feed_after)] {
+            for reason in [SettleReason::Stable, SettleReason::BudgetExhausted] {
+                let mut report = SettleReport::new(1000);
+                report.reason = reason;
+                report.settled = true;
+                let mut body = serde_json::json!({});
+                mark_no_scroll_progress(
+                    &mut body,
+                    &serde_json::json!({"type":"scroll","dy":100}),
+                    before,
+                    after,
+                    &report,
+                );
+                assert!(body.get("no_scroll_progress").is_none());
+            }
+        }
     }
 
     #[test]

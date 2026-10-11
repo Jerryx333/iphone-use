@@ -631,29 +631,6 @@ impl DaemonClient {
         read_response(req.send().await?).await
     }
 
-    /// Use the same remembered read as observed input, without replacing an explicit token.
-    fn list_body_with_snapshot(&self, path: &str, body: &serde_json::Value) -> serde_json::Value {
-        let mut body = body.clone();
-        if !matches!(path, "/agent/collect" | "/agent/scroll_find") {
-            return body;
-        }
-        let Some(object) = body
-            .as_object_mut()
-            .filter(|object| !object.contains_key("snapshot"))
-        else {
-            return body;
-        };
-        if let Some(snapshot) = self
-            .last_snapshot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            object.insert("snapshot".into(), snapshot.clone().into());
-        }
-        body
-    }
-
     /// A swiping list call (`/agent/collect`, `/agent/scroll_find`): several
     /// reads and swipes in one request, so it gets the batch budget — the
     /// daemon answers within its own 80 s deadline.
@@ -662,7 +639,6 @@ impl DaemonClient {
         path: &str,
         body: &serde_json::Value,
     ) -> anyhow::Result<DaemonResponse> {
-        let body = self.list_body_with_snapshot(path, body);
         let req = self
             .auth(self.client.post(self.url(path)))
             .timeout(ACTIONS_TIMEOUT)
@@ -1431,35 +1407,6 @@ mod tests {
             std::thread::sleep(delay);
         });
         (format!("http://{addr}"), task)
-    }
-
-    #[test]
-    fn collect_auto_snapshot_both_tools_and_explicit_token() {
-        let client = DaemonClient::new("http://127.0.0.1:44321", None);
-        for path in ["/agent/collect", "/agent/scroll_find"] {
-            let body = serde_json::json!({"label":"Target"});
-            assert_eq!(client.list_body_with_snapshot(path, &body), body);
-        }
-        client.remember_snapshot(Some(&serde_json::json!({"snapshot":"last"})));
-        for path in ["/agent/collect", "/agent/scroll_find"] {
-            let body = serde_json::json!({"label":"Target"});
-            assert_eq!(
-                client.list_body_with_snapshot(path, &body)["snapshot"],
-                "last"
-            );
-            for token in [
-                serde_json::json!("explicit"),
-                serde_json::json!(""),
-                serde_json::Value::Null,
-            ] {
-                let explicit = serde_json::json!({"snapshot":token});
-                assert_eq!(client.list_body_with_snapshot(path, &explicit), explicit);
-            }
-        }
-        assert_eq!(
-            client.list_body_with_snapshot("/other", &serde_json::json!({})),
-            serde_json::json!({})
-        );
     }
 
     #[test]
