@@ -4,6 +4,10 @@ version = "0.17.18"
 edition = "2021"
 description = "MCP stdio server that wraps the iphone-use daemon's agent HTTP API"
 
+[lib]
+name = "iphone_use_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "iphone-use-mcp"
 path = "src/main.rs"

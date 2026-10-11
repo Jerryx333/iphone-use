@@ -77,6 +77,8 @@ pub struct Setup {
     interactive_lock: Option<InteractiveLock>,
     /// Set when the phone takes the legacy (iOS 15/16) path.
     legacy_ios: Option<LegacyRun>,
+    /// The on-phone daemon library linked into the runner (see `embed`).
+    embed: Option<super::embed::EmbedLib>,
 }
 
 /// A phone on the legacy (iOS 15/16) path: see `legacy_ios`.
@@ -148,6 +150,7 @@ impl Setup {
             over_tunnel: false,
             interactive_lock: None,
             legacy_ios: None,
+            embed: None,
         }
     }
 
@@ -446,6 +449,7 @@ impl Setup {
         self.prerequisites()?;
         self.resolve_device()?;
         let source_hash = self.runner_source()?;
+        self.embed = self.embed_library()?;
         let (deployment_override, sdk) = self.xcconfig()?;
         self.destination_fallback()?;
         self.legacy = Legacy::new(&self.ctx, &self.ctx.team_id, &self.ctx.bundle_id);
@@ -519,6 +523,7 @@ impl Setup {
                 &xcode_version,
                 sdk.as_deref().unwrap_or(""),
                 &deployment_override,
+                &super::embed::cache_component(self.embed.as_ref()),
             ),
             icon::cache_component(self.icon_source.as_deref())
         );
@@ -818,6 +823,45 @@ impl Setup {
             ));
         }
         Ok(hash)
+    }
+
+    /// The on-phone daemon library to link, if any (never fails setup: a
+    /// missing one builds the plain runner).
+    fn embed_library(&mut self) -> Step<Option<super::embed::EmbedLib>> {
+        let inputs = super::embed::Inputs {
+            embed: &self.ctx.embed,
+            embed_lib: &self.ctx.embed_lib,
+            runner_src: &self.ctx.runner_src,
+            keepalive: self.ctx.keepalive,
+        };
+        let log = self.rel("embed-build.log");
+        let home = self.ctx.home.clone();
+        let mut stopped = None;
+        let (lib, line) = super::embed::resolve(&inputs, |repo| {
+            info("Building the on-phone daemon library (scripts/build-ios-embed.sh) ...");
+            let _ = std::fs::write(&log, b"");
+            match proc::run_logged(
+                Path::new("/usr/bin/env"),
+                &super::embed::build_argv(repo, &home),
+                Some(repo),
+                &log,
+                &XcconfigEnv::default(),
+            ) {
+                Ok(built) => built,
+                Err(exit) => {
+                    stopped = Some(exit);
+                    false
+                }
+            }
+        });
+        if let Some(exit) = stopped {
+            return Err(exit);
+        }
+        match &lib {
+            Some(lib) => ok(&format!("{line} (sha256 {})", &lib.sha256[..12])),
+            None => info(&line),
+        }
+        Ok(lib)
     }
 
     /// Returns (deployment override, SDK version).
@@ -1360,8 +1404,12 @@ impl Setup {
             "-allowProvisioningUpdates".into(),
             format!("DEVELOPMENT_TEAM={}", signing.team),
             format!("PRODUCT_BUNDLE_IDENTIFIER={}", signing.bundle),
-            "build-for-testing".into(),
         ];
+        let mut extra = extra.to_vec();
+        if let Some(lib) = &self.embed {
+            extra.push(super::embed::xcodebuild_setting(lib));
+        }
+        extra.push("build-for-testing".into());
         let Ok(args) = runner::project_argv(&self.ctx, &extra) else {
             self.validation_error =
                 format!("build-for-testing failed (log: {})", build_log.display());
@@ -1664,6 +1712,28 @@ impl Setup {
         ))
     }
 
+    /// The on-phone daemon's credentials and listen address for the runner's
+    /// environment (each name behind `prefix`). Generated once per instance
+    /// and kept in its state dir; never logged.
+    fn phone_daemon_env(&self, prefix: &str) -> Step<Vec<(String, String)>> {
+        let Ok(credentials) = crate::phone_daemon::load_or_create(self.ctx.state_dir()) else {
+            return die("could not store the on-phone daemon's credentials in the state dir");
+        };
+        let host = self.ctx.daemon_host.trim();
+        let host = if host.is_empty() {
+            None
+        } else if crate::phone_daemon::valid_host(host) {
+            Some(host)
+        } else {
+            warn(&format!(
+                "{} must be an IP address (got '{host}'); the on-phone daemon stays on 127.0.0.1",
+                crate::phone_daemon::HOST_ENV
+            ));
+            None
+        };
+        Ok(crate::phone_daemon::runner_env(&credentials, host, prefix))
+    }
+
     fn runner_session(&self) -> Option<String> {
         let udid = &self.ctx.udid;
         let auth = crate::runner_token::TokenSource::at(self.ctx.state_dir());
@@ -1696,13 +1766,19 @@ impl Setup {
         let Ok(token) = crate::runner_token::rotate(self.ctx.state_dir()) else {
             return die("could not store the device runner's launch token in the state dir");
         };
+        let mut env = vec![(
+            crate::runner_token::XCODEBUILD_TOKEN_ENV.to_string(),
+            token,
+        )];
+        env.extend(self.phone_daemon_env(crate::phone_daemon::XCODEBUILD_PREFIX)?);
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let Ok(spawned) = proc::spawn_detached_env(
             xcodebuild,
             &argv,
             Some(self.ctx.state_dir()),
             &self.ctx.run_log,
             Some(&self.xcconfig),
-            &[(crate::runner_token::XCODEBUILD_TOKEN_ENV, token.as_str())],
+            &env,
         ) else {
             return die(format!(
                 "xcodebuild did not become the exact expected runner process; no unverified PID was signalled.\n   Inspect {} and any listener before retrying.",
@@ -3247,8 +3323,40 @@ impl ProbeCount {
     }
 }
 
+/// A plain runner is enough only when this setup did not link the daemon.
+/// A supervisor that launched a different product must not pass handoff.
+fn handoff_daemon_ready(body: &[u8], expected: bool) -> bool {
+    if !expected {
+        return true;
+    }
+    let Ok(status) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let daemon = &status["value"]["daemon"];
+    daemon["linked"] == true && daemon["state"] == "serving"
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handoff_requires_the_linked_daemon_to_be_serving() {
+        use super::handoff_daemon_ready as ready;
+        assert!(ready(
+            br#"{"value":{"daemon":{"linked":true,"state":"serving"}}}"#,
+            true
+        ));
+        for body in [
+            br#"{"value":{"daemon":{"linked":false}}}"#.as_slice(),
+            br#"{"value":{"daemon":{"linked":true,"state":"failed"}}}"#,
+            br#"{"value":{"daemon":{"linked":true,"state":"not_started"}}}"#,
+            br#"{"value":{"ready":true}}"#,
+            b"invalid",
+        ] {
+            assert!(!ready(body, true), "unexpectedly accepted {body:?}");
+            assert!(ready(body, false), "plain runner setup stays compatible");
+        }
+    }
+
     #[test]
     fn an_ios_below_the_coredevice_floor_is_ios_too_old() {
         // Hardware: iPhone 12 mini, lockdownd ProductVersion 15.4.1, Xcode
@@ -3819,6 +3927,14 @@ impl Setup {
             ("WDA_TEAM_ID", ctx.team_id.clone()),
             ("WDA_BUNDLE_ID", ctx.bundle_id.clone()),
         ];
+        // A checkout/custom setup must keep using the explicitly selected
+        // engine after launchd takes over, rather than an older installed app.
+        if let Ok(binary) = std::env::var("IPHONE_USE_SETUP_BIN") {
+            if !binary.is_empty() {
+                let path = std::fs::canonicalize(&binary).unwrap_or_else(|_| PathBuf::from(binary));
+                pairs.push(("IPHONE_USE_SETUP_BIN", path.to_string_lossy().into_owned()));
+            }
+        }
         if ctx.runner_src != ctx.runner_default_src {
             pairs.push((
                 "IPU_RUNNER_SRC",
@@ -3829,6 +3945,11 @@ impl Setup {
         pairs.push(("MJPEG_PORT", ctx.mjpeg_port.clone()));
         pairs.push(("WDA_ALLOW_LAN", ctx.allow_lan.clone()));
         pairs.push(("WDA_TRANSPORT", ctx.transport.clone()));
+        // The on-phone daemon: the supervisor's relaunches must build and
+        // start the same runner as this run.
+        pairs.push(("IPU_EMBED", ctx.embed.clone()));
+        pairs.push(("IPU_EMBED_LIB", ctx.embed_lib.clone()));
+        pairs.push((crate::phone_daemon::HOST_ENV, ctx.daemon_host.clone()));
         if let Ok(icon) = std::env::var("WDA_RUNNER_ICON") {
             if !icon.is_empty() && icon != "auto" {
                 pairs.push(("WDA_RUNNER_ICON", icon));
@@ -3983,11 +4104,14 @@ impl Setup {
                     mjpeg_port,
                 )
                 && status::phase_is(&ctx.status_file, "ready")
-                && sys::runner_ok(
+                && sys::runner_get(
                     &format!("{target_url}/status"),
                     Duration::from_secs(4),
                     &self.ctx.runner_auth(),
                 )
+                .is_some_and(|(status, body)| {
+                    status < 400 && handoff_daemon_ready(&body, self.embed.is_some())
+                })
             {
                 ok("launchd replacement verified: runner identity, both loopback relays, and runner /status");
                 return Ok(());
@@ -4554,13 +4678,17 @@ impl Setup {
                         "could not store the device runner's launch token in the state dir",
                     );
                 };
+                let mut env = vec![(crate::runner_token::TOKEN_ENV.to_string(), token)];
+                env.extend(self.phone_daemon_env("")?);
+                let env: Vec<(&str, &str)> =
+                    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let Ok(spawned) = proc::spawn_detached_env(
                     &launcher,
                     &argv,
                     Some(self.ctx.state_dir()),
                     &self.ctx.run_log,
                     None,
-                    &[(crate::runner_token::TOKEN_ENV, token.as_str())],
+                    &env,
                 ) else {
                     return die("could not start the iOS 15/16 launcher");
                 };

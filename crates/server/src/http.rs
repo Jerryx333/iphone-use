@@ -956,6 +956,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/pair/new", post(pair_new))
         .route("/pair", get(pair_page).post(pair_submit))
         .route("/pair/probe", get(pair_probe))
+        .route("/browser/chrome", post(browser_chrome))
         // Browser control: one HTTP request per gesture, each with an explicit
         // ACK, alongside the MJPEG view.
         .route("/control", post(direct_control))
@@ -975,6 +976,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/collect", post(agent_collect))
         .route("/agent/scroll_find", post(agent_scroll_find))
         .route("/agent/flow/draft", get(agent_flow_draft))
+        .route("/agent/flow/record", get(agent_flow_record).post(agent_flow_record))
+        .route("/agent/flow/save", post(agent_flow_save))
+        .route("/agent/flows", get(agent_flows))
+        .route("/agent/flow/run", post(agent_flow_run))
+        .route("/agent/task", post(agent_task_start))
+        .route("/agent/task/:id", get(agent_task_get))
+        .route("/agent/task/:id/:verb", post(agent_task_act))
+        .route("/agent/tasks", get(agent_tasks))
         .route("/agent/reference", get(agent_reference))
         // Shortcuts RPC return path: the phone POSTs structured results here.
         // Safe GET only peeks; destructive consumption has an explicit,
@@ -995,6 +1004,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/owner", post(agent_owner))
         .route("/agent/prewarm", post(agent_prewarm))
         .route("/agent/login-link", post(agent_login_link))
+        .route("/agent/phone-daemon/pair", post(crate::phone_daemon::pair))
         .route("/agent/capabilities", get(agent_capabilities))
         .route("/agent/metrics", get(agent_metrics))
         .route("/agent/run", post(agent_run))
@@ -2827,8 +2837,10 @@ async fn agent_status(
     // Agent Do Not Disturb: whether it is on and the gate's last outcome with
     // its time, so a Shortcuts flash on a recording can be matched to it.
     let agent_focus = recover(state.agent_focus.lock()).status_json();
+    // The daemon inside the runner on the phone, as its last /status said.
+    let phone_daemon = crate::phone_daemon::status_json(wda);
     let body = format!(
-        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus}}}"#,
+        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -9417,6 +9429,16 @@ async fn direct_agent_action(
             let Some(bundle) = bundle else {
                 return WdaControlOutcome::Unsupported;
             };
+            // `fresh`: quit it first, so it opens on its first screen and not
+            // the page it was left on (recorded flows start there).
+            let fresh = value.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
+            if fresh {
+                if let Err(error) = w.terminate_app(&bundle).await {
+                    tracing::warn!("fresh launch: terminate {bundle} failed, launching as is: {error:#}");
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
             Some(w.launch_app(&bundle).await)
         }
         "tap" if value.get("label").is_some() => {
@@ -9685,21 +9707,32 @@ async fn direct_control(
         {
             return None;
         }
+        // A recording turns a person's coordinate tap into the element under
+        // the finger, read before the tap changes the screen.
+        let recorded_locator = if recording_tap(&state, &value) {
+            locate_tap(&mut client, &value).await
+        } else {
+            None
+        };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        Some(
-            wda_control_with_client(
-                &mut client,
-                &state.wda_actionable,
-                &value,
-                &mut detail,
-                false,
-            )
-            .await,
+        let outcome = wda_control_with_client(
+            &mut client,
+            &state.wda_actionable,
+            &value,
+            &mut detail,
+            false,
         )
+        .await;
+        Some((outcome, recorded_locator))
     })
     .await;
     let outcome = match outcome {
-        Ok(Some(outcome)) => outcome,
+        Ok(Some((outcome, recorded_locator))) => {
+            if outcome == WdaControlOutcome::Applied {
+                record_control_step(&state, &value, recorded_locator);
+            }
+            outcome
+        }
         Ok(None) => return wda_deadline_response(false),
         Err(_) => {
             let mark = *recover(dispatched.lock());
@@ -11031,6 +11064,7 @@ async fn agent_actions_inner(
     // a name that does not resolve refuses the whole batch with nothing sent.
     for step in &mut request.steps {
         if let AgentActionStep::Action { action, .. } = step {
+            fresh_launch_while_recording(&state, action);
             if let Err(refusal) = resolve_launch_app_action(&state, action).await {
                 return refusal;
             }
@@ -12835,6 +12869,7 @@ async fn agent_input_inner(
         return response;
     }
     let mut value = value;
+    fresh_launch_while_recording(&state, &mut value);
     if let Err(refusal) = resolve_launch_app_action(&state, &mut value).await {
         return refusal;
     }
@@ -13515,8 +13550,12 @@ fn record_flow_action(state: &AppState, action: &serde_json::Value, now: Instant
     let mut trail = recover(state.flow_trail.lock());
     if let Some(bundle) = &bundle {
         trail.launched(bundle, now);
+        let mut step = serde_json::json!({"kind":"launch_app","bundle":bundle});
+        if let Some(fresh) = action.get("fresh").and_then(serde_json::Value::as_bool) {
+            step["fresh"] = serde_json::json!(fresh);
+        }
         trail.record(
-            crate::flows::Converted::Step(serde_json::json!({"kind":"launch_app","bundle":bundle})),
+            crate::flows::Converted::Step(step),
             now,
         );
     } else {
@@ -13679,19 +13718,385 @@ async fn agent_reference(State(state): State<Arc<AppState>>, headers: HeaderMap)
 /// flow v1 document plus a `todo` list. Typed text is never included; each
 /// typing step references a named input instead. 404 `no_trail` when nothing
 /// worth drafting has been recorded since the daemon started.
+/// Recording and a coordinate tap a person sent (not an element/label tap,
+/// which converts by itself).
+fn recording_tap(state: &AppState, value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("tap")
+        && value.get("element").is_none()
+        && value.get("label").is_none()
+        && recover(state.flow_trail.lock()).is_recording()
+}
+
+/// The locator of what a normalized `(x, y)` tap hits on the current screen.
+async fn locate_tap(client: &mut crate::wda::WdaClient, value: &serde_json::Value) -> Option<serde_json::Value> {
+    let x = value.get("x").and_then(serde_json::Value::as_f64)?;
+    let y = value.get("y").and_then(serde_json::Value::as_f64)?;
+    let (width, height) = client.window_size().await.ok()?;
+    let rows = client.elements().await.ok()?;
+    crate::flows::locator_at(&rows, x * width, y * height)
+}
+
+/// A person's applied control message, into an active recording.
+fn record_control_step(state: &AppState, value: &serde_json::Value, locator: Option<serde_json::Value>) {
+    let mut trail = recover(state.flow_trail.lock());
+    if !trail.is_recording() {
+        return;
+    }
+    let converted = match locator {
+        Some(locator) => crate::flows::Converted::Step(serde_json::json!({"kind": "tap_locator", "locator": locator})),
+        None => crate::flows::convert_action(value, None),
+    };
+    trail.record(converted, Instant::now());
+}
+
+fn agent_json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    with_security_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+/// The agent bearer token, or the session cookie the iPhone app holds (it
+/// pairs and renews a session, like the web page). Writes still need
+/// `X-Phone-Control`, which a cross-site form cannot send.
+fn agent_auth_refusal(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    if is_authed(state, headers) && !state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
+        crate::timing::authenticated();
+        return None;
+    }
+    match agent_auth(state, headers) {
+        AgentAuth::Locked => Some(with_security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+        )),
+        AgentAuth::Denied => Some(with_security_headers(
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        )),
+        AgentAuth::Ok => None,
+    }
+}
+
+/// `GET /agent/flow/record` — whether a recording runs and its draft so far.
+/// `POST /agent/flow/record {"action": "start" | "stop"}` — start one (every
+/// step applied through `/control`, `/agent/input` or `/agent/actions` lands
+/// in it, a person's coordinate taps as the element under the finger), or
+/// stop it and answer its draft.
+async fn agent_flow_record(
+    State(state): State<Arc<AppState>>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if method == axum::http::Method::GET {
+        let trail = recover(state.flow_trail.lock());
+        return agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "recording": trail.is_recording(),
+                "steps": trail.recording_steps(),
+                "draft": trail.recording_draft(),
+            }),
+        );
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let action = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("action").and_then(serde_json::Value::as_str).map(str::to_string));
+    let mut trail = recover(state.flow_trail.lock());
+    match action.as_deref() {
+        Some("start") => {
+            trail.start_recording();
+            agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "recording": true}))
+        }
+        Some("stop") => {
+            let draft = trail.stop_recording();
+            agent_json_response(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "recording": false, "draft": draft}),
+            )
+        }
+        _ => agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "invalid_action", "hint": "send {\"action\": \"start\"} or {\"action\": \"stop\"}"}),
+        ),
+    }
+}
+
+/// `POST /agent/flow/save {"id": "app/name", "name": …, "description"?: …,
+/// "flow"?: {…}}` — install a flow into this daemon's local store, where
+/// schedules and tasks find it. Without `flow`, the running or last recording,
+/// else the current trail's draft, is saved. Never publishes anywhere.
+async fn agent_flow_save(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return agent_json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok": false, "error": "invalid_json"}));
+    };
+    let Some(id) = request.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+        return agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "id_required", "hint": "an id like \"myapp/daily-check\""}),
+        );
+    };
+    let flow = match request.get("flow") {
+        Some(flow) => Some(flow.clone()),
+        None => {
+            let mut trail = recover(state.flow_trail.lock());
+            let draft = trail.stop_recording().or_else(|| trail.draft());
+            draft.and_then(|draft| draft.get("flow").cloned())
+        }
+    };
+    let Some(mut flow) = flow else {
+        return agent_json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"ok": false, "error": "no_trail", "hint": "record first (POST /agent/flow/record {\"action\":\"start\"}) or send \"flow\""}),
+        );
+    };
+    for key in ["name", "description"] {
+        if let Some(value) = request.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
+            flow[key] = value.clone();
+        }
+    }
+    let result = tokio::task::spawn_blocking(move || save_local_flow(&id, &flow)).await;
+    match result {
+        Ok(Ok(saved)) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "saved": saved})),
+        Ok(Err(error)) => agent_json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"ok": false, "error": "invalid_flow", "message": format!("{error:#}")}),
+        ),
+        Err(error) => agent_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"ok": false, "error": "save_failed", "message": error.to_string()}),
+        ),
+    }
+}
+
+/// `GET /agent/flows[?app=<bundle or name>]` — the flows this daemon can run
+/// (registry and local), as `iphone-use-mcp flow list --json` prints them.
+async fn agent_flows(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    let filter = iphone_use_mcp::registry::ListFilter {
+        category: query.get("category").cloned(),
+        app: query.get("app").cloned(),
+        verified_only: false,
+    };
+    match iphone_use_mcp::registry::list(&filter) {
+        Ok((entries, index)) => agent_json_response(
+            StatusCode::OK,
+            iphone_use_mcp::registry::list_json(&entries, &index, None),
+        ),
+        Err(error) => agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok": true, "flows": [], "note": format!("{error:#}")}),
+        ),
+    }
+}
+
+/// `POST /agent/flow/run {"id": "app/flow", "inputs"?: {"k": "v"}, "confirm"?: bool}`
+/// — run a flow this daemon can see (registry or local) in this process, as
+/// the caller's owner (`X-Phone-Owner`, else `flow-run`), and answer its
+/// result. `confirm` is required for a flow that sends, pays or deletes.
+async fn agent_flow_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return agent_json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok": false, "error": "invalid_json"}));
+    };
+    let Some(id) = request.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+        return agent_json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok": false, "error": "id_required"}));
+    };
+    let Some(scheduler) = crate::schedules::current() else {
+        return agent_json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok": false, "error": "not_ready"}),
+        );
+    };
+    let owner = headers
+        .get("x-phone-owner")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("flow-run")
+        .to_string();
+    let inputs: Vec<String> = request
+        .get("inputs")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+        .collect();
+    let confirm = request.get("confirm").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let daemon = scheduler.self_client(&owner);
+    match iphone_use_mcp::flow::run_for_task(&daemon, &id, &inputs, confirm).await {
+        Ok((succeeded, value)) => agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({"ok": succeeded, "result": value}),
+        ),
+        Err(error) => agent_json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"ok": false, "error": "flow_not_run", "message": format!("{error:#}")}),
+        ),
+    }
+}
+
+/// `POST /agent/task` — hand the daemon a goal (docs/agent-task.md). 202 with
+/// the task id; 409 `task_running` while another task runs.
+async fn agent_task_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let mut request: iphone_use_mcp::task::TaskRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return agent_json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok": false, "error": "invalid_request", "message": error.to_string()}),
+            )
+        }
+    };
+    if request.app.is_none() {
+        request.app = crate::app_lookup::starting_app(&request.goal);
+        request.app_fresh = request.app.is_some();
+    }
+    request.return_bundle = headers
+        .get("x-task-return-bundle")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 200 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .map(str::to_string);
+    let Some(scheduler) = crate::schedules::current() else {
+        return agent_json_response(StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({"ok": false, "error": "not_ready"}));
+    };
+    match iphone_use_mcp::task::start(request, |owner| scheduler.self_client(owner)) {
+        Ok(id) => agent_json_response(StatusCode::ACCEPTED, serde_json::json!({"ok": true, "id": id, "status": "running"})),
+        Err(iphone_use_mcp::task::StartError::Busy(id)) => agent_json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"ok": false, "error": "task_running", "id": id}),
+        ),
+        Err(iphone_use_mcp::task::StartError::Invalid(message)) => agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "invalid_request", "message": message}),
+        ),
+    }
+}
+
+/// `GET /agent/task/<id>[?since=n]` (`current` for the running or last task).
+async fn agent_task_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    let since = query.get("since").and_then(|v| v.parse().ok());
+    match iphone_use_mcp::task::get(&id, since) {
+        Some(mut task) => {
+            task["ok"] = serde_json::json!(true);
+            agent_json_response(StatusCode::OK, task)
+        }
+        None => agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+    }
+}
+
+/// `POST /agent/task/<id>/confirm {"approve": bool}` and `POST /agent/task/<id>/cancel`.
+async fn agent_task_act(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, verb)): axum::extract::Path<(String, String)>,
+    body: String,
+) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let result = match verb.as_str() {
+        "confirm" => {
+            let approve = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("approve").and_then(serde_json::Value::as_bool));
+            let Some(approve) = approve else {
+                return agent_json_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"ok": false, "error": "invalid_request", "message": "send {\"approve\": true|false}"}),
+                );
+            };
+            iphone_use_mcp::task::answer(&id, approve)
+        }
+        "cancel" => iphone_use_mcp::task::cancel(&id),
+        "pause" => iphone_use_mcp::task::pause(&id, true),
+        "resume" => iphone_use_mcp::task::pause(&id, false),
+        _ => return agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+    };
+    match result {
+        Ok(()) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true})),
+        Err("not_found") => agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
+        Err(error) => agent_json_response(StatusCode::CONFLICT, serde_json::json!({"ok": false, "error": error})),
+    }
+}
+
+/// `GET /agent/tasks` — the running task and the last ones, newest first.
+async fn agent_tasks(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    agent_json_response(StatusCode::OK, iphone_use_mcp::task::list())
+}
+
+/// Validate and install `flow` as local flow `id` (the same check and store as
+/// `iphone-use-mcp flow add`).
+fn save_local_flow(id: &str, flow: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let bytes = serde_json::to_vec_pretty(flow)?;
+    iphone_use_mcp::flow::parse_flow(&bytes, id)?;
+    let dir = tempfile::Builder::new().prefix("flow-save").tempdir()?;
+    let file = dir.path().join("flow.json");
+    std::fs::write(&file, &bytes)?;
+    iphone_use_mcp::registry::add(&file, id)
+}
+
 async fn agent_flow_draft(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
     }
     let draft = recover(state.flow_trail.lock()).draft();
     let (status, body) = match draft {
@@ -16398,6 +16803,16 @@ async fn resolve_launch_app_action(
         );
     }
     Ok(())
+}
+
+/// While recording, an app launch starts the app fresh (on its first screen),
+/// as the recorded flow will when it replays.
+fn fresh_launch_while_recording(state: &AppState, action: &mut serde_json::Value) {
+    if action.get("type").and_then(serde_json::Value::as_str) == Some("launch_app")
+        && recover(state.flow_trail.lock()).is_recording()
+    {
+        action["fresh"] = serde_json::json!(true);
+    }
 }
 
 fn agent_apps_json(status: StatusCode, body: serde_json::Value) -> Response {
@@ -20055,6 +20470,9 @@ mod tests {
         assert!(!INDEX_HTML.contains("turn-creds"));
         assert!(!INDEX_HTML.contains("RTCPeerConnection"));
         assert!(INDEX_HTML.contains("id=\"flowPanel\""));
+        // Pairing the app with the daemon on its own phone.
+        assert!(INDEX_HTML.contains("id=\"pairSelf\""));
+        assert!(INDEX_HTML.contains("'/agent/phone-daemon/pair'"));
         // Lock readiness: the daemon's own hint for phones that will lock.
         assert!(INDEX_HTML.contains("id=\"lockNotice\""));
         assert!(INDEX_HTML.contains("status?.lock_readiness"));
@@ -20321,6 +20739,44 @@ mod tests {
 
     fn readiness_test_state() -> Arc<AppState> {
         fixture_app_state(None)
+    }
+
+    #[test]
+    fn flow_draft_accepts_the_apps_session_without_leaking_to_anonymous_callers() {
+        block(async {
+            let state = fixture_app_state(Some("synthetic-password"));
+            {
+                let mut trail = recover(state.flow_trail.lock());
+                let now = Instant::now();
+                trail.launched("com.apple.Preferences", now);
+                trail.record(crate::flows::Converted::Step(serde_json::json!({"kind":"launch_app","bundle":"com.apple.Preferences"})), now);
+                trail.record(crate::flows::Converted::Step(serde_json::json!({"kind":"tap_locator","locator":{"label":"电池"}})), now);
+            }
+            assert_eq!(agent_flow_draft(State(state.clone()), HeaderMap::new()).await.status(), StatusCode::UNAUTHORIZED);
+            let mut invalid = HeaderMap::new();
+            invalid.insert(header::COOKIE, HeaderValue::from_static("phone_session=invalid"));
+            assert_eq!(agent_flow_draft(State(state.clone()), invalid).await.status(), StatusCode::UNAUTHORIZED);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, HeaderValue::from_str(&make_session_cookie(&state, false)).unwrap());
+            let response = agent_flow_draft(State(state), headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let draft: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(draft["flow"]["app"], "com.apple.Preferences");
+        });
+    }
+
+    #[test]
+    fn recorded_launch_keeps_its_reset_choice_for_later_replay() {
+        for fresh in [Some(true), Some(false), None] {
+            let state = fixture_app_state(None);
+            let mut action = serde_json::json!({"type":"launch_app","bundle":"com.apple.Preferences"});
+            if let Some(fresh) = fresh { action["fresh"] = serde_json::json!(fresh); }
+            record_flow_action(&state, &action, Instant::now());
+            record_flow_action(&state, &serde_json::json!({"type":"tap","label":"电池"}), Instant::now());
+            let draft = recover(state.flow_trail.lock()).draft().unwrap();
+            assert_eq!(draft["flow"]["steps"][0].get("fresh"), action.get("fresh"));
+        }
     }
 
     /// A synthetic WDA on loopback that the test owns and shuts down.
@@ -22132,4 +22588,25 @@ mod unlock_before_action_tests {
         assert!(!should_unlock_before_action(Some(false), LockReport::Unknown));
         assert!(!should_unlock_before_action(None, LockReport::Unlocked));
     }
+}
+
+/// Independent encrypted Chrome grant: HTTP session credentials never unlock it.
+async fn browser_chrome(axum::Json(raw): axum::Json<serde_json::Value>) -> Response {
+    #[cfg(target_os = "macos")]
+    {
+        if raw.to_string().len()>512*1024 { return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"ok":false,"error":"request_too_large"}))).into_response(); }
+        let result=tokio::task::spawn_blocking(move || {
+            let file=ipu_browser_session::desktop::default_scope_file()?;
+            let home=std::env::var_os("HOME").ok_or("home_unavailable")?;
+            let sites=std::path::PathBuf::from(home).join(".chrome-use/sites");
+            ipu_browser_session::desktop::handle(&file,&sites,&raw,std::path::Path::new("chrome-use"))
+        }).await;
+        match result {
+            Ok(Ok(value))=>axum::Json(value).into_response(),
+            Ok(Err(code))=>(StatusCode::BAD_REQUEST,axum::Json(serde_json::json!({"ok":false,"error":code}))).into_response(),
+            Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,axum::Json(serde_json::json!({"ok":false,"error":"chrome_bridge_unavailable"}))).into_response(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _=raw; (StatusCode::NOT_IMPLEMENTED,axum::Json(serde_json::json!({"ok":false,"error":"chrome_requires_paired_mac"}))).into_response() }
 }

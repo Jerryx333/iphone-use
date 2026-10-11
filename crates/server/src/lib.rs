@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod advice;
 pub mod app_lookup;
+pub mod boot;
 pub mod apps;
 pub mod collect;
 pub mod config;
@@ -20,6 +21,7 @@ pub mod logcap;
 pub mod login;
 pub mod metrics;
 pub mod pairing;
+pub mod phone_daemon;
 pub mod prewarm;
 pub mod protocol;
 pub mod redaction;

@@ -298,6 +298,10 @@ pub enum PhoneStep {
         bundle: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app: Option<String>,
+        /// Quit the app first so it opens on its first screen, not the page
+        /// it was left on (flows recorded on the phone start there).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fresh: bool,
         #[serde(default)]
         after_ms: u64,
     },
@@ -2465,6 +2469,7 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
             PhoneStep::LaunchApp {
                 bundle: None,
                 app: Some(app),
+                fresh,
                 after_ms,
             } => {
                 validate_after(after_ms)?;
@@ -2474,10 +2479,11 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
                         "steps[{index}].app must be an app name of 1 to 100 characters; no action was sent"
                     ));
                 }
-                action_step(
-                    serde_json::json!({"type":"launch_app","app":app}),
-                    after_ms,
-                )
+                let mut action = serde_json::json!({"type":"launch_app","app":app});
+                if fresh {
+                    action["fresh"] = serde_json::json!(true);
+                }
+                action_step(action, after_ms)
             }
             PhoneStep::LaunchApp {
                 bundle: None,
@@ -2496,6 +2502,7 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
             PhoneStep::LaunchApp {
                 bundle: Some(bundle),
                 app: None,
+                fresh,
                 after_ms,
             } => {
                 validate_after(after_ms)?;
@@ -2509,10 +2516,13 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
                         "steps[{index}].bundle must be a valid reverse-DNS identifier up to 200 bytes; no action was sent"
                     ));
                 }
-                action_step(
-                    serde_json::json!({"type":"launch_app","bundle":bundle}),
-                    after_ms,
-                )
+                {
+                    let mut action = serde_json::json!({"type":"launch_app","bundle":bundle});
+                    if fresh {
+                        action["fresh"] = serde_json::json!(true);
+                    }
+                    action_step(action, after_ms)
+                }
             }
             PhoneStep::Back { after_ms } => {
                 validate_after(after_ms)?;
@@ -3674,10 +3684,20 @@ mod tests {
         let request = phone_steps_request(vec![PhoneStep::LaunchApp {
             bundle: Some("com.example.SampleApp".to_string()),
             app: None,
+            fresh: false,
             after_ms: 500,
         }])
         .unwrap();
         assert_eq!(request["steps"][0]["action"]["type"], "launch_app");
+        assert!(request["steps"][0]["action"].get("fresh").is_none(), "only when asked");
+        let fresh = phone_steps_request(vec![PhoneStep::LaunchApp {
+            bundle: Some("com.example.SampleApp".to_string()),
+            app: None,
+            fresh: true,
+            after_ms: 0,
+        }])
+        .unwrap();
+        assert_eq!(fresh["steps"][0]["action"]["fresh"], true);
         assert_eq!(
             request["steps"][0]["action"]["bundle"],
             "com.example.SampleApp"
@@ -3686,6 +3706,7 @@ mod tests {
         let error = phone_steps_request(vec![PhoneStep::LaunchApp {
             bundle: Some("not a bundle".to_string()),
             app: None,
+            fresh: false,
             after_ms: 0,
         }])
         .unwrap_err();
