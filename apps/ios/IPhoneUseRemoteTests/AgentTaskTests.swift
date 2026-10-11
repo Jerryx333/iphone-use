@@ -309,16 +309,37 @@ final class ModelsPayloadTests: XCTestCase {
         return String(decoding: try encoder.encode(payload), as: UTF8.self)
     }
 
-    /// Out of the box: public Zen, followed by Kilo without a key.
+    /// Out of the box: only the primary Zen model; fallback is opt-in.
     func testDefaultIsTheFreeTier() throws {
         let payload = ModelSettings().payload { _ in nil }
         XCTAssertEqual(try json(payload),
-                       #"{"assist":[{"base_url":"https://opencode.ai/zen/v1","format":"openai","key":"public","model":"big-pickle"},{"base_url":"https://api.kilo.ai/api/openrouter","format":"openai","key":"","model":"free"}]}"#)
+                       #"{"assist":[{"base_url":"https://opencode.ai/zen/v1","format":"openai","key":"public","model":"big-pickle"}]}"#)
+    }
+
+    func testFallbackRequiresExplicitChoiceAndSurvivesSaving() throws {
+        var settings = ModelSettings()
+        XCTAssertEqual(settings.payload { _ in nil }?.assist.count, 1)
+        settings.allowModelFallback = true
+        XCTAssertEqual(settings.payload { _ in nil }?.assist.count, 2)
+        let restored = try JSONDecoder().decode(ModelSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertTrue(restored.allowModelFallback)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any])
+        object.removeValue(forKey: "allowModelFallback")
+        let legacy = try JSONDecoder().decode(ModelSettings.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertFalse(legacy.allowModelFallback)
+        XCTAssertEqual(legacy.assist, settings.assist)
+    }
+
+    func testMissingPrimaryCredentialDoesNotSelectAnotherService() {
+        var settings = ModelSettings()
+        settings.assist = [ModelProvider(kind: .anthropic), ModelProvider(kind: .free)]
+        XCTAssertNil(settings.payload { _ in nil })
     }
 
     /// Everything set: the shape of docs/agent-task.md › Models, assist in the person's order.
     func testFullShapeMatchesTheContract() throws {
         var settings = ModelSettings()
+        settings.allowModelFallback = true
         let anthropic = ModelProvider(kind: .anthropic)
         let free = ModelProvider(kind: .free, model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
         settings.assist = [anthropic, free]
@@ -335,6 +356,7 @@ final class ModelsPayloadTests: XCTestCase {
 
     func testProvidersWithoutAKeyOrSwitchedOffAreLeftOut() throws {
         var settings = ModelSettings()
+        settings.allowModelFallback = true
         var off = ModelProvider(kind: .free)
         off.enabled = false
         let noKey = ModelProvider(kind: .openRouter)

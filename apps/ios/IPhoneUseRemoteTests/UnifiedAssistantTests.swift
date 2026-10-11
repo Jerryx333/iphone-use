@@ -106,6 +106,25 @@ final class UnifiedAssistantTests: XCTestCase {
         XCTAssertEqual(assistant.task?.state, .failed); XCTAssertEqual(reader.calls, 0); XCTAssertEqual(planner.calls, 0)
         XCTAssertTrue(assistant.message?.contains("不执行电脑") == true)
     }
+    func testInformationalPauseDoesNotBlockVoiceStopAndRestart() async throws {
+        let defaults = defaults(), app = AppModel(defaults: defaults), planner = FixturePlanner(), (workspace, _) = try await workspace()
+        let archive = file(), key = Data(repeating: 5, count: 32)
+        var task = UnifiedTask(goal: "Synthetic paused read", mode: .automatic, profileID: workspace.library.activeID)
+        task.phases = [.init(tool: .browser, goal: "Read fixture")]; task.state = .paused
+        struct Saved: Encodable { var task: UnifiedTask; var history: [UnifiedTask] = [] }
+        try AES.GCM.seal(JSONEncoder().encode(Saved(task: task)), using: SymmetricKey(data: key)).combined!.write(to: archive)
+        let assistant = UnifiedAssistant(app: app, workspace: workspace, defaults: defaults, file: archive, key: key, reasoning: planner)
+        XCTAssertNotNil(assistant.message)
+        let voice = UnifiedVoiceControl(assistant: assistant)
+        XCTAssertNil(voice.state.linkNote)
+        XCTAssertNil(voice.state.error)
+        await voice.stop()
+        XCTAssertFalse(voice.state.busy)
+        let accepted = await voice.start(goal: "Read new fixture")
+        XCTAssertTrue(accepted)
+        await assistant.stop()
+    }
+
     func testStoppedUnknownWriteCannotResumeRemainingPhases() async throws {
         let defaults = defaults(), app = AppModel(defaults: defaults), planner = FixturePlanner(), (workspace, reader) = try await workspace()
         let archive = file(), key = Data(repeating: 5, count: 32)

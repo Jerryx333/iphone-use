@@ -19,6 +19,11 @@ protocol AssistantVoiceAudio: AnyObject {
     func interrupt()
     func resume() throws
     func setSpeaker(_ value: Bool) throws
+    func diagnosticSnapshot() -> [String: Any]
+}
+
+extension AssistantVoiceAudio {
+    func diagnosticSnapshot() -> [String: Any] { [:] }
 }
 
 struct AssistantVoiceAudioError: LocalizedError {
@@ -77,6 +82,20 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
     var onPlaybackEnd: (() -> Void)?
     var onLevel: ((Float) -> Void)?
 
+    private var inputBuffers = 0
+    private var peakInput: Float = 0
+    private var recognitionEvents = 0
+    private var recognitionFailures = 0
+    private var ttsPackets = 0
+    private var scheduledFrames = 0
+    private var graphRestarts = 0
+    private var graphRecoveryStreak = 0
+    private var lastGraphRecoveryAt = Date.distantPast
+    private var graphRecovery: Task<Void, Never>?
+    func diagnosticSnapshot() -> [String: Any] {
+        let audio = AVAudioSession.sharedInstance()
+        return ["category": audio.category.rawValue, "mode": audio.mode.rawValue, "input_buffers": inputBuffers, "peak_input": peakInput, "recognition_events": recognitionEvents, "recognition_failures": recognitionFailures, "tts_packets": ttsPackets, "scheduled_frames": scheduledFrames, "graph_restarts": graphRestarts, "engine_running": engine.isRunning, "recognition_present": recognition != nil, "using_local_recognition": usingLocal, "input_ports": audio.currentRoute.inputs.map { $0.portType.rawValue }, "output_ports": audio.currentRoute.outputs.map { $0.portType.rawValue }, "output_volume": audio.outputVolume, "record_permission": audio.recordPermission == .granted, "speech_permission": SFSpeechRecognizer.authorizationStatus() == .authorized]
+    }
     private var engine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
     private var synthesizer = AVSpeechSynthesizer()
@@ -126,6 +145,29 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
                 self.rebuild()
             }
         }.store(in: &observations)
+        NotificationCenter.default.publisher(for: .AVAudioEngineConfigurationChange).sink { @Sendable [weak self] note in
+            let changed = note.object.map { ObjectIdentifier($0 as AnyObject) }
+            Task { @MainActor in
+                guard let self, changed == ObjectIdentifier(self.engine), self.active, !self.paused, !self.engine.isRunning else { return }
+                self.graphRecovery?.cancel()
+                let token = self.sessionID
+                self.graphRecovery = Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled, let self, self.active, !self.paused, self.sessionID == token, !self.engine.isRunning else { return }
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastGraphRecoveryAt) >= 12 { self.graphRecoveryStreak = 0 }
+                    self.lastGraphRecoveryAt = now
+                    self.graphRestarts += 1; self.graphRecoveryStreak += 1
+                    guard self.graphRecoveryStreak <= 3 else { self.onError?("音频设备反复改变，请重新连接通话。"); return }
+                    let pending = self.playback
+                    self.onStatus?("正在恢复音频设备", true)
+                    do { try self.restartConfiguredGraph() }
+                    catch { self.onError?("音频设备恢复失败，请重新连接通话。"); return }
+                    self.onStatus?(self.muted ? "麦克风已静音" : "正在听", false)
+                    if !pending.isEmpty { self.speak(pending) }
+                }
+            }
+        }.store(in: &observations)
         NotificationCenter.default.publisher(for: AVAudioSession.mediaServicesWereResetNotification).sink { @Sendable [weak self] _ in
             Task { @MainActor in self?.rebuild() }
         }.store(in: &observations)
@@ -149,6 +191,7 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
         muted = false
         paused = false
         retryCount = 0
+        graphRestarts = 0; graphRecoveryStreak = 0; lastGraphRecoveryAt = .distantPast
         preferLocal = true
         outputSpeaker = true
         do { try configureGraph(); listen() }
@@ -156,6 +199,7 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
     }
 
     private func configureGraph() throws {
+        synthesizer.usesApplicationAudioSession = true
         let audio = AVAudioSession.sharedInstance()
         try audio.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
         try audio.setActive(true)
@@ -165,6 +209,12 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
         try engine.inputNode.setVoiceProcessingEnabled(true)
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
+        try installCaptureTap()
+        engine.prepare()
+        try engine.start()
+    }
+
+    private func installCaptureTap() throws {
         let format = engine.inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw AssistantVoiceAudioError(message: "麦克风不可用，请检查音频设备。") }
         let sink = self.sink
@@ -180,12 +230,25 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
             Task { @MainActor in self?.receivedLevel(value) }
         }
         hasTap = true
-        engine.prepare()
-        try engine.start()
+    }
+    private func restartConfiguredGraph() throws {
+        guard active, !paused else { return }
+        stopRecognition()
+        interrupt()
+            let audio = AVAudioSession.sharedInstance()
+            try audio.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try audio.setActive(true)
+            if hasTap { engine.inputNode.removeTap(onBus: 0); hasTap = false }
+            try installCaptureTap()
+            engine.prepare()
+            try engine.start()
+            engine.inputNode.isVoiceProcessingInputMuted = muted
+            if !muted { listen() }
     }
 
     private func receivedLevel(_ value: Float) {
         guard active, !paused else { return }
+        inputBuffers += 1; peakInput = max(peakInput, value)
         let now = Date()
         if value > 0.015 { lastVoiceAt = now }
         if now.timeIntervalSince(lastLevelAt) > 0.1 {
@@ -199,6 +262,7 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
         active = false
         paused = false
         recovery?.cancel(); recovery = nil
+        graphRecovery?.cancel(); graphRecovery = nil
         stopRecognition()
         interrupt()
         engine.stop()
@@ -213,6 +277,7 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
     func pause() {
         paused = true
         recovery?.cancel(); recovery = nil
+        graphRecovery?.cancel(); graphRecovery = nil
         stopRecognition()
         interrupt()
         engine.stop()
@@ -299,6 +364,8 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
 
     private func recognized(_ text: String?, final: Bool, failure: Bool, token: UUID) {
         guard active, !paused, !muted, recognitionID == token else { return }
+        if text != nil { recognitionEvents += 1 }
+        if failure { recognitionFailures += 1 }
         if let text, !text.isEmpty {
             if (!playback.isEmpty || Date() < echoUntil), AssistantVoiceEchoGate.isEcho(text, playback: playback.isEmpty ? echoText : playback) {
                 if final { listen() }
@@ -387,7 +454,15 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
         playback = String(text.prefix(500))
         let token = playbackID
         let utterance = AVSpeechUtterance(string: playback)
-        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+        // Use the best already-installed Mandarin voice; never require an
+        // asset download to start a phone-only conversation.
+        utterance.voice = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language == "zh-CN" }
+            .sorted { $0.quality.rawValue > $1.quality.rawValue }.first
+            ?? AVSpeechSynthesisVoice(language: "zh-CN")
+        utterance.rate = min(AVSpeechUtteranceMaximumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * 1.15)
+        utterance.preUtteranceDelay = 0
+        utterance.postUtteranceDelay = 0
         let stream = AsyncStream<VoicePCM> { continuation in
             synthesizer.write(utterance) { @Sendable buffer in
                 guard let pcm = buffer as? AVAudioPCMBuffer else { continuation.finish(); return }
@@ -399,6 +474,7 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
             guard let self else { return }
             for await packet in stream {
                 guard !Task.isCancelled, self.playbackID == token else { return }
+                self.ttsPackets += 1
                 do { try self.schedule(packet.buffer, token: token) }
                 catch { self.interrupt(); self.onError?("语音播报失败，请重新连接通话。"); return }
             }
@@ -427,6 +503,7 @@ final class NativeAssistantVoiceAudio: AssistantVoiceAudio {
         guard status != .error, error == nil else { throw error ?? AssistantVoiceAudioError(message: "音频转换失败。") }
         guard output.frameLength > 0 else { return }
         outstanding += 1
+        scheduledFrames += Int(output.frameLength)
         player.scheduleBuffer(output, completionCallbackType: .dataPlayedBack) { @Sendable [weak self] _ in
             Task { @MainActor in
                 guard let self, self.playbackID == token else { return }

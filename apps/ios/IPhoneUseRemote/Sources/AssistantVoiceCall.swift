@@ -53,6 +53,8 @@ final class AssistantVoiceCall: ObservableObject {
         }
     }
 
+    func diagnosticAudioSnapshot() -> [String: Any] { audio.diagnosticSnapshot() }
+
     func start(agent: AgentController, deviceID: UUID) async {
         await start(phone: AssistantPhoneControl(agent: agent, deviceID: deviceID))
     }
@@ -346,7 +348,7 @@ final class AssistantVoiceCall: ObservableObject {
     private func current(_ token: UUID, _ session: UUID) -> Bool { active && !paused && generation == token && callID == session }
 
     nonisolated static func isStop(_ text: String) -> Bool {
-        ["停止", "停下", "停止任务", "停止操作", "取消任务", "别操作了", "先停一下"].contains(AssistantVoiceEchoGate.normalized(text))
+        ["停止", "停下", "停止任务", "停止当前任务", "取消当前任务", "停止现在的任务", "停止当前操作", "停止操作", "取消任务", "别操作了", "先停一下"].contains(AssistantVoiceEchoGate.normalized(text))
     }
     nonisolated static func isStatus(_ text: String) -> Bool {
         ["现在怎么样了", "做到哪了", "做完了吗", "任务进度", "现在什么进度"].contains(AssistantVoiceEchoGate.normalized(text))

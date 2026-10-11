@@ -4,6 +4,8 @@ import XCTest
 final class AssistantVoiceCallTests: XCTestCase {
     func testStopAcceptsSpeechPunctuationButDoesNotMatchAnInstructionContainingStop() {
         XCTAssertTrue(AssistantVoiceCall.isStop("停止。"))
+        XCTAssertTrue(AssistantVoiceCall.isStop("停止当前任务"))
+        XCTAssertTrue(AssistantVoiceCall.isStop("取消当前任务。"))
         XCTAssertTrue(AssistantVoiceCall.isStop(" 停止任务！ "))
         XCTAssertFalse(AssistantVoiceCall.isStop("打开设置，不要停止任务"))
         XCTAssertFalse(AssistantVoiceCall.isStop("搜索停止操作的方法"))

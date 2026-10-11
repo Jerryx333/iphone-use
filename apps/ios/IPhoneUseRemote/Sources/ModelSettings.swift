@@ -108,6 +108,8 @@ extension ModelProvider.Kind {
 struct ModelSettings: Codable, Equatable, Sendable {
     /// Off: send no `models`, so the daemon uses its own (a Mac's environment).
     var sendModels = true
+    /// Switching services requires an explicit choice in model settings.
+    var allowModelFallback = false
     /// Tried in this order; the first that answers is used.
     var assist: [ModelProvider] = [ModelProvider(kind: .zen), ModelProvider(kind: .free)]
     var jevModel = "jev-latest"
@@ -124,6 +126,7 @@ struct ModelSettings: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let fresh = ModelSettings()
         sendModels = try c.decodeIfPresent(Bool.self, forKey: .sendModels) ?? fresh.sendModels
+        allowModelFallback = try c.decodeIfPresent(Bool.self, forKey: .allowModelFallback) ?? false
         assist = try c.decodeIfPresent([ModelProvider].self, forKey: .assist) ?? fresh.assist
         jevModel = try c.decodeIfPresent(String.self, forKey: .jevModel) ?? fresh.jevModel
         textBaseURL = try c.decodeIfPresent(String.self, forKey: .textBaseURL) ?? fresh.textBaseURL
@@ -143,7 +146,9 @@ struct ModelSettings: Codable, Equatable, Sendable {
         func secret(_ account: String) -> String {
             (key(account) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        let assist: [ModelsPayload.Assist] = self.assist.compactMap { provider in
+        let enabled = self.assist.filter(\.enabled)
+        let selected = allowModelFallback ? enabled : Array(enabled.prefix(1))
+        let assist: [ModelsPayload.Assist] = selected.compactMap { provider in
             let base = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let model = provider.model.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = provider.requestKey(provider.needsKey ? secret(provider.keyAccount) : nil)

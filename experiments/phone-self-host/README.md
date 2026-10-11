@@ -133,3 +133,17 @@ python3 experiments/phone-self-host/mac-control.py --udid <UDID>
 - [LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN/tree/af3fd697803ada4ac2b8d518358f5ab0a534844c)：可测试的虚拟网络工具，引用其本地地址反射方案，版权与自定义许可证见 `THIRD-PARTY-NOTICES.txt`；未安装外部工具。
 - [Apple 后台执行说明](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time)：普通后台任务提供有限执行时间。
 - [Apple Network Extension 用途说明](https://developer.apple.com/documentation/technotes/tn3120-expected-use-cases-for-network-extension-packet-tunnel-providers)：自有 Network Extension 方案还需验证，不能把网络扩展当成任意后台服务。
+
+## 2026-10-12 语音验收与音色接入
+
+麦克风停止却显示已连接的问题已修复。手机记录显示音频引擎运行、识别收到事件；用户确认能回复、能操作，但任务报 API 错误。[失败状态](evidence/iphone14-voice-task-failed.json)保留任务失败与音频正常的区别，不包含原始语音、转写或密钥。相关模拟器回归 35 项通过；后续本地音色调整另经设备构建验证。
+
+本地朗读优先使用手机已安装的高质量普通话音色，语速参数为系统默认的 1.15 倍。改进版已安装到 iPhone 14，用户试听确认“语速合适，音色仍机械”。这不构成音色质量通过。
+
+后续准备接入[豆包双向流式语音合成](https://docs.volcengine.com/docs/DoubaoVoice/bidirectional-streaming-text-to-speech-websocket?lang=zh)。目前用户没有该服务授权，云端功能尚未实现、启用或计费。现有 `AssistantVoiceAudio` 协议提供开始、暂停、恢复、播报和立即打断入口；接入时保留原有本地识别与控制，云端播报沿用 PCM 播放及 generation 校验，避免打断后播放旧音频。手机直接连接语音服务，不依赖 Mac；云端音色需要互联网。授权保存在 Keychain，不写入日志或仓库；断网和服务失败回退到本地音色，并显示当前使用的引擎。
+
+接入验收需覆盖首包延迟、中文音色试听、连续对话、播报中打断、断网回退、旧音频丢弃及 API 错误；未经真机验证不宣称自然音色已交付。
+
+### 模型选择
+
+从 iPhone 14 读取的非密钥配置为 Zen / big-pickle 在前、Kilo / free 在后，两者原先均启用。原有执行链只返回最后一次失败，因此 Kilo 报错掩盖了主模型的失败。更新增加主模型选择和“失败时允许使用备用模型”开关，默认关闭跨服务切换，旧配置保留原有列表与顺序。模型选择规则 11 项、语音及统一助手 10 项回归通过；设备签名构建与安装成功。语音页面的“模型设置”可直接进入选择；开启备用后才发送整个模型列表。合成文本向 Zen / big-pickle 请求得到 HTTP 403，该桌面请求不能替代真机请求结果；模型可列出也不代表请求可用。

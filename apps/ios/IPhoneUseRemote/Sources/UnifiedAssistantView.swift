@@ -6,6 +6,8 @@ struct UnifiedAssistantView: View {
     @ObservedObject var workspace: BrowserWorkspace
     @StateObject private var assistant: UnifiedAssistant
     @State private var pairing = false
+    @State private var localSetup = false
+    @State private var voiceQAStarted = false
     @State private var models = false
     @State private var library = false
     @State private var flows = false
@@ -127,6 +129,32 @@ struct UnifiedAssistantView: View {
             }
             .onAppear { assistant.showBrowser = openBrowser; assistant.showAssistant = openAssistant; presentPhoneApproval() }
             .appOnChange(of: phoneApprovalKey) { _, _ in presentPhoneApproval() }
+            .task {
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("--voice-runtime-qa"), !voiceQAStarted {
+                    voiceQAStarted = true
+                    if #available(iOS 17.4, *) {
+                        do {
+                            guard await app.connectStandaloneControlIfReady(), let local = app.thisPhoneSession else { throw BrowserToolError.actionFailed("本机控制尚未就绪") }
+                            app.agent.targetID = local.id
+                            await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant))
+                            Task { @MainActor in
+                                for _ in 0..<1800 {
+                                    let call = app.voiceCall
+                                    let report: [String: Any] = ["schema": 1, "observed_at": ISO8601DateFormatter().string(from: Date()), "active": call.active, "connecting": call.connecting, "paused": call.paused, "muted": call.muted, "user_turns": call.messages.filter { $0.role == .user }.count, "assistant_turns": call.messages.filter { $0.role != .user }.count, "phone_available": assistant.phoneAvailable, "task_active": assistant.task?.active == true, "task_state": assistant.task?.state.rawValue ?? "none", "current_tool": assistant.current?.tool.rawValue ?? "none", "has_error": call.error != nil, "transcript_length": call.transcript.count, "thinking": call.thinking, "speaking": call.speaking, "audio": call.diagnosticAudioSnapshot()]
+                                    if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+                                        let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("voice-runtime-qa.json")
+                                        try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                                    }
+                                    if !call.active && !call.connecting { break }
+                                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                                }
+                            }
+                        } catch { app.toast = "语音验收启动失败，请检查本机服务。" }
+                    }
+                }
+                #endif
+            }
             .navigationTitle("助手")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -183,9 +211,10 @@ struct UnifiedAssistantView: View {
 }
 
 @MainActor
-private final class UnifiedVoiceControl: AssistantPhoneControlling {
+final class UnifiedVoiceControl: AssistantPhoneControlling {
     private weak var assistant: UnifiedAssistant?
     private var observation: AnyCancellable?
+    private weak var heldSession: DeviceSession?
     var onChange: (() -> Void)?
     init(assistant: UnifiedAssistant) {
         self.assistant = assistant
@@ -201,10 +230,15 @@ private final class UnifiedVoiceControl: AssistantPhoneControlling {
             "任务\(task.state.title)。当前工具：\(assistant.current?.tool.title ?? "核验结果")。下一步：\(assistant.next)。" + (assistant.message ?? task.reply ?? "")
         } ?? "当前没有正在执行的任务。"
         return .init(valid: true, connected: true, busy: assistant.task?.active == true, unifiedTools: true, assistantStatus: status,
-            task: snapshot, linkNote: assistant.message, error: assistant.message)
+            task: snapshot, linkNote: nil, error: (assistant.task?.state == .failed || assistant.task?.state == .needsReview) ? assistant.message : nil)
     }
     var models: [ModelsPayload.Assist] { assistant?.models ?? [] }
     func start(goal: String) async -> Bool { assistant?.start(goal) ?? false }
     func stop() async { await assistant?.stop() }
-    func disconnect() { onChange = nil; observation = nil }
+    func maintainConnection(_ enabled: Bool) {
+        heldSession?.voiceCallKeepsConnection = false
+        heldSession = enabled ? assistant?.local : nil
+        heldSession?.voiceCallKeepsConnection = enabled
+    }
+    func disconnect() { maintainConnection(false); onChange = nil; observation = nil }
 }
