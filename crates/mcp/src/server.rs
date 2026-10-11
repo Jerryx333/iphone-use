@@ -2083,7 +2083,9 @@ fn keep_codex_images(mut result: CallToolResult, codex_client: bool) -> CallTool
             Some(format!("{key}:{value}"))
         })
         .collect::<Vec<_>>();
-    result.content.push(Content::text(verdict.join(" ")));
+    if !verdict.is_empty() {
+        result.content.push(Content::text(verdict.join(" ")));
+    }
     result
 }
 
@@ -2995,6 +2997,13 @@ mod tests {
             serde_json::to_vec(&keep_codex_images(shaped.clone(), true)).unwrap(),
             serde_json::to_vec(&shaped).unwrap()
         );
+        // A structured body with no verdict keys adds no empty text block.
+        let mut bare = image_verdict_result();
+        bare.content.retain(|block| block.as_image().is_some());
+        bare.structured_content = Some(serde_json::json!({"rows": 3}));
+        let adapted = keep_codex_images(bare, true);
+        assert!(adapted.structured_content.is_none());
+        assert!(adapted.content.iter().all(|block| block.as_text().is_none()));
     }
 
     /// A misspelled or unsupported argument must fail loudly. Before this,
