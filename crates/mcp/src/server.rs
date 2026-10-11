@@ -661,9 +661,9 @@ impl PhoneHandler {
     async fn selector_failure_screenshot(
         &self,
         result: CallToolResult,
-        label_resolution_failed: bool,
+        label_resolution_failure: Option<crate::client::LabelResolutionFailureKind>,
     ) -> CallToolResult {
-        attach_selector_failure_screenshot(result, label_resolution_failed, || {
+        attach_selector_failure_screenshot(result, label_resolution_failure, || {
             self.daemon.screenshot(Some(800))
         })
         .await
@@ -1259,7 +1259,7 @@ impl PhoneHandler {
                 format!("tap_element #{element} failed: {e:#}."),
             ),
         };
-        let result = self.selector_failure_screenshot(result, false).await;
+        let result = self.selector_failure_screenshot(result, None).await;
         self.note_progress(guard, result)
     }
 
@@ -1281,7 +1281,7 @@ impl PhoneHandler {
         // The snapshot comes from the element read this call performs — never
         // a cached or borrowed baseline.
         let guard = self.progress_guard(&crate::hints::Action::TapLabel(&label));
-        let mut label_resolution_failed = false;
+        let mut label_resolution_failure = None;
         let result = match self.daemon.tap_label_observed(&label, observe).await {
             Ok(response) => {
                 daemon_action_result(&response, observe, &format!("tapped element: {label}"))
@@ -1293,7 +1293,9 @@ impl PhoneHandler {
             // request to the phone: what the first arm can claim is that no
             // MUTATION was dispatched, not that nothing was sent.
             Err(crate::client::TapLabelFailure::BeforeDispatch(e)) => {
-                label_resolution_failed = e.is::<crate::client::LabelResolutionFailure>();
+                label_resolution_failure = e
+                    .downcast_ref::<crate::client::LabelResolutionFailure>()
+                    .map(|failure| failure.kind);
                 not_sent_result(
                     "label_lookup_failed",
                     format!(
@@ -1311,7 +1313,7 @@ impl PhoneHandler {
             ),
         };
         let result = self
-            .selector_failure_screenshot(result, label_resolution_failed)
+            .selector_failure_screenshot(result, label_resolution_failure)
             .await;
         self.note_progress(guard, result)
     }
@@ -2029,7 +2031,7 @@ impl StructuredMode {
 /// Enrich selector failures without changing the original verdict.
 async fn attach_selector_failure_screenshot<F, Fut>(
     mut result: CallToolResult,
-    label_resolution_failed: bool,
+    label_resolution_failure: Option<crate::client::LabelResolutionFailureKind>,
     capture: F,
 ) -> CallToolResult
 where
@@ -2048,7 +2050,7 @@ where
                 )
             )
     });
-    if result.is_error != Some(true) || !(selector_refusal || label_resolution_failed) {
+    if result.is_error != Some(true) || !(selector_refusal || label_resolution_failure.is_some()) {
         return result;
     }
     // Same endpoint as phone_screenshot, including the daemon's redacted
@@ -2064,12 +2066,25 @@ where
             return result;
         }
     }
-    result.content.push(Content::text(
-        "Inspect the screenshot first. If the target is visible, use phone_tap with \
+    let ambiguous_hint = if label_resolution_failure
+        == Some(crate::client::LabelResolutionFailureKind::Ambiguous)
+        || result
+            .structured_content
+            .as_ref()
+            .is_some_and(|body| body["error"] == "ambiguous_element_label")
+    {
+        "Several elements match the label: pick the intended candidate's index from \
+         phone_elements and call phone_tap_element with that index and the same snapshot. "
+    } else {
+        ""
+    };
+    result.content.push(Content::text(format!(
+        "Inspect the screenshot first. {ambiguous_hint}If the target is identified only visually, \
+             use phone_tap with \
              normalized coordinates (x = pixel x / image width, y = pixel y / image height). \
              If it is occluded, dismiss the covering UI first. Do not repeatedly retry \
              label taps with different wording.",
-    ));
+    )));
     result
 }
 
@@ -3047,7 +3062,7 @@ mod tests {
         });
         let mut original = CallToolResult::error(vec![Content::text("original error")]);
         original.structured_content = Some(body.clone());
-        let result = block(handler_for(&url).selector_failure_screenshot(original, false));
+        let result = block(handler_for(&url).selector_failure_screenshot(original, None));
         task.join().unwrap();
         assert_eq!(result.structured_content, Some(body));
         assert_eq!(result.is_error, Some(true));
@@ -3085,7 +3100,7 @@ mod tests {
                 "ok": false, "error": "element_occluded", "retry_safe": true
             }));
             let result =
-                block(handler_for(&url).selector_failure_screenshot(original.clone(), false));
+                block(handler_for(&url).selector_failure_screenshot(original.clone(), None));
             task.join().unwrap();
             assert_eq!(result.structured_content, original.structured_content);
             assert_eq!(result.content[0], original.content[0]);
@@ -3114,7 +3129,7 @@ mod tests {
         ] {
             let mut original = CallToolResult::error(vec![Content::text(code)]);
             original.structured_content = Some(serde_json::json!({"ok": false, "error": code}));
-            let result = block(handler.selector_failure_screenshot(original.clone(), false));
+            let result = block(handler.selector_failure_screenshot(original.clone(), None));
             assert_eq!(result, original);
         }
         assert_eq!(
@@ -3127,7 +3142,10 @@ mod tests {
     fn selector_failure_screenshot_local_label_resolution_is_typed() {
         let (url, task) = scripted_daemon("200 OK", b"png fixture".to_vec());
         let original = not_sent_result("label_lookup_failed", "original lookup error".into());
-        let result = block(handler_for(&url).selector_failure_screenshot(original.clone(), true));
+        let result = block(handler_for(&url).selector_failure_screenshot(
+            original.clone(),
+            Some(crate::client::LabelResolutionFailureKind::NotFound),
+        ));
         task.join().unwrap();
         assert_eq!(result.structured_content, original.structured_content);
         assert_eq!(result.content[0], original.content[0]);
@@ -3135,13 +3153,16 @@ mod tests {
     }
 
     #[test]
-    fn selector_failure_screenshot_tap_label_local_failures() {
-        for elements in [
-            serde_json::json!([]),
-            serde_json::json!([
-                {"label": "Target", "kind": "Button"},
-                {"label": "Target", "kind": "Button"}
-            ]),
+    fn selector_failure_screenshot_ambiguous_tap_label_local_failures() {
+        for (elements, ambiguous) in [
+            (serde_json::json!([]), false),
+            (
+                serde_json::json!([
+                    {"label": "Target", "kind": "Button"},
+                    {"label": "Target", "kind": "Button"}
+                ]),
+                true,
+            ),
         ] {
             let (url, task) = scripted_daemon_sequence(vec![
                 (
@@ -3165,6 +3186,11 @@ mod tests {
             );
             task.join().unwrap();
             assert_eq!(result.is_error, Some(true));
+            let hint = &result.content.last().unwrap().as_text().unwrap().text;
+            assert_eq!(
+                hint.contains("intended candidate's index from phone_elements"),
+                ambiguous
+            );
             let body = result.structured_content.unwrap();
             assert_eq!(body["error"], "label_lookup_failed");
             assert_eq!(body["retry_safe"], true);
@@ -3251,7 +3277,7 @@ mod tests {
         let original = not_sent_result("element_not_found", "original".into());
         let result = block(attach_selector_failure_screenshot(
             original.clone(),
-            false,
+            None,
             || async { Ok(b"png".to_vec()) },
         ));
         assert_eq!(result.structured_content, original.structured_content);
@@ -3259,12 +3285,62 @@ mod tests {
         assert!(result.content[1].as_image().is_some());
         assert!(text_of(&result).contains("Do not repeatedly retry"));
     }
+
+    #[test]
+    fn selector_failure_screenshot_ambiguous_prefers_snapshot_bound_candidate() {
+        for code in ["ambiguous_element_label", "element_not_found"] {
+            let original = not_sent_result(code, "original".into());
+            let result = block(attach_selector_failure_screenshot(
+                original,
+                None,
+                || async { Ok(b"png".to_vec()) },
+            ));
+            let hint = &result.content.last().unwrap().as_text().unwrap().text;
+            let coordinate_tap = hint.find("use phone_tap with").unwrap();
+            if code == "ambiguous_element_label" {
+                let element_tap = hint.find("call phone_tap_element").unwrap();
+                let snapshot = hint.find("the same snapshot").unwrap();
+                assert!(hint.contains("intended candidate's index from phone_elements"));
+                assert!(element_tap < snapshot);
+                assert!(snapshot < coordinate_tap);
+            } else {
+                assert!(!hint.contains("phone_tap_element"));
+            }
+        }
+    }
+
+    #[test]
+    fn selector_failure_screenshot_ambiguous_local_hint() {
+        let original = not_sent_result("label_lookup_failed", "original".into());
+        let result = block(attach_selector_failure_screenshot(
+            original.clone(),
+            Some(crate::client::LabelResolutionFailureKind::Ambiguous),
+            || async { Ok(b"png".to_vec()) },
+        ));
+        assert_eq!(result.structured_content, original.structured_content);
+        let hint = &result.content.last().unwrap().as_text().unwrap().text;
+        assert!(hint.contains("intended candidate's index from phone_elements"));
+        assert!(hint.contains("call phone_tap_element with that index and the same snapshot"));
+    }
+
+    #[test]
+    fn selector_failure_screenshot_ambiguous_local_not_found_omits_hint() {
+        let result = block(attach_selector_failure_screenshot(
+            not_sent_result("label_lookup_failed", "original".into()),
+            Some(crate::client::LabelResolutionFailureKind::NotFound),
+            || async { Ok(b"png".to_vec()) },
+        ));
+        let hint = &result.content.last().unwrap().as_text().unwrap().text;
+        assert!(result.content[1].as_image().is_some());
+        assert!(!hint.contains("phone_tap_element"));
+    }
+
     #[test]
     fn selector_failure_screenshot_pure_unavailable_preserves_error() {
         let original = not_sent_result("element_occluded", "original".into());
         let result = block(attach_selector_failure_screenshot(
             original.clone(),
-            false,
+            None,
             || async { anyhow::bail!("unavailable") },
         ));
         assert_eq!(result.structured_content, original.structured_content);
@@ -3286,7 +3362,7 @@ mod tests {
             let original = not_sent_result(code, "original".into());
             let result = block(attach_selector_failure_screenshot(
                 original.clone(),
-                false,
+                None,
                 || async { panic!("must not capture") },
             ));
             assert_eq!(result, original);
@@ -3297,7 +3373,7 @@ mod tests {
         let original = not_sent_result("label_lookup_failed", "original".into());
         let result = block(attach_selector_failure_screenshot(
             original.clone(),
-            true,
+            Some(crate::client::LabelResolutionFailureKind::NotFound),
             || async { Ok(b"png".to_vec()) },
         ));
         assert_eq!(result.structured_content, original.structured_content);
@@ -3317,7 +3393,7 @@ mod tests {
             original.structured_content = Some(body.clone());
             let result = block(attach_selector_failure_screenshot(
                 original,
-                false,
+                None,
                 || async { Ok(b"png".to_vec()) },
             ));
             assert_eq!(result.structured_content, Some(body));
@@ -3330,7 +3406,7 @@ mod tests {
         let original = not_sent_result("element_not_visible", "original".into());
         let result = block(attach_selector_failure_screenshot(
             original.clone(),
-            false,
+            None,
             || std::future::pending(),
         ));
         assert_eq!(result.structured_content, original.structured_content);

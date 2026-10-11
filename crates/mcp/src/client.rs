@@ -201,9 +201,18 @@ fn outermost_match(elements: &[ElementSummary], matches: &[usize]) -> Option<usi
 }
 
 /// A valid tree had zero or multiple exact label matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LabelResolutionFailureKind {
+    NotFound,
+    Ambiguous,
+}
+
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub(crate) struct LabelResolutionFailure(String);
+#[error("{message}")]
+pub(crate) struct LabelResolutionFailure {
+    pub(crate) kind: LabelResolutionFailureKind,
+    message: String,
+}
 
 fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String)> {
     if label.trim().is_empty() {
@@ -234,9 +243,12 @@ fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String
             )
             .map(|hint| format!(" — {hint}"))
             .unwrap_or_default();
-            Err(LabelResolutionFailure(format!(
-                "no element matched the exact label '{label}'; no action was sent{hint}"
-            ))
+            Err(LabelResolutionFailure {
+                kind: LabelResolutionFailureKind::NotFound,
+                message: format!(
+                    "no element matched the exact label '{label}'; no action was sent{hint}"
+                ),
+            }
             .into())
         }
         [(index, _)] => Ok((*index, response.snapshot)),
@@ -254,12 +266,15 @@ fn unique_label_target(body: &str, label: &str) -> anyhow::Result<(usize, String
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            Err(LabelResolutionFailure(format!(
-                "ambiguous exact label '{label}' matched {} elements ({candidates}); \
-                 no action was sent — choose an element index from phone_elements and \
-                 call phone_tap_element with the same snapshot",
-                matches.len()
-            ))
+            Err(LabelResolutionFailure {
+                kind: LabelResolutionFailureKind::Ambiguous,
+                message: format!(
+                    "ambiguous exact label '{label}' matched {} elements ({candidates}); \
+                     no action was sent — choose an element index from phone_elements and \
+                     call phone_tap_element with the same snapshot",
+                    matches.len()
+                ),
+            }
             .into())
         }
     }
@@ -1609,15 +1624,21 @@ mod tests {
 
     #[test]
     fn selector_failure_screenshot_label_resolution_is_typed() {
-        for elements in [
-            serde_json::json!([]),
-            serde_json::json!([
-                {"label":"Target","kind":"Button"}, {"label":"Target","kind":"Button"}
-            ]),
+        for (elements, kind) in [
+            (serde_json::json!([]), LabelResolutionFailureKind::NotFound),
+            (
+                serde_json::json!([
+                    {"label":"Target","kind":"Button"}, {"label":"Target","kind":"Button"}
+                ]),
+                LabelResolutionFailureKind::Ambiguous,
+            ),
         ] {
             let body = serde_json::json!({"snapshot":"s1","elements":elements}).to_string();
             let error = unique_label_target(&body, "Target").unwrap_err();
-            assert!(error.is::<LabelResolutionFailure>());
+            assert_eq!(
+                error.downcast_ref::<LabelResolutionFailure>().unwrap().kind,
+                kind
+            );
         }
         assert!(!unique_label_target("invalid JSON", "Target")
             .unwrap_err()
