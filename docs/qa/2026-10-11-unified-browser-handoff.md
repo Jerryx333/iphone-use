@@ -88,3 +88,13 @@ App build 17 普通模式允许分支已通过。输入完整观察后仅提交�
 iOS 内嵌库的换行修复构建仍在隔离工作树运行，尚未安装，原稳定 `69829e8/libipu_embed.a` 保留。因此本次 App 允许验收使用更新后的 Mac 输入服务和原有手机嵌入服务，不能宣称全部手机服务已更新。
 
 另已定位并提交认证源码修复：`4a02197` 补充 Apple 登录字段的中文邮件占位符，并在完成响应后释放单次 CLI 的自身租约。其他所有者拒绝及传输结果未知时不提前释放，避免服务器可能仍在填写凭据。新增隔离 HTTP/合成占位符测试已排队，未操作真实凭据、未部署该认证修复。
+
+## 手机内嵌库更新与单 App 会话接管
+
+`db9897c` 的 iOS 静态库以部署目标 15.0 编译通过，耗时 36 分 45 秒，保存在 `~/.iphone-use/local-builds/db9897c/libipu_embed.a`；构建元数据及 SHA256 保存在同目录 `native-build.json`。旧 `69829e8` 稳定库未覆盖。该库只包含换行查询修复，不包含后续认证提交 `4a02197`。
+
+强制重建正常 runner 的 managed setup 返回 0，操作期间核验了 runner、relay、Mac drivable=true。supervisor 持久配置为新库路径、IPU_EMBED=1、IPU_DAEMON_HOST=127.0.0.1，原 plist 备份在同目录 `wda-original.plist`。日志 `/tmp/iphone-db9897c-managed-update.log`。
+
+后续读回发现正常服务因 Mac 空闲释放策略停止，故 setup 当时通过不能视为持续运行通过。准备恢复时已有 `codex-single-app` 租约并重连；用户明确答复让该会话继续占用，已停止所有手机操作和恢复请求。最后稳定物理验收仍是前述 App 允许任务；新库安装后的持续运行及任务复验交由单 App 会话窗口再核对。
+
+认证修复的隔离回归 `/tmp/iphone-auth-regression.log` 仍在运行，未部署该改动，也未操作真实凭据。
