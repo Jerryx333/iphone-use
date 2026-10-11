@@ -64,3 +64,13 @@ iPhone 17 当前通过 Wi-Fi 连接，用户没有 USB 线。确认允许分支�
 无需设备的检查：setup shim 15 项、客户端配置 7 项、agent-bench 检查通过。服务端/MCP 回归尝试在 rustup 代理阶段无输出；直接使用已安装工具链并跳过 sccache 后仍排队等待另一个 release 构建。本轮取消了自己的等待任务，没有计作回归通过。先前 886 项通过只对应 v0.17.18。
 
 iPhone 17 最后明确分配仍属于独立实验会话。尚未收到结束、normal supervisor/VPN 恢复及设备交还确认，因此没有操作手机或补跑允许分支。请求状态已存入 OCS；后续编译诊断消息存储成功但唤醒因 IPC ECONNREFUSED 失败，不能当作已读确认。
+
+## build 17 允许分支复测与换行查询修复
+
+2026-10-12 独立实验会话明确交还设备，报告正常 v0.17.19 ready、phone daemon serving，supervisor 稳定库及 loopback 配置保留。随后发现 Pocket Gamepad 会话同时安装/启动 App，已协调独占窗口；没有把这次前台切换算作助手缺陷。
+
+复测尚未提交新的流程任务。旧 QA 草稿值为 `\n0342e6。`。snapshot-bound 的输入框操作返回 `wda_pre_dispatch_failed`、`outcome=not_sent`、`retry_safe=true`。直接向同一原生 runner 做只读查询确认：NSPredicate 不能解析含原样换行的字符串；把换行写为 `\\n` 后，同一 TextField 查询返回一个匹配。
+
+已修改 `wda_predicate_literal`，在反斜杠和单引号之后转义 LF、CR、TAB，并添加多行值查询回归。本轮 Rust 回归及修复后的本地 CLI 构建还在运行，没有提前记录通过。现有文件存在大量旧格式差异，全文件 rustfmt check 未通过；本轮未扩大格式修改。
+
+手机临时交给 Pocket Gamepad 会话约 15 分钟；我的控制租约已释放，USB 观察 relay 已停止，未变更 VPN 或稳定嵌入库。等待对方明确结束后，用修复后的服务继续 App 的允许分支。证据目录 `/tmp/iphone17-build17-approval-evidence`。

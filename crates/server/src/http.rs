@@ -8559,7 +8559,17 @@ async fn tap_unique_locator(
 }
 
 fn wda_predicate_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    // NSPredicate rejects literal line breaks inside quoted strings. Source
+    // values can contain them (for example a multiline SwiftUI composer).
+    format!(
+        "'{}'",
+        value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
 }
 
 /// Build a fresh WDA element lookup for a strict agent locator.
@@ -20987,6 +20997,22 @@ mod tests {
             value,
             "type == 'XCUIElementTypeCell' AND (label == '保存到“文件”' OR name == '保存到“文件”') AND focused == 0 AND enabled == 1 AND visible == 1"
         );
+    }
+
+    #[test]
+    fn locator_wda_query_escapes_multiline_field_value() {
+        let locator: AgentElementLocator = serde_json::from_value(serde_json::json!({
+            "kind": "TextField", "label": "local-agent-goal",
+            "value": "\nQA\r\t'\\n"
+        }))
+        .unwrap();
+        let (using, query) = locator_wda_query(&locator).unwrap();
+        assert_eq!(using, "predicate string");
+        assert_eq!(
+            query,
+            "type == 'XCUIElementTypeTextField' AND (label == 'local-agent-goal' OR name == 'local-agent-goal') AND value == '\\nQA\\r\\t\\'\\\\n'"
+        );
+        assert!(!query.contains(['\n', '\r', '\t']));
     }
 
     #[test]
