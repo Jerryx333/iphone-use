@@ -19,6 +19,27 @@ private final class ZenCatalogFixture: URLProtocol, @unchecked Sendable {
 
 @MainActor
 final class ModelCatalogTests: XCTestCase {
+    func testLiveZenToolCheck() async throws {
+        guard ProcessInfo.processInfo.environment["ZEN_LIVE"] == "1" else { throw XCTSkip("Set TEST_RUNNER_ZEN_LIVE=1 for a synthetic public Zen tool-call check") }
+        try await ModelCatalog.check(ModelProvider(kind: .zen))
+    }
+
+    func testZenStreamReassemblesToolArgumentsAndRejectsTruncation() throws {
+        let stream = #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"browser_action","arguments":"{\"action\":"}}]}}]}"# + "\n" + #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"done\",\"explanation\":\"OK\"}"}}]},"finish_reason":"tool_calls"}]}"# + "\ndata: [DONE]\n"
+        let result = try ZenCompatibility.collapse(Data(stream.utf8))
+        let message = (result["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any]
+        let call = (message?["tool_calls"] as? [[String: Any]])?.first?["function"] as? [String: String]
+        XCTAssertEqual(call?["name"], "browser_action")
+        XCTAssertEqual(try BrowserModelClient.parse(call!["arguments"]!).action, .done)
+        XCTAssertThrowsError(try ZenCompatibility.collapse(Data(stream.replacingOccurrences(of: "data: [DONE]", with: "").utf8)))
+        XCTAssertThrowsError(try ZenCompatibility.collapse(Data("data: {\"error\":{\"message\":\"failed\"}}\ndata: [DONE]\n".utf8)))
+    }
+
+    func testZenCompatibilityDoesNotApplyToOtherServicesOrPersonalKeys() {
+        XCTAssertTrue(ZenCompatibility.matches("https://opencode.ai/zen/v1", key: "public"))
+        XCTAssertFalse(ZenCompatibility.matches("https://other.example/v1", key: "public"))
+        XCTAssertFalse(ZenCompatibility.matches("https://opencode.ai/zen/v1", key: "personal-key"))
+    }
     func testZenDiscoverySendsPublicToThePresetEndpoint() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ZenCatalogFixture.self]

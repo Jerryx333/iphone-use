@@ -457,6 +457,7 @@ struct Chat {
     free_models: tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// The free model that last answered, per gateway: tried first next time.
     free_pick: Mutex<std::collections::HashMap<String, String>>,
+    zen_session: String,
 }
 
 /// `free` (pick one) or a `…:free` model id: free models come and go and hit
@@ -485,6 +486,7 @@ impl Chat {
             chain,
             free_models: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             free_pick: Mutex::new(std::collections::HashMap::new()),
+            zen_session: zen_id("ses_", 13),
         }
     }
 
@@ -605,7 +607,7 @@ impl Chat {
         let base = endpoint.base_url.trim_end_matches('/');
         let image_b64 = image.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
         let media = image.map(image_media_type).unwrap_or("image/png");
-        let (url, body, anthropic) = match endpoint.format {
+        let (url, mut body, anthropic) = match endpoint.format {
             Format::Openai => {
                 let content = match &image_b64 {
                     Some(b64) => json!([
@@ -645,12 +647,29 @@ impl Chat {
                 )
             }
         };
+        let zen = !anthropic && base == "https://opencode.ai/zen/v1" && endpoint.key == "public";
+        if zen {
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({"include_usage": true});
+            body["tools"] = json!(["bash", "edit", "glob", "grep", "read"].map(|name| json!({
+                "type": "function", "function": {"name": name,
+                "description": "Not available. Never call this tool.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": false}}
+            })));
+        }
         let mut request = self
             .http
             .post(&url)
             .timeout(Duration::from_secs(60))
             .header("content-type", "application/json")
             .body(body.to_string());
+        if zen {
+            request = request.header("user-agent", "opencode/1.18.34")
+                .header("accept", "text/event-stream").header("x-opencode-client", "cli")
+                .header("x-opencode-project", "global").header("x-opencode-request", zen_id("req_", 16))
+                .header("x-session-id", &self.zen_session).header("x-opencode-session", &self.zen_session)
+                .header("x-session-affinity", &self.zen_session);
+        }
         if anthropic {
             request = request.header("x-api-key", &endpoint.key).header("anthropic-version", "2023-06-01");
         } else if !endpoint.key.is_empty() {
@@ -661,7 +680,7 @@ impl Chat {
         if !status.is_success() {
             bail!("{} answered HTTP {status}", endpoint.model);
         }
-        let value: Value = response.json().await?;
+        let value: Value = if zen { collapse_zen_text(&response.text().await?)? } else { response.json().await? };
         let text = if anthropic {
             value["content"]
                 .as_array()
@@ -678,6 +697,36 @@ impl Chat {
         }
         Ok(text)
     }
+}
+
+fn zen_id(prefix: &str, length: usize) -> String {
+    let mut bytes = vec![0; length];
+    for chunk in bytes.chunks_mut(8) { fill_id_bytes(chunk); }
+    format!("{prefix}{}", hex::encode(bytes))
+}
+
+/// A task expects JSON in text, never execution of the placeholder tools.
+fn collapse_zen_text(stream: &str) -> Result<Value> {
+    let mut text = String::new();
+    let mut finished = false;
+    let mut ended = false;
+    for line in stream.lines().filter_map(|line| line.strip_prefix("data:")) {
+        let line = line.trim();
+        if line == "[DONE]" { ended = true; break; }
+        let chunk: Value = serde_json::from_str(line)?;
+        if !chunk["error"].is_null() { bail!("Zen stream returned an error"); }
+        let Some(choice) = chunk["choices"].as_array().and_then(|choices| choices.first()) else { continue; };
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            if !matches!(reason, "stop") { bail!("Zen stream did not finish with text: {reason}"); }
+            finished = true;
+        }
+        if choice["delta"]["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()) {
+            bail!("Zen requested an unavailable tool");
+        }
+        if let Some(part) = choice["delta"]["content"].as_str() { text.push_str(part); }
+    }
+    if !ended || !finished { bail!("Zen stream ended before completion"); }
+    Ok(json!({"choices": [{"message": {"content": text}}]}))
 }
 
 fn image_media_type(bytes: &[u8]) -> &'static str {
@@ -1364,6 +1413,25 @@ pub fn plain_summary(status: Status, steps: usize, error: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zen_stream_requires_completion_and_rejects_tools_and_errors() {
+        let complete = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n";
+        assert_eq!(collapse_zen_text(complete).unwrap()["choices"][0]["message"]["content"], "OK");
+        assert!(collapse_zen_text(complete.split("data: [DONE]").next().unwrap()).is_err());
+        assert!(collapse_zen_text("data: {\"error\":{\"message\":\"overloaded\"}}\n").is_err());
+        assert!(collapse_zen_text("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{}]}}]}\ndata: [DONE]\n").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "real public Zen request with synthetic data"]
+    async fn zen_public_live_text() {
+        let chat = Chat::new(reqwest::Client::new(), &ModelsConfig::default());
+        let endpoint = AssistEndpoint { format: Format::Openai, base_url: "https://opencode.ai/zen/v1".into(), key: "public".into(), model: "big-pickle".into() };
+        let image = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP1sAAAAASUVORK5CYII=").unwrap();
+        let text = chat.ask_one(&endpoint, "Reply exactly OK. Never call tools.", "Synthetic connection test with a one-pixel image.", Some(&image), 256).await.unwrap();
+        assert_eq!(text.trim(), "OK");
+    }
 
     #[test]
     fn summary_keeps_control_state_and_static_values_without_field_contents() {

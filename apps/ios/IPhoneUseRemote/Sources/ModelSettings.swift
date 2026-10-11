@@ -71,7 +71,7 @@ extension ModelProvider.Kind {
     var detail: String {
         switch self {
         case .free: return String(localized: "Kilo Gateway 的免费模型，不用密钥；有频率限制")
-        case .zen: return String(localized: "自动使用 public，无需个人密钥。Zen 可能限制第三方客户端，请先检测连接。")
+        case .zen: return String(localized: "Zen 免费模型，public 已自动配置，无需个人密钥；有频率限制")
         case .openRouter: return String(localized: "用你自己的 OpenRouter 密钥；:free 模型不扣费")
         case .anthropic: return String(localized: "用你自己的 Anthropic 密钥")
         case .custom: return String(localized: "任何兼容 OpenAI 接口的服务：地址、密钥、模型")
@@ -109,7 +109,7 @@ struct ModelSettings: Codable, Equatable, Sendable {
     /// Off: send no `models`, so the daemon uses its own (a Mac's environment).
     var sendModels = true
     /// Tried in this order; the first that answers is used.
-    var assist: [ModelProvider] = [ModelProvider(kind: .free), ModelProvider(kind: .zen, enabled: false)]
+    var assist: [ModelProvider] = [ModelProvider(kind: .zen), ModelProvider(kind: .free)]
     var jevModel = "jev-latest"
     var textBaseURL = "https://openrouter.ai/api/v1"
     var textModel = "inception/mercury-2.5"
@@ -236,7 +236,7 @@ enum ModelSettingsStore {
             if settings.assist.count == 1, let first = settings.assist.first,
                first.kind == .free, first.baseURL == ModelProvider.Kind.free.defaultBaseURL,
                first.model == "free", first.enabled {
-                settings.assist.append(ModelProvider(kind: .zen, enabled: false))
+                settings.assist.insert(ModelProvider(kind: .zen), at: 0)
                 save(settings, to: defaults)
             }
             defaults.set(true, forKey: zenPresetKey)

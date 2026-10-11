@@ -85,3 +85,60 @@ func validateModelResponse(_ data: Data, response: URLResponse) throws {
         throw BrowserToolError.actionFailed(String(localized: "模型服务请求失败（\(code)），请检查模型设置后重试"))
     }
 }
+
+enum ZenCompatibility {
+    static func matches(_ base: String, key: String) -> Bool {
+        key == "public" && base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "https://opencode.ai/zen/v1"
+    }
+
+    static func prepare(_ request: inout URLRequest, body: inout [String: Any], session: String) {
+        request.setValue("opencode/1.18.34", forHTTPHeaderField: "User-Agent")
+        request.setValue("cli", forHTTPHeaderField: "x-opencode-client")
+        request.setValue("global", forHTTPHeaderField: "x-opencode-project")
+        request.setValue("req_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(), forHTTPHeaderField: "x-opencode-request")
+        for field in ["x-session-id", "x-opencode-session", "x-session-affinity"] { request.setValue(session, forHTTPHeaderField: field) }
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        body["stream"] = true
+        body["stream_options"] = ["include_usage": true]
+        var tools = body["tools"] as? [[String: Any]] ?? []
+        let names = Set(tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String })
+        for name in ["bash", "edit", "glob", "grep", "read"] where !names.contains(name) {
+            tools.append(["type": "function", "function": ["name": name, "description": "Not available. Never call this tool.", "parameters": ["type": "object", "properties": [:], "additionalProperties": false]]])
+        }
+        body["tools"] = tools
+    }
+
+    /// Buffer one decision, preserving native tool arguments across SSE fragments.
+    /// No operation is executed until the stream has ended successfully.
+    static func collapse(_ data: Data) throws -> [String: Any] {
+        var content = ""
+        var calls: [Int: [String: Any]] = [:]
+        var finished = false
+        var ended = false
+        for line in String(decoding: data, as: UTF8.self).components(separatedBy: .newlines) where line.hasPrefix("data:") {
+            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { ended = true; break }
+            guard let chunk = try JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any], chunk["error"] == nil else { throw BrowserToolError.invalidResult }
+            guard let choice = (chunk["choices"] as? [[String: Any]])?.first else { continue }
+            if let reason = choice["finish_reason"] as? String {
+                guard ["stop", "tool_calls"].contains(reason) else { throw BrowserToolError.invalidResult }
+                finished = true
+            }
+            let delta = choice["delta"] as? [String: Any] ?? [:]
+            content += delta["content"] as? String ?? ""
+            for call in delta["tool_calls"] as? [[String: Any]] ?? [] {
+                guard let index = call["index"] as? Int else { throw BrowserToolError.invalidResult }
+                var saved = calls[index] ?? ["type": "function"]
+                if let id = call["id"] { saved["id"] = id }
+                var function = saved["function"] as? [String: String] ?? [:]
+                if let piece = call["function"] as? [String: String] {
+                    for field in ["name", "arguments"] { function[field] = (function[field] ?? "") + (piece[field] ?? "") }
+                }
+                saved["function"] = function
+                calls[index] = saved
+            }
+        }
+        guard ended && finished else { throw BrowserToolError.invalidResult }
+        return ["choices": [["message": ["content": content, "tool_calls": calls.keys.sorted().compactMap { calls[$0] }]]]]
+    }
+}

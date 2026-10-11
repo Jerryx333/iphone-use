@@ -5,6 +5,7 @@ final class BrowserModelClient: BrowserReasoning {
     private let session: URLSession
     private var freeModels: [String: [String]] = [:]
     private var preferredModels: [String: String] = [:]
+    private let zenSession = "ses_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(26)
 
     init(session: URLSession? = nil) {
         self.session = session ?? URLSession(configuration: .ephemeral, delegate: BrowserModelRedirectGuard(), delegateQueue: nil)
@@ -88,10 +89,12 @@ final class BrowserModelClient: BrowserReasoning {
             body["tools"] = [["type": "function", "function": ["name": "browser_action", "description": "Take one browser action", "parameters": Self.actionSchema]]]
             body["tool_choice"] = ["type": "function", "function": ["name": "browser_action"]]
         }
+        let zen = !anthropic && ZenCompatibility.matches(provider.baseURL, key: provider.key)
+        if zen { ZenCompatibility.prepare(&request, body: &body, session: zenSession) }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
         try validateModelResponse(data, response: response)
-        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let object = zen ? try ZenCompatibility.collapse(data) : try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let answer: String?
         if anthropic {
             let calls = (object?["content"] as? [[String: Any]] ?? []).filter { $0["type"] as? String == "tool_use" }

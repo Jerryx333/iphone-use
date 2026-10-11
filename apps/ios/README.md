@@ -161,13 +161,15 @@ listed free models on the same service. Kilo discovery only selects models tagge
 enabled providers are tried in the configured order.
 
 Model settings include a searchable list fetched from the service and a connection check that
-requests a real tool call using synthetic data, without phone screenshots. Kilo's automatic
-free-model selection remains enabled by default. OpenCode Zen is preconfigured with
-`https://opencode.ai/zen/v1`, the public credential `public`, and `big-pickle`, but starts disabled:
-on 2026-10-11 its model list was accessible while inference returned HTTP 403 `FreeTierError`
-(free tier restricted to OpenCode). Check the connection before enabling it. A successful model
-listing alone does not establish task availability. The Zen picker shows free Chat Completions
-models; SystemOne and Responses models are excluded. Existing custom providers are preserved.
+requests a real tool call using synthetic data, without phone screenshots. OpenCode Zen is
+preconfigured with `https://opencode.ai/zen/v1`, the public credential `public`, and `big-pickle`,
+followed by Kilo's automatic free-model fallback. Public Zen requests use the client headers,
+session identifiers, placeholder tools and streaming format used by the Magpie Zen free plugin.
+Placeholder tools cannot execute: browser tasks accept only `browser_action`, and phone tasks
+accept text decisions. Truncated streams and stream errors fail before any action runs.
+A successful model listing alone does not establish task availability. The Zen picker shows
+free Chat Completions models; SystemOne and Responses models are excluded. Existing custom
+providers, provider order and explicitly disabled entries are preserved.
 
 Take Over pauses execution and lets you use the page; Continue reads the page again. Stop
 cancels the pending model request and rejects late answers. Backgrounding the app pauses

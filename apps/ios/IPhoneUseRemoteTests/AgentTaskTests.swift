@@ -300,11 +300,11 @@ final class ModelsPayloadTests: XCTestCase {
         return String(decoding: try encoder.encode(payload), as: UTF8.self)
     }
 
-    /// Out of the box: the free tier alone, with its key present and empty.
+    /// Out of the box: public Zen, followed by Kilo without a key.
     func testDefaultIsTheFreeTier() throws {
         let payload = ModelSettings().payload { _ in nil }
         XCTAssertEqual(try json(payload),
-                       #"{"assist":[{"base_url":"https://api.kilo.ai/api/openrouter","format":"openai","key":"","model":"free"}]}"#)
+                       #"{"assist":[{"base_url":"https://opencode.ai/zen/v1","format":"openai","key":"public","model":"big-pickle"},{"base_url":"https://api.kilo.ai/api/openrouter","format":"openai","key":"","model":"free"}]}"#)
     }
 
     /// Everything set: the shape of docs/agent-task.md › Models, assist in the person's order.
@@ -368,7 +368,7 @@ final class ModelsPayloadTests: XCTestCase {
         // The defaults are saved on first load: the same list comes back.
         let first = ModelSettingsStore.load(from: defaults)
         XCTAssertEqual(ModelSettingsStore.load(from: defaults), first)
-        XCTAssertEqual(first.assist.map(\.kind), [.free, .zen])
+        XCTAssertEqual(first.assist.map(\.kind), [.zen, .free])
         var settings = first
         settings.assist.append(ModelProvider(kind: .anthropic))
         settings.jevModel = "jev-2"
@@ -389,7 +389,7 @@ final class ModelsPayloadTests: XCTestCase {
         XCTAssertFalse(settings.assist[0].needsKey)
     }
 
-    func testUpgradeAddsDisabledZenOnceAndPreservesDeletion() throws {
+    func testUpgradeAddsZenOnceAndPreservesDeletion() throws {
         let suite = "test.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -397,9 +397,9 @@ final class ModelsPayloadTests: XCTestCase {
         old.assist = [ModelProvider(kind: .free)]
         ModelSettingsStore.save(old, to: defaults)
         let upgraded = ModelSettingsStore.load(from: defaults)
-        XCTAssertEqual(upgraded.assist[0], old.assist[0])
-        XCTAssertEqual(upgraded.assist.last?.kind, .zen)
-        XCTAssertEqual(upgraded.assist.last?.enabled, false)
+        XCTAssertEqual(upgraded.assist[1], old.assist[0])
+        XCTAssertEqual(upgraded.assist.first?.kind, .zen)
+        XCTAssertEqual(upgraded.assist.first?.enabled, true)
         ModelSettingsStore.save(old, to: defaults)
         XCTAssertEqual(ModelSettingsStore.load(from: defaults), old)
     }

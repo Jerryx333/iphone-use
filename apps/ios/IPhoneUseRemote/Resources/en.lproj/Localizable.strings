@@ -474,6 +474,7 @@
 "用你自己的 Anthropic 密钥" = "Your own Anthropic key";
 "任何兼容 OpenAI 接口的服务：地址、密钥、模型" = "Any OpenAI-compatible service: address, key, model";
 "自动使用 public，无需个人密钥。Zen 可能限制第三方客户端，请先检测连接。" = "Uses public automatically, without a personal key. Zen may restrict third-party clients; check the connection first.";
+"Zen 免费模型，public 已自动配置，无需个人密钥；有频率限制" = "Free Zen models, with public configured automatically. No personal key needed; rate limited.";
 "自动选择免费模型" = "Choose a free model automatically";
 "无需密钥" = "No key needed";
 "从服务选择模型" = "Choose a model from the service";
