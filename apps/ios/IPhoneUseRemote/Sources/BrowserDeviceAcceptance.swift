@@ -29,6 +29,13 @@ struct BrowserDeviceAcceptanceView: View {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let suite = "device-acceptance-" + UUID().uuidString
             let defaults = UserDefaults(suiteName: suite)!
+            let withPhone = UserDefaults.standard.bool(forKey: "browserAcceptancePhone")
+            if withPhone {
+                // Reuse only this phone's existing credential references; no production task/draft data.
+                let local = DeviceStore.load(from: .standard, hasCredentials: DeviceSession.hasCredentials).filter(\.isThisPhone)
+                guard !local.isEmpty else { throw BrowserToolError.actionFailed("合成跨工具验收需要本机已配对") }
+                DeviceStore.save(local, to: defaults)
+            }
             let app = AppModel(defaults: defaults); fixtureApp = app
             app.agent.settings = ModelSettings() // Only built-in free providers in a fresh suite.
             let key = Data((0..<32).map { UInt8($0) }) // Synthetic archive only.
@@ -45,15 +52,29 @@ struct BrowserDeviceAcceptanceView: View {
             workspace.browser.open(address.absoluteString)
             try await workspace.browser.waitUntilReady()
             let assistant = UnifiedAssistant(app: app, workspace: workspace, defaults: defaults, file: directory.appendingPathComponent(UUID().uuidString + ".enc"), key: key)
-            self.assistant = assistant; assistant.mode = .browser
-            guard assistant.start("在 Name 输入框填入 Phone Use，然后点击 Continue。段落显示 Form updated 后才完成。不要点击 Prompt fixture。") else { throw BrowserToolError.actionFailed("合成任务未启动") }
-            for _ in 0..<2400 {
+            self.assistant = assistant
+            if withPhone {
+                for _ in 0..<400 where !assistant.phoneAvailable { try await Task.sleep(for: .milliseconds(50)) }
+                guard assistant.phoneAvailable else { throw BrowserToolError.actionFailed("本机执行服务未连接") }
+            }
+            assistant.mode = withPhone ? .automatic : .browser
+            let goal = withPhone
+                ? "按三个步骤依次完成：1 在内置浏览器读取当前网页标题。2 用手机打开设置读取当前电池电量，不修改任何设置。3 回到内置浏览器，在 Name 输入框填入 Phone Use，点击 Continue，核验段落 Form updated，再合并网页标题与电量结果。不要点击 Prompt fixture。"
+                : "在 Name 输入框填入 Phone Use，然后点击 Continue。段落显示 Form updated 后才完成。不要点击 Prompt fixture。"
+            guard assistant.start(goal) else { throw BrowserToolError.actionFailed("合成任务未启动") }
+            for _ in 0..<(withPhone ? 7200 : 2400) {
                 if assistant.task?.state == .done || assistant.task?.state == .failed || assistant.task?.state == .paused || assistant.task?.state == .needsReview { break }
                 try await Task.sleep(for: .milliseconds(50))
             }
             let value = try await workspace.browser.webView.evaluateJavaScript("document.querySelector('input').value") as? String
             let paragraph = try await workspace.browser.webView.evaluateJavaScript("document.querySelector('p').textContent") as? String
-            let success = assistant.task?.state == .done && value == "Phone Use" && paragraph == "Form updated"
+            let tools = assistant.task?.phases.map { $0.tool.rawValue } ?? []
+            let nativeIDs = assistant.task?.phases.compactMap(\.nativeID) ?? []
+            let crossToolsVerified = !withPhone || (tools == ["browser", "phone", "browser"] && nativeIDs.count == 1)
+            let success = assistant.task?.state == .done && value == "Phone Use" && paragraph == "Form updated" && crossToolsVerified
+            report["cross_tools"] = .bool(withPhone)
+            report["phase_tools"] = .array(tools.map(JSONValue.string))
+            report["native_ids"] = .array(nativeIDs.map(JSONValue.string))
             report["success"] = .bool(success); report["state"] = .string(assistant.task?.state.rawValue ?? "none")
             report["field_value"] = .string(value ?? ""); report["paragraph"] = .string(paragraph ?? "")
             report["reply"] = .string(assistant.task?.reply ?? assistant.message ?? "")
