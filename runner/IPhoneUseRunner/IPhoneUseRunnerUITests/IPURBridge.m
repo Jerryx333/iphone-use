@@ -182,6 +182,7 @@ static void IPURNoopVoidMethod(Class cls, NSString *selectorName, NSMutableArray
 static BOOL IPURRequestCacheEnabled = NO;
 static NSArray *IPURCachedActive = nil;
 static id IPURCachedSystem = nil;
+static NSValue *IPURCachedScreenSize = nil;
 
 + (void)setRequestCacheEnabled:(BOOL)enabled
 {
@@ -189,6 +190,7 @@ static id IPURCachedSystem = nil;
   IPURRequestCacheEnabled = enabled;
   IPURCachedActive = nil;
   IPURCachedSystem = nil;
+  IPURCachedScreenSize = nil;
 }
 
 + (void)invalidateRequestCache
@@ -196,6 +198,7 @@ static id IPURCachedSystem = nil;
   if (!NSThread.isMainThread) return;
   IPURCachedActive = nil;
   IPURCachedSystem = nil;
+  IPURCachedScreenSize = nil;
 }
 
 static BOOL IPURUseRequestCache(void)
@@ -527,6 +530,42 @@ static NSDictionary *IPURRect(id snapshot)
     @"width": @(frame.size.width),
     @"height": @(frame.size.height),
   };
+}
+
+// A valid system frame is this device's screen and does not change: callers apply the
+// interface orientation from its short and long sides. So it is read once per runner launch
+// rather than once per request (a snapshot round trip before every touch). The UIKit fallback
+// is not kept, so a later call tries the system frame again.
+static CGSize IPURStableScreenSize;
+static BOOL IPURHasStableScreenSize = NO;
+
++ (CGSize)screenSizePoints
+{
+  @synchronized (self) {
+    if (IPURHasStableScreenSize) return IPURStableScreenSize;
+  }
+  if (IPURUseRequestCache() && IPURCachedScreenSize != nil) return IPURCachedScreenSize.CGSizeValue;
+  // Read the system root only: no foreground resolution (which itself needs screenCenter),
+  // children, or application content. UIKit's nativeBounds can be compatibility-sized too.
+  id system = [self systemApplicationElement];
+  id snapshot = system == nil ? nil : [self requestSnapshotForElement:system
+                                                            maxDepth:1 maxNodes:1 error:NULL];
+  CGRect frame = CGRectZero;
+  id value = IPURKVC(snapshot, @"frame");
+  if ([value isKindOfClass:NSValue.class] && strcmp([(NSValue *)value objCType], @encode(CGRect)) == 0) {
+    [(NSValue *)value getValue:&frame];
+  }
+  CGSize systemSize = IPURScreenSizeFromFrame(frame, CGSizeZero);
+  if (systemSize.width > 0) {
+    @synchronized (self) {
+      IPURStableScreenSize = systemSize;
+      IPURHasStableScreenSize = YES;
+    }
+    return systemSize;
+  }
+  CGSize size = UIScreen.mainScreen.bounds.size;
+  if (IPURUseRequestCache()) IPURCachedScreenSize = [NSValue valueWithCGSize:size];
+  return size;
 }
 
 static NSString *IPURBoolString(id snapshot, NSString *key, BOOL fallback)
@@ -873,7 +912,7 @@ static long long IPURTouchOrientation = 1;
 
 static CGPoint IPURTouchPoint(CGPoint point)
 {
-  return IPURPortraitPoint(point, IPURTouchOrientation, UIScreen.mainScreen.bounds.size);
+  return IPURPortraitPoint(point, IPURTouchOrientation, [IPURBridge screenSizePoints]);
 }
 
 static NSString *IPURCreateGestureRecord(NSString *name, int pid, id *record)

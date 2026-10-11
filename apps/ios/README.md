@@ -303,3 +303,11 @@ derived from HTTP login credentials. Requests/results use AES-GCM with separate
 contexts. Encrypted execution records precede Chrome execution, preventing blind
 replay after a crash. Keep pairing links private. The Mac daemon must run this
 version, with chrome-use and the selected site scripts installed.
+
+Languages: the source strings in the code are Chinese, and
+`Resources/en.lproj/Localizable.strings` translates them, keyed by the Chinese text. English is
+the development language, so a phone set to any language other than Chinese gets English.
+`zh-Hans.lproj/Localizable.strings` maps every key to itself and must keep the same keys as the
+English table; without it iOS would fall back to English on a Chinese phone. Text the daemon
+sends in both languages (`next_step`, lock-screen hints) follows the app's language
+(`AppLanguage`).

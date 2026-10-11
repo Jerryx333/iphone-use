@@ -35,7 +35,7 @@ passcode.
 | `device_state` | Meaning | What to do |
 |---|---|---|
 | `ready` + `drivable:true` | Drivable | Proceed with the task. |
-| `locked` | Phone is locked | Without a passcode the next `/agent/input` unlocks it first; with one, ask the operator to unlock it — only if the task needs the phone. While a session drives the phone it is kept from auto-locking (`PHONE_REMOTE_KEEP_AWAKE_SECS`). |
+| `locked` | Phone is locked | Without a passcode the next `/agent/input` unlocks it first; with one, ask the operator to unlock it — only if the task needs the phone. While a session drives the phone it is kept from auto-locking (`IPHONE_USE_KEEP_AWAKE_SECS`). |
 | `released` / `released:true` | Normal idle | Leave it unless the task needs the phone; then see *Reconnect* below. |
 | `releasing` | Release in progress | Do not reconnect or hold. Wait, then reassess, only if the task still needs it. |
 | reconnecting (`reconnecting:true`) | Bring-up running | If `setup_blocked_on` is set, follow `hint`; else report `setup_phase`/`setup_message` and poll. A first build after an Xcode update can take minutes. |
@@ -96,12 +96,12 @@ curl -s -H "$AUTH" -H "$MUTATION" -H 'Content-Type: application/json' \
   -X POST "$HOST/agent/mode" -d '{"mode":"agent"}'      # MCP: phone_reconnect
 ```
 
-The target is canonical: to switch devices, change `PHONE_REMOTE_UDID`, rerun
+The target is canonical: to switch devices, change `IPHONE_USE_UDID`, rerun
 setup, and restart the daemon. Never pass a one-off UDID. `503
 device_release_in_progress` (with `Retry-After`) means release already started.
 
 **Owner lease.** Name yourself on every state-changing request with
-`X-Phone-Owner: <session-name>` (MCP does it from `PHONE_REMOTE_OWNER`, else
+`X-Phone-Owner: <session-name>` (MCP does it from `IPHONE_USE_OWNER`, else
 `mcp-<pid>`). Status shows `owner` and `owner_lease_remaining_secs`. If `owner`
 is someone else, do not drive: control calls answer `409 phone_owned`. Never
 send `X-Phone-Owner-Takeover: 1` unless the user confirms the other session is
@@ -115,7 +115,11 @@ prevents idle release; it does not start WDA or prove readiness. Never use it
 to keep the phone ready without a task. Taking a hold extends your owner
 lease to cover it, so no other session can drive the phone during the pause.
 A live owner lease also prevents idle release; the idle window starts when you
-release it.
+release it. `"private":true` (MCP `phone_hold(secs, private=true)`) is for the
+person signing in: until the hold ends or is cleared nobody reads the screen —
+screenshots, `/agent/elements` and live video answer `423 screen_private`, open
+streams end, and status shows `screen_private_secs`. A later hold without
+`private` lifts it.
 
 **Pre-warm.** A released phone may already be coming back when you look:
 `warming:true` means the daemon started the bring-up ahead of time (MCP does
@@ -202,7 +206,7 @@ KeepAlive keeps the last concrete blocker while it re-checks).
 `{"reason":"relaunch_needs_person","because":"passcode"|"wifi_start_refused","hint":{zh,en}}`
 when idle release keeps a runner that is up because starting it again would need a
 person (a passcode phone, or the Wi-Fi case above). The screen still auto-locks; only
-the runner process stays. `PHONE_REMOTE_IDLE_RELEASE=force` on the daemon turns it off.
+the runner process stays. `IPHONE_USE_IDLE_RELEASE=force` on the daemon turns it off.
 - **`usb`**: the configured iPhone is neither on USB nor on its encrypted
   CoreDevice Wi-Fi tunnel (or `WDA_TRANSPORT=usb` requires the cable). Off the
   cable, setup and relaunch go through that tunnel on their own, with no flag;
@@ -261,13 +265,14 @@ only on a trusted network.
 |---|---|
 | `GET /agent/status` | `{ok, backend, device_state, screen_state, wda, wda_actionable, wda_locked, drivable, released, owner, hint, setup_blocked_on, setup_phase, setup_message, version, latest, update_available, lock_readiness, keep_runner_alive, device, …}` — gate on `drivable` |
 | `GET /agent/capabilities` | What this build supports + whether the phone is drivable now (`blocked_by`); touches nothing |
-| `GET /agent/elements` | UI as text: `{snapshot, elements:[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?}], ax_stats, alert?, registry?}`. `?since=<snapshot>` returns a `delta` `{added,changed,removed,unchanged}` (+ `app_changed`) instead of the full tree. With `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1` rows also carry `actions`, `selected`, `min`/`max` |
+| `GET /agent/elements` | UI as text: `{snapshot, elements:[{kind,label,identifier?,rect,depth,value?,enabled?,visible?,accessible?,focused?,placeholder?}], ax_stats, alert?, registry?}`. `?since=<snapshot>` returns a `delta` `{added,changed,removed,unchanged}` (+ `app_changed`) instead of the full tree. With `IPHONE_USE_ELEMENTS_AFFORDANCES=1` rows also carry `actions`, `selected`, `min`/`max` |
 | `GET /agent/screenshot` | Device PNG. `?max_side=1200` shrinks it (~0.9k image tokens instead of ~1.5k; MCP's default) and lets a current live frame answer while someone watches. `X-Capture-Redacted: 1` = wireframe of a protected screen ([below](#screens-hidden-from-capture)); `?raw=1` untouched. A sized request is shrunk and JPEG-encoded on the phone, so a slow link carries ~50–100 KB instead of a multi-MB PNG. A capture the link cuts or times out is retried once smaller (`X-Screenshot-Degraded: max_side=N`); a failure is JSON with `cause` (`timeout`, `body_truncated`, `connection_lost`, `connect`, `runner_error`), `transport` and `attempts` (504 on timeout, else 502) |
 | `POST /agent/input` | One action; `?return=delta` adds the settled change |
 | `POST /agent/actions` | `{"steps":[…]}`: up to 24 `action` / `wait_for` / `pause` steps, validated first, stops at the first failure |
 | `POST /agent/collect` | Read a list across pages: rows of `row_kind`, one swipe per page, deduplicated ([below](#long-lists-collect-and-scroll_find)) |
 | `POST /agent/scroll_find` | Is this label on screen and tappable? Swipe at most `max_swipes` (default 1) to find it ([below](#long-lists-collect-and-scroll_find)) |
 | `GET /agent/flow/draft` | The daemon's recorded trail as a flow v1 draft ([below](#saving-a-flow)) |
+| `GET /agent/activity` | What agents did, in plain words, for people watching: `{items:[{seq,at_ms,text,text_zh,owner?}], next, budget?}`; `?since=<next>` for newer lines only ([below](#owner-limits-and-the-activity-feed)) |
 | `GET /agent/reference` | This document, as compiled into the running daemon (`text/markdown`) |
 | `GET /agent/apps` | Installed apps `{device, apps:[{bundle,name,version,bundle_version,system,…}]}`; `?bundle=`; cached 10 min (`?refresh=1`). `503 apps_unavailable` = unknown, not "not installed" |
 | `GET /agent/apps?query=<name>` | App lookup by name: `{candidates:[{name,bundle_id,source,installed_verified,match,publisher?}], installation_checked, warnings}`. `source=auto` (phone's app list → bundled catalog → App Store), `installed`, `catalog` (offline), `apple` (`country=cn`, rate limited). Exact matches hide partial ones. MCP `phone_apps` |
@@ -317,9 +322,11 @@ values from the start), `characters_uncertain`, `remaining_text`, and
 `clear:false` — never the whole text again. One batch types at most 20000
 characters in total.
 To check a long text, look at a screenshot of its end. Do not compare
-`value`: iOS cuts a text view's accessibility value short. On an iPhone
-17 Pro Max with iOS 27, a 1986-character note read back as only its first
-477 characters, although the whole text was on screen.
+`value`: iOS cuts a text field's or text view's accessibility value at 512
+UTF-16 code units (an emoji counts two to four). On an iPhone 17 Pro Max
+with iOS 27, a 1986-character note read back as only its first 477
+characters, although the whole text was on screen. When the cut splits an
+emoji, the value ends in U+FFFD.
 
 `force_press` answers `422 force_press_unsupported` (retry-safe, nothing sent)
 on every iPhone since XR/11; use `menu`. App uninstall: `{"type":"uninstall","bundle":…}`
@@ -410,9 +417,38 @@ is no longer cached). The action result and the observation are separate facts:
   from a tree with nothing in it — screenshot instead.
 - A 502/504 after dispatch (`outcome_unknown`, `retry_safe:false`) may have
   acted. Read elements or a screenshot before deciding; never replay text,
-  scroll, back, pay, send or delete blindly.
+  scroll, back, pay, send or delete blindly. When the runner answered with an
+  error, `runner_error` (`call`, `status`, `code`, `message`) says why.
+- `422 runner_rejected` (`not_sent`, `retry_safe:true`): the runner refused the
+  action before touching the screen (for example a point outside the screen it
+  measures); `runner_error.message` names the reason.
 - A non-2xx read or an empty tree with `error` is a failed checkpoint even if
   the last status said `drivable:true`.
+
+## Resuming an interrupted task
+
+A dropped connection, a client timeout, a daemon restart or a crashed agent
+session can cut a task off mid-step. Before you continue, decide what each
+cut-off call did, and only then go on:
+
+- **Reads** (`/agent/elements`, screenshots, status, `wait_for` on its own) can
+  simply be repeated.
+- **An action whose answer you never got** counts as `outcome:"unknown"`: it
+  may have reached the phone. Read the screen first. If what you see shows it
+  applied, carry on from there; if it shows it did not, send it again. Never
+  resend text, a scroll, back, send, pay or delete before you have looked.
+- **A batch** answers `completed` / `applied_actions`: steps before
+  `failed_step` ran, later ones never did. Continue from `failed_step`, not
+  from the start, after reading the screen. `failed_step_outcome:"not_sent"`
+  only means *that* step can be sent again.
+- **A flow** that stopped is a batch that stopped: never run it again from the
+  top when its first steps may have acted (see [Fixing a flow](#fixing-a-flow)).
+- **After a daemon restart**, take a fresh `/agent/elements` before tapping by
+  `element`: snapshot tokens live in memory and do not survive the restart.
+  An open `/agent/run` does not either; start a new one.
+
+What the agent did last is on the [activity feed](#owner-limits-and-the-activity-feed),
+which helps a person (or you, after losing context) see where the task stopped.
 
 ## Long lists: collect and scroll_find
 
@@ -518,7 +554,7 @@ where they stopped.
   `needs_permission`), `at_ms` (Unix ms) and `elapsed_ms`. The request it
   happened in also carries it in `agent-timing.jsonl` as `notes.agent_focus`.
   Banners otherwise hijack taps (hardware-seen: a chat banner opened WeChat; a
-  recurring alert banner broke flow runs). Opt out with `PHONE_REMOTE_AUTO_FOCUS=0`.
+  recurring alert banner broke flow runs). Opt out with `IPHONE_USE_AUTO_FOCUS=0`.
 
 ## Logging in from the password vault
 
@@ -551,8 +587,9 @@ Face ID / Touch ID, an app passcode or PIN, a one-time code with no source
 `phone_login` can read, a login `phone_login` could not finish, or a payment
 confirmation: these belong to the person.
 
-1. Stop sending input. Take `phone_hold(secs)` so the phone stays ready while
-   they act.
+1. Stop sending input. Take `phone_hold(secs, private=true)` (HTTP
+   `{"secs":N,"private":true}`): the phone stays ready while they act, and
+   nothing reads or streams its screen until you clear the hold.
 2. Ask with the host's question tool (for example `AskUserQuestion` in Claude
    Code, `request_user_input` in Codex), not a line in your reply. Name the app, what the screen
    asks for and what you will do next; offer "Done, continue" and "Can't right
@@ -561,7 +598,7 @@ confirmation: these belong to the person.
    only in some modes); then wait for the person's reply.
 3. Never ask for the password, PIN or code, and never type one with
    `phone_type` or a batch, even when the field is not marked secure.
-4. After "Done": clear the hold, read the screen again (`phone_elements`) and
+4. After "Done": clear the hold (`phone_hold(0)`), read the screen again (`phone_elements`) and
    plan from what is there. The person may have moved on; old snapshots,
    element ids and coordinates are stale. If something was submitted during
    the hand-off, read the result before resending anything.
@@ -668,6 +705,43 @@ sized to keep the whole answer under about 3.5 MB; otherwise the answer says
 `image_omitted` and the text stays. MCP `phone_elements` reads with
 `image=auto` and returns that same image once as image content, with its
 labels in the text and no base64 in the text or the structured copy.
+
+## Owner limits and the activity feed
+
+**Limits.** The phone's owner can set limits the daemon enforces whatever an
+agent's prompt says. Both are off by default:
+
+| Setting | Effect |
+|---|---|
+| `IPHONE_USE_BLOCKED_APPS` | Comma-separated bundle ids or app names (`Wallet, com.example.bank, 微信`). An agent cannot open or uninstall them, and while one is in front only leaving is allowed: `{"type":"home"}` or `launch_app` of another app (`collect` and `scroll_find` are refused there too). |
+| `IPHONE_USE_MAX_ACTIONS` | Actions per run and `X-Phone-Owner`: a batch counts each `action` step; `collect`, `scroll_find` and an intent count one each. A run starts with `POST /agent/run {"action":"start"}`, or after 2 minutes without an action. |
+
+A refusal is `403` with `outcome:"not_sent"` and a `hint`: nothing reached the
+phone. `error` is `blocked_app` (with `app`), `foreground_unverified` (the app
+in front could not be read; `retry_safe:true`, read the screen and retry) or
+`action_budget_exhausted` (with `budget:{max,used}`). On a blocked app, tell
+the user; do not try to reach it another way. On an exhausted budget, stop
+and report progress. `GET /agent/capabilities` lists the limits under
+`limits`. The web control page and people driving the phone are never limited.
+
+The daemon runs as a LaunchAgent, so a limit goes into its plist and the
+daemon is restarted:
+
+```sh
+plist=~/Library/LaunchAgents/com.leeguoo.iphone-use.plist
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:IPHONE_USE_BLOCKED_APPS string 'Wallet, Passwords'" "$plist"
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:IPHONE_USE_MAX_ACTIONS string 80" "$plist"
+launchctl bootout gui/$(id -u) "$plist"; launchctl bootstrap gui/$(id -u) "$plist"
+```
+
+**Activity feed.** Every action an agent applied is kept as one line in plain
+words, resolved from the screen the action named: `Tapped “Wi-Fi”`,
+`Opened Settings`, `Typed 12 characters` (typed text and set values are never
+kept, only their length). `GET /agent/activity` returns the last lines
+(`text` in English, `text_zh` in Chinese, `owner` when the caller named
+itself) and `next`; pass `?since=<next>` to get only newer ones. The web
+control page shows each new line over the phone screen for a few seconds. The
+feed is in memory (the last 50 lines) and starts empty after a restart.
 
 ## Flows: format, compat, saving, fixing
 

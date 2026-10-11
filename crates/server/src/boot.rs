@@ -42,7 +42,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
                 Some(Arc::new(tokio::sync::Mutex::new(c)))
             }
             Err(e) => {
-                tracing::warn!("PHONE_REMOTE_WDA_URL set but client failed: {e:#}");
+                tracing::warn!("IPHONE_USE_WDA_URL set but client failed: {e:#}");
                 None
             }
         },
@@ -50,7 +50,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
         managed_wda_pending: inputs.managed_wda_pending,
         latest_release: Arc::new(Mutex::new(None)),
         // WDA's MJPEG stream (see /agent/mjpeg); the relay forwards it to
-        // 127.0.0.1:9100 (override with PHONE_REMOTE_WDA_MJPEG_URL).
+        // 127.0.0.1:9100 (override with IPHONE_USE_WDA_MJPEG_URL).
         video: crate::video::VideoHub::supported()
             .then(|| crate::video::VideoHub::new(inputs.mjpeg_url.clone())),
         mjpeg_url: Some(inputs.mjpeg_url),
@@ -79,6 +79,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
             crate::focus::state_path(),
         ))),
         hold_until: Arc::new(Mutex::new(None)),
+        private_until: Arc::new(Mutex::new(None)),
         owner: Arc::new(Mutex::new(None)),
         owner_lease_secs: inputs.cfg.owner_lease_secs,
         wda_bootstrap: crate::http::write_and_bootstrap_wda_agent,
@@ -115,10 +116,10 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     let password = options.password.clone();
     let agent_token = options.agent_token.clone();
     let cfg = Config::from_map(|key| match key {
-        "PHONE_REMOTE_HOST" => Some(host.clone()),
-        "PHONE_REMOTE_PORT" => Some(port.clone()),
-        "PHONE_REMOTE_PASSWORD" => password.clone(),
-        "PHONE_REMOTE_AGENT_TOKEN" => agent_token.clone(),
+        "IPHONE_USE_HOST" => Some(host.clone()),
+        "IPHONE_USE_PORT" => Some(port.clone()),
+        "IPHONE_USE_PASSWORD" => password.clone(),
+        "IPHONE_USE_AGENT_TOKEN" => agent_token.clone(),
         _ => std::env::var(key).ok(),
     });
     sandbox_dirs()?;
@@ -127,9 +128,12 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
     );
     std::fs::create_dir_all(&instance.state_dir)
         .with_context(|| format!("create {}", instance.state_dir.display()))?;
-    instance.verify_on_disk().map_err(|error| anyhow::anyhow!(error))?;
+    instance
+        .verify_on_disk()
+        .map_err(|error| anyhow::anyhow!(error))?;
     if let Some(token) = &options.runner_token {
-        crate::runner_token::write(&instance.state_dir, token).map_err(|error| anyhow::anyhow!(error))?;
+        crate::runner_token::write(&instance.state_dir, token)
+            .map_err(|error| anyhow::anyhow!(error))?;
     }
     crate::timing::set_log_path(instance.state_dir.join("agent-timing.jsonl"));
     crate::metrics::set_runs_log(instance.state_dir.join("agent-runs.jsonl"));
@@ -159,7 +163,11 @@ pub fn serve_embedded(options: EmbeddedOptions) -> Result<()> {
         let listener = tokio::net::TcpListener::bind((cfg.host.as_str(), cfg.port))
             .await
             .with_context(|| format!("bind {}:{}", cfg.host, cfg.port))?;
-        tracing::info!("embedded daemon on {}:{} → runner {wda_url}", cfg.host, cfg.port);
+        tracing::info!(
+            "embedded daemon on {}:{} → runner {wda_url}",
+            cfg.host,
+            cfg.port
+        );
         crate::schedules::start(
             "127.0.0.1",
             cfg.port,
@@ -194,7 +202,7 @@ fn sandbox_dirs() -> Result<()> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     let support = std::path::Path::new(&home).join("Library/Application Support/iphone-use");
     for (key, dir) in [
-        ("PHONE_REMOTE_STATE_DIR", support.join("state")),
+        ("IPHONE_USE_STATE_DIR", support.join("state")),
         ("IPHONE_USE_FLOWS_DIR", support.join("flows")),
     ] {
         if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
@@ -252,7 +260,8 @@ fn embedded_secret(state_dir: &std::path::Path) -> Result<Vec<u8>> {
     }
     let mut secret = vec![0_u8; 32];
     getrandom::fill(&mut secret).map_err(|error| anyhow::anyhow!("CSPRNG failed: {error}"))?;
-    crate::runtime_dir::write_secret(state_dir, FILE, &secret).context("save the session secret")?;
+    crate::runtime_dir::write_secret(state_dir, FILE, &secret)
+        .context("save the session secret")?;
     Ok(secret)
 }
 
@@ -263,9 +272,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = super::embedded_secret(dir.path()).unwrap();
         assert_eq!(first.len(), 32);
-        assert_eq!(super::embedded_secret(dir.path()).unwrap(), first, "same secret after a restart");
+        assert_eq!(
+            super::embedded_secret(dir.path()).unwrap(),
+            first,
+            "same secret after a restart"
+        );
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(dir.path().join("session-secret")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(dir.path().join("session-secret"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -64,7 +64,7 @@ pub struct WdaClient {
     /// What the read path has learned about tree sizes; decides when a read
     /// needs the size probe (see [`ProbeMemory::should_probe`]).
     probe: ProbeMemory,
-    /// `PHONE_REMOTE_SOURCE_VISIBLE=1`: read trees with `isVisible` again
+    /// `IPHONE_USE_SOURCE_VISIBLE=1`: read trees with `isVisible` again
     /// (size-probed). Off by default: every read skips it.
     full_visibility: bool,
     /// The screen as it stood after the last action settled, kept in memory
@@ -241,6 +241,9 @@ impl Capture {
 /// are not.
 pub fn screenshot_failure_cause(error: &anyhow::Error) -> &'static str {
     for cause in error.chain() {
+        if cause.downcast_ref::<RunnerHttpError>().is_some() {
+            return "runner_error";
+        }
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
             if error.is_timeout() {
                 return "timeout";
@@ -1863,7 +1866,7 @@ impl WdaClient {
     /// Probing every read (not once per app) matters: one app can hold both
     /// kinds of screen, and backing out of a WeChat chat lands on the list.
     async fn bounded_source(&mut self) -> Result<(serde_json::Value, bool)> {
-        if std::env::var("PHONE_REMOTE_SOURCE_PROBE").is_ok_and(|value| value.trim() == "0") {
+        if std::env::var("IPHONE_USE_SOURCE_PROBE").is_ok_and(|value| value.trim() == "0") {
             return Ok((self.source().await?, false));
         }
         // Every read skips `isVisible` unless asked otherwise (the approach
@@ -2183,6 +2186,12 @@ impl WdaClient {
         self.last_tree = None;
     }
 
+    /// Drop the cached window size, returning it: the next gesture reads the
+    /// size the runner checks its points against again.
+    pub fn forget_window_size(&mut self) -> Option<(f64, f64)> {
+        self.window.take().map(|(size, _)| size)
+    }
+
     /// `POST /session/:id/wda/lock` — lock the phone's screen.
     ///
     /// This is a generic WDA primitive. Backend selection is persisted at
@@ -2202,19 +2211,19 @@ impl WdaClient {
 
 /// Node count above which [`WdaClient::bounded_source`] keeps the tree read
 /// without `isVisible`. 1000 is about a quarter of the WeChat list that
-/// killed the runner; `PHONE_REMOTE_SOURCE_MAX_NODES` overrides it.
+/// killed the runner; `IPHONE_USE_SOURCE_MAX_NODES` overrides it.
 fn full_source_max_nodes() -> usize {
-    std::env::var("PHONE_REMOTE_SOURCE_MAX_NODES")
+    std::env::var("IPHONE_USE_SOURCE_MAX_NODES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(1000)
 }
 
-/// `PHONE_REMOTE_SOURCE_VISIBLE=1`: read trees with WDA's `isVisible` again
+/// `IPHONE_USE_SOURCE_VISIBLE=1`: read trees with WDA's `isVisible` again
 /// (size-probed, as before every read went lite).
 fn full_visibility_requested() -> bool {
-    std::env::var("PHONE_REMOTE_SOURCE_VISIBLE").is_ok_and(|value| value.trim() == "1")
+    std::env::var("IPHONE_USE_SOURCE_VISIBLE").is_ok_and(|value| value.trim() == "1")
 }
 
 /// WDA attributes the size probe does not compute: the two per-node
@@ -2438,17 +2447,17 @@ fn mark_rows_clipped_by_scroll_containers(tree: &serde_json::Value, rows: &mut [
 }
 
 /// Bounded-snapshot WDA settings from the environment (issue #44), applied
-/// once per created session. `PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH` maps to
+/// once per created session. `IPHONE_USE_WDA_SNAPSHOT_MAX_DEPTH` maps to
 /// WDA's `snapshotMaxDepth` (tree levels; WDA's own default is 50) and
-/// `PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S` to `customSnapshotTimeout` (seconds;
+/// `IPHONE_USE_WDA_SNAPSHOT_TIMEOUT_S` to `customSnapshotTimeout` (seconds;
 /// WDA's default 15). Unset or unparseable values are simply omitted, so the
 /// default daemon applies no settings at all.
 fn snapshot_settings_from_env() -> Option<serde_json::Map<String, serde_json::Value>> {
     snapshot_settings(
-        std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_MAX_DEPTH")
+        std::env::var("IPHONE_USE_WDA_SNAPSHOT_MAX_DEPTH")
             .ok()
             .as_deref(),
-        std::env::var("PHONE_REMOTE_WDA_SNAPSHOT_TIMEOUT_S")
+        std::env::var("IPHONE_USE_WDA_SNAPSHOT_TIMEOUT_S")
             .ok()
             .as_deref(),
     )
@@ -2526,7 +2535,7 @@ pub struct ElementRow {
     /// Text-input placeholder when WDA exposes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
-    /// Derived non-default affordances (`PHONE_REMOTE_ELEMENTS_AFFORDANCES=1`
+    /// Derived non-default affordances (`IPHONE_USE_ELEMENTS_AFFORDANCES=1`
     /// only): the named `perform` actions this element supports beyond the
     /// universal tap/longpress family, from `type` + accessibility traits +
     /// min/max — e.g. `["increment","decrement","adjust"]`. Emitted only for
@@ -2544,7 +2553,7 @@ pub struct ElementRow {
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
-    /// Verbatim accessibility trait names (`PHONE_REMOTE_ELEMENTS_TRAITS=1`
+    /// Verbatim accessibility trait names (`IPHONE_USE_ELEMENTS_TRAITS=1`
     /// only, for debugging/forward-compat) — most values duplicate `kind`, so
     /// this is not part of the default or affordances payload.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2752,10 +2761,10 @@ fn derived_actions(
 /// default to off, which keeps the emitted JSON byte-identical.
 #[derive(Debug, Clone, Copy, Default)]
 struct FlattenOptions {
-    /// `PHONE_REMOTE_ELEMENTS_AFFORDANCES=1`: emit sparse `actions`,
+    /// `IPHONE_USE_ELEMENTS_AFFORDANCES=1`: emit sparse `actions`,
     /// `selected`, `min`, and `max` derived from traits + min/max values.
     affordances: bool,
-    /// `PHONE_REMOTE_ELEMENTS_TRAITS=1`: emit the verbatim `traits` names.
+    /// `IPHONE_USE_ELEMENTS_TRAITS=1`: emit the verbatim `traits` names.
     raw_traits: bool,
 }
 
@@ -2765,8 +2774,8 @@ fn env_flag(name: &str) -> bool {
 
 fn flatten_options_from_env() -> FlattenOptions {
     FlattenOptions {
-        affordances: env_flag("PHONE_REMOTE_ELEMENTS_AFFORDANCES"),
-        raw_traits: env_flag("PHONE_REMOTE_ELEMENTS_TRAITS"),
+        affordances: env_flag("IPHONE_USE_ELEMENTS_AFFORDANCES"),
+        raw_traits: env_flag("IPHONE_USE_ELEMENTS_TRAITS"),
     }
 }
 
@@ -3078,13 +3087,111 @@ async fn ensure_wda_success(
     response: reqwest::Response,
     operation: &str,
 ) -> Result<serde_json::Value> {
+    let status = response.status();
+    if !status.is_success() {
+        // `error_for_status` dropped the body, and with it the runner's own
+        // reason (issue #257: a refused swipe surfaced only as "400 Bad
+        // Request for url (http://no.url.provided.local/)").
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::Error::new(RunnerHttpError::from_body(
+            operation, status, &body,
+        )));
+    }
     let body = response
-        .error_for_status()
-        .with_context(|| format!("{operation} HTTP status"))?
         .text()
         .await
         .with_context(|| format!("{operation} response body"))?;
     parse_wda_value(&body, operation)
+}
+
+/// The longest runner error message carried into logs and responses.
+const RUNNER_MESSAGE_MAX_CHARS: usize = 300;
+
+/// The device runner answered a request with a non-2xx status. Only the W3C
+/// error envelope's `error` code and `message` are kept, never the raw body
+/// (see [`body_summary`]): the message is the runner's own sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerHttpError {
+    pub operation: String,
+    pub status: reqwest::StatusCode,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+impl RunnerHttpError {
+    pub fn from_body(operation: &str, status: reqwest::StatusCode, body: &str) -> Self {
+        let value = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|root| root.get("value").cloned());
+        let field = |name: &str| {
+            value
+                .as_ref()
+                .and_then(|v| v.get(name))
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.chars().count() > RUNNER_MESSAGE_MAX_CHARS {
+                        let cut: String = s.chars().take(RUNNER_MESSAGE_MAX_CHARS).collect();
+                        format!("{cut}…")
+                    } else {
+                        s.to_string()
+                    }
+                })
+        };
+        Self {
+            operation: operation.to_string(),
+            status,
+            code: field("error"),
+            message: field("message"),
+        }
+    }
+
+    /// The runner said it refused the request before acting on the phone.
+    /// Its `/actions` route checks every touch point against the screen
+    /// before it synthesizes anything, and that refusal (HTTP 400, "invalid
+    /// argument") ends "nothing was sent". A 400 alone proves nothing: the
+    /// same status can follow touches already played.
+    pub fn nothing_sent(&self) -> bool {
+        self.status == reqwest::StatusCode::BAD_REQUEST
+            && self.code.as_deref() == Some("invalid argument")
+            && self
+                .message
+                .as_deref()
+                .is_some_and(|m| m.trim_end().ends_with("nothing was sent"))
+    }
+
+    /// `runner_error` for a response body.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "call": self.operation,
+            "status": self.status.as_u16(),
+            "code": self.code,
+            "message": self.message,
+        })
+    }
+}
+
+impl std::fmt::Display for RunnerHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // "HTTP status 404 Not Found": callers match the status text.
+        write!(f, "{} HTTP status {}", self.operation, self.status)?;
+        if let Some(code) = &self.code {
+            write!(f, ": {code}")?;
+        }
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RunnerHttpError {}
+
+/// The runner's HTTP error behind `error`, if that is what failed.
+pub fn runner_http_error(error: &anyhow::Error) -> Option<&RunnerHttpError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RunnerHttpError>())
 }
 
 /// Errors never quote a runner response: a /source body is the whole screen,
@@ -3204,6 +3311,51 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // Issue #257: a runner's error status keeps its own reason.
+    #[test]
+    fn runner_http_errors_keep_the_envelope_reason_and_status_text() {
+        let refused = RunnerHttpError::from_body(
+            "POST /actions (swipe)",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"value":{"error":"invalid argument","message":"action point (196, 489) is outside the 852x393 screen; nothing was sent"}}"#,
+        );
+        assert!(refused.nothing_sent());
+        assert_eq!(
+            refused.to_string(),
+            "POST /actions (swipe) HTTP status 400 Bad Request: invalid argument: action point (196, 489) is outside the 852x393 screen; nothing was sent"
+        );
+        let other = RunnerHttpError::from_body(
+            "POST /actions",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"value":{"error":"invalid argument","message":"unsupported pointer action 'x'"}}"#,
+        );
+        assert!(!other.nothing_sent(), "a 400 alone proves nothing");
+        let server = RunnerHttpError::from_body(
+            "POST /actions",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"value":{"error":"invalid argument","message":"x; nothing was sent"}}"#,
+        );
+        assert!(!server.nothing_sent());
+        // A body that is not an envelope is never quoted.
+        let raw = RunnerHttpError::from_body(
+            "GET /source",
+            reqwest::StatusCode::NOT_FOUND,
+            "<html>secret screen text</html>",
+        );
+        assert_eq!(raw.to_string(), "GET /source HTTP status 404 Not Found");
+        // The 404 checks read the status text.
+        assert!(wda_error_is_not_found(&anyhow::Error::new(raw)));
+        let long = RunnerHttpError::from_body(
+            "POST /x",
+            reqwest::StatusCode::BAD_REQUEST,
+            &serde_json::json!({"value":{"message":"m".repeat(1000)}}).to_string(),
+        );
+        assert_eq!(
+            long.message.unwrap().chars().count(),
+            RUNNER_MESSAGE_MAX_CHARS + 1
+        );
+    }
 
     // Issue #57: a force press with no explicit pressure/duration used to send
     // an empty body, which WDA 9.15.3 answers with 400 Bad Request.

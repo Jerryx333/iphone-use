@@ -1256,13 +1256,13 @@ impl Scheduler {
         command
             .args(Self::command_args(&schedule, &artifacts))
             .current_dir(&artifacts)
-            .env("PHONE_REMOTE_URL", &self.config.self_url)
-            .env("PHONE_REMOTE_OWNER", &owner)
+            .env("IPHONE_USE_URL", &self.config.self_url)
+            .env("IPHONE_USE_OWNER", &owner)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         match &self.config.credential {
-            Some(token) => command.env("PHONE_REMOTE_TOKEN", token),
-            None => command.env_remove("PHONE_REMOTE_TOKEN"),
+            Some(token) => command.env("IPHONE_USE_TOKEN", token),
+            None => command.env_remove("IPHONE_USE_TOKEN"),
         };
         let outcome = tokio::time::timeout(RUN_TIMEOUT, command.output()).await;
         let duration_ms = clock.elapsed().as_millis() as u64;
@@ -1352,7 +1352,8 @@ impl Scheduler {
             .unwrap_or_default();
         tracing::warn!("schedule {} ({label}) {what}: {detail}", schedule.id);
         if self.config.notify && cfg!(target_os = "macos") {
-            let message = truncate(&format!("{label} {what}: {detail}"), 200);
+            let chinese = crate::locale::prefers_chinese();
+            let (message, title) = notification_text(&label, run.state, &detail, chinese);
             let _ = tokio::process::Command::new("/usr/bin/osascript")
                 .args([
                     "-e",
@@ -1362,7 +1363,7 @@ impl Scheduler {
                     "-e",
                     "end run",
                     &message,
-                    "iphone-use schedule",
+                    title,
                 ])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -1389,6 +1390,40 @@ impl Scheduler {
             }
         }
     }
+}
+
+/// The Mac notification for a run that did not pass, `(message, title)`, in
+/// the Mac's language (launchd starts the daemon with no `LANG`, so macOS's
+/// preferred language decides). The server's own detail stays as it is.
+fn notification_text(
+    label: &str,
+    state: RunState,
+    detail: &str,
+    chinese: bool,
+) -> (String, &'static str) {
+    let message = if chinese {
+        let what = match state {
+            RunState::Failed => "运行失败",
+            RunState::Missed => "错过了运行",
+            RunState::Skipped => "已跳过",
+            _ => "运行结束",
+        };
+        format!("{label} {what}：{detail}")
+    } else {
+        let what = match state {
+            RunState::Failed => "failed",
+            RunState::Missed => "missed",
+            RunState::Skipped => "skipped",
+            _ => "finished",
+        };
+        format!("{label} {what}: {detail}")
+    };
+    let title = if chinese {
+        "iphone-use 定时任务"
+    } else {
+        "iphone-use schedule"
+    };
+    (truncate(&message, 200), title)
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,6 +1702,20 @@ pub async fn run_now(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_notification_speaks_the_macs_language() {
+        let (message, title) =
+            notification_text("早报", RunState::Failed, "exit 1", true);
+        assert_eq!(message, "早报 运行失败：exit 1");
+        assert_eq!(title, "iphone-use 定时任务");
+        let (message, title) =
+            notification_text("Morning", RunState::Missed, "the Mac was asleep", false);
+        assert_eq!(message, "Morning missed: the Mac was asleep");
+        assert_eq!(title, "iphone-use schedule");
+        let (message, _) = notification_text("x", RunState::Skipped, "busy", true);
+        assert_eq!(message, "x 已跳过：busy");
+    }
 
     /// A fixed "local" calendar for tests: treat unix time as UTC.
     fn utc(unix: u64) -> LocalTime {

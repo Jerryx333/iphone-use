@@ -109,7 +109,7 @@ impl VideoMode {
     }
 
     /// The runner's `/h264` query. `performance_kbps` is the configured
-    /// performance bitrate (`PHONE_REMOTE_H264_KBPS`); quality keeps the
+    /// performance bitrate (`IPHONE_USE_H264_KBPS`); quality keeps the
     /// runner's own preset.
     pub fn runner_query(self, performance_kbps: u32) -> String {
         match self {
@@ -314,6 +314,8 @@ pub struct VideoHub {
     verdict_running: AtomicBool,
     /// The newest upstream JPEG and when it arrived, while the pipeline runs.
     latest_jpeg: Mutex<Option<(Bytes, std::time::Instant)>>,
+    /// The screen is private until then (see [`VideoHub::hide_until`]).
+    hidden_until: Mutex<Option<std::time::Instant>>,
 }
 
 /// Keeps a subscription counted; dropping it lets the pipeline wind down.
@@ -334,7 +336,7 @@ impl Drop for Subscription {
 
 impl VideoHub {
     pub fn new(mjpeg_url: String) -> Arc<Self> {
-        let bitrate = std::env::var("PHONE_REMOTE_H264_KBPS")
+        let bitrate = std::env::var("IPHONE_USE_H264_KBPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|kbps| (300..=20_000).contains(kbps))
@@ -356,6 +358,7 @@ impl VideoHub {
             verdict_at: Mutex::new(None),
             verdict_running: AtomicBool::new(false),
             latest_jpeg: Mutex::new(None),
+            hidden_until: Mutex::new(None),
         })
     }
 
@@ -765,7 +768,31 @@ impl VideoHub {
     /// under the `running` lock, which `subscribe` takes after counting
     /// itself: a newcomer either keeps this pipeline alive or finds it
     /// stopped and starts its own, never attaches to one that is leaving.
+    /// The person is signing in on the phone until `until` (a private hold):
+    /// stop capturing now rather than after [`IDLE_LINGER`], and drop the
+    /// newest frame so a screenshot taken later cannot be served from it.
+    /// `None` lifts it early.
+    pub fn hide_until(&self, until: Option<std::time::Instant>) {
+        *self.hidden_until.lock().unwrap_or_else(|e| e.into_inner()) = until;
+        if until.is_some() {
+            *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.wake.notify_one();
+        }
+    }
+
+    fn hidden(&self) -> bool {
+        self.hidden_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| until > std::time::Instant::now())
+    }
+
     fn should_stop(&self, idle_since: &mut Option<std::time::Instant>) -> bool {
+        if self.hidden() {
+            *self.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return true;
+        }
         if self.subscribers.load(Ordering::Acquire) > 0 {
             *idle_since = None;
             return false;
@@ -802,9 +829,9 @@ enum Passthrough {
 /// Runner flag: the frame's content band is one flat colour.
 const FLAG_BLANK: u8 = 0x02;
 
-/// `PHONE_REMOTE_H264_PASSTHROUGH=0` always re-encodes on the Mac.
+/// `IPHONE_USE_H264_PASSTHROUGH=0` always re-encodes on the Mac.
 fn passthrough_enabled() -> bool {
-    std::env::var("PHONE_REMOTE_H264_PASSTHROUGH").map_or(true, |value| value.trim() != "0")
+    std::env::var("IPHONE_USE_H264_PASSTHROUGH").map_or(true, |value| value.trim() != "0")
 }
 
 /// One complete runner message off the front of `buf`: the frame and its
@@ -1394,6 +1421,27 @@ mod tests {
 
     const JPEG_A: &[u8] = &[0xFF, 0xD8, 1, 2, 3, 0xFF, 0x00, 4, 0xFF, 0xD9];
     const JPEG_B: &[u8] = &[0xFF, 0xD8, 9, 8, 0xFF, 0xD9];
+
+    #[test]
+    fn a_private_screen_stops_capture_at_once_even_with_viewers() {
+        let hub = VideoHub::new("http://127.0.0.1:1".into());
+        *hub.running.lock().unwrap() = true;
+        hub.subscribers.store(1, Ordering::Release);
+        *hub.latest_jpeg.lock().unwrap() = Some((Bytes::from_static(JPEG_A), std::time::Instant::now()));
+
+        hub.hide_until(Some(std::time::Instant::now() + Duration::from_secs(60)));
+        assert!(hub.latest_jpeg.lock().unwrap().is_none(), "no frame outlives the hold");
+        let mut idle = None;
+        assert!(hub.should_stop(&mut idle), "no linger while private");
+        assert!(!*hub.running.lock().unwrap());
+
+        // Lifted (or expired): viewers keep it running again.
+        hub.hide_until(None);
+        *hub.running.lock().unwrap() = true;
+        assert!(!hub.should_stop(&mut idle));
+        hub.hide_until(Some(std::time::Instant::now() - Duration::from_secs(1)));
+        assert!(!hub.should_stop(&mut idle), "an expired private hold no longer stops it");
+    }
 
     #[test]
     fn stopping_is_decided_and_marked_under_the_running_lock() {

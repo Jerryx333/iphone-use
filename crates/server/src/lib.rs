@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod advice;
 pub mod app_lookup;
 pub mod boot;
@@ -7,11 +8,13 @@ pub mod config;
 pub mod device_identity;
 pub mod flows;
 pub mod focus;
+pub mod guard;
 pub mod h264sps;
 pub mod http;
 pub mod instance;
 pub mod keep_awake;
 pub mod keep_runner;
+pub mod locale;
 pub mod lock_readiness;
 pub mod lockdown;
 pub mod logcap;

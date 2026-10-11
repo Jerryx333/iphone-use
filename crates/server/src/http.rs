@@ -345,7 +345,7 @@ pub struct AppState {
     /// action and POSTs the result here. Bounded ring buffer; oldest dropped.
     pub inbox: Arc<Mutex<std::collections::VecDeque<InboxItem>>>,
     /// Optional L2 element-tree control via WebDriverAgent on the phone
-    /// (`PHONE_REMOTE_WDA_URL`, e.g. `http://<phone-ip>:8100`). When present,
+    /// (`IPHONE_USE_WDA_URL`, e.g. `http://<phone-ip>:8100`). When present,
     /// agent input auto-routes through it (see [`agent_input`]): text goes in
     /// as Unicode (CJK lands cleanly), taps are synthesized on-device (no host
     /// cursor). Control fails closed on WDA errors.
@@ -355,7 +355,7 @@ pub struct AppState {
     /// Whether this daemon owns the local WDA supervisor and relay lifecycle.
     ///
     /// Only a direct backend pointed at a loopback WDA URL is managed. A remote
-    /// `PHONE_REMOTE_WDA_URL` is externally owned: this process may use it, but
+    /// `IPHONE_USE_WDA_URL` is externally owned: this process may use it, but
     /// must never stop or bootstrap local launchd jobs on its behalf.
     pub managed_wda: bool,
     /// A local Direct backend whose managed ownership is waiting for a
@@ -372,7 +372,7 @@ pub struct AppState {
     /// is configured. The `/agent/mjpeg` endpoint proxies it for live video —
     /// the MJPEG server runs inside the same XCUITest session as control.
     /// Defaults to `127.0.0.1:9100` (the relay target), override via
-    /// `PHONE_REMOTE_WDA_MJPEG_URL`.
+    /// `IPHONE_USE_WDA_MJPEG_URL`.
     pub mjpeg_url: Option<String>,
     /// The H.264 re-encoder fed from `mjpeg_url` (see [`crate::video`]);
     /// `None` where it cannot run (no WDA video, or not macOS).
@@ -454,6 +454,11 @@ pub struct AppState {
     /// in the loop (typing a password, approving a prompt) otherwise trips the
     /// idle window and pays a 60–120s WDA rebuild every time.
     pub hold_until: Arc<Mutex<Option<Instant>>>,
+    /// A hold taken with `"private":true` (the person is signing in on the
+    /// phone): until then nothing reads the screen — screenshots, live video
+    /// and the element tree are refused and open streams end. Ends with the
+    /// hold. See [`AppState::screen_private_secs`].
+    pub private_until: Arc<Mutex<Option<Instant>>>,
     /// Who is driving the phone right now (issue #72). A client that names
     /// itself with `X-Phone-Owner` takes this lease on its first control
     /// request and refreshes it on every one; other clients' control requests
@@ -768,6 +773,12 @@ impl AppState {
             .unwrap_or(0)
     }
 
+    /// Seconds left while the screen is private (0 when it is not). See
+    /// `AppState::private_until`.
+    pub fn screen_private_secs(&self) -> u64 {
+        private_secs_left(&self.private_until)
+    }
+
     /// Whether a hold lease is currently keeping the phone.
     fn held(&self) -> bool {
         self.hold_remaining_secs() > 0
@@ -961,6 +972,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/h264", get(agent_h264))
         .route("/agent/h264/keyframe", post(agent_h264_keyframe))
         .route("/agent/elements", get(agent_elements))
+        .route("/agent/activity", get(agent_activity))
         .route("/agent/collect", post(agent_collect))
         .route("/agent/scroll_find", post(agent_scroll_find))
         .route("/agent/flow/draft", get(agent_flow_draft))
@@ -1035,15 +1047,16 @@ fn with_security_headers(mut resp: Response) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Extract the `phone_session` cookie value from request headers.
+/// Every `Cookie` header is read: a client may send cookies (the session and
+/// `iphone_use_lang`) in separate headers.
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix(&format!("{SESSION_COOKIE}=")) {
-            return Some(value.to_string());
-        }
-    }
-    None
+    let prefix = format!("{SESSION_COOKIE}=");
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| pair.trim().strip_prefix(prefix.as_str()).map(str::to_string))
 }
 
 /// Return `true` if the request is authenticated.
@@ -1150,6 +1163,9 @@ button{background:var(--accent);border:1px solid var(--accent);color:#fff;border
 button:hover{filter:brightness(1.06)}
 .err{color:var(--danger);font-size:13px;line-height:1.4}
 .err:empty{display:none}
+.lang{align-self:center;color:var(--muted);font-size:12.5px;text-decoration:none;padding:4px 8px;border-radius:8px}
+.lang:hover{color:var(--text)}
+.lang:focus-visible{outline:3px solid var(--ring);outline-offset:1px}
 </style></head><body>
 <form method="POST" action="/login" novalidate>
   <div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg></div>
@@ -1162,7 +1178,62 @@ button:hover{filter:brightness(1.06)}
     aria-describedby="passwordHint loginError" aria-invalid="__INVALID__" />
   <div class="err" id="loginError" role="alert" aria-live="assertive">__ERR__</div>
   <button type="submit">登录</button>
+  __LANG_SWITCH__
 </form></body></html>"#;
+
+/// `LOGIN_HTML` (Chinese, the source) → English, phrase by phrase.
+const LOGIN_EN: &[(&str, &str)] = &[
+    (r#"<html lang="zh-CN">"#, r#"<html lang="en">"#),
+    ("<title>登录 · iphone-use</title>", "<title>Sign in · iphone-use</title>"),
+    (
+        "请输入这台 Mac 安装 iphone-use 时生成的控制密码。忘记后，请回到 Mac 重新运行安装程序查看或重设。",
+        "Enter the control password created when iphone-use was installed on this Mac. If you forgot it, run the installer again on the Mac to see or reset it.",
+    ),
+    (
+        r#"<label for="password">控制密码</label>"#,
+        r#"<label for="password">Control password</label>"#,
+    ),
+    (
+        r#"<button type="submit">登录</button>"#,
+        r#"<button type="submit">Sign in</button>"#,
+    ),
+];
+
+/// Login errors, `[Chinese, English]`.
+const LOGIN_EMPTY: [&str; 2] = ["请输入控制密码", "Enter the control password"];
+const LOGIN_LOCKED: [&str; 2] = [
+    "尝试次数过多。为保护手机，请 30 秒后再试",
+    "Too many attempts. To protect the phone, try again in 30 seconds",
+];
+const LOGIN_WRONG: [&str; 2] = [
+    "密码错误，请检查安装时保存的控制密码",
+    "Wrong password. Check the control password you saved during installation",
+];
+
+/// A Chinese page → English through its phrase table; Chinese stays as is.
+fn localize_page(html: &str, table: &[(&str, &str)], chinese: bool) -> String {
+    if chinese {
+        return html.to_string();
+    }
+    table
+        .iter()
+        .fold(html.to_string(), |page, (zh, en)| page.replace(zh, en))
+}
+
+/// The small 中文/English link on the daemon's own pages: it names the other
+/// language and remembers the choice the way the web pages' `setLang` does
+/// (localStorage + the `iphone_use_lang` cookie), then reloads with a GET so
+/// a page answering a form POST is not resubmitted. A failed sign-in answers
+/// the POST at bare `/login`, keeping its destination only in the form's
+/// hidden `next`; the reload carries it so the destination survives.
+fn lang_switch(chinese: bool) -> String {
+    let (lang, label) = if chinese { ("en", "English") } else { ("zh", "中文") };
+    format!(
+        r##"<a class="lang" href="#" data-lang="{lang}" aria-label="切换语言 / Switch language">{label}</a>
+<script>document.querySelector('a.lang').addEventListener('click',function(e){{e.preventDefault();var l=this.getAttribute('data-lang');try{{localStorage.setItem('iphone-use-lang',l)}}catch(_){{}}document.cookie='{cookie}='+l+'; Path=/; Max-Age=31536000; SameSite=Lax';var u=location.pathname+location.search,n=document.querySelector('input[name=next]');if(n&&!/[?&]next=/.test(location.search))u=location.pathname+'?next='+encodeURIComponent(n.value);location.replace(u)}})</script>"##,
+        cookie = crate::locale::LANG_COOKIE,
+    )
+}
 
 fn login_destination(next: Option<&str>) -> &'static str {
     match next {
@@ -1172,13 +1243,15 @@ fn login_destination(next: Option<&str>) -> &'static str {
     }
 }
 
-fn render_login(error: &str, next: Option<&str>) -> String {
+fn render_login(error: Option<[&str; 2]>, next: Option<&str>, chinese: bool) -> String {
+    let error = error.map_or("", |[zh, en]| if chinese { zh } else { en });
     let next_input = match login_destination(next) {
         "/setup" => r#"<input type="hidden" name="next" value="/setup">"#,
         "/schedules" => r#"<input type="hidden" name="next" value="/schedules">"#,
         _ => "",
     };
-    LOGIN_HTML
+    localize_page(LOGIN_HTML, LOGIN_EN, chinese)
+        .replace("__LANG_SWITCH__", &lang_switch(chinese))
         .replace("__NEXT_INPUT__", next_input)
         .replace("__ERR__", error)
         .replace(
@@ -1203,7 +1276,8 @@ async fn login_form(
     if is_authed(&state, &headers) {
         return with_security_headers(Redirect::to(destination).into_response());
     }
-    with_security_headers(Html(render_login("", Some(destination))).into_response())
+    let chinese = crate::locale::request_prefers_chinese(&headers);
+    with_security_headers(Html(render_login(None, Some(destination), chinese)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1219,6 +1293,7 @@ async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let destination = login_destination(form.next.as_deref());
+    let chinese = crate::locale::request_prefers_chinese(&headers);
     let expected = match &state.password {
         // Open mode: any login succeeds (no password configured); no limiting.
         None => return redirect_with_cookie(&state, destination, &headers),
@@ -1229,7 +1304,7 @@ async fn login_submit(
     // missing value as an authentication failure: the user has not attempted a
     // credential yet.
     if form.password.is_empty() {
-        let mut resp = Html(render_login("请输入控制密码", Some(destination))).into_response();
+        let mut resp = Html(render_login(Some(LOGIN_EMPTY), Some(destination), chinese)).into_response();
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return with_security_headers(resp);
     }
@@ -1237,10 +1312,7 @@ async fn login_submit(
     {
         let limiter = state.auth_limiter.lock().unwrap();
         if limiter.is_locked() {
-            let mut resp = Html(render_login(
-                "尝试次数过多。为保护手机，请 30 秒后再试",
-                Some(destination),
-            ))
+            let mut resp = Html(render_login(Some(LOGIN_LOCKED), Some(destination), chinese))
             .into_response();
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
             resp.headers_mut()
@@ -1253,7 +1325,7 @@ async fn login_submit(
         redirect_with_cookie(&state, destination, &headers)
     } else {
         state.auth_limiter.lock().unwrap().record_failure();
-        let body = render_login("密码错误，请检查安装时保存的控制密码", Some(destination));
+        let body = render_login(Some(LOGIN_WRONG), Some(destination), chinese);
         let mut resp = Html(body).into_response();
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         with_security_headers(resp)
@@ -1347,7 +1419,7 @@ async fn pair_new(
             serde_json::json!({
                 "ok": false,
                 "error": "loopback_only",
-                "hint": "this Mac only listens on 127.0.0.1, so a phone cannot reach it; set PHONE_REMOTE_HOST=0.0.0.0 (re-run install.sh and allow LAN access)"
+                "hint": "this Mac only listens on 127.0.0.1, so a phone cannot reach it; set IPHONE_USE_HOST=0.0.0.0 (re-run install.sh and allow LAN access)"
             }),
         );
     }
@@ -1471,15 +1543,44 @@ a,button{display:block;box-sizing:border-box;width:100%;text-align:center;text-d
 a{background:#4f8cff;color:#fff;border:1px solid #4f8cff}
 button{background:transparent;color:#eef2ff;border:1px solid #272b38}
 form{margin:0}
-</style></head><body><main>__BODY__</main></body></html>"#;
+a.lang{display:inline-block;width:auto;align-self:center;background:none;border:0;color:#8b93a7;
+  font-size:13px;font-weight:500;padding:6px 10px}
+a.lang:hover{color:#eef2ff}
+</style></head><body><main>__BODY__
+__LANG_SWITCH__</main></body></html>"#;
 
-fn render_pair_page(body: &str) -> String {
-    PAIR_HTML.replace("__BODY__", body)
+/// The pairing pages (`PAIR_HTML` and the bodies below; Chinese is the
+/// source) → English.
+const PAIR_EN: &[(&str, &str)] = &[
+    (r#"<html lang="zh-CN">"#, r#"<html lang="en">"#),
+    ("<title>扫码连接 · iphone-use</title>", "<title>Scan to connect · iphone-use</title>"),
+    ("<h1>二维码已失效</h1>", "<h1>QR code expired</h1>"),
+    (
+        "<p>每个二维码只能用一次，5 分钟内有效。请在 Mac 的 iphone-use 页面上点「手机扫码连接」重新生成。</p>",
+        "<p>Each QR code works once, for 5 minutes. On the iphone-use page on your Mac, click “Scan to connect” to make a new one.</p>",
+    ),
+    ("<h1>正在登录 iphone-use…</h1>", "<h1>Signing in to iphone-use…</h1>"),
+    (">打开控制页</button>", ">Open the control page</button>"),
+    ("<h1>连接这台 Mac 上的 iPhone</h1>", "<h1>Connect to the iPhone on this Mac</h1>"),
+    (
+        "<p>装了 Phone Use Remote App 就用 App 打开，画面更流畅；没装也可以直接在浏览器里控制。</p>",
+        "<p>If you have the Phone Use Remote App, open it there for smoother video. Without it, you can control the phone right here in the browser.</p>",
+    ),
+    (">在 Phone Use Remote App 中打开</a>", ">Open in Phone Use Remote App</a>"),
+    (">在浏览器里控制</button>", ">Control in the browser</button>"),
+    ("<h1>尝试次数过多</h1>", "<h1>Too many attempts</h1>"),
+    ("<p>为保护手机，请 30 秒后再试。</p>", "<p>To protect the phone, try again in 30 seconds.</p>"),
+];
+
+fn render_pair_page(body: &str, chinese: bool) -> String {
+    let page = PAIR_HTML.replace("__BODY__", body);
+    localize_page(&page, PAIR_EN, chinese).replace("__LANG_SWITCH__", &lang_switch(chinese))
 }
 
-fn pair_expired_html() -> String {
+fn pair_expired_html(chinese: bool) -> String {
     render_pair_page(
         "<h1>二维码已失效</h1><p>每个二维码只能用一次，5 分钟内有效。请在 Mac 的 iphone-use 页面上点「手机扫码连接」重新生成。</p>",
+        chinese,
     )
 }
 
@@ -1499,8 +1600,9 @@ async fn pair_page(
     Query(query): Query<PairQuery>,
 ) -> Response {
     let code = query.c.unwrap_or_default();
+    let chinese = crate::locale::request_prefers_chinese(&headers);
     if !pair_code_shape_ok(&code) || !state.pairing.is_live(&code) {
-        let mut resp = Html(pair_expired_html()).into_response();
+        let mut resp = Html(pair_expired_html(chinese)).into_response();
         *resp.status_mut() = StatusCode::GONE;
         return with_security_headers(resp);
     }
@@ -1512,7 +1614,7 @@ async fn pair_page(
 <form method="POST" action="/pair"><input type="hidden" name="c" value="{code}"><button type="submit">打开控制页</button></form>
 <script>document.forms[0].submit()</script>"#
         );
-        return with_security_headers(Html(render_pair_page(&body)).into_response());
+        return with_security_headers(Html(render_pair_page(&body, chinese)).into_response());
     }
     let scheme = if request_is_https(&state, &headers) {
         "https"
@@ -1531,7 +1633,7 @@ async fn pair_page(
 <a href="{app_link}">在 Phone Use Remote App 中打开</a>
 <form method="POST" action="/pair"><input type="hidden" name="c" value="{code}"><button type="submit">在浏览器里控制</button></form>"#
     );
-    with_security_headers(Html(render_pair_page(&body)).into_response())
+    with_security_headers(Html(render_pair_page(&body, chinese)).into_response())
 }
 
 #[derive(Default, Deserialize)]
@@ -1563,6 +1665,7 @@ async fn pair_submit(
         } else {
             let mut r = Html(render_pair_page(
                 "<h1>尝试次数过多</h1><p>为保护手机，请 30 秒后再试。</p>",
+                crate::locale::request_prefers_chinese(&headers),
             ))
             .into_response();
             *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
@@ -1581,7 +1684,8 @@ async fn pair_submit(
             return redirect_with_cookie(&state, "/phone", &headers);
         }
         state.auth_limiter.lock().unwrap().record_failure();
-        let mut resp = Html(pair_expired_html()).into_response();
+        let chinese = crate::locale::request_prefers_chinese(&headers);
+        let mut resp = Html(pair_expired_html(chinese)).into_response();
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         return with_security_headers(resp);
     }
@@ -1689,7 +1793,7 @@ fn pair_form_code(body: &[u8]) -> String {
 // Agent operation entry (connect-in HTTP API)
 // ---------------------------------------------------------------------------
 //
-// An agent (Hermes, an MCP client, or a script) drives the phone by POSTing to
+// An agent (an MCP client or a script) drives the phone by POSTing to
 // this already-running daemon, which dispatches to on-device WDA.
 
 /// Extract the bytes after `Authorization: Bearer `.
@@ -2462,6 +2566,7 @@ async fn agent_status(
     let releasing = lifecycle == WdaLifecycleTransition::Releasing;
     let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
     let hold_remaining = state.hold_remaining_secs();
+    let screen_private_secs = state.screen_private_secs();
     let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
     let human_handoff = released && human_handoff_active();
     // L2 health — action-level, not just /status (which lies: it reports
@@ -2599,7 +2704,7 @@ async fn agent_status(
         ("releasing", "direct device service is being released after inactivity — wait for confirmation before reconnecting")
     } else if !wda {
         if state.managed_wda_pending {
-            ("unconfigured", "no canonical iPhone target is configured — run iphone-use setup to persist PHONE_REMOTE_UDID; until then the daemon will not stop or start the local device runner")
+            ("unconfigured", "no canonical iPhone target is configured — run iphone-use setup to persist IPHONE_USE_UDID; until then the daemon will not stop or start the local device runner")
         } else if let Some(blocker_hint) = setup_hint.as_deref() {
             ("blocker", blocker_hint)
         } else if reconnecting {
@@ -2735,7 +2840,7 @@ async fn agent_status(
     // The daemon inside the runner on the phone, as its last /status said.
     let phone_daemon = crate::phone_daemon::status_json(wda);
     let body = format!(
-        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
+        r#"{{"ok":true,"backend":"direct","instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&state.device_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -3214,8 +3319,8 @@ fn relay_ports_label() -> String {
     };
     format!(
         "{}/{}",
-        port("PHONE_REMOTE_WDA_URL", "8100"),
-        port("PHONE_REMOTE_WDA_MJPEG_URL", "9100")
+        port("IPHONE_USE_WDA_URL", "8100"),
+        port("IPHONE_USE_WDA_MJPEG_URL", "9100")
     )
 }
 
@@ -3834,8 +3939,8 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
             "WDA_ASC_ISSUER_ID",
             // A named instance's supervisor must run its own setup copy as
             // that instance (#67); unset for the default instance.
-            "PHONE_REMOTE_INSTANCE",
-            "PHONE_REMOTE_STATE_DIR",
+            "IPHONE_USE_INSTANCE",
+            "IPHONE_USE_STATE_DIR",
         ] {
             if let Ok(value) = std::env::var(key) {
                 if !value.is_empty() {
@@ -4137,7 +4242,7 @@ fn prepare_idle_wda_probe(state: &AppState) -> bool {
 }
 
 /// Idle auto-release — the phone belongs to its owner first. When WDA is
-/// configured and nobody has driven it for `PHONE_REMOTE_IDLE_RELEASE_SECS`
+/// configured and nobody has driven it for `IPHONE_USE_IDLE_RELEASE_SECS`
 /// (default 300; `0` disables) and no viewer is streaming, stop the on-phone
 /// WDA runner and boot out its KeepAlive LaunchAgent so the device is free for
 /// hands-on use. The next `/agent/input` re-bootstraps WDA (see [`agent_input`]).
@@ -4150,7 +4255,7 @@ fn prepare_idle_wda_probe(state: &AppState) -> bool {
 const COLD_START_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Idle window before the watchdog releases the phone when
-/// `PHONE_REMOTE_IDLE_RELEASE_SECS` is unset. Five minutes: while a runner is
+/// `IPHONE_USE_IDLE_RELEASE_SECS` is unset. Five minutes: while a runner is
 /// up iOS shows its "Automation Running" overlay, so an idle phone should not
 /// keep it long; a phone wanted back soon after a release stretches the next
 /// window (see the adaptive idle window below), so steady work does not pay a
@@ -4229,13 +4334,13 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     // iphone-use (one install logged 11,717 launches, 200 of them successful).
     // The cost that justified keeping it up is gone: a reconnect reuses the
     // cached runner product instead of rebuilding. `0` still keeps it up.
-    let idle_secs = std::env::var("PHONE_REMOTE_IDLE_RELEASE_SECS")
+    let idle_secs = std::env::var("IPHONE_USE_IDLE_RELEASE_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_IDLE_RELEASE_SECS);
     if idle_secs == 0 {
         tracing::info!(
-            "idle auto-release disabled (PHONE_REMOTE_IDLE_RELEASE_SECS=0): the runner stays up between requests"
+            "idle auto-release disabled (IPHONE_USE_IDLE_RELEASE_SECS=0): the runner stays up between requests"
         );
         return;
     }
@@ -4444,7 +4549,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                             "idle, but keeping the runner: it is up over Wi-Fi and this iPhone refused to start one over Wi-Fi (wifi_automation_refused), so a release would need the cable to undo"
                         ),
                         crate::keep_runner::Because::Passcode => tracing::info!(
-                            "idle, but keeping the runner: this iPhone has a passcode and every runner start asks for it on the phone, so a release would need a person to undo (PHONE_REMOTE_IDLE_RELEASE=force releases anyway)"
+                            "idle, but keeping the runner: this iPhone has a passcode and every runner start asks for it on the phone, so a release would need a person to undo (IPHONE_USE_IDLE_RELEASE=force releases anyway)"
                         ),
                     }
                 }
@@ -5018,6 +5123,45 @@ async fn agent_metrics(
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentActivityQuery {
+    since: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// `GET /agent/activity?since=<seq>&limit=<n>` — what the agent did, in plain
+/// words (`Tapped “Wi-Fi”`), oldest first; `next` is the cursor for the next
+/// call. Readable by a logged-in browser, like `/agent/status`.
+async fn agent_activity(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AgentActivityQuery>,
+    headers: HeaderMap,
+) -> Response {
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    let limit = query.limit.unwrap_or(20).min(crate::activity::CAPACITY);
+    let mut body = crate::activity::recent(query.since.unwrap_or(0), limit);
+    if let Some(budget) = crate::guard::budget_status(
+        crate::guard::Policy::get(),
+        &guard_owner(&headers),
+        crate::metrics::now_ms(),
+    ) {
+        body["budget"] = budget;
+    }
+    json_response(StatusCode::OK, body)
+}
+
 /// `POST /agent/run` — mark a run boundary for the caller (`X-Phone-Owner`):
 /// `{"action":"start","run_id":…,"complete_trace":true?}` or
 /// `{"action":"end","run_id":…,"turn_ids":[…]?}`. An explicit run makes the
@@ -5055,8 +5199,9 @@ async fn agent_run(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
     if !crate::metrics::valid_id(&owner) || !crate::metrics::valid_id(run_id) {
         return invalid("owner and run_id: 1–64 characters of A-Z a-z 0-9 . _ : @ -");
     }
-    // A run boundary: the no_progress tracker starts over.
+    // A run boundary: the no_progress tracker and the action budget start over.
     crate::advice::reset(&owner);
+    crate::guard::reset(&owner);
     match value.get("action").and_then(serde_json::Value::as_str) {
         Some("start") => {
             let complete = value.get("complete_trace") == Some(&serde_json::Value::Bool(true));
@@ -5147,6 +5292,8 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
             "lifecycle_managed_here": state.managed_wda,
         },
         "available": capability_availability(&state, &headers),
+        // Owner-set limits (`IPHONE_USE_BLOCKED_APPS`, `IPHONE_USE_MAX_ACTIONS`).
+        "limits": crate::guard::describe(crate::guard::Policy::get()),
     });
 
     with_security_headers(
@@ -5357,7 +5504,7 @@ async fn agent_mode_inner(
     // Optional target UDID. Invalid values are rejected rather than silently
     // falling back to another phone. Once Direct has a persisted target, a
     // transient request may not switch it behind status/idle recovery's back;
-    // change PHONE_REMOTE_UDID and restart to make a target change atomic.
+    // change IPHONE_USE_UDID and restart to make a target change atomic.
     let requested_udid = parsed
         .as_ref()
         .and_then(|v| v.get("udid").and_then(|u| u.as_str()))
@@ -5374,7 +5521,7 @@ async fn agent_mode_inner(
                     .status(StatusCode::CONFLICT)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"ok":false,"error":"target_not_configured","hint":"run setup-wda.sh so PHONE_REMOTE_UDID is persisted before starting managed WDA"}"#,
+                        r#"{"ok":false,"error":"target_not_configured","hint":"run setup-wda.sh so IPHONE_USE_UDID is persisted before starting managed WDA"}"#,
                     ))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             );
@@ -5910,6 +6057,10 @@ enum WdaControlOutcome {
     /// ones were sent without an acknowledgement and may be partly typed.
     /// Never replayed — the caller appends only the rest.
     TextPartial { confirmed: usize, uncertain: usize },
+    /// The runner refused the request and said nothing reached the screen
+    /// (issue #257: a scroll point outside the runner's screen). Its reason
+    /// is in the `runner_error` detail.
+    RunnerRejected,
     Failed,
 }
 
@@ -8638,14 +8789,41 @@ async fn wda_control_with_client(
             tracing::warn!("wda control ({typ}): not sent, WDA unreachable: {e:#}");
             WdaControlOutcome::NotSent
         }
-        Err(e) => {
-            // A WDA call that should have worked failed. Callers fail closed.
-            actionable.store(false, Ordering::Relaxed);
-            w.invalidate_session();
-            tracing::warn!("wda control ({typ}): {e:#}");
-            WdaControlOutcome::Failed
-        }
+        Err(e) => runner_failure_outcome(w, actionable, &e, typ, detail),
     }
+}
+
+/// A runner call failed after the request reached it. When the runner said it
+/// acted on nothing (see [`crate::wda::RunnerHttpError::nothing_sent`]) the
+/// action was refused: the session and the read path stay as they were, and
+/// the cached window size goes (the refusal is a touch point off the screen
+/// the runner measures, so the daemon's size disagreed with it). Anything
+/// else fails closed as an unknown outcome. Either way the runner's own
+/// reason rides along in `detail.runner_error`.
+fn runner_failure_outcome(
+    w: &mut crate::wda::WdaClient,
+    actionable: &std::sync::atomic::AtomicBool,
+    error: &anyhow::Error,
+    typ: &str,
+    detail: &mut Option<serde_json::Value>,
+) -> WdaControlOutcome {
+    use std::sync::atomic::Ordering;
+    let runner = crate::wda::runner_http_error(error);
+    if let Some(runner) = runner {
+        *detail = Some(serde_json::json!({ "runner_error": runner.to_json() }));
+    }
+    if runner.is_some_and(crate::wda::RunnerHttpError::nothing_sent) {
+        let cached = w.forget_window_size();
+        tracing::warn!(
+            "wda control ({typ}): refused by the runner before dispatch (daemon window size {cached:?}): {error:#}"
+        );
+        return WdaControlOutcome::RunnerRejected;
+    }
+    // A WDA call that should have worked failed. Callers fail closed.
+    actionable.store(false, Ordering::Release);
+    w.invalidate_session();
+    tracing::warn!("wda control ({typ}): {error:#}");
+    WdaControlOutcome::Failed
 }
 
 /// `POST /control` — cookie-authenticated browser control for the direct backend.
@@ -8720,6 +8898,49 @@ fn wda_failed_after_dispatch_response() -> Response {
                 r#"{"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false}"#,
             ))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
+/// `outcome_unknown`, carrying the runner's own reason (`runner_error`) when
+/// it answered with an error status (issue #257).
+fn wda_failed_after_dispatch_response_with(detail: Option<&serde_json::Value>) -> Response {
+    let Some(runner_error) = detail.and_then(|d| d.get("runner_error")) else {
+        return wda_failed_after_dispatch_response();
+    };
+    let body = serde_json::json!({
+        "ok": false,
+        "error": "outcome_unknown",
+        "outcome": "unknown",
+        "retry_safe": false,
+        "runner_error": runner_error,
+    });
+    with_security_headers((StatusCode::BAD_GATEWAY, axum::Json(body)).into_response())
+}
+
+const RUNNER_REJECTED_HINT: &str = "the device runner refused this action before touching the screen (see runner_error); nothing was sent, so fix what it names and send it again";
+
+/// The runner refused the action and said nothing reached the screen.
+fn runner_rejected_body(detail: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "ok": false,
+        "error": "runner_rejected",
+        "outcome": "not_sent",
+        "retry_safe": true,
+        "hint": RUNNER_REJECTED_HINT,
+    });
+    if let Some(runner_error) = detail.and_then(|d| d.get("runner_error")) {
+        body["runner_error"] = runner_error.clone();
+    }
+    body
+}
+
+fn runner_rejected_response(detail: Option<&serde_json::Value>) -> Response {
+    with_security_headers(
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(runner_rejected_body(detail)),
+        )
+            .into_response(),
     )
 }
 
@@ -9220,12 +9441,7 @@ async fn direct_agent_action(
             actionable.store(true, Ordering::Release);
             WdaControlOutcome::Applied
         }
-        Err(error) => {
-            actionable.store(false, Ordering::Release);
-            w.invalidate_session();
-            tracing::warn!("wda agent action ({typ}): {error:#}");
-            WdaControlOutcome::Failed
-        }
+        Err(error) => runner_failure_outcome(w, actionable, &error, typ, detail),
     }
 }
 
@@ -9404,7 +9620,10 @@ async fn direct_control(
             actionable: false,
             locked,
         };
-        return wda_failed_after_dispatch_response();
+        return wda_failed_after_dispatch_response_with(detail.as_ref());
+    }
+    if outcome == WdaControlOutcome::RunnerRejected {
+        return runner_rejected_response(detail.as_ref());
     }
     if outcome == WdaControlOutcome::NotSent {
         mark_wda_read_path_unactionable(&state);
@@ -9613,6 +9832,42 @@ impl ControlRefusal {
                 .body(Body::from(self.body.to_string()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         )
+    }
+}
+
+/// How long the guard waits for the foreground app before refusing.
+const GUARD_FOREGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// A [`crate::guard`] refusal: `403`, nothing sent. `batch` adds the
+/// `/agent/actions` fields that say no step ran.
+fn guard_refusal(refusal: &crate::guard::Refusal, batch: bool) -> Response {
+    let refusal = ControlRefusal {
+        status: StatusCode::FORBIDDEN,
+        body: refusal.to_json(),
+        retry_soon: false,
+    };
+    if batch { refusal.for_batch() } else { refusal }.into_response()
+}
+
+/// The caller a run budget belongs to: its `X-Phone-Owner`, or one shared
+/// budget for callers that send none.
+fn guard_owner(headers: &HeaderMap) -> String {
+    named_owner(headers).unwrap_or_default().to_string()
+}
+
+/// Refuse `action` when a blocked app is in front and the action does not
+/// leave it. No read at all without a blocklist.
+async fn guard_foreground(
+    client: &mut crate::wda::WdaClient,
+    action: &serde_json::Value,
+) -> Result<(), crate::guard::Refusal> {
+    let policy = crate::guard::Policy::get();
+    if !policy.needs_foreground(action) {
+        return Ok(());
+    }
+    match tokio::time::timeout(GUARD_FOREGROUND_TIMEOUT, client.active_bundles()).await {
+        Ok(Ok(active)) => policy.check_foreground(&active),
+        _ => Err(crate::guard::Refusal::ForegroundUnknown),
     }
 }
 
@@ -10690,6 +10945,27 @@ async fn agent_actions_inner(
             .into_response();
     };
 
+    // Owner limits (`crate::guard`): blocked launches and the run budget
+    // refuse the whole batch before anything is sent; a blocked app in front
+    // is checked per step, since an earlier step may have left or entered it.
+    let policy = crate::guard::Policy::get();
+    if policy.is_active() {
+        let mut actions = 0_u32;
+        for step in &request.steps {
+            if let AgentActionStep::Action { action, .. } = step {
+                if let Err(refusal) = policy.check_launch(action) {
+                    return guard_refusal(&refusal, true);
+                }
+                actions += 1;
+            }
+        }
+        if let Err(refusal) =
+            crate::guard::charge(policy, &guard_owner(&headers), actions, crate::metrics::now_ms())
+        {
+            return guard_refusal(&refusal, true);
+        }
+    }
+
     state.touch_activity();
     state.cancel_settled_frame_prefetch();
     // Do Not Disturb at a quiet moment; a batch that opens with launch_app
@@ -10764,17 +11040,41 @@ async fn agent_actions_inner(
 
         match step {
             AgentActionStep::Action { action, after_ms } => {
+                if let Err(refusal) = guard_foreground(&mut w, action).await {
+                    let mut body = agent_actions_failure_body(
+                        index,
+                        completed,
+                        applied_actions,
+                        refusal.error(),
+                        "not_sent",
+                        applied_actions == 0
+                            && matches!(refusal, crate::guard::Refusal::ForegroundUnknown),
+                        &step_results,
+                        None,
+                    );
+                    if let (Some(body), serde_json::Value::Object(extra)) =
+                        (body.as_object_mut(), refusal.to_json())
+                    {
+                        for key in ["hint", "app"] {
+                            if let Some(value) = extra.get(key) {
+                                body.insert(key.to_string(), value.clone());
+                            }
+                        }
+                    }
+                    return agent_actions_json(StatusCode::FORBIDDEN, body);
+                }
                 // Dispatch exactly once. If the batch deadline wins after this
                 // point, the action outcome is unknown and the whole batch must
                 // not be replayed automatically.
                 let post_mark = w.last_post();
+                let mut step_detail = None;
                 let outcome = match tokio::time::timeout_at(
                     batch_deadline,
                     direct_agent_action(
                         &mut w,
                         &state.wda_actionable,
                         action,
-                        &mut None,
+                        &mut step_detail,
                         batch_deadline,
                     ),
                 )
@@ -10934,6 +11234,12 @@ async fn agent_actions_inner(
                             "not_sent",
                             true,
                         ),
+                        WdaControlOutcome::RunnerRejected => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "runner_rejected",
+                            "not_sent",
+                            true,
+                        ),
                         WdaControlOutcome::Failed => {
                             (StatusCode::BAD_GATEWAY, "outcome_unknown", "unknown", false)
                         }
@@ -10947,8 +11253,7 @@ async fn agent_actions_inner(
                     ) {
                         mark_wda_read_path_unactionable(&state);
                     }
-                    return agent_actions_failure(
-                        status,
+                    let mut body = agent_actions_failure_body(
                         index,
                         completed,
                         applied_actions,
@@ -10958,8 +11263,16 @@ async fn agent_actions_inner(
                         &step_results,
                         None,
                     );
+                    // The runner's own reason for a refused or failed step.
+                    if let Some(runner_error) =
+                        step_detail.as_ref().and_then(|d| d.get("runner_error"))
+                    {
+                        body["runner_error"] = runner_error.clone();
+                    }
+                    return agent_actions_json(status, body);
                 }
                 applied_actions += 1;
+                record_activity(&state, &headers, action);
                 if *after_ms > 0
                     && tokio::time::timeout_at(
                         batch_deadline,
@@ -11323,6 +11636,20 @@ async fn begin_list_control<'a>(
         ));
     }
     unlock_before_action(state, &mut w, deadline).await;
+    // Owner limits (`crate::guard`): these calls swipe inside the app in
+    // front, and count as one action.
+    let policy = crate::guard::Policy::get();
+    if policy.is_active() {
+        if let Err(refusal) = guard_foreground(&mut w, &serde_json::json!({"type": "swipe"})).await
+        {
+            return Err(guard_refusal(&refusal, false));
+        }
+        if let Err(refusal) =
+            crate::guard::charge(policy, &guard_owner(headers), 1, crate::metrics::now_ms())
+        {
+            return Err(guard_refusal(&refusal, false));
+        }
+    }
     Ok(w)
 }
 
@@ -12248,6 +12575,12 @@ async fn agent_input_inner(
                     );
                 }
             };
+            // A blocked app is the owner's to remove, not an agent's.
+            if let Err(refusal) = crate::guard::Policy::get()
+                .check_launch(&serde_json::json!({"type": "launch_app", "bundle": bundle}))
+            {
+                return guard_refusal(&refusal, false);
+            }
             let bundle = bundle.to_string();
             let r =
                 tokio::task::spawn_blocking(move || devicectl_uninstall(udid.as_deref(), &bundle))
@@ -12276,7 +12609,7 @@ async fn agent_input_inner(
                             .status(StatusCode::CONFLICT)
                             .header(header::CONTENT_TYPE, "application/json")
                             .body(Body::from(format!(
-                                r#"{{"ok":false,"error":"target_required","connected_candidates":{count},"hint":"configure PHONE_REMOTE_UDID or pass an explicit matching udid"}}"#
+                                r#"{{"ok":false,"error":"target_required","connected_candidates":{count},"hint":"configure IPHONE_USE_UDID or pass an explicit matching udid"}}"#
                             )))
                             .unwrap_or_else(|_| {
                                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -12332,6 +12665,10 @@ async fn agent_input_inner(
     if let Err(refusal) = resolve_launch_app_action(&state, &mut value).await {
         return refusal;
     }
+    // A blocked app is refused before anything else runs (`crate::guard`).
+    if let Err(refusal) = crate::guard::Policy::get().check_launch(&value) {
+        return guard_refusal(&refusal, false);
+    }
     // The MCP client waits 30 seconds. Keep the daemon's complete Direct WDA
     // budget comfortably below that so the authoritative HTTP outcome arrives
     // before the client can abandon a still-running action. It starts AFTER
@@ -12360,6 +12697,28 @@ async fn agent_input_inner(
         + crate::text_input::action_allowance(&value);
     if tokio::time::Instant::now() >= agent_wda_deadline {
         return wda_deadline_response(false);
+    }
+    // Owner limits (`crate::guard`), checked last so a refused action costs
+    // no budget; the foreground read happens only with a blocklist.
+    let policy = crate::guard::Policy::get();
+    if policy.is_active() {
+        if policy.needs_foreground(&value) {
+            let checked = tokio::time::timeout_at(agent_wda_deadline, async {
+                let mut client = wda.lock().await;
+                guard_foreground(&mut client, &value).await
+            })
+            .await;
+            match checked {
+                Ok(Ok(())) => {}
+                Ok(Err(refusal)) => return guard_refusal(&refusal, false),
+                Err(_) => return wda_deadline_response(false),
+            }
+        }
+        if let Err(refusal) =
+            crate::guard::charge(policy, &guard_owner(&headers), 1, crate::metrics::now_ms())
+        {
+            return guard_refusal(&refusal, false);
+        }
     }
     let dispatched = Arc::new(std::sync::Mutex::new(None::<Option<std::time::Instant>>));
     let dispatch_marker = dispatched.clone();
@@ -12594,7 +12953,8 @@ async fn agent_input_inner(
                     .into_response(),
             )
         }
-        WdaControlOutcome::Failed => wda_failed_after_dispatch_response(),
+        WdaControlOutcome::RunnerRejected => runner_rejected_response(detail.as_ref()),
+        WdaControlOutcome::Failed => wda_failed_after_dispatch_response_with(detail.as_ref()),
     }
 }
 
@@ -12993,6 +13353,19 @@ fn record_flow_action(state: &AppState, action: &serde_json::Value, now: Instant
     bundle
 }
 
+/// One applied action on the activity feed, in plain words (`crate::activity`).
+fn record_activity(state: &AppState, headers: &HeaderMap, action: &serde_json::Value) {
+    let rows = action
+        .get("snapshot")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|snapshot| lookup_element_snapshot(state, snapshot));
+    crate::activity::record(
+        named_owner(headers),
+        crate::activity::describe(action, rows.as_deref().map(Vec::as_slice)),
+        crate::metrics::now_ms(),
+    );
+}
+
 /// `registry` (after a launch) and `flow_suggestion` (when due) for one
 /// applied `/agent/input` action.
 fn flow_after_input(
@@ -13000,6 +13373,7 @@ fn flow_after_input(
     headers: &HeaderMap,
     action: &serde_json::Value,
 ) -> Vec<(&'static str, serde_json::Value)> {
+    record_activity(state, headers, action);
     if headers.contains_key(FLOW_RUN_HEADER) {
         return Vec::new();
     }
@@ -13701,6 +14075,9 @@ async fn agent_elements_inner(
         }
         AgentAuth::Ok => {}
     }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
     // Always answer with parseable JSON, while preserving failure in the HTTP
     // status. A 200 empty tree is indistinguishable from a genuinely empty
     // screen and caused MCP clients to continue from false state.
@@ -14007,8 +14384,10 @@ fn attach_alert(body: String, alert: Option<(String, Vec<String>)>) -> String {
 const AGENT_HOLD_MAX_SECS: u64 = 4 * 3600;
 
 /// `POST /agent/hold` `{"secs": N}` — keep the phone for N seconds regardless
-/// of idle time (0 clears). Bearer + mutation header, like every control
-/// endpoint. Returns `{"ok":true,"hold_remaining_secs":N}`.
+/// of idle time (0 clears). `"private": true` also keeps the screen unread
+/// for that time — the person is signing in on the phone (see
+/// `AppState::private_until`). Bearer + mutation header, like every control
+/// endpoint. Returns `{"ok":true,"hold_remaining_secs":N,"screen_private_secs":M}`.
 /// Take (or, with `secs == 0`, clear) the idle-release hold, arbitrated
 /// against the watchdog.
 ///
@@ -14029,6 +14408,60 @@ fn try_take_hold(
     }
     *hold = (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs));
     true
+}
+
+/// Seconds left on a private hold (0 when none or expired).
+fn private_secs_left(private_until: &Mutex<Option<Instant>>) -> u64 {
+    recover(private_until.lock())
+        .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(0)
+}
+
+fn screen_private_now(private_until: &Mutex<Option<Instant>>) -> bool {
+    recover(private_until.lock()).is_some_and(|until| until > Instant::now())
+}
+
+/// Run `work` unless the screen turns private first (checked every 250 ms),
+/// so an open live feed ends at once when a private hold begins instead of
+/// waiting out its inactivity timeout.
+async fn unless_private<T>(
+    private_until: &Mutex<Option<Instant>>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        if screen_private_now(private_until) {
+            return None;
+        }
+        if let Ok(out) = tokio::time::timeout(std::time::Duration::from_millis(250), &mut work).await {
+            // Finished after the hold began: drop it, never send it.
+            return (!screen_private_now(private_until)).then_some(out);
+        }
+    }
+}
+
+/// Set or lift the private screen together with the hold it belongs to. The
+/// last hold decides: one taken without `private` (or `secs: 0`) lifts it.
+fn set_screen_private(state: &AppState, private: bool, secs: u64) {
+    let until = (private && secs > 0)
+        .then(|| Instant::now() + std::time::Duration::from_secs(secs));
+    *recover(state.private_until.lock()) = until;
+    if let Some(hub) = &state.video {
+        hub.hide_until(until);
+    }
+}
+
+/// 423 for every screen read while the person signs in on the phone.
+fn screen_private_refusal(state: &AppState) -> Option<Response> {
+    let secs = private_secs_left(&state.private_until);
+    (secs > 0).then(|| {
+        json_response(
+            StatusCode::LOCKED,
+            serde_json::json!({"ok": false, "error": "screen_private", "screen_private_secs": secs,
+                "hint": "the person is signing in on the phone, so its screen is not read; wait for them, then clear the hold (phone_hold 0 / POST /agent/hold {\"secs\":0}) and read it again"}),
+        )
+    })
 }
 
 /// The owner who takes a hold keeps the phone for as long as the hold lasts:
@@ -14215,9 +14648,20 @@ async fn agent_hold(
         Ok(true) => prewarm_on_new_lease(&state, &headers),
         Ok(false) => {}
     }
-    let secs = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let secs = parsed
+        .as_ref()
         .and_then(|value| value.get("secs").and_then(serde_json::Value::as_u64));
+    let private = match parsed.as_ref().and_then(|value| value.get("private")) {
+        None | Some(serde_json::Value::Null) => Some(false),
+        Some(value) => value.as_bool(),
+    };
+    let Some(private) = private else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"ok": false, "error": "invalid_hold", "hint": "private must be true or false"}),
+        );
+    };
     let Some(secs) = secs.filter(|secs| *secs <= AGENT_HOLD_MAX_SECS) else {
         return with_security_headers(
             Response::builder()
@@ -14255,12 +14699,14 @@ async fn agent_hold(
             std::time::Duration::from_secs(state.owner_lease_secs),
         );
     }
+    set_screen_private(&state, private, secs);
     state.touch_activity();
+    let screen_private_secs = state.screen_private_secs();
     with_security_headers(
         Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(format!(
-                r#"{{"ok":true,"hold_remaining_secs":{secs}}}"#
+                r#"{{"ok":true,"hold_remaining_secs":{secs},"screen_private_secs":{screen_private_secs}}}"#
             )))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
@@ -14649,6 +15095,9 @@ async fn agent_screenshot(
         }
         AgentAuth::Ok => {}
     }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
     if state.managed_wda_pending {
         return target_not_configured_response();
     }
@@ -14965,6 +15414,9 @@ async fn agent_mjpeg(
         }
         None => None,
     };
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
     if state.managed_wda_pending {
         return target_not_configured_response();
     }
@@ -15085,13 +15537,23 @@ async fn agent_mjpeg(
             let activity_guard = stream_id.map(|stream_id| {
                 MjpegActivityGuard::register(state.mjpeg_stream_activity.clone(), stream_id)
             });
+            // A private hold taken while this feed is open ends it: the
+            // person is signing in on the phone.
+            let private_until = state.private_until.clone();
             let timed = futures_util::stream::unfold(
                 (upstream, guard, activity_guard, false),
-                |(mut upstream, guard, activity_guard, done)| async move {
+                move |(mut upstream, guard, activity_guard, done)| {
+                    let private_until = private_until.clone();
+                    async move {
                     if done {
                         return None;
                     }
-                    match tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, upstream.next()).await {
+                    let next = unless_private(
+                        &private_until,
+                        tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, upstream.next()),
+                    )
+                    .await?;
+                    match next {
                         Ok(Some(Ok(bytes))) => {
                             if let Some(activity) = &activity_guard {
                                 activity.touch();
@@ -15113,6 +15575,7 @@ async fn agent_mjpeg(
                             )),
                             (upstream, guard, activity_guard, true),
                         )),
+                    }
                     }
                 },
             );
@@ -15175,6 +15638,9 @@ async fn agent_h264(
         }
         None => None,
     };
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
     let Some(hub) = state.video.clone() else {
         return with_security_headers(
             (StatusCode::NOT_IMPLEMENTED, "H.264 video is unavailable on this daemon").into_response(),
@@ -15218,13 +15684,21 @@ async fn agent_h264(
     let activity_guard = stream_id.map(|stream_id| {
         MjpegActivityGuard::register(state.mjpeg_stream_activity.clone(), stream_id)
     });
+    // A private hold taken while this feed is open ends it (the hub stops
+    // capturing too, see `VideoHub::hide_until`).
+    let private_until = state.private_until.clone();
     let frames = futures_util::stream::unfold(
         (subscription, stream_guard, activity_guard, hub),
-        |(mut subscription, guard, activity_guard, hub)| async move {
+        move |(mut subscription, guard, activity_guard, hub)| {
+            let private_until = private_until.clone();
+            async move {
             loop {
-                match tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, subscription.frames.recv())
-                    .await
-                {
+                let next = unless_private(
+                    &private_until,
+                    tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, subscription.frames.recv()),
+                )
+                .await?;
+                match next {
                     Ok(Ok(frame)) => {
                         if let Some(activity) = &activity_guard {
                             activity.touch();
@@ -15243,6 +15717,7 @@ async fn agent_h264(
                         return None
                     }
                 }
+            }
             }
         },
     );
@@ -15830,7 +16305,7 @@ impl InventoryFailure {
     fn reason(&self) -> String {
         match self {
             Self::TargetRequired(count) => format!(
-                "devicectl inventory needs an explicit target ({count} connected candidates); configure PHONE_REMOTE_UDID"
+                "devicectl inventory needs an explicit target ({count} connected candidates); configure IPHONE_USE_UDID"
             ),
             Self::Unavailable(reason) => reason.clone(),
         }
@@ -15845,7 +16320,7 @@ impl InventoryFailure {
                     "ok": false,
                     "error": "target_required",
                     "connected_candidates": count,
-                    "hint": "configure PHONE_REMOTE_UDID (run setup-wda.sh) so the daemon knows which phone to ask",
+                    "hint": "configure IPHONE_USE_UDID (run setup-wda.sh) so the daemon knows which phone to ask",
                 }),
             ),
             Self::Unavailable(reason) => agent_apps_json(
@@ -16376,11 +16851,20 @@ async fn agent_intent(
     state.touch_activity();
     let Some(wda) = &state.wda else {
         return intent_error_response(&IntentError::BridgeUnavailable {
-            reason: "WDA is not configured (PHONE_REMOTE_WDA_URL / setup)".to_string(),
+            reason: "WDA is not configured (IPHONE_USE_WDA_URL / setup)".to_string(),
         });
     };
     if tokio::time::Instant::now() >= agent_wda_deadline {
         return intent_error_response(&IntentError::NotSent);
+    }
+    // An intent is one action against the run budget (`crate::guard`).
+    if let Err(refusal) = crate::guard::charge(
+        crate::guard::Policy::get(),
+        &guard_owner(&headers),
+        1,
+        crate::metrics::now_ms(),
+    ) {
+        return guard_refusal(&refusal, false);
     }
     let _priority = state.begin_wda_control();
     let correlation_id = new_intent_correlation_id();
@@ -19147,6 +19631,18 @@ mod tests {
     }
 
     #[test]
+    fn the_session_cookie_is_found_in_any_cookie_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "iphone_use_lang=en".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            format!("other=1; {SESSION_COOKIE}=abc").parse().unwrap(),
+        );
+        assert_eq!(session_cookie(&headers).as_deref(), Some("abc"));
+        assert_eq!(session_cookie(&HeaderMap::new()), None);
+    }
+
+    #[test]
     fn embedded_index_html_is_the_client() {
         // include_str! must pick up web/index.html (the browser client).
         assert!(INDEX_HTML.contains("iphone-use"));
@@ -19506,10 +20002,15 @@ mod tests {
                     };
                     let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                     let body = responder(&request);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
+                    // A responder that returns a whole response picks its own status.
+                    let response = if body.starts_with("HTTP/1.1 ") {
+                        body
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
                     let _ = stream.write_all(response.as_bytes());
                 }
             });
@@ -20731,6 +21232,136 @@ mod tests {
             .await;
             assert_eq!(outcome, WdaControlOutcome::NotSent);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 0);
+            wda.shutdown();
+        });
+    }
+
+    // -- runner error statuses (issue #257) ------------------------------------
+
+    /// A runner that answers `POST /actions` with `status` and the W3C error
+    /// envelope `{code, message}`, and a 393×852 window otherwise.
+    fn refusing_actions_wda(
+        status: &'static str,
+        code: &'static str,
+        message: &'static str,
+    ) -> (MockWda, Arc<std::sync::atomic::AtomicUsize>) {
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = posts.clone();
+        let wda = MockWda::start(move |request| {
+            if request.starts_with("POST /session/SESSION/actions ") {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body =
+                    serde_json::json!({"value": {"error": code, "message": message}}).to_string();
+                return format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+            if request.contains("/window/size") {
+                return r#"{"value":{"width":393,"height":852}}"#.to_string();
+            }
+            healthy_wda_responder(request)
+        });
+        (wda, posts)
+    }
+
+    const OFF_SCREEN_REFUSAL: &str =
+        "action point (196, 489) is outside the 852x393 screen; nothing was sent";
+
+    #[test]
+    fn a_scroll_the_runner_refused_before_dispatch_is_not_sent_with_its_reason() {
+        block(async {
+            let (mut wda, posts) =
+                refusing_actions_wda("400 Bad Request", "invalid argument", OFF_SCREEN_REFUSAL);
+            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let actionable = std::sync::atomic::AtomicBool::new(true);
+            let mut detail = None;
+            let outcome = direct_agent_action(
+                &mut client,
+                &actionable,
+                &serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}),
+                &mut detail,
+                far_deadline(),
+            )
+            .await;
+            assert_eq!(outcome, WdaControlOutcome::RunnerRejected);
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "sent once"
+            );
+            assert!(
+                actionable.load(std::sync::atomic::Ordering::SeqCst),
+                "a refused request says nothing about the runner's health"
+            );
+            let runner = &detail.as_ref().unwrap()["runner_error"];
+            assert_eq!(runner["status"], 400);
+            assert_eq!(runner["code"], "invalid argument");
+            assert_eq!(runner["message"], OFF_SCREEN_REFUSAL);
+            assert_eq!(runner["call"], "POST /actions (swipe)");
+
+            let body = runner_rejected_body(detail.as_ref());
+            assert_eq!(body["error"], "runner_rejected");
+            assert_eq!(body["outcome"], "not_sent");
+            assert_eq!(body["retry_safe"], true);
+            assert_eq!(body["runner_error"]["message"], OFF_SCREEN_REFUSAL);
+            wda.shutdown();
+        });
+    }
+
+    #[test]
+    fn any_other_runner_error_stays_unknown_but_keeps_its_reason() {
+        block(async {
+            // A 400 alone does not prove nothing happened.
+            let (mut wda, _) =
+                refusing_actions_wda("400 Bad Request", "invalid argument", "typing failed");
+            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let actionable = std::sync::atomic::AtomicBool::new(true);
+            let mut detail = None;
+            let outcome = direct_agent_action(
+                &mut client,
+                &actionable,
+                &serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}),
+                &mut detail,
+                far_deadline(),
+            )
+            .await;
+            assert_eq!(outcome, WdaControlOutcome::Failed);
+            assert!(!actionable.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                detail.as_ref().unwrap()["runner_error"]["message"],
+                "typing failed"
+            );
+            wda.shutdown();
+
+            let (mut wda, _) = refusing_actions_wda(
+                "500 Internal Server Error",
+                "unknown error",
+                "actions failed: synthesis error",
+            );
+            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let mut detail = None;
+            let outcome = direct_agent_action(
+                &mut client,
+                &actionable,
+                &serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}),
+                &mut detail,
+                far_deadline(),
+            )
+            .await;
+            assert_eq!(outcome, WdaControlOutcome::Failed);
+            let response = wda_failed_after_dispatch_response_with(detail.as_ref());
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            use http_body_util::BodyExt;
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "outcome_unknown");
+            assert_eq!(body["retry_safe"], false);
+            assert_eq!(body["runner_error"]["status"], 500);
+            assert_eq!(
+                body["runner_error"]["message"],
+                "actions failed: synthesis error"
+            );
             wda.shutdown();
         });
     }

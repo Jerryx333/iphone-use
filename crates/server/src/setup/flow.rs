@@ -1878,7 +1878,7 @@ impl Setup {
                     "trust",
                     "trust the Apple Development cert on the iPhone",
                 );
-                return die("Developer cert not trusted. On the iPhone: 设置 → 通用 → VPN与设备管理 → 信任 'Apple Development: …', then re-run. (pitfall ②)");
+                return die("Developer cert not trusted. On the iPhone: Settings → General → VPN & Device Management → Trust 'Apple Development: …' (设置 → 通用 → VPN与设备管理 → 信任), then re-run. (pitfall ②)");
             }
             if pid::validate(
                 &self.ctx,
@@ -2316,7 +2316,7 @@ impl Setup {
         if !ctx.daemon_plist.is_file() {
             warn("daemon LaunchAgent not found; the runner can be verified, but the product daemon cannot be started");
             println!(
-                "    PHONE_REMOTE_BACKEND=direct PHONE_REMOTE_WDA_URL={target_url} PHONE_REMOTE_WDA_MJPEG_URL={mjpeg_url} iphone-use serve"
+                "    IPHONE_USE_BACKEND=direct IPHONE_USE_WDA_URL={target_url} IPHONE_USE_WDA_MJPEG_URL={mjpeg_url} iphone-use serve"
             );
             return Ok(DaemonEndpoint {
                 port: "44321".into(),
@@ -2353,20 +2353,20 @@ impl Setup {
         }
         let current = |key: &str| sys::plist_env(&staged, key);
         let mut changed: Vec<&str> = Vec::new();
-        if current("PHONE_REMOTE_BACKEND") != "direct" {
-            changed.push("PHONE_REMOTE_BACKEND");
+        if current("IPHONE_USE_BACKEND") != "direct" {
+            changed.push("IPHONE_USE_BACKEND");
         }
-        if current("PHONE_REMOTE_UDID") != ctx.udid {
-            changed.push("PHONE_REMOTE_UDID");
+        if current("IPHONE_USE_UDID") != ctx.udid {
+            changed.push("IPHONE_USE_UDID");
         }
-        if current("PHONE_REMOTE_WDA_URL") != target_url {
-            changed.push("PHONE_REMOTE_WDA_URL");
+        if current("IPHONE_USE_WDA_URL") != target_url {
+            changed.push("IPHONE_USE_WDA_URL");
         }
-        if current("PHONE_REMOTE_WDA_MJPEG_URL") != mjpeg_url {
-            changed.push("PHONE_REMOTE_WDA_MJPEG_URL");
+        if current("IPHONE_USE_WDA_MJPEG_URL") != mjpeg_url {
+            changed.push("IPHONE_USE_WDA_MJPEG_URL");
         }
-        if current("PHONE_REMOTE_WDA_MANAGED") != "true" {
-            changed.push("PHONE_REMOTE_WDA_MANAGED");
+        if current("IPHONE_USE_WDA_MANAGED") != "true" {
+            changed.push("IPHONE_USE_WDA_MANAGED");
         }
         // A per-phone Xcode reaches the daemon's own devicectl/xcrun calls
         // through its environment, which it reads at startup.
@@ -2388,11 +2388,11 @@ impl Setup {
         let config_changed = !changed.is_empty();
         if config_changed {
             for (key, value) in [
-                ("PHONE_REMOTE_BACKEND", "direct"),
-                ("PHONE_REMOTE_UDID", ctx.udid.as_str()),
-                ("PHONE_REMOTE_WDA_URL", target_url),
-                ("PHONE_REMOTE_WDA_MJPEG_URL", mjpeg_url.as_str()),
-                ("PHONE_REMOTE_WDA_MANAGED", "true"),
+                ("IPHONE_USE_BACKEND", "direct"),
+                ("IPHONE_USE_UDID", ctx.udid.as_str()),
+                ("IPHONE_USE_WDA_URL", target_url),
+                ("IPHONE_USE_WDA_MJPEG_URL", mjpeg_url.as_str()),
+                ("IPHONE_USE_WDA_MANAGED", "true"),
                 ("WDA_ALLOW_LAN", ctx.allow_lan.as_str()),
                 ("WDA_TRANSPORT", ctx.transport.as_str()),
             ] {
@@ -2439,7 +2439,7 @@ impl Setup {
         } else {
             warn("daemon LaunchAgent loaded state could not be verified");
         }
-        let mut port = sys::plist_env(&ctx.daemon_plist, "PHONE_REMOTE_PORT");
+        let mut port = sys::plist_env(&ctx.daemon_plist, "IPHONE_USE_PORT");
         if port.is_empty() {
             port = "44321".into();
         }
@@ -2526,9 +2526,9 @@ impl Setup {
         };
         let max_tries = env_number("DAEMON_STATUS_MAX_TRIES", 120);
         let grace = env_number("DAEMON_REACHABLE_GRACE_TRIES", 20);
-        let mut token = sys::plist_env(&self.ctx.daemon_plist, "PHONE_REMOTE_AGENT_TOKEN");
+        let mut token = sys::plist_env(&self.ctx.daemon_plist, "IPHONE_USE_AGENT_TOKEN");
         if token.is_empty() {
-            token = sys::plist_env(&self.ctx.daemon_plist, "PHONE_REMOTE_PASSWORD");
+            token = sys::plist_env(&self.ctx.daemon_plist, "IPHONE_USE_PASSWORD");
         }
         let handoff_after = env_number("DAEMON_HANDOFF_AFTER_TRIES", 20);
         let url = format!("http://127.0.0.1:{}/agent/status", daemon.port);
@@ -3917,7 +3917,7 @@ impl Setup {
         }
         let mut env: Vec<(&str, String)> = Vec::new();
         if !ctx.instance.is_default() {
-            env.push(("PHONE_REMOTE_INSTANCE", ctx.instance.name.clone()));
+            env.push(("IPHONE_USE_INSTANCE", ctx.instance.name.clone()));
         }
         // The key order is the script's, so a plist reads the same either way.
         let mut pairs: Vec<(&str, String)> = vec![
@@ -3964,8 +3964,8 @@ impl Setup {
         if let Some(dir) = &ctx.developer_dir {
             pairs.push(("DEVELOPER_DIR", dir.to_string_lossy().into_owned()));
         }
-        if let Ok(dir) = std::env::var("PHONE_REMOTE_STATE_DIR") {
-            pairs.push(("PHONE_REMOTE_STATE_DIR", dir));
+        if let Ok(dir) = std::env::var("IPHONE_USE_STATE_DIR") {
+            pairs.push(("IPHONE_USE_STATE_DIR", dir));
         }
         let env_block: String = pairs
             .iter()
@@ -4595,9 +4595,12 @@ impl Setup {
     /// The signed legacy app, reused while nothing that goes into it changed.
     fn legacy_app(&mut self, built: &Path, key: &str) -> Step<(PathBuf, String)> {
         let (profile, identity) = self.legacy_signing(built)?;
+        // The recipe version: a fix to the assembly itself must not be
+        // skipped by an app the previous recipe assembled from the same inputs.
         let assembled_key = legacy_ios::sha256_hex(
             format!(
-                "{key}|{identity}|{}|{}",
+                "r{}|{key}|{identity}|{}|{}",
+                legacy_ios::ASSEMBLY_RECIPE,
                 legacy_ios::sha256_hex(&profile),
                 legacy_ios::sha256_hex(legacy_ios::host_source(&self.ctx).as_bytes())
             )

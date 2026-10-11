@@ -90,6 +90,13 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 /// within 250 ms share one answer.
 + (NSInteger)interfaceOrientation;
 
+/// Main screen points from a shallow SpringBoard snapshot, falling back to UIKit when the
+/// system frame is unavailable. The runner host's UIScreen can be a 320x480 compatibility
+/// viewport; both bounds checks and synthesized touch conversion must use the system frame.
+/// A valid system frame is kept for the runner's lifetime; the UIKit fallback only for one
+/// command request, so the system frame is tried again.
++ (CGSize)screenSizePoints;
+
 /// Process id of an XCUIApplication (private `processID`), or 0.
 + (int)pidForApplication:(XCUIApplication *)application;
 

@@ -7,7 +7,7 @@ runner that runs as one long-lived XCTest method (`RunnerTests.testServe`) and s
 on the phone:
 
 - **port 8100**: an HTTP/1.1 API. It answers every WebDriverAgent route the daemon's `WdaClient`
-  (`crates/server/src/wda.rs`) uses, with the same shapes, so `PHONE_REMOTE_WDA_URL` can point at
+  (`crates/server/src/wda.rs`) uses, with the same shapes, so `IPHONE_USE_WDA_URL` can point at
   it unchanged. It also has a few native routes.
 - **port 9100**: an MJPEG screen stream in WDA's wire format, read by the daemon's `MjpegSplitter`.
 
@@ -433,7 +433,7 @@ python3 scripts/runner-compat.py           # every WdaClient route + MJPEG; read
 python3 scripts/runner-smoke.py --runs 5   # timing of the native routes
 ```
 
-- **Pointing the daemon at it.** Set `PHONE_REMOTE_WDA_URL=http://127.0.0.1:8100`. The MJPEG URL
+- **Pointing the daemon at it.** Set `IPHONE_USE_WDA_URL=http://127.0.0.1:8100`. The MJPEG URL
   stays `:9100`.
 - **Other ports.** Set `TEST_RUNNER_IPU_RUNNER_PORT=…` and `TEST_RUNNER_IPU_RUNNER_MJPEG_PORT=…` on
   the `xcodebuild` command. xcodebuild strips the `TEST_RUNNER_` prefix. MJPEG port `0` turns the
@@ -495,9 +495,13 @@ hardware verification:
   whatever orientation the record names (iPhone 13, iOS 27, Safari in landscape: a landscape
   record still took portrait points), so the record says portrait and the bridge turns each point
   from the interface orientation (`XCUIApplication.interfaceOrientation`, read from testmanagerd;
-  `IPURPortraitPoint`). The same orientation sizes `/window/size` and the off-screen checks. Never
-  the physical `XCUIDevice.orientation`: a phone lying on its side reads landscape while its UI
-  stays portrait. No target pid is set, so events go to whatever is on screen, as with WDA.
+  `IPURPortraitPoint`). The same orientation sizes `/window/size` and the off-screen checks.
+  Their dimensions come from SpringBoard's shallow root frame, shared with the touch conversion:
+  the runner host's UIKit viewport (including `nativeBounds`) can be compatibility-sized at
+  320×480 on a larger phone (#257). A missing or invalid system frame falls back to UIKit, and
+  a valid frame is read once per runner launch (the fallback is retried on the next request). Never the physical `XCUIDevice.orientation`: a
+  phone lying on its side reads landscape while its UI stays portrait. No target pid is set, so
+  events go to whatever is on screen, as with WDA.
 - **Screen capture.** The `XCTScreenshotRequest` is built with `CGRectNull` as the full-screen rect.
   If testmanagerd rejects that, the next capture path takes over.
 - **Lock state.** `SBGetScreenLockStatus` / `SBSSpringBoardServerPort` are loaded with
