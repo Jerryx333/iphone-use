@@ -653,19 +653,6 @@ update / publish / report`.
   `summary`. `IPHONE_USE_MCP_STRUCTURED=full` sends the whole JSON; `off`
   sends none. Claude Code shows the model only `structuredContent` on success;
   Codex CLI shows both parts.
-- `phone_tap_label` and `phone_tap_element` attach one screenshot after the
-  error text for `element_not_found`, `ambiguous_element_label`,
-  `element_occluded`, `element_not_visible`, or a typed local label-resolution
-  failure. Capture is capped at 800 px and a 3 s overall budget. Inspect the
-  screenshot first. When several elements match (`ambiguous_element_label`, or
-  a `phone_tap_label` lookup with several matches), pick the intended
-  candidate's index from `phone_elements` and call `phone_tap_element` with
-  that index and the same snapshot. If the target is identified only visually,
-  use `phone_tap` with normalized coordinates (`x = pixel x / image width`,
-  `y = pixel y / image height`). Dismiss covering UI when occluded; do not
-  repeatedly retry label taps with different wording. If capture fails, the
-  original error remains with one short note. Images survive full/slim/off
-  result shaping; enabled structured output keeps the error verdict fields.
 - `phone_status` and `phone_capabilities` return the JSON itself;
   `phone_screenshot` returns an image.
 - Single-step act tools observe by default (= `?return=delta`, baseline = the
