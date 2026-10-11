@@ -19,7 +19,7 @@ final class MainTabsUITests: XCTestCase {
         app.launch()
         defer { app.terminate() }
 
-        for title in ["设备", "浏览器", "任务", "设置"] {
+        for title in ["本机助手", "浏览器", "远程控制", "任务", "设置"] {
             XCTAssertTrue(app.tabBars.buttons[title].waitForExistence(timeout: 10))
         }
         let field = app.textFields["browser-address"]
@@ -87,6 +87,11 @@ final class MainTabsUITests: XCTestCase {
         let start = app.buttons["browser-start-task"]
         guard start.isEnabled else { XCTFail("The browser task composer must enable Send after typing a goal"); return }
         start.tap()
+        XCTAssertTrue(app.buttons["browser-close-chat"].waitForExistence(timeout: 10))
+        let composer = app.textFields["browser-chat-goal"].exists ? app.textFields["browser-chat-goal"] : app.textViews["browser-chat-goal"]
+        XCTAssertFalse((composer.value as? String ?? "").contains("在 Name"), "Accepted messages must clear the composer")
+        capture("browser-conversation-running")
+        app.buttons["browser-close-chat"].tap()
         capture("browser-task-running")
         let updated = app.webViews.staticTexts["Form updated"]
         let deadline = Date().addingTimeInterval(120)
@@ -94,6 +99,7 @@ final class MainTabsUITests: XCTestCase {
             if app.buttons["browser-approve"].exists {
                 capture("browser-task-confirm")
                 app.buttons["browser-approve"].tap()
+                if app.buttons["browser-close-chat"].exists { app.buttons["browser-close-chat"].tap() }
             }
             if app.buttons["browser-task-result"].exists { break }
             _ = updated.waitForExistence(timeout: 1)
@@ -103,12 +109,53 @@ final class MainTabsUITests: XCTestCase {
         while Date() < finishDeadline, !app.buttons["browser-task-result"].exists {
             if app.buttons["browser-approve"].exists {
                 app.buttons["browser-approve"].tap()
+                if app.buttons["browser-close-chat"].exists { app.buttons["browser-close-chat"].tap() }
             }
             _ = app.buttons["browser-task-result"].waitForExistence(timeout: 1)
         }
         XCTAssertTrue(app.buttons["browser-task-result"].exists)
-        XCTAssertTrue(app.tabBars.buttons["设备"].isHittable, "Autofill must not leave the web keyboard toolbar over the tab bar")
+        XCTAssertTrue(app.tabBars.buttons["本机助手"].isHittable, "Autofill must not leave the web keyboard toolbar over the tab bar")
         capture("browser-task-completed")
+        app.buttons["browser-open-chat"].tap()
+        XCTAssertTrue(app.staticTexts["browser-assistant-message"].waitForExistence(timeout: 10))
+        capture("browser-conversation-result")
+        let followUp = app.textFields["browser-chat-goal"].exists ? app.textFields["browser-chat-goal"] : app.textViews["browser-chat-goal"]
+        followUp.tap()
+        followUp.typeText("刚才 Name 填了什么？只回复答案，不要再点击。")
+        app.buttons["browser-chat-send"].tap()
+        let replyDeadline = Date().addingTimeInterval(120)
+        while Date() < replyDeadline, app.staticTexts.matching(identifier: "browser-assistant-message").count < 2 {
+            _ = app.staticTexts.matching(identifier: "browser-assistant-message").element(boundBy: 1).waitForExistence(timeout: 1)
+        }
+        XCTAssertEqual(app.staticTexts.matching(identifier: "browser-user-message").count, 2)
+        XCTAssertEqual(app.staticTexts.matching(identifier: "browser-assistant-message").count, 2)
+        XCTAssertTrue(app.staticTexts.matching(identifier: "browser-assistant-message").element(boundBy: 1).label.contains("Phone Use"))
+        capture("browser-conversation-follow-up")
+    }
+
+    func testConversationKeepsTheDraftWhenExpandedAndCollapsed() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-tab", "browser", "-clearBrowserDraft", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launch()
+        defer { app.terminate() }
+        let dock = app.textFields["browser-goal"]
+        XCTAssertTrue(dock.waitForExistence(timeout: 10))
+        dock.tap()
+        dock.typeText("帮我整理这个网页")
+        app.buttons["browser-open-chat"].tap()
+        XCTAssertTrue(app.buttons["browser-close-chat"].waitForExistence(timeout: 10))
+        let editor = app.textFields["browser-chat-goal"].exists ? app.textFields["browser-chat-goal"] : app.textViews["browser-chat-goal"]
+        XCTAssertEqual(editor.value as? String, "帮我整理这个网页")
+        capture("browser-conversation-draft")
+        app.buttons["browser-close-chat"].tap()
+        XCTAssertEqual(dock.value as? String, "帮我整理这个网页")
+        app.tabBars.buttons["本机助手"].tap()
+        XCTAssertTrue(app.buttons["pair-local-phone"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.textFields["local-agent-goal"].exists)
+        capture("local-assistant")
+        app.tabBars.buttons["远程控制"].tap()
+        XCTAssertTrue(app.buttons["扫码连接"].waitForExistence(timeout: 5))
+        capture("remote-control")
     }
 
     private func capture(_ name: String) {

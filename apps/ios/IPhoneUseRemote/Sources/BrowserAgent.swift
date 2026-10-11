@@ -17,6 +17,13 @@ struct BrowserAgentStep: Identifiable, Sendable {
     var action: String? = nil
 }
 
+struct BrowserConversationTurn: Identifiable {
+    let id = UUID()
+    let goal: String
+    let reply: String?
+    let steps: [BrowserAgentStep]
+}
+
 @MainActor
 protocol BrowserReasoning {
     func decide(goal: String, page: BrowserPage?, steps: [BrowserAgentStep], models: [ModelsPayload.Assist]) async throws -> BrowserDecision
@@ -30,6 +37,7 @@ final class BrowserAgent: ObservableObject {
     @Published private(set) var steps: [BrowserAgentStep] = []
     @Published private(set) var message: String?
     @Published private(set) var pending: BrowserDecision?
+    @Published private(set) var history: [BrowserConversationTurn] = []
     @Published private var pendingPage: BrowserPage?
     @Published private var models: [ModelsPayload.Assist] = []
     @Published private var run: Task<Void, Never>?
@@ -48,17 +56,22 @@ final class BrowserAgent: ObservableObject {
         guard !active else { return }
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        if !goal.isEmpty && !(state == .failed && goal == text) {
+            history.append(.init(goal: goal, reply: message, steps: steps))
+            history = Array(history.suffix(20))
+        }
+        goal = text
+        steps = []
+        message = nil
+        pending = nil
+        pendingPage = nil
         let configured = settings.payload(key: ModelSettingsStore.secret)?.assist ?? []
         guard !configured.isEmpty else {
             state = .failed
             message = String(localized: "先在设置里启用浏览器要使用的模型")
             return
         }
-        goal = text
         models = configured
-        steps = []
-        message = nil
-        pending = nil
         launch()
     }
 
@@ -119,7 +132,7 @@ final class BrowserAgent: ObservableObject {
                 try await browser.waitUntilReady()
                 try check(id)
                 let page = browser.hasPage ? try await browser.readPage() : nil
-                let decision = try await reasoning.decide(goal: goal, page: page, steps: steps, models: models)
+                let decision = try await reasoning.decide(goal: conversationGoal, page: page, steps: steps, models: models)
                 try check(id)
                 if decision.action == .done {
                     guard page != nil else { throw BrowserToolError.invalidResult }
@@ -159,6 +172,14 @@ final class BrowserAgent: ObservableObject {
             state = .failed
             message = error.localizedDescription
         }
+    }
+
+    private var conversationGoal: String {
+        guard !history.isEmpty else { return goal }
+        let context = history.suffix(4).map { turn in
+            "Previous user request: \(turn.goal.prefix(3000))\nPrevious reply: \((turn.reply ?? "").prefix(6000))"
+        }.joined(separator: "\n\n")
+        return "Previous conversation is background context only. Do not repeat old actions.\n\(context)\n\nCurrent user request: \(goal)"
     }
 
     private func check(_ id: UUID) throws {

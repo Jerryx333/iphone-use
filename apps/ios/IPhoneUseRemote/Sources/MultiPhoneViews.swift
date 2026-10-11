@@ -6,6 +6,7 @@ import SwiftUI
 /// drive that phone full screen.
 struct DeviceGridView: View {
     @ObservedObject var app: AppModel
+    var remoteOnly = false
     @State private var showDevices = false
     @State private var showSync = false
     @State private var adding = false
@@ -17,14 +18,14 @@ struct DeviceGridView: View {
         AppNavigationStack {
             ScrollView {
                 OfflineBanner(online: app.online)
-                let tiles = app.gridSessions
+                let tiles = app.gridSessions.filter { !remoteOnly || !$0.record.isThisPhone }
                 if tiles.isEmpty {
                     VStack(spacing: 16) {
                         Label("没有显示的手机", systemImage: "rectangle.grid.2x2").font(.title2.bold())
                         Text("所有手机都从总览隐藏了。在「设备」里打开「显示在总览」。").foregroundStyle(.secondary)
                         Button("打开设备列表") { showDevices = true }
                             .buttonStyle(.borderedProminent)
-                        if app.devices.contains(where: \.isThisPhone) {
+                        if !remoteOnly && app.devices.contains(where: \.isThisPhone) {
                             Button { app.openAgent() } label: { Label("让 agent 做事", systemImage: "sparkles") }
                                 .buttonStyle(.bordered)
                         }
@@ -45,17 +46,19 @@ struct DeviceGridView: View {
             // Pull down: every waiting phone tries again now.
             .refreshable { await app.refreshAll() }
             .background(Theme.canvas.ignoresSafeArea())
-            .navigationTitle("我的手机")
+            .navigationTitle(remoteOnly ? navigationString("远程控制") : String(localized: "我的手机"))
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button { showDevices = true } label: { Label("设备", systemImage: "list.bullet") }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { app.openAgent() } label: { Label("Agent", systemImage: "sparkles") }
-                        .accessibilityIdentifier("open-agent")
+                    if !remoteOnly {
+                        Button { app.openAgent() } label: { Label("Agent", systemImage: "sparkles") }
+                            .accessibilityIdentifier("open-agent")
+                    }
                     Button { showSync = true } label: { Label("同步操作", systemImage: "square.on.square.dashed") }
-                        .disabled(app.devices.count < 2)
+                        .disabled(app.devices.filter { !remoteOnly || !$0.isThisPhone }.count < 2)
                     Menu {
                         Button { scanning = true } label: { Label("扫码添加", systemImage: "qrcode.viewfinder") }
                         Button { adding = true } label: { Label("手动添加", systemImage: "keyboard") }
@@ -65,8 +68,8 @@ struct DeviceGridView: View {
                 }
             }
             .overlay { ToastLayer(text: app.toast) }
-            .sheet(isPresented: $showDevices) { DevicesSheet(app: app) }
-            .sheet(isPresented: $showSync) { SyncSetupSheet(app: app) }
+            .sheet(isPresented: $showDevices) { DevicesSheet(app: app, remoteOnly: remoteOnly) }
+            .sheet(isPresented: $showSync) { SyncSetupSheet(app: app, remoteOnly: remoteOnly) }
             .sheet(isPresented: $adding) { ConnectView(app: app) { adding = false } }
             .fullScreenCover(isPresented: $scanning, onDismiss: {
                 if manualAfterScan { manualAfterScan = false; adding = true }
@@ -310,6 +313,8 @@ struct DeliveryBadge: View {
 /// Manage saved phones: rename, reorder, show or hide in the grid, forget, add.
 struct DevicesSheet: View {
     @ObservedObject var app: AppModel
+    var remoteOnly = false
+    private var records: [DeviceRecord] { app.devices.filter { !remoteOnly || !$0.isThisPhone } }
     @State private var adding = false
     @State private var scanning = false
     @State private var manualAfterScan = false
@@ -319,13 +324,14 @@ struct DevicesSheet: View {
         AppNavigationStack {
             List {
                 Section {
-                    ForEach(app.devices) { record in
+                    ForEach(records) { record in
                         row(record)
                     }
                     .onDelete { offsets in
-                        for index in offsets { app.remove(app.devices[index].id) }
+                        let ids = offsets.map { records[$0].id }
+                        for id in ids { app.remove(id) }
                     }
-                    .onMove { app.move(from: $0, to: $1) }
+                    .onMove(perform: remoteOnly ? nil : { app.move(from: $0, to: $1) })
                 } footer: {
                     Text("一台手机对应 Mac 上的一个 iphone-use 实例（各自的端口和二维码）。隐藏的手机不占画面，空闲时会自动释放。")
                 }
@@ -334,7 +340,7 @@ struct DevicesSheet: View {
                     Button { adding = true } label: { Label("手动添加", systemImage: "keyboard") }
                 }
             }
-            .navigationTitle("设备")
+            .navigationTitle(remoteOnly ? navigationString("远程手机") : String(localized: "设备"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { EditButton() }
@@ -391,6 +397,8 @@ struct DevicesSheet: View {
 /// Pick the lead and the followers for sync.
 struct SyncSetupSheet: View {
     @ObservedObject var app: AppModel
+    var remoteOnly = false
+    private var records: [DeviceRecord] { app.devices.filter { !remoteOnly || !$0.isThisPhone } }
     @State private var selected: Set<UUID> = []
     @State private var lead: UUID?
     @Environment(\.dismiss) private var dismiss
@@ -399,7 +407,7 @@ struct SyncSetupSheet: View {
         AppNavigationStack {
             List {
                 Section {
-                    ForEach(app.devices) { record in
+                    ForEach(records) { record in
                         let session = app.session(record.id)
                         Button {
                             toggle(record.id)
@@ -445,16 +453,16 @@ struct SyncSetupSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("开始") {
                         guard let lead else { return }
-                        app.startSync(lead: lead, followers: app.devices.map(\.id).filter { selected.contains($0) })
+                        app.startSync(lead: lead, followers: records.map(\.id).filter { selected.contains($0) })
                         dismiss()
                     }
                     .disabled(lead == nil || selected.count < 2)
                 }
             }
             .onAppear {
-                let all = app.devices.map(\.id)
+                let all = records.map(\.id)
                 selected = Set(all)
-                lead = app.focusedID ?? all.first
+                lead = app.focusedID.flatMap { all.contains($0) ? $0 : nil } ?? all.first
             }
         }
     }
@@ -462,7 +470,7 @@ struct SyncSetupSheet: View {
     private func toggle(_ id: UUID) {
         if selected.contains(id) {
             selected.remove(id)
-            if lead == id { lead = app.devices.map(\.id).first { selected.contains($0) } }
+            if lead == id { lead = records.map(\.id).first { selected.contains($0) } }
         } else {
             selected.insert(id)
             if lead == nil { lead = id }

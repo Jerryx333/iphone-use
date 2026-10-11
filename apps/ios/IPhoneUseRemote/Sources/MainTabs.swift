@@ -1,22 +1,25 @@
 import Combine
 import SwiftUI
 
-enum AppTab: String, Hashable { case devices, browser, tasks, settings }
+enum AppTab: String, Hashable { case assistant, browser, remote, tasks, settings }
 
 struct MainTabsView: View {
     @ObservedObject var app: AppModel
-    @State private var selection: AppTab = .devices
+    @State private var selection: AppTab = .assistant
     @StateObject private var workspace = BrowserWorkspace()
 
     var body: some View {
         TabView(selection: $selection) {
-            devices
-                .tabItem { Label("设备", systemImage: "iphone") }
-                .tag(AppTab.devices)
+            LocalAssistantView(app: app, agent: app.agent)
+                .tabItem { Label(navigationString("本机助手"), systemImage: "iphone") }
+                .tag(AppTab.assistant)
             BrowserWorkspaceView(settings: app.agent, workspace: workspace)
                 .tabItem { Label("浏览器", systemImage: "globe") }
                 .tag(AppTab.browser)
-            TaskHubView(app: app, browserAgent: workspace.agent, openBrowser: { selection = .browser })
+            devices
+                .tabItem { Label(navigationString("远程控制"), systemImage: "rectangle.on.rectangle") }
+                .tag(AppTab.remote)
+            TaskHubView(app: app, browserAgent: workspace.agent, openBrowser: { selection = .browser }, openPhone: { selection = .assistant })
                 .tabItem { Label("任务", systemImage: "checklist") }
                 .tag(AppTab.tasks)
             AppSettingsView(app: app)
@@ -25,10 +28,10 @@ struct MainTabsView: View {
         }
         .tint(Theme.accent)
         .onDisappear { workspace.agent.pause() }
-        .appOnChange(of: app.focusedID) { _, id in if id != nil { selection = .devices } }
+        .appOnChange(of: app.focusedID) { _, id in if id != nil, app.focused?.record.isThisPhone != true { selection = .remote } }
         .onAppear {
             #if DEBUG
-            if let name = UserDefaults.standard.string(forKey: "tab"), let tab = AppTab(rawValue: name) {
+            if let name = UserDefaults.standard.string(forKey: "tab"), let tab = AppTab(rawValue: name) ?? (name == "devices" ? .remote : nil) {
                 selection = tab
             }
             #endif
@@ -36,9 +39,9 @@ struct MainTabsView: View {
     }
 
     @ViewBuilder private var devices: some View {
-        if app.devices.isEmpty {
+        if !app.devices.contains(where: { !$0.isThisPhone }) {
             WelcomeView(app: app)
-        } else if let session = app.focused {
+        } else if let session = app.focused, !session.record.isThisPhone {
             Group {
                 if let group = app.sync, group.lead == session.id {
                     SyncView(app: app, lead: session, group: group)
@@ -47,7 +50,7 @@ struct MainTabsView: View {
                 }
             }.id(session.id)
         } else {
-            DeviceGridView(app: app)
+            DeviceGridView(app: app, remoteOnly: true)
         }
     }
 }
@@ -56,13 +59,14 @@ struct TaskHubView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var browserAgent: BrowserAgent
     var openBrowser: () -> Void
+    var openPhone: () -> Void
     @State private var flows = false
 
     var body: some View {
         AppNavigationStack {
             List {
                 Section {
-                    Button { app.openAgent() } label: {
+                    Button(action: openPhone) {
                         Label("新建任务", systemImage: "square.and.pencil")
                     }.accessibilityIdentifier("new-task")
                     Button { flows = true } label: {

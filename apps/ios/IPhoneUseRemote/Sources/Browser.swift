@@ -162,6 +162,7 @@ struct BrowserView: View {
     @State private var input = ""
     @State private var pageText: String?
     @State private var reading = false
+    @State private var conversationOpen = false
     @State private var dialogText = ""
     @FocusState private var addressing: Bool
 
@@ -206,7 +207,7 @@ struct BrowserView: View {
                     startPage
                 }
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) { BrowserTaskBar(agent: agent, settings: settings) }
+            .safeAreaInset(edge: .bottom, spacing: 0) { BrowserTaskBar(agent: agent, settings: settings, expanded: $conversationOpen) }
             .background(Color(uiColor: .systemBackground))
             .navigationTitle("浏览器")
             .navigationBarTitleDisplayMode(.inline)
@@ -236,7 +237,7 @@ struct BrowserView: View {
             }
             .appOnChange(of: session.address) { _, address in if !addressing { input = address } }
             .appOnChange(of: session.dialog?.id) { _, id in
-                if id != nil { dialogText = session.dialog?.initialText ?? ""; agent.pause() }
+                if id != nil { conversationOpen = false; dialogText = session.dialog?.initialText ?? ""; agent.pause() }
             }
             .alert(session.dialog?.origin ?? String(localized: "网页消息"),
                    isPresented: Binding(get: { session.dialog != nil && !legacyPrompt }, set: { _ in }),

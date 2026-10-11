@@ -147,7 +147,7 @@ The phone being controlled must stay unlocked: iOS does not let automation type 
 lock-screen passcode.
 
 
-The app now uses a native tab bar for 设备 / 浏览器 / 任务 / 设置, system colors, and the
+The app now uses a native tab bar for 本机助手 / 浏览器 / 远程控制 / 任务 / 设置, system colors, and the
 system's light or dark appearance. Remote controls and pairing keep their existing paths.
 
 The Browser tab runs a local WKWebView; browsing and browser tasks do not require a paired
@@ -199,3 +199,15 @@ The same opt-in enables `BrowserTests/testLivePublicPageLoads` and
 `BrowserAgentTests/testLiveFreeModelCompletesTheBrowserTask` in the unit scheme. Ordinary unit
 runs skip those external calls. Debug-only `-tab browser` opens the browser directly;
 `-clearBrowserDraft YES` resets only its draft for UI tests. Neither switch changes model keys.
+
+
+On-Device Assistant submits only to this iPhone's paired loopback service. Remote Control
+shows other iPhones and keeps this device out of its overview and sync picker. The Tasks
+page links to the assistant and retains the flow/schedule entry points.
+
+Browser conversations open in a native expandable sheet. The dock and sheet share one draft;
+accepted messages clear it, while failed submissions retain it. Complete replies remain in
+the conversation, with execution steps collapsed by default. Closing the sheet returns to
+the page without stopping the task; taking over pauses and returns to the page. The session
+retains up to 20 previous turns and supplies the last four to follow-up requests as background
+context. Conversation history is currently in memory, not restored after restarting the app.
