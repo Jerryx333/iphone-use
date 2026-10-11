@@ -48,7 +48,7 @@ iPhone 17 当前通过 Wi-Fi 连接，用户没有 USB 线。确认允许分支�
 - v0.17.18 回归：server lib 694 通过、1 忽略；MCP lib 169 通过、1 忽略；core lib 23 通过。手机嵌入库已编译，managed setup 返回 0。
 - 最新 App build 17 已编译并安装。风险确认自动弹出系统对话框，收起键盘，并按任务 ID、提示内容及步骤数绑定回应，防止旧确认作用于新任务。拒绝按钮使用普通按钮，避免被系统隐藏为取消项。
 - build 17 普通 App 真机拒绝分支通过：`t-773d8cef2d` 从手机操作回到 App 显示确认，拒绝后 `blocked`、0 步，模型 `mimo-v2.6-flash-free`。日志 `/tmp/iphone17-risk-ui-build17-test.log`。测试仅使用 Home 动作的合成风险 flow；任务准备导航不等于执行 flow。
-- 允许分支没有取得有效通过证据。Wi-Fi runner 多次连接中断，用户没有 USB 线，因此停止重试。build 17 的完整跨工具流程也未重跑，不能把 build 15 的报告算作 build 17 全量验收。
+- 2026-10-11 允许分支因 Wi-Fi 中断没有通过证据；2026-10-12 已补过该分支，见下方。build 17 的完整跨工具流程仍未重跑，不能把 build 15 报告算作 build 17 全量验收。
 - 新启动的 v0.17.18 MCP 对 Codex 客户端返回有效内联 PNG（242002 字节），报告 `/tmp/iphone17-mcp018-image-result.json`。没有改写其他会话的 MCP 配置。
 - 交还前 Mac 状态报告 v0.17.19、`drivable=true`、`owner=null`；本轮后端回归证据仍对应 v0.17.18，未把运行时版本变化视为 v0.17.19 全量验收。
 - 已恢复手机服务仅监听 `127.0.0.1`，恢复操作日志 `/tmp/iphone17-restore-loopback.log` 返回 0。临时合成网页服务和 USB 观察 relay 在交还设备前关闭。设备转交独立控制实验会话；Wi-Fi 稳定性仍需观察。
@@ -74,3 +74,17 @@ iPhone 17 最后明确分配仍属于独立实验会话。尚未收到结束、n
 已修改 `wda_predicate_literal`，在反斜杠和单引号之后转义 LF、CR、TAB，并添加多行值查询回归。本轮 Rust 回归及修复后的本地 CLI 构建还在运行，没有提前记录通过。现有文件存在大量旧格式差异，全文件 rustfmt check 未通过；本轮未扩大格式修改。
 
 手机临时交给 Pocket Gamepad 会话约 15 分钟；我的控制租约已释放，USB 观察 relay 已停止，未变更 VPN 或稳定嵌入库。等待对方明确结束后，用修复后的服务继续 App 的允许分支。证据目录 `/tmp/iphone17-build17-approval-evidence`。
+
+## 2026-10-12 最新确认验收
+
+换行修复提交 `db9897c` 的回归已结束：server lib 820 通过、1 忽略；MCP lib 208 通过、1 忽略，包含 `locator_wda_query_escapes_multiline_field_value`。日志 `/tmp/iphone-continue-regression.log`。本地 CLI 编译通过，已复制、签名并更新默认 Mac 服务，原 plist 备份保留在 `~/.iphone-use/local-builds/db9897c/daemon-original.plist`。
+
+App build 17 普通模式允许分支已通过。输入完整观察后仅提交一次 `Run flow qa/confirm-nav-sync-dd0342e6.`，从手机操作回到 App 显示相同合成流程的确认，点击允许后，App 原生任务详情读回：完成、1 步 `RUN_FLOW` 成功、使用保存的 `qa/confirm-nav-sync-dd0342e6`、`assist: mimo-v2.6-flash-free`，约 14 秒。此次没有 Mac 侧原生 task JSON，也未记录原生任务 ID；证据来自 App 拉取的原生任务详情，不能假称取得原始 API 快照。
+
+最初脚本只识别中文结果，漏掉英文完成文案；原失败报告保留，随后只读回同一任务详情确认，没有再次提交任务。验证报告 `/tmp/iphone17-build17-approval-evidence/verified-result.json`，原生详情 `native-task-detail.json`。
+
+清理读回确认：草稿为空、执行方式恢复自动选择、租约释放、Mac drivable=true、phone daemon linked/serving/8787。没有启用勿扰（释放前 focus_engaged=false），没有修改沙盒账号或 VPN。
+
+iOS 内嵌库的换行修复构建仍在隔离工作树运行，尚未安装，原稳定 `69829e8/libipu_embed.a` 保留。因此本次 App 允许验收使用更新后的 Mac 输入服务和原有手机嵌入服务，不能宣称全部手机服务已更新。
+
+另已定位并提交认证源码修复：`4a02197` 补充 Apple 登录字段的中文邮件占位符，并在完成响应后释放单次 CLI 的自身租约。其他所有者拒绝及传输结果未知时不提前释放，避免服务器可能仍在填写凭据。新增隔离 HTTP/合成占位符测试已排队，未操作真实凭据、未部署该认证修复。
