@@ -19,7 +19,7 @@ struct MainTabsView: View {
             UnifiedAssistantView(app: app, workspace: workspace, openBrowser: { selection = .browser }, openAssistant: { selection = .assistant })
                 .tabItem { Label("助手", systemImage: "sparkles") }
                 .tag(AppTab.assistant)
-            BrowserWorkspaceView(settings: app.agent, workspace: workspace)
+            PhoneSiteBrowserWorkspaceView(workspace: workspace, settings: app.agent)
                 .tabItem { Label("浏览器", systemImage: "globe") }
                 .tag(AppTab.browser)
             devices

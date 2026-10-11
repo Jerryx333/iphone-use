@@ -15,6 +15,11 @@ final class BrowserWorkspace: NSObject, ObservableObject, WKHTTPCookieStoreObser
     init(library: BrowserLibrary? = nil, reasoning: any BrowserReasoning = BrowserModelClient()) {
         let library = library ?? BrowserLibrary()
         self.library = library; self.reasoning = reasoning
+        if library.catalog.adapters.isEmpty {
+            do {
+                if let package = try PhoneSiteCatalogDownloader.bundled() { try library.installCatalog(package.catalog) }
+            } catch { library.error = error.localizedDescription }
+        }
         let browser = BrowserSession(dataStore: Self.store(for: library.activeID))
         self.browser = browser
         agent = BrowserAgent(browser: browser, reasoning: reasoning, library: library)
