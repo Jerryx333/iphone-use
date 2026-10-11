@@ -36,9 +36,18 @@ final class AgentStartFailureTests: XCTestCase {
     func testThisPhoneTransportFailureExplainsTheLocalService() {
         let error = DaemonError.transport(.cannotConnectToHost, "private details")
         let message = AgentController.describe(error, onThisPhone: true)
-        XCTAssertEqual(message, String(localized: "本机 Agent 服务没有响应。请在 Mac 上启动这台 iPhone 的服务，再回来重试。"))
+        XCTAssertEqual(message, String(localized: "本机执行服务未连接。请从 Mac 启动这台 iPhone 的执行服务，再重试。"))
         XCTAssertFalse(message.contains("private details"))
         XCTAssertEqual(AgentController.describe(error, onThisPhone: false), error.localizedDescription)
+    }
+
+    func testLocalServiceFailureDoesNotSayTheMacIsUnreachable() {
+        let local = DeviceSession(record: DeviceRecord(address: "http://127.0.0.1:8787"))
+        local.phase = .failed(.unreachable(.refused))
+        XCTAssertEqual(local.shortState, String(localized: "本机执行服务未连接"))
+        let remote = DeviceSession(record: DeviceRecord(address: "http://192.168.1.20:44321"))
+        remote.phase = .failed(.unreachable(.refused))
+        XCTAssertEqual(remote.shortState, String(localized: "连不上 Mac"))
     }
 }
 

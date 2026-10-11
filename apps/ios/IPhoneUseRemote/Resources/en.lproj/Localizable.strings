@@ -565,6 +565,11 @@
 "稍后再说" = "Not now";
 "关掉这一页，不回答；任务继续等你" = "Closes this without answering; the task keeps waiting for you";
 "本机 Agent 服务没有响应。请在 Mac 上启动这台 iPhone 的服务，再回来重试。" = "This iPhone's Agent service isn't responding. Start its service from your Mac, then try again.";
+"本机执行服务未连接" = "This iPhone's execution service is disconnected";
+"请从 Mac 启动这台 iPhone 的执行服务，再重试连接。服务启动后，任务由手机自行执行。" = "Start this iPhone's execution service from your Mac, then reconnect. Once started, tasks run on the phone itself.";
+"正在连接本机执行服务…" = "Connecting to this iPhone's execution service…";
+"与本机执行服务的连接已断开" = "Disconnected from this iPhone's execution service";
+"本机执行服务未连接。请从 Mac 启动这台 iPhone 的执行服务，再重试。" = "This iPhone's execution service is disconnected. Start it from your Mac, then try again.";
 "本机还没有有效配对。请扫描 Mac 上这台 iPhone 的「配对本机 Agent」二维码。" = "This iPhone needs pairing. Scan its \"Pair this iPhone's Agent\" code on your Mac.";
 "重新配对本机" = "Pair this iPhone again";
 

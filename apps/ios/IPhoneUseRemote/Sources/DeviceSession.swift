@@ -934,7 +934,22 @@ final class DeviceSession: ObservableObject, Identifiable {
 
     /// What every surface says about this device (see `ConnectionPresentation`).
     func presentation(now: Date = Date()) -> ConnectionPresentation {
-        ConnectionPresentation.make(inputs(now: now))
+        let input = inputs(now: now)
+        var result = ConnectionPresentation.make(input)
+        guard record.isThisPhone else { return result }
+        switch input.phase {
+        case .failed(.unreachable):
+            result.title = String(localized: "本机执行服务未连接")
+            result.short = result.title
+            result.detail = String(localized: "请从 Mac 启动这台 iPhone 的执行服务，再重试连接。服务启动后，任务由手机自行执行。")
+        case .connecting:
+            result.title = String(localized: "正在连接本机执行服务…")
+        case .connected where input.linkDownSince != nil:
+            result.title = String(localized: "与本机执行服务的连接已断开")
+            result.detail = String(localized: "正在自动重连…")
+        default: break
+        }
+        return result
     }
 
     /// One short state for a pill or a tile.
