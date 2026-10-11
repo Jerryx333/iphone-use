@@ -10,6 +10,25 @@ struct UnifiedAssistantView: View {
     @State private var library = false
     @State private var flows = false
     @State private var verify = false
+    @State private var phoneApproval: PhoneApproval?
+    private struct PhoneApproval: Identifiable {
+        let snapshot: AgentTaskSnapshot
+        let confirm: AgentConfirm
+        var id: String { "\(snapshot.id)|\(snapshot.steps.count)|\(confirm.action)|\(confirm.target ?? "")" }
+    }
+    private var phoneApprovalKey: String? {
+        guard assistant.task?.state == .confirming, assistant.task?.stopRequested != true,
+              let native = assistant.native, let confirm = native.pendingConfirm else { return nil }
+        return "\(native.id)|\(native.steps.count)|\(String(describing: confirm))"
+    }
+    private func presentPhoneApproval() {
+        guard phoneApprovalKey != nil, let native = assistant.native, let confirm = native.pendingConfirm else {
+            phoneApproval = nil; return
+        }
+        composing = false
+        pairing = false; models = false; library = false; flows = false; verify = false
+        phoneApproval = PhoneApproval(snapshot: native, confirm: confirm)
+    }
     @FocusState private var composing: Bool
     var openBrowser: () -> Void
     var openAssistant: () -> Void
@@ -35,13 +54,13 @@ struct UnifiedAssistantView: View {
                     ForEach(assistant.history.reversed()) { task in taskCard(task) }
                     if let task = assistant.task {
                         taskCard(task)
-                        if let native = assistant.native, let prompt = native.pendingConfirm {
+                        if assistant.task?.stopRequested != true, let native = assistant.native, let prompt = native.pendingConfirm {
                             VStack(alignment: .leading, spacing: 10) {
                                 Label("需要确认手机操作", systemImage: "hand.raised")
                                 Text(AgentController.describe(prompt))
                                 HStack {
-                                    Button("拒绝") { assistant.answerPhone(approve: false) }
-                                    Button("允许这一次") { assistant.answerPhone(approve: true) }
+                                    Button("拒绝") { assistant.answerPhone(approve: false, taskID: native.id, expected: prompt, expectedSteps: native.steps.count) }
+                                    Button("允许这一次") { assistant.answerPhone(approve: true, taskID: native.id, expected: prompt, expectedSteps: native.steps.count) }
                                 }
                             }.padding().background(Theme.surface, in: RoundedRectangle(cornerRadius: 16))
                         } else if workspace.agent.state == .confirming, let pending = workspace.agent.pending {
@@ -106,7 +125,8 @@ struct UnifiedAssistantView: View {
                     }
                 }.padding(16).background(.bar)
             }
-            .onAppear { assistant.showBrowser = openBrowser; assistant.showAssistant = openAssistant }
+            .onAppear { assistant.showBrowser = openBrowser; assistant.showAssistant = openAssistant; presentPhoneApproval() }
+            .appOnChange(of: phoneApprovalKey) { _, _ in presentPhoneApproval() }
             .navigationTitle("助手")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -123,6 +143,14 @@ struct UnifiedAssistantView: View {
             .sheet(isPresented: $models) { AppNavigationStack { ModelSettingsView(agent: app.agent) } }
             .sheet(isPresented: $library) { BrowserLibraryView(workspace: workspace, onBrowse: openBrowser) }
             .sheet(isPresented: $flows) { if let local = assistant.local { FlowsHubView(session: local) } }
+            .confirmationDialog("需要确认手机操作", isPresented: Binding(get: { phoneApproval != nil }, set: { if !$0 { phoneApproval = nil } }), titleVisibility: .visible, presenting: phoneApproval) { approval in
+                Button("拒绝") {
+                    assistant.answerPhone(approve: false, taskID: approval.snapshot.id, expected: approval.confirm, expectedSteps: approval.snapshot.steps.count)
+                }
+                Button("允许这一次") {
+                    assistant.answerPhone(approve: true, taskID: approval.snapshot.id, expected: approval.confirm, expectedSteps: approval.snapshot.steps.count)
+                }
+            } message: { approval in Text(AgentController.describe(approval.confirm)) }
             .confirmationDialog("确认你已检查上次操作结果", isPresented: $verify, titleVisibility: .visible) {
                 Button(assistant.task?.stopRequested == true ? "我已核对，结束任务" : "本步骤已完成，继续后续步骤") { assistant.markVerifiedComplete() }
                 Button("取消", role: .cancel) {}

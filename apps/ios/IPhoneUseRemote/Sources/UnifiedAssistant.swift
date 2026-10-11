@@ -159,7 +159,7 @@ final class UnifiedAssistant: ObservableObject {
     var local: DeviceSession? { app?.devices.first(where: \.isThisPhone).flatMap { app?.session($0.id) } }
     var phoneAvailable: Bool { local?.phase == .connected }
     var current: AssistantPhase? { task.flatMap { $0.phases.indices.contains($0.index) ? $0.phases[$0.index] : nil } }
-    var next: String { guard let task, task.phases.indices.contains(task.index + 1) else { return "核验并返回结果" }; return task.phases[task.index + 1].tool.title }
+    var next: String { guard let task, task.phases.indices.contains(task.index + 1) else { return "核验并返回结果" }; return String(task.phases[task.index + 1].goal.prefix(100)) }
     var models: [ModelsPayload.Assist] { app?.agent.settings.payload(key: ModelSettingsStore.secret)?.assist ?? [] }
     var canStart: Bool { writable && !busy && task?.active != true && !workspace.switching && !workspace.lockedForTask && !workspace.agent.active && app?.agent.live?.task.state.isTerminal != false && app?.agent.pendingGoal == nil }
 
@@ -272,7 +272,7 @@ final class UnifiedAssistant: ObservableObject {
             case .browser:
                 guard foreground else {
                     task?.state = .paused; task?.automaticPause = true; try save()
-                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: phase.tool.title, steps: task?.index ?? 0))
+                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: String(phase.goal.prefix(100)), steps: task?.index ?? 0))
                     return
                 }
                 message = "正在操作浏览器；下一步：\(next)"
@@ -311,7 +311,7 @@ final class UnifiedAssistant: ObservableObject {
             case .site, .desktop:
                 guard foreground else {
                     task?.state = .paused; task?.automaticPause = true; try save()
-                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: phase.tool.title, steps: task?.index ?? 0))
+                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: String(phase.goal.prefix(100)), steps: task?.index ?? 0))
                     return
                 }
                 guard let adapter = workspace.library.catalog.adapters.first(where: { $0.spec == phase.siteSpec }), adapter.fingerprint == phase.sourceHash else { throw BrowserToolError.actionFailed("网站操作内容已变化，请重新确认任务") }
@@ -340,7 +340,7 @@ final class UnifiedAssistant: ObservableObject {
             try check(id)
             task?.phases[task!.index].result = result
             task?.index += 1; task?.approvedSite = nil; try save()
-            AgentLiveStatus.shared.update(.init(current: "\(phase.tool.title)步骤已完成", next: current?.tool.title ?? "核验并返回结果", steps: task?.index ?? 0))
+            AgentLiveStatus.shared.update(.init(current: "\(phase.tool.title)步骤已完成", next: String((current?.goal ?? "核验并返回结果").prefix(100)), steps: task?.index ?? 0))
         }
         let results = task?.phases.compactMap(\.result) ?? []
         if results.count == 1 { task?.reply = results.first }
@@ -368,8 +368,12 @@ final class UnifiedAssistant: ObservableObject {
         } else { launch() }
     }
     func approveSite() { guard current?.tool == .site || current?.tool == .desktop else { return }; task?.approvedSite = current?.id; try? save(); resume() }
-    func answerPhone(approve: Bool) {
-        guard let nativeID = current?.nativeID, let api = local?.client else { return }
+    func answerPhone(approve: Bool, taskID: String, expected: AgentConfirm, expectedSteps: Int) {
+        guard task?.stopRequested != true, task?.state == .confirming,
+              current?.nativeID == taskID, native?.id == taskID,
+              native?.pendingConfirm == expected, native?.steps.count == expectedSteps,
+              let api = local?.client else { return }
+        let nativeID = taskID
         Task { do { try await api.answer(task: nativeID, approve: approve) } catch { message = error.localizedDescription } }
     }
     func pause() async {
