@@ -183,7 +183,10 @@ final class UnifiedAssistant: ObservableObject {
             do { try await self.run(id) }
             catch is CancellationError { }
             catch { if self.epoch == id { self.fail(error) } }
-            if self.epoch == id { self.busy = false; self.runner = nil }
+            if self.epoch == id {
+                self.busy = false; self.runner = nil
+                self.resumeAutomaticPauseIfReady()
+            }
         }
     }
 
@@ -424,7 +427,13 @@ final class UnifiedAssistant: ObservableObject {
     }
     private func becameActive() {
         foreground = true
-        if task?.automaticPause == true && !busy && task?.inFlightRisky != true { task?.automaticPause = false; resume() }
+        resumeAutomaticPauseIfReady()
+    }
+    private func resumeAutomaticPauseIfReady() {
+        guard foreground, !busy, task?.state == .paused, task?.automaticPause == true,
+              task?.inFlightRisky != true, task?.stopRequested != true else { return }
+        task?.automaticPause = false
+        resume()
     }
     func inspectExistingPhoneTask() {
         guard let phase = current, phase.tool == .phone, let api = local?.client else { return }

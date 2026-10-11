@@ -63,7 +63,7 @@ struct BrowserDeviceAcceptanceView: View {
                 : "在 Name 输入框填入 Phone Use，然后点击 Continue。段落显示 Form updated 后才完成。不要点击 Prompt fixture。"
             guard assistant.start(goal) else { throw BrowserToolError.actionFailed("合成任务未启动") }
             for _ in 0..<(withPhone ? 7200 : 2400) {
-                if assistant.task?.state == .done || assistant.task?.state == .failed || assistant.task?.state == .paused || assistant.task?.state == .needsReview { break }
+                if assistant.task?.state == .done || assistant.task?.state == .failed || (assistant.task?.state == .paused && assistant.task?.automaticPause != true) || assistant.task?.state == .needsReview { break }
                 try await Task.sleep(for: .milliseconds(50))
             }
             let value = try await workspace.browser.webView.evaluateJavaScript("document.querySelector('input').value") as? String

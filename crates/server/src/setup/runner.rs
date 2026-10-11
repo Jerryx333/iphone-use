@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn the_source_hash_is_read_back_from_a_cache_key() {
         let ctx = crate::setup::ctx::tests_support::ctx();
-        let key = cache_key(&ctx, "abc123", "b", "T", "U", "27.0", "27.0", "");
+        let key = cache_key(&ctx, "abc123", "b", "T", "U", "27.0", "27.0", "", "");
         assert_eq!(key_source_hash(&key), Some("abc123"));
         // The icon component setup appends does not disturb it.
         assert_eq!(key_source_hash(&format!("{key}|icon:xyz")), Some("abc123"));

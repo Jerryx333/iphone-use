@@ -1,5 +1,6 @@
 import XCTest
 import CryptoKit
+import UIKit
 @testable import IPhoneUseRemote
 
 @MainActor
@@ -12,8 +13,9 @@ private final class FixturePlanner: AssistantReasoning {
 @MainActor
 private final class FixtureReader: BrowserReasoning {
     var calls = 0
+    var firstDecision: (() async -> Void)?
     func decide(goal: String, page: BrowserPage?, steps: [BrowserAgentStep], models: [ModelsPayload.Assist]) async throws -> BrowserDecision {
-        calls += 1; return .init(action: .done, explanation: "Observed synthetic fixture")
+        calls += 1; if calls == 1 { await firstDecision?() }; return .init(action: .done, explanation: "Observed synthetic fixture")
     }
 }
 
@@ -52,6 +54,23 @@ final class UnifiedAssistantTests: XCTestCase {
         XCTAssertFalse(String(decoding: try Data(contentsOf: archive), as: UTF8.self).contains("Observed synthetic"))
         let restored = UnifiedAssistant(app: app, workspace: workspace, defaults: defaults, file: archive, key: key, reasoning: planner)
         XCTAssertEqual(restored.task?.state, .done); XCTAssertEqual(planner.calls, 1)
+    }
+    func testForegroundWhilePausingDoesNotStrandBrowserTask() async throws {
+        let defaults = defaults(), app = AppModel(defaults: defaults), planner = FixturePlanner()
+        let (workspace, reader) = try await workspace()
+        reader.firstDecision = {
+            NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+            NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        let assistant = UnifiedAssistant(app: app, workspace: workspace, defaults: defaults,
+                                         file: file(), key: Data(repeating: 8, count: 32), reasoning: planner)
+        assistant.mode = .browser
+        XCTAssertTrue(assistant.start("Read synthetic fixture after returning to foreground"))
+        try await wait { assistant.task?.state == .done || assistant.task?.state == .failed }
+        XCTAssertEqual(assistant.task?.state, .done, assistant.message ?? "")
+        XCTAssertEqual(reader.calls, 2)
+        XCTAssertFalse(assistant.task?.automaticPause ?? true)
     }
     func testUnknownWriteRecoveryRequiresManualVerification() async throws {
         let defaults = defaults(), app = AppModel(defaults: defaults), planner = FixturePlanner(), (workspace, reader) = try await workspace()
