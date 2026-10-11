@@ -7628,6 +7628,8 @@ fn element_swipe_endpoints(
 async fn scroll_snapshot_element(
     w: &mut crate::wda::WdaClient,
     value: &serde_json::Value,
+    guard_alert: bool,
+    detail: &mut Option<serde_json::Value>,
 ) -> Result<(), SnapshotElementTapError> {
     let dx = value
         .get("dx")
@@ -7680,6 +7682,12 @@ async fn scroll_snapshot_element(
     let (x1, y1, x2, y2) = element_swipe_endpoints(row.rect, [x, y, width, height], screen, dx, dy);
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
+    if refuse_scroll_alert(w, guard_alert, detail).await {
+        return Err(SnapshotElementTapError::Refused(
+            "alert_present",
+            SCROLL_ALERT_HINT,
+        ));
+    }
     w.swipe(x1, y1, x2, y2, duration)
         .await
         .map_err(SnapshotElementTapError::AfterDispatch)
@@ -8507,6 +8515,7 @@ async fn wda_control_with_client(
     actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
+    guard_alert: bool,
 ) -> WdaControlOutcome {
     use std::sync::atomic::Ordering;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -8636,12 +8645,15 @@ async fn wda_control_with_client(
                     tracing::info!("scroll page: drag ({x1:.0},{y1:.0}) -> ({x2:.0},{y2:.0})");
                     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
                     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
+                    if refuse_scroll_alert(w, guard_alert, detail).await {
+                        return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+                    }
                     w.swipe(x1, y1, x2, y2, duration).await
                 }
             }
         }
         "scroll" if v.get("element").is_some() => {
-            let result = scroll_snapshot_element(w, v).await;
+            let result = scroll_snapshot_element(w, v, guard_alert, detail).await;
             match snapshot_element_outcome(result, w, "control element scroll") {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
@@ -8700,7 +8712,26 @@ async fn wda_control_with_client(
             {
                 return WdaControlOutcome::Unsupported;
             }
-            wda_swipe(w, nx, ny, dx, dy).await
+            if guard_alert {
+                let plan = async {
+                    let (sw, sh) = w.window_size().await?;
+                    coordinate_swipe_endpoints(nx, ny, dx, dy, sw, sh)
+                }
+                .await;
+                match plan {
+                    Ok((x1, y1, x2, y2)) => {
+                        if refuse_scroll_alert(w, guard_alert, detail).await {
+                            return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+                        }
+                        let duration = (((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt() * 1.2)
+                            .clamp(120.0, 600.0) as u64;
+                        w.swipe(x1, y1, x2, y2, duration).await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                wda_swipe(w, nx, ny, dx, dy).await
+            }
         }
         "text" => match v.get("text").and_then(|t| t.as_str()) {
             Some(t) => w.keys(t).await,
@@ -8742,7 +8773,7 @@ async fn wda_control_with_client(
                         .into_iter()
                         .all(|n| (0.0..=1.0).contains(&n)) =>
                 {
-                    async {
+                    let plan = async {
                         let (sw, sh) = w.window_size().await?;
                         let (ax, ay, bx, by) = (
                             normalized_wda_axis(x1, sw)?,
@@ -8755,14 +8786,26 @@ async fn wda_control_with_client(
                             .get("duration_ms")
                             .and_then(|x| x.as_u64())
                             .unwrap_or_else(|| (dist * 0.9).clamp(120.0, 500.0) as u64);
-                        if typ == "drag" {
-                            let hold = v.get("hold_ms").and_then(|x| x.as_u64()).unwrap_or(500);
-                            w.drag(ax, ay, bx, by, hold, duration).await
-                        } else {
-                            w.swipe(ax, ay, bx, by, duration).await
-                        }
+                        Ok::<_, anyhow::Error>((ax, ay, bx, by, duration))
                     }
-                    .await
+                    .await;
+                    match plan {
+                        Ok((ax, ay, bx, by, duration)) => {
+                            let hold = v.get("hold_ms").and_then(|x| x.as_u64()).unwrap_or(500);
+                            if refuse_scroll_alert(w, guard_alert, detail).await {
+                                return WdaControlOutcome::Refused(
+                                    "alert_present",
+                                    SCROLL_ALERT_HINT,
+                                );
+                            }
+                            if typ == "drag" {
+                                w.drag(ax, ay, bx, by, hold, duration).await
+                            } else {
+                                w.swipe(ax, ay, bx, by, duration).await
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 (x1, y1, x2, y2) if coordinates_out_of_range(&[x1, y1, x2, y2]) => {
                     return WdaControlOutcome::InvalidValue(COORDINATES_HINT);
@@ -9259,6 +9302,59 @@ fn reject_oversized_text(value: &serde_json::Value) -> Result<(), Response> {
     ))
 }
 
+const SCROLL_ALERT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
+const SCROLL_ALERT_HINT: &str = "a system alert is up: answer it first with {\"type\":\"alert\",\"button\":\"<exact button>\"} (or an alert step in phone_run_steps), asking the user before granting a permission, then retry the scroll or gesture";
+
+fn scroll_alert_guard<E>(
+    probe: Result<Option<(String, Vec<String>)>, E>,
+) -> Option<serde_json::Value> {
+    let alert = alert_json(
+        probe
+            .ok()
+            .flatten()
+            .filter(|(text, buttons)| !text.trim().is_empty() || !buttons.is_empty()),
+    )?;
+    Some(
+        serde_json::json!({"ok":false,"error":"alert_present","outcome":"not_sent",
+        "retry_safe":true,"alert":alert,"hint":SCROLL_ALERT_HINT}),
+    )
+}
+
+async fn refuse_scroll_alert(
+    w: &mut crate::wda::WdaClient,
+    guard_alert: bool,
+    detail: &mut Option<serde_json::Value>,
+) -> bool {
+    if !guard_alert {
+        return false;
+    }
+    let probe = tokio::time::timeout(SCROLL_ALERT_PROBE_TIMEOUT, w.alert_summary()).await;
+    let block = scroll_alert_guard(probe.map(|result| result.ok().flatten()));
+    if let Some(block) = block {
+        *detail = Some(block);
+        return true;
+    }
+    false
+}
+
+async fn with_scroll_alert_detail(
+    response: Response,
+    detail: Option<&serde_json::Value>,
+) -> Response {
+    let Some(detail) = detail.filter(|d| d.get("alert").is_some()) else {
+        return response;
+    };
+    let (response, body) = read_json_response(response).await;
+    let Some(mut body) = body else {
+        return response;
+    };
+    body["alert"] = detail["alert"].clone();
+    body["hint"] = detail["hint"].clone();
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(body.to_string()))
+}
+
 /// Execute one Direct agent action exactly once.
 ///
 /// Locator and geometry reads may precede the mutation, but once a mutating WDA
@@ -9434,7 +9530,7 @@ async fn direct_agent_action(
     };
 
     let Some(result) = custom_result else {
-        return wda_control_with_client(w, actionable, value, detail).await;
+        return wda_control_with_client(w, actionable, value, detail, true).await;
     };
     match result {
         Ok(()) => {
@@ -9580,7 +9676,14 @@ async fn direct_control(
             None
         };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        let outcome = wda_control_with_client(&mut client, &state.wda_actionable, &value, &mut detail).await;
+        let outcome = wda_control_with_client(
+            &mut client,
+            &state.wda_actionable,
+            &value,
+            &mut detail,
+            false,
+        )
+        .await;
         Some((outcome, recorded_locator))
     })
     .await;
@@ -11269,7 +11372,11 @@ async fn agent_actions_inner(
                     {
                         body["runner_error"] = runner_error.clone();
                     }
-                    return agent_actions_json(status, body);
+                    return with_scroll_alert_detail(
+                        agent_actions_json(status, body),
+                        step_detail.as_ref(),
+                    )
+                    .await;
                 }
                 applied_actions += 1;
                 record_activity(&state, &headers, action);
@@ -12927,7 +13034,7 @@ async fn agent_input_inner(
             hinted_control_response(StatusCode::CONFLICT, error, "no_effect", hint)
         }
         WdaControlOutcome::Refused(error, hint) => {
-            hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint)
+            with_scroll_alert_detail(hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint), detail.as_ref()).await
         }
         WdaControlOutcome::NoAlert if optional_alert(&value) => with_security_headers(
             Response::builder()
@@ -16938,6 +17045,236 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scroll_alert_present_refuses_all_gesture_modes() {
+        let source = include_str!("http.rs");
+        let shared = source
+            .split("async fn wda_control_with_client(")
+            .nth(1)
+            .unwrap()
+            .split("fn no_alert_response")
+            .next()
+            .unwrap();
+        assert!(shared.contains("scroll_snapshot_element(w, v, guard_alert, detail)"));
+        // Page, coordinate and swipe/drag dispatch each have a gate; element has its own.
+        assert_eq!(
+            shared
+                .split("refuse_scroll_alert(w, guard_alert, detail).await")
+                .count()
+                - 1,
+            3
+        );
+        for typ in ["scroll", "swipe", "drag"] {
+            let block =
+                scroll_alert_guard::<()>(Ok(Some((typ.into(), vec!["Cancel".into()])))).unwrap();
+            assert_eq!(block["error"], "alert_present");
+            assert_eq!(block["outcome"], "not_sent");
+            assert_eq!(block["retry_safe"], true);
+        }
+    }
+
+    #[test]
+    fn scroll_alert_absent_allows_dispatch() {
+        assert!(scroll_alert_guard::<()>(Ok(None)).is_none());
+    }
+    #[test]
+    fn scroll_alert_probe_error_allows_dispatch() {
+        assert!(scroll_alert_guard::<&str>(Err("probe failed")).is_none());
+    }
+    #[test]
+    fn scroll_alert_empty_allows_dispatch() {
+        assert!(scroll_alert_guard::<()>(Ok(Some(("".into(), vec![])))).is_none());
+        assert!(scroll_alert_guard::<()>(Ok(Some(("  ".into(), vec![])))).is_none());
+    }
+    #[test]
+    fn scroll_alert_empty_filter_is_guard_only() {
+        for text in ["", "  "] {
+            let alert = Some((text.to_string(), vec![]));
+            let expected = serde_json::json!({"text":text,"buttons":[]});
+            // Failed source reads use this conversion to detect BlockingAlert
+            // and return 409 alert_blocking, including an empty WDA alert.
+            assert_eq!(alert_json(alert.clone()), Some(expected.clone()));
+            // Successful reads must also preserve the empty alert block.
+            let body = attach_alert(r#"{"elements":[]}"#.into(), alert.clone());
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["alert"], expected);
+            assert_eq!(body["elements"], serde_json::json!([]));
+            assert!(scroll_alert_guard::<()>(Ok(alert)).is_none());
+        }
+    }
+
+    #[test]
+    fn scroll_alert_buttons_only_blocks() {
+        assert!(scroll_alert_guard::<()>(Ok(Some(("".into(), vec!["OK".into()])))).is_some());
+    }
+    #[test]
+    fn scroll_alert_invalid_coordinates_do_not_probe() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for action in [
+                    serde_json::json!({"type":"scroll","x":200,"y":0.5,"dy":100}),
+                    serde_json::json!({"type":"swipe","x1":0.5,"y1":0.8,"x2":195,"y2":100}),
+                    serde_json::json!({"type":"drag","x1":0.5,"y1":0.8,"x2":195,"y2":100}),
+                ] {
+                    let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                    let actionable = std::sync::atomic::AtomicBool::new(true);
+                    let mut detail = None;
+                    {
+                        let mut action = std::pin::pin!(direct_agent_action(
+                            &mut w,
+                            &actionable,
+                            &action,
+                            &mut detail,
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+                        ));
+                        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                        assert_eq!(
+                            std::future::Future::poll(action.as_mut(), &mut cx),
+                            std::task::Poll::Ready(WdaControlOutcome::InvalidValue(
+                                COORDINATES_HINT
+                            ))
+                        );
+                    }
+                    assert!(detail.is_none());
+                }
+            });
+    }
+    #[test]
+    fn scroll_alert_other_actions_not_gated() {
+        // A non-gesture can complete on its first poll, without starting a probe.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                let actionable = std::sync::atomic::AtomicBool::new(true);
+                for typ in ["tap", "text", "key", "longpress"] {
+                    let mut detail = None;
+                    let action = serde_json::json!({"type":typ});
+                    let mut future = std::pin::pin!(direct_agent_action(
+                        &mut w,
+                        &actionable,
+                        &action,
+                        &mut detail,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+                    ));
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_ready());
+                }
+            });
+    }
+    #[test]
+    fn scroll_alert_browser_control_never_probes() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                assert!(!refuse_scroll_alert(&mut w, false, &mut None).await);
+            });
+        let source = include_str!("http.rs");
+        let browser = source
+            .split("async fn direct_control(")
+            .nth(1)
+            .unwrap()
+            .split("struct AgentActionsRequest")
+            .next()
+            .unwrap();
+        assert!(browser
+            .split_whitespace()
+            .collect::<String>()
+            .contains("&mutdetail,false"));
+        let agent = source
+            .split("async fn direct_agent_action(")
+            .nth(1)
+            .unwrap()
+            .split("async fn direct_control(")
+            .next()
+            .unwrap();
+        assert!(agent.contains("value, detail, true)"));
+    }
+    #[test]
+    fn scroll_alert_error_keeps_full_json_and_buttons() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let block = scroll_alert_guard::<()>(Ok(Some((
+                    "Allow?".into(),
+                    vec!["Allow".into(), "Cancel".into()],
+                ))))
+                .unwrap();
+                let response = with_scroll_alert_detail(
+                    hinted_control_response(
+                        StatusCode::CONFLICT,
+                        "alert_present",
+                        "not_sent",
+                        SCROLL_ALERT_HINT,
+                    ),
+                    Some(&block),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                for key in ["ok", "error", "outcome", "retry_safe", "alert", "hint"] {
+                    assert_eq!(body[key], block[key]);
+                }
+            });
+    }
+    #[test]
+    fn scroll_alert_batch_preserves_prior_steps_and_retry_safety() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for applied in [0, 1] {
+                    let steps = if applied == 0 {
+                        vec![]
+                    } else {
+                        vec![serde_json::json!({"index":0,"kind":"action","ok":true})]
+                    };
+                    let block = scroll_alert_guard::<()>(Ok(Some((
+                        "Allow?".into(),
+                        vec!["Cancel".into()],
+                    ))))
+                    .unwrap();
+                    let response = with_scroll_alert_detail(
+                        agent_actions_failure(
+                            StatusCode::CONFLICT,
+                            applied,
+                            applied,
+                            applied,
+                            "alert_present",
+                            "not_sent",
+                            applied == 0,
+                            &steps,
+                            None,
+                        ),
+                        Some(&block),
+                    )
+                    .await;
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(body["steps"], serde_json::json!(steps));
+                    assert_eq!(body["failed_step_outcome"], "not_sent");
+                    assert_eq!(body["retry_safe"], applied == 0);
+                    assert_eq!(body["alert"], block["alert"]);
+                }
+            });
+    }
+
     #[test]
     fn launchctl_print_pid_is_the_jobs_own_line() {
         let running = "gui/501/com.leeguoo.iphone-use.wda = {\n\tactive count = 1\n\tstate = running\n\tpid = 72917\n\tresource coalition = {\n\t\tID = 42823\n\t}\n}\n";
