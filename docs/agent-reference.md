@@ -509,6 +509,19 @@ where they stopped.
   the centre — scroll it clear (`perform scroll_to_visible`) and re-read;
   `"allow_occluded":true` taps whatever is on top. Rows with `visible:false` are
   not drawn: `409 element_not_visible`; ignore them.
+- **Gesture alert refusal**: agent `scroll` (coordinate, element or page),
+  `swipe` and `drag` answer `409 alert_present` before dispatch when a system
+  alert has text or buttons. The response includes `ok:false`, `outcome:"not_sent"`,
+  `retry_safe:true`, `alert:{text,buttons}` and a hint. Answer the alert first
+  with `{"type":"alert","button":"<exact button>"}` (or an alert step in
+  `phone_run_steps`), ask the user before granting a permission, then retry
+  the scroll or gesture. The probe runs after validation and gesture
+  preparation, uses the short-lived no-alert cache, and is capped at 800 ms.
+  An alert whose text was read refuses the gesture even if its button list
+  could not be read. Other probe errors, timeouts and empty alerts allow
+  dispatch. Browser `/control`
+  is unaffected. A batch keeps prior step results; prior applied actions make
+  the whole batch unsafe to replay even when the refused step was not sent.
 - **Scroll**: positive `dy` reveals content below. Travel is 1.5×|dy| points,
   clamped to 15–75% of the screen. Coordinate scrolls keep 44pt clear of the
   edges (an anchor at `x=0.06` got taken by the back-swipe). A gesture that must
