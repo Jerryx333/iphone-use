@@ -99,8 +99,12 @@ pub extern "C" fn ipu_daemon_state() -> i32 {
 /// length, -1 while the daemon is not serving, -2 when `out` is NULL or too
 /// small. The code is valid for five minutes and redeems once at
 /// `POST /pair` on the daemon (`{"code"}`).
+///
+/// # Safety
+/// A non-NULL `out` must point to at least `capacity` writable bytes and
+/// remain valid for the duration of this call, with no concurrent access.
 #[no_mangle]
-pub extern "C" fn ipu_daemon_pair_code(out: *mut c_char, capacity: usize) -> i32 {
+pub unsafe extern "C" fn ipu_daemon_pair_code(out: *mut c_char, capacity: usize) -> i32 {
     if STATE.load(Ordering::SeqCst) != 1 {
         return -1;
     }
@@ -111,8 +115,8 @@ pub extern "C" fn ipu_daemon_pair_code(out: *mut c_char, capacity: usize) -> i32
     if out.is_null() || bytes.len() + 1 > capacity {
         return -2;
     }
-    // SAFETY: `out` holds `capacity` writable bytes (checked above to fit the
-    // code and its NUL), per this function's contract.
+    // SAFETY: the caller guarantees `capacity` writable bytes; the check
+    // above establishes that the code and its NUL fit in that buffer.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), bytes.len());
         *out.add(bytes.len()) = 0;

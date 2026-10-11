@@ -34,6 +34,8 @@ suite: 设置冒烟测试 (4 cases)
 | `--confirm` | 套件会发送、发布、付款或删除时必须加 |
 | `--owner NAME` | 本次运行的手机占用者名字（`X-Phone-Owner`） |
 | `--validate` | 只解析和校验文件，不连 daemon |
+| `--from N[:M]` | 从第 N 个用例开始，或从第 N 个用例的第 M 步开始（见[下文](#断点续跑重试和耗时记录)） |
+| `--retries N` | 用例失败后重跑，最多 N 次（上限 10） |
 
 退出码：`0` 全部通过，`1` 有用例失败，`2` 套件无效或手机用不了（锁屏、被别的会话占用、连不上）。手机处于空闲释放状态时，会先重连一次。
 
@@ -73,7 +75,29 @@ cases:
 - `steps.json`：跑过的每一步、耗时，以及 daemon 的回答。
 - `error.json`：哪一步或哪条断言失败，为什么。
 
+不论成败，每次运行还会写一份 `<artifacts-dir>/trace.ndjson`（见下文）。
+
 通常足以分清是 App 坏了还是测试写错了。举个例子：iPhone 13 上「通用」那一行被 iOS 26 底部的悬浮搜索栏挡住，截图一眼就能看出点击落在了搜索栏上。
+
+### 断点续跑、重试和耗时记录
+
+**`--from N[:M]`** 从中间开始跑。用例和步骤都从 1 数起；一个用例的步骤是它的 `steps`（`flow` 步骤按该 flow 的步数计），再接上它的断言。
+
+- `--from 3`：先跑 `setup`，再跑第 3 个用例及之后的用例。
+- `--from 3:2`：跳过 `setup`，从第 3 个用例的第 2 步开始，手机停在哪个画面就从哪个画面接着跑。适合手动修好手机或套件之后继续。
+
+用例失败时会打印续跑位置（`resume: --from 3:2`，即失败的那一步；`--json` 里是 `resume_from`）。跳过的用例在报告和 JUnit 文件里记为 `skipped`。
+
+**`--retries N`**：用例失败后从它的第一步重跑，最多再跑 N 次。任何一次通过就算通过，报告会写明（`passed on attempt 2`；`--json` 里有 `attempts` 和 `earlier_failures`）。证据只保留最后一次失败的。重跑是从上次停下的画面开始的，所以每个用例最好先把 App 带回一个确定的画面。
+
+**`trace.ndjson`**：每跑一步写一行 JSON，包括 setup 和每一次重试：
+
+```json
+{"case":"打开通用","attempt":1,"step":1,"origin":"cases[1].steps[0]","kind":"tap_locator","role":"step","ms":412,"outcome":"ok"}
+{"case":"打开通用","attempt":1,"step":2,"origin":"cases[1].assert[0]","kind":"wait_for","role":"assert","ms":5003,"outcome":"expectation_timeout"}
+```
+
+`step` 就是 `--from N:M` 里的 `M`；`outcome` 是 `ok` 或导致失败的错误。每次运行会覆盖这个文件；`jq -s 'sort_by(-.ms)[:5]' trace.ndjson` 能列出最慢的几步。
 
 ### 写出稳定的套件
 
@@ -81,6 +105,47 @@ cases:
 - `scroll` 之后给列表留出停稳的时间再点（`after_ms: 2500`）。列表还在滑动时点一下，只会让它停下。
 - App 会停在上次离开的页面。在 `setup` 里先回到一个确定的画面。
 - 每种界面语言一个套件，标签按屏幕上写的来（`settings-smoke.en.yaml` 和 `settings-smoke.zh-CN.yaml`）。
+
+### 在 CI 里用模拟器跑套件（预览）
+
+模拟器不需要手机，也不需要 Apple ID，所以套件可以在 GitHub 托管的 Mac 上跑。`iphone-use simulator start` 会启动模拟器、为它编译 runner、启动 runner 和守护进程，两者都有响应后返回。模拟器支持还是预览版，还没在各个 Xcode 版本上验证过，详见[设计说明](research/2026-10-simulator-support.md)。
+
+```yaml
+# .github/workflows/ui-tests.yml
+jobs:
+  ui-tests:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 iphone-use（不做设备配置，不注册 MCP 客户端）
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh \
+            | IPHONE_USE_NO_SETUP=1 IPHONE_USE_NO_CLIENT_SETUP=1 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: 启动模拟器、runner 和守护进程
+        run: iphone-use simulator start "iPhone 15" --instance ci-sim
+      - name: 编译并安装被测 App
+        run: |
+          xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 15' \
+            -derivedDataPath build build
+          xcrun simctl install booted build/Build/Products/Debug-iphonesimulator/MyApp.app
+      - name: 跑套件
+        run: IPHONE_USE_INSTANCE=ci-sim iphone-use-mcp test tests/smoke.yaml --junit report.xml
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-tests
+          path: |
+            report.xml
+            ~/.iphone-use/instances/ci-sim/simulator-daemon.log
+      - if: always()
+        run: iphone-use simulator stop "iPhone 15" --instance ci-sim || true
+```
+
+- 套件的退出码决定任务成败：`0` 全部通过，`1` 有用例失败，`2` 套件没能运行。
+- `--instance ci-sim` 给实例起名，测试步骤用 `IPHONE_USE_INSTANCE` 找到它。如果 App 有已知的慢页面，可以给测试步骤加 `--retries 1`。
+- `simulator start` 会关掉模拟器的「连接硬件键盘」选项，这样 `type` 步骤能弹出软键盘。
+- 模拟器没有摄像头、不能装 App Store 应用，推送通知只能用 `simctl push` 模拟。需要这些的套件请留在真机上跑。
 
 ## 定时任务
 

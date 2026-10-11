@@ -23,6 +23,9 @@ use serde_json::{json, Value};
 use crate::client::DaemonClient;
 use crate::jev::{self, Executed, Models, Screen};
 
+/// Operation, target index, text and reason returned by a step decision.
+pub type AssistDecision = (String, Option<usize>, Option<String>, Option<String>);
+
 pub const MAX_STEPS_LIMIT: usize = 60;
 const RECENT_KEPT: usize = 20;
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -992,7 +995,7 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
         // Decide.
         let started = Instant::now();
         let mut by = "jev";
-        let mut decision: Option<(String, Option<usize>, Option<String>, Option<String>)> = None;
+        let mut decision: Option<AssistDecision> = None;
         if let Some(models) = &jev_models {
             if jev_misses < JEV_MISSES_BEFORE_ASSIST || !chat.available() {
                 task.with(|s| s.phase = "jev");
@@ -1262,7 +1265,7 @@ async fn assist_decide(
     screen: &Screen,
     goal: &str,
     history: &[Value],
-) -> Result<(String, Option<usize>, Option<String>, Option<String>)> {
+) -> Result<AssistDecision> {
     let image = daemon.screenshot(Some(900)).await.ok();
     let (answer, model) = chat.ask(ASSIST_SYSTEM, &screen_prompt(screen, goal, history), image.as_deref(), 2_000).await?;
     task.with(|s| s.models_used["assist"] = json!(model));
@@ -1270,7 +1273,7 @@ async fn assist_decide(
 }
 
 /// `(operation, target index, text, reason)` from the assist model's answer.
-pub fn parse_assist(answer: &str, targets: usize) -> Result<(String, Option<usize>, Option<String>, Option<String>)> {
+pub fn parse_assist(answer: &str, targets: usize) -> Result<AssistDecision> {
     let value = first_json_object(answer).with_context(|| format!("the assist model answered no JSON: {}", answer.chars().take(200).collect::<String>()))?;
     let operation = value["operation"].as_str().unwrap_or("").trim().to_uppercase();
     const OPS: [&str; 11] = ["CLICK", "TYPE_TEXT", "SCROLL_DOWN", "SCROLL_UP", "BACK", "HOME", "SPOTLIGHT", "PRESS_RETURN", "WAIT", "DONE", "BLOCKED"];

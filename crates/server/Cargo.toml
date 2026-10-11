@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.17.18"
+version = "0.17.19"
 edition = "2021"
 
 # The daemon binary. Lib stays for unit-testable glue (http/signaling/webrtc
@@ -69,6 +69,10 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # (png decode) and the accessibility tree is drawn over it (ab_glyph text).
 png = "0.17"
 ab_glyph = "0.2"
+
+# App install reads the bundle id from the app's Info.plist (binary or XML);
+# already in the tree through legacy-launch.
+plist = "1.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 browser-session = { path = "../browser-session", features = ["desktop"] }
