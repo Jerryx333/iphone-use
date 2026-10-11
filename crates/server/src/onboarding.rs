@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use server::instance::Instance;
+use server::locale::prefers_chinese;
 
 const DEFAULT_PORT: u16 = 44321;
 const TRY_OWNER: &str = "iphone-use-try";
@@ -336,20 +337,21 @@ fn owned_message(value: &Value) -> String {
     format!("the phone is being driven by {owner}; try again when it is done")
 }
 
-/// What the person should do next, in their language when we have both.
-fn next_step(status: &Value) -> Option<String> {
-    let step = status.get("next_step")?;
-    let zh = step.get("zh").and_then(Value::as_str);
-    let en = step.get("en").and_then(Value::as_str);
-    let chinese = std::env::var("LANG")
-        .map(|lang| lang.starts_with("zh"))
-        .unwrap_or(false);
+/// One `{zh, en}` pair in the person's language, or whichever half exists.
+fn localized(pair: &Value, chinese: bool) -> Option<String> {
+    let zh = pair.get("zh").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let en = pair.get("en").and_then(Value::as_str).filter(|s| !s.is_empty());
     match (zh, en) {
         (Some(zh), _) if chinese => Some(zh.to_string()),
         (_, Some(en)) => Some(en.to_string()),
         (Some(zh), None) => Some(zh.to_string()),
         _ => None,
     }
+}
+
+/// What the person should do next, in their language when we have both.
+fn next_step(status: &Value) -> Option<String> {
+    localized(status.get("next_step")?, prefers_chinese())
 }
 
 fn hint(status: &Value) -> Option<String> {
@@ -506,25 +508,26 @@ fn print_status(target: &Target, status: &Value) {
     if let Some(owner) = status["owner"].as_str() {
         println!("  in use by: {owner}");
     }
-    if let Some(line) = lock_line(status) {
+    if let Some(line) = lock_line(status, prefers_chinese()) {
         println!("  {line}");
     }
 }
 
 /// The lock-screen line of `iphone-use status`: shown when the phone will
 /// lock on its own (`lock_readiness`), so the owner can change Auto-Lock.
-fn lock_line(status: &Value) -> Option<String> {
+/// Label and hint follow the same language as `next_step` above it.
+fn lock_line(status: &Value, chinese: bool) -> Option<String> {
     let readiness = &status["lock_readiness"];
-    let label = match readiness["verdict"].as_str()? {
-        "will_lock_needs_person" => "lock screen: needs a person",
-        "will_lock_auto_unlocks" => "lock screen: unlocks by itself",
+    let label = match (readiness["verdict"].as_str()?, chinese) {
+        ("will_lock_needs_person", false) => "lock screen: needs a person",
+        ("will_lock_needs_person", true) => "锁屏：需要有人解锁",
+        ("will_lock_auto_unlocks", false) => "lock screen: unlocks by itself",
+        ("will_lock_auto_unlocks", true) => "锁屏：会自动解锁",
         _ => return None,
     };
-    let hint = readiness["hint"]["en"].as_str().unwrap_or_default();
-    Some(if hint.is_empty() {
-        label.to_string()
-    } else {
-        format!("{label} — {hint}")
+    Some(match localized(&readiness["hint"], chinese) {
+        Some(hint) => format!("{label} — {hint}"),
+        None => label.to_string(),
     })
 }
 
@@ -709,18 +712,26 @@ mod tests {
 
     #[test]
     fn status_names_a_phone_that_will_lock() {
-        let hint = json!({"en": "Set Auto-Lock to Never."});
+        let hint = json!({"en": "Set Auto-Lock to Never.", "zh": "把自动锁定设为永不。"});
         let status = |verdict: &str| json!({"lock_readiness": {"verdict": verdict, "hint": hint}});
         assert_eq!(
-            lock_line(&status("will_lock_needs_person")).as_deref(),
+            lock_line(&status("will_lock_needs_person"), false).as_deref(),
             Some("lock screen: needs a person — Set Auto-Lock to Never.")
         );
-        assert!(lock_line(&status("will_lock_auto_unlocks"))
+        // The whole line is in one language.
+        assert_eq!(
+            lock_line(&status("will_lock_needs_person"), true).as_deref(),
+            Some("锁屏：需要有人解锁 — 把自动锁定设为永不。")
+        );
+        assert!(lock_line(&status("will_lock_auto_unlocks"), false)
             .unwrap()
             .starts_with("lock screen: unlocks by itself"));
-        assert_eq!(lock_line(&status("ready")), None);
-        assert_eq!(lock_line(&status("unknown")), None);
-        assert_eq!(lock_line(&json!({})), None);
+        assert!(lock_line(&status("will_lock_auto_unlocks"), true)
+            .unwrap()
+            .starts_with("锁屏：会自动解锁"));
+        assert_eq!(lock_line(&status("ready"), true), None);
+        assert_eq!(lock_line(&status("unknown"), false), None);
+        assert_eq!(lock_line(&json!({}), false), None);
     }
 
     #[test]
@@ -749,6 +760,16 @@ mod tests {
         assert_eq!(next_step(&status).as_deref(), Some("Unlock the iPhone"));
         assert_eq!(hint(&json!({"hint": "raw"})).as_deref(), Some("raw"));
         assert_eq!(hint(&json!({"hint": ""})), None);
+    }
+
+    #[test]
+    fn a_pair_falls_back_to_the_half_it_has() {
+        let both = json!({"zh": "解锁手机", "en": "Unlock the iPhone"});
+        assert_eq!(localized(&both, true).as_deref(), Some("解锁手机"));
+        assert_eq!(localized(&both, false).as_deref(), Some("Unlock the iPhone"));
+        assert_eq!(localized(&json!({"en": "Unlock"}), true).as_deref(), Some("Unlock"));
+        assert_eq!(localized(&json!({"zh": "解锁"}), false).as_deref(), Some("解锁"));
+        assert_eq!(localized(&json!({"zh": ""}), false), None);
     }
 
     #[test]
