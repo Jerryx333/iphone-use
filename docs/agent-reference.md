@@ -639,7 +639,10 @@ update / publish / report`.
 - `structuredContent` is slim by default: the top-level verdict fields plus
   `summary`. `IPHONE_USE_MCP_STRUCTURED=full` sends the whole JSON; `off`
   sends none. Claude Code shows the model only `structuredContent` on success;
-  Codex CLI shows both parts.
+  Codex shows only non-null `structuredContent` when present.
+- Codex clients receive screenshots because `structuredContent` is left out
+  when a result carries an image; its verdict fields (`ok`, `error`,
+  `outcome`, `retry_safe`, `hint`) are appended as one text line instead.
 - `phone_status` and `phone_capabilities` return the JSON itself;
   `phone_screenshot` returns an image.
 - Single-step act tools observe by default (= `?return=delta`, baseline = the

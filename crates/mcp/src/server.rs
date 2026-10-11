@@ -8,8 +8,8 @@
 //!   1. `#[tool_router]` on the `impl PhoneHandler` block generates the static
 //!      `PhoneHandler::tool_router()` fn.
 //!   2. `#[tool_handler]` on the `impl ServerHandler` block fills in
-//!      `call_tool`, `list_tools`, and `get_tool`.  We add `get_info` manually
-//!      inside the same block so the macro skips its default stub.
+//!      defaults we do not override. Our `call_tool` routes and shapes the
+//!      result, then adapts image-bearing results for the initialized peer.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rmcp::{
@@ -1901,8 +1901,8 @@ impl PhoneHandler {
 // ---------------------------------------------------------------------------
 // ServerHandler impl
 //
-// `#[tool_handler]` fills in call_tool / list_tools / get_tool automatically.
-// We provide get_info() ourselves so the macro skips its default stub.
+// `#[tool_handler]` supplies defaults for methods we do not override.
+// Our call_tool preserves routing and shapes the final wire result.
 // ---------------------------------------------------------------------------
 
 /// Drop the parts of a schemars schema a model never needs: the meta-schema
@@ -1984,12 +1984,17 @@ fn listed_tools() -> Vec<rmcp::model::Tool> {
 ///
 /// Clients do not show the model what the spec suggests: Claude Code hands
 /// the model ONLY `structuredContent` when a successful result has one (the
-/// text block is dropped), and Codex CLI serialises the whole result, text and
-/// structure both. So the full JSON — an element tree, every step of a batch —
+/// text block is dropped). Codex also sends ONLY non-null structured content
+/// as text, dropping every content block, including images (openai/codex,
+/// `codex-rs/protocol/src/models.rs`,
+/// `CallToolResult::as_function_call_output_payload`, 806d973). So the full
+/// JSON — an element tree, every step of a batch —
 /// is what those models read, and the compact text is wasted. The default
 /// `slim` keeps the verdict a program branches on (the top-level scalars:
 /// `ok`, `outcome`, `retry_safe`, `error`, `snapshot`, counts) plus the
 /// compact text as `summary`; `full` sends the whole JSON; `off` sends none.
+/// After shaping, Codex results carrying images omit structured content and
+/// carry any missing verdict fields in text so the model receives the images.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuredMode {
     Slim,
@@ -2053,6 +2058,37 @@ fn shape_structured(mut result: CallToolResult, mode: StructuredMode) -> CallToo
     }
 }
 
+fn is_codex_client(name: &str) -> bool {
+    name.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("codex"))
+}
+
+/// Adapt only image-bearing Codex results, after upstream result shaping.
+fn keep_codex_images(mut result: CallToolResult, codex_client: bool) -> CallToolResult {
+    if !codex_client
+        || !result
+            .content
+            .iter()
+            .any(|block| block.as_image().is_some())
+    {
+        return result;
+    }
+    let Some(structured) = result.structured_content.take() else {
+        return result;
+    };
+    let verdict = ["ok", "error", "outcome", "retry_safe", "hint"]
+        .into_iter()
+        .filter_map(|key| {
+            let value = structured.get(key)?;
+            Some(format!("{key}:{value}"))
+        })
+        .collect::<Vec<_>>();
+    if !verdict.is_empty() {
+        result.content.push(Content::text(verdict.join(" ")));
+    }
+    result
+}
+
 #[tool_handler]
 impl ServerHandler for PhoneHandler {
     async fn call_tool(
@@ -2061,9 +2097,16 @@ impl ServerHandler for PhoneHandler {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let name = request.name.clone();
+        let codex_client = context
+            .peer
+            .peer_info()
+            .is_some_and(|info| is_codex_client(&info.client_info.name));
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = Self::tool_router().call(tcc).await?;
-        Ok(finish_result(&name, result, StructuredMode::from_env()))
+        Ok(keep_codex_images(
+            finish_result(&name, result, StructuredMode::from_env()),
+            codex_client,
+        ))
     }
 
     async fn list_tools(
@@ -2837,6 +2880,131 @@ async fn send_input_observed(
 
 #[cfg(test)]
 mod tests {
+
+    fn image_verdict_result() -> CallToolResult {
+        let mut result = CallToolResult::error(vec![
+            Content::text("Screenshot after failure · retry_safe:true"),
+            Content::image("cG5n", "image/png"),
+        ]);
+        result.structured_content = Some(serde_json::json!({
+            "ok": false, "error": "x", "outcome": "not_sent",
+            "retry_safe": true, "hint": "try again", "elements": ["bulk"],
+        }));
+        result
+    }
+
+    #[test]
+    fn codex_image_keeps_image_and_always_appends_verdict() {
+        let shaped = finish_result(
+            "phone_screenshot",
+            image_verdict_result(),
+            StructuredMode::Slim,
+        );
+        let mut expected = shaped.clone();
+        expected.structured_content = None;
+        expected.content.push(Content::text(
+            "ok:false error:\"x\" outcome:\"not_sent\" retry_safe:true hint:\"try again\"",
+        ));
+        let adapted = keep_codex_images(shaped, is_codex_client("codex-mcp-client"));
+        assert!(adapted.structured_content.is_none());
+        assert_eq!(adapted.content[1].as_image().unwrap().data, "cG5n");
+        assert_eq!(
+            serde_json::to_vec(&adapted).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_image_without_image_is_unchanged() {
+        let mut result = image_verdict_result();
+        result.content.retain(|block| block.as_image().is_none());
+        for mode in [
+            StructuredMode::Slim,
+            StructuredMode::Full,
+            StructuredMode::Off,
+        ] {
+            let shaped = finish_result("phone_elements", result.clone(), mode);
+            assert_eq!(
+                serde_json::to_vec(&keep_codex_images(shaped.clone(), true)).unwrap(),
+                serde_json::to_vec(&shaped).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_other_clients_are_unchanged() {
+        for mode in [
+            StructuredMode::Slim,
+            StructuredMode::Full,
+            StructuredMode::Off,
+        ] {
+            let shaped = finish_result("phone_screenshot", image_verdict_result(), mode);
+            assert_eq!(
+                serde_json::to_vec(&keep_codex_images(shaped.clone(), false)).unwrap(),
+                serde_json::to_vec(&shaped).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_name_matching_is_case_insensitive_prefix_only() {
+        for name in ["codex", "Codex-MCP-Client", "CODEX-desktop"] {
+            assert!(is_codex_client(name), "{name}");
+        }
+        for name in ["my-codex", "code", "", " codex", "你好codex"] {
+            assert!(!is_codex_client(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn codex_image_device_text_does_not_suppress_verdict() {
+        for mode in [StructuredMode::Slim, StructuredMode::Full] {
+            let mut result = CallToolResult::success(vec![
+                Content::text("#0 [StaticText] \"Status ok:true now\""),
+                Content::image("cG5n", "image/png"),
+            ]);
+            result.structured_content = Some(serde_json::json!({"ok": true}));
+            let shaped = finish_result("phone_screenshot", result, mode);
+            let mut expected = shaped.clone();
+            expected.structured_content = None;
+            expected.content.push(Content::text("ok:true"));
+            let adapted = keep_codex_images(shaped, true);
+            assert_eq!(
+                serde_json::to_vec(&adapted).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_verdict_without_text_and_modes() {
+        for mode in [StructuredMode::Slim, StructuredMode::Full] {
+            let mut result = image_verdict_result();
+            result.content.retain(|block| block.as_image().is_some());
+            let adapted = keep_codex_images(finish_result("phone_screenshot", result, mode), true);
+            assert!(adapted.structured_content.is_none());
+            assert_eq!(
+                adapted.content.last().unwrap().as_text().unwrap().text,
+                "ok:false error:\"x\" outcome:\"not_sent\" retry_safe:true hint:\"try again\""
+            );
+        }
+        let shaped = finish_result(
+            "phone_screenshot",
+            image_verdict_result(),
+            StructuredMode::Off,
+        );
+        assert_eq!(
+            serde_json::to_vec(&keep_codex_images(shaped.clone(), true)).unwrap(),
+            serde_json::to_vec(&shaped).unwrap()
+        );
+        // A structured body with no verdict keys adds no empty text block.
+        let mut bare = image_verdict_result();
+        bare.content.retain(|block| block.as_image().is_some());
+        bare.structured_content = Some(serde_json::json!({"rows": 3}));
+        let adapted = keep_codex_images(bare, true);
+        assert!(adapted.structured_content.is_none());
+        assert!(adapted.content.iter().all(|block| block.as_text().is_none()));
+    }
 
     /// A misspelled or unsupported argument must fail loudly. Before this,
     /// `phone_tap_label {"label":…, "kind":"Button"}` silently dropped
