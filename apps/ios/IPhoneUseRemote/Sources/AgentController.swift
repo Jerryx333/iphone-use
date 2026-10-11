@@ -248,7 +248,9 @@ final class AgentController: ObservableObject {
                 announced = prompt.id
                 confirmPrompt = prompt
                 // Wherever the person is in the app, the question comes up.
-                app?.agentOpen = true
+                // The call sheet presents the same native confirmation UI.
+                // Do not ask its covered parent to present a second sheet.
+                if app?.voiceCall.showing != true { app?.agentOpen = true }
                 notifyIfAway(title: String(localized: "Agent 等你确认"),
                              body: Self.describe(confirm), id: "agent-confirm-\(task.id)")
             }

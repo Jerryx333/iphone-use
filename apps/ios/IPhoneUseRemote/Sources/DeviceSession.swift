@@ -177,8 +177,17 @@ final class DeviceSession: ObservableObject, Identifiable {
     @Published var suspended = false {
         didSet {
             guard suspended != oldValue else { return }
-            if suspended { cancelRetry() }
+            if suspended && !voiceCallKeepsConnection { cancelRetry() }
             updateStream()
+        }
+    }
+
+    /// A user-started voice call can reconnect its own loopback control
+    /// connection in the background while video remains suspended.
+    var voiceCallKeepsConnection = false {
+        didSet {
+            if !voiceCallKeepsConnection && suspended { cancelRetry() }
+            if voiceCallKeepsConnection { Task { await retryIfWaiting() } }
         }
     }
 
@@ -340,7 +349,7 @@ final class DeviceSession: ObservableObject, Identifiable {
     /// Try again later, sooner at first. Paused while the app is in the
     /// background; coming back (or the network returning) retries at once.
     private func scheduleRetry(_ problem: ConnectProblem) {
-        guard !suspended else { return }
+        guard !suspended || voiceCallKeepsConnection else { return }
         let delay = RetryPolicy.delay(attempt: retryAttempt, problem: problem)
         retryAttempt += 1
         nextRetryAt = Date().addingTimeInterval(delay)

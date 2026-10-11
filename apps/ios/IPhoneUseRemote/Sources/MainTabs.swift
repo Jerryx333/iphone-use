@@ -6,7 +6,13 @@ enum AppTab: String, Hashable { case assistant, browser, remote, tasks, settings
 struct MainTabsView: View {
     @ObservedObject var app: AppModel
     @State private var selection: AppTab = .assistant
+    @ObservedObject private var voiceCall: AssistantVoiceCall
     @StateObject private var workspace = BrowserWorkspace()
+
+    init(app: AppModel) {
+        self.app = app
+        self.voiceCall = app.voiceCall
+    }
 
     var body: some View {
         TabView(selection: $selection) {
@@ -26,6 +32,8 @@ struct MainTabsView: View {
                 .tabItem { Label("设置", systemImage: "gearshape") }
                 .tag(AppTab.settings)
         }
+        .safeAreaInset(edge: .top) { AssistantVoiceCallBanner(call: voiceCall) }
+        .sheet(isPresented: $voiceCall.showing) { AssistantVoiceCallView(call: voiceCall, agent: app.agent) }
         .tint(Theme.accent)
         .onDisappear { workspace.agent.pause() }
         .appOnChange(of: app.focusedID) { _, id in if id != nil, app.focused?.record.isThisPhone != true { selection = .remote } }
@@ -100,7 +108,10 @@ struct TaskHubView: View {
                 }
             }
             .navigationTitle("任务")
-            .task { app.agent.chooseDefaultTarget(); await app.agent.refreshHistory() }
+            .task {
+                if !app.voiceCall.active { app.agent.chooseDefaultTarget() }
+                await app.agent.refreshHistory()
+            }
             .refreshable { await app.agent.refreshHistory() }
             .sheet(isPresented: $flows) {
                 if let session = app.agent.target { FlowsHubView(session: session) }

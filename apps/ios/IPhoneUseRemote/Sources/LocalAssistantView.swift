@@ -79,13 +79,29 @@ struct LocalAssistantView: View {
             .sheet(isPresented: $savingFlow) { if let local { SaveFlowSheet(session: local, draft: nil) } }
             .onAppear { visible = true; selectLocal() }
             .onDisappear { visible = false }
-            .task(id: local?.id) { selectLocal(); await agent.refreshHistory() }
+            .task(id: local?.id) {
+                if app.voiceCall.active && !localSelected { app.voiceCall.end() }
+                selectLocal(); await agent.refreshHistory()
+            }
             .appOnChange(of: app.agentOpen) { _, open in if !open && visible { selectLocal() } }
         }
     }
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 10) {
+            Button {
+                composing = false
+                app.voiceCall.showing = true
+                if !app.voiceCall.active, !app.voiceCall.connecting, let id = local?.id {
+                    Task { await app.voiceCall.start(agent: agent, deviceID: id) }
+                }
+            } label: {
+                Image(systemName: app.voiceCall.active ? "waveform.circle.fill" : "phone.circle.fill")
+                    .font(.title).frame(width: 44, height: 44)
+            }
+            .disabled(!app.voiceCall.active && local?.phase != .connected)
+            .accessibilityLabel("语音通话")
+            .accessibilityIdentifier("local-voice-call")
             AppTextField(LocalizedStringKey(navigationString("告诉助手要做什么")), text: $agent.draft, axis: .vertical)
                 .appLineLimit(1...5).focused($composing)
                 .padding(12).background(Theme.surface, in: RoundedRectangle(cornerRadius: 22))

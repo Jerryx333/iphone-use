@@ -81,6 +81,7 @@ final class AppModel: ObservableObject {
     /// The Agent screen (a goal typed here, carried out by a daemon).
     @Published var agentOpen = false
     let agent: AgentController
+    let voiceCall = AssistantVoiceCall()
 
     private let defaults: UserDefaults
 

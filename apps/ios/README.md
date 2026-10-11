@@ -211,3 +211,53 @@ the conversation, with execution steps collapsed by default. Closing the sheet r
 the page without stopping the task; taking over pauses and returns to the page. The session
 retains up to 20 previous turns and supplies the last four to follow-up requests as background
 context. Conversation history is currently in memory, not restored after restarting the app.
+
+
+The On-Device Assistant's phone button starts a continuous Chinese voice conversation.
+Microphone capture and synthesized replies share a voice-processing AVAudioEngine graph;
+the assistant can listen while speaking, and a new utterance interrupts playback and pending
+reasoning. On-device recognition is preferred; missing/failed local assets can fall back to
+Apple's service under Speech permission. Recognized text and bounded conversation context
+are sent to the enabled chat providers in Model Settings, preserving their fallback order.
+
+Ordinary conversation and follow-up questions use the chat model without starting phone
+tasks. A validated `run` decision submits a contextual goal to the paired loopback task API.
+Status questions use current task evidence, including errors and pending confirmations.
+Exact stop commands such as “停止” work without a model call. Replacing a running task
+requires an explicit request, waits for cancellation acknowledgement, and aborts if another
+task appears. The assistant never approves a phone action from speech: the existing native
+confirmation sheet remains available inside the call screen.
+
+The audio background mode keeps capture and replies alive while the execution service opens
+other apps. The bound local connection can retry during the call while video stays suspended.
+The call banner remains available across tabs; closing the call sheet keeps the call active.
+Hanging up releases audio and connection upkeep, cancels pending reasoning, and prevents late
+model replies from starting tasks. A phone request already sent is not replayed or silently
+cancelled by a voice interruption. Use Stop Task to cancel an accepted task.
+
+Recognition rotates before its duration limit and retries transient errors with a bounded
+failure budget. Audio route changes rebuild the graph; system interruptions pause reasoning
+and audio, and resume only when the system recommends it or the person chooses Continue.
+Persistent failures expose Reconnect. Muting discards pending speech and reasoning. The call
+screen includes speaker/receiver switching, conversation text, model settings and native
+confirmation. It provides in-app voice conversation; PSTN numbers and incoming VoIP/CallKit
+calls are outside this scope.
+
+Voice regression tests use synthetic audio/phone/model fixtures and exercise interruption,
+late replies, conversation context, device changes, cancellation, confirmation, model-provider
+fallback and compact/dark layouts. Live inference and physical audio require explicit opt-in:
+
+```bash
+TEST_RUNNER_VOICE_LIVE_MODEL_TEST=1 xcodebuild -scheme IPhoneUseRemote \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:IPhoneUseRemoteTests/AssistantConversationModelTests/testRealFreeProviderWithSyntheticConversationOnly test
+# Use the separate QA bundle when another session owns the installed production app.
+TEST_RUNNER_VOICE_NATIVE_AUDIO_TEST=1 xcodebuild -scheme IPhoneUseRemote \
+  -destination 'platform=iOS,id=<QA-device-UDID>' \
+  -only-testing:IPhoneUseRemoteTests/AssistantNativeAudioTests test
+```
+
+The selected physical QA device is iPhone 14. Real microphone recognition, acoustic echo
+cancellation, background capture while other apps are open, Bluetooth route changes, and
+actual incoming-call interruptions require that device's unlocked/authorized runner and audio
+permissions. A compile or mocked test does not establish these hardware results.
