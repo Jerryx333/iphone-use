@@ -64,11 +64,18 @@ final class BrowserTests: XCTestCase {
         browser.loading = true
         browser.webView.loadHTMLString("<h1>Dialog fixture</h1>", baseURL: URL(string: "https://example.com"))
         try await browser.waitUntilReady()
+        // WebKit dialogs need a visible view; an offscreen view can suppress
+        // the callback on recent iOS, leaving this test waiting indefinitely.
+        let window = UIWindow(frame: browser.webView.frame)
+        let controller = UIViewController(); controller.view = browser.webView
+        window.rootViewController = controller; window.makeKeyAndVisible()
+        defer { window.isHidden = true; browser.answerDialog(false) }
         let result = Task { try await browser.webView.evaluateJavaScript("confirm('Approve fixture?')") as? Bool }
         for _ in 0..<100 {
             if browser.dialog != nil { break }
             try await Task.sleep(for: .milliseconds(50))
         }
+        guard browser.dialog != nil else { result.cancel(); XCTFail("WebKit did not present the fixture dialog"); return }
         XCTAssertEqual(browser.dialog?.message, "Approve fixture?")
         browser.answerDialog(true)
         let accepted = try await result.value

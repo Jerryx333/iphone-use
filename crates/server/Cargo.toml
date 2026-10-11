@@ -71,6 +71,7 @@ png = "0.17"
 ab_glyph = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+browser-session = { path = "../browser-session", features = ["desktop"] }
 objc2-core-foundation = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"

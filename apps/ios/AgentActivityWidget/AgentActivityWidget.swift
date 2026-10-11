@@ -20,7 +20,7 @@ struct AgentLiveActivity: Widget {
       }.padding(16)
         .activityBackgroundTint(Color.black.opacity(0.9))
         .activitySystemActionForegroundColor(.white)
-        .widgetURL(URL(string: "iphoneuse://agent"))
+        .widgetURL(URL(string: context.attributes.route ?? "iphoneuse://agent"))
     } dynamicIsland: { context in
       DynamicIsland {
         DynamicIslandExpandedRegion(.leading) {
@@ -42,7 +42,7 @@ struct AgentLiveActivity: Widget {
           systemName: context.state.terminal
             ? (context.state.succeeded ? "checkmark" : "exclamationmark") : "sparkles")
       }
-      .widgetURL(URL(string: "iphoneuse://agent"))
+      .widgetURL(URL(string: context.attributes.route ?? "iphoneuse://agent"))
       .keylineTint(.cyan)
     }
   }

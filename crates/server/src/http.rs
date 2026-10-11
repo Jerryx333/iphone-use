@@ -945,6 +945,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/pair/new", post(pair_new))
         .route("/pair", get(pair_page).post(pair_submit))
         .route("/pair/probe", get(pair_probe))
+        .route("/browser/chrome", post(browser_chrome))
         // Browser control: one HTTP request per gesture, each with an explicit
         // ACK, alongside the MJPEG view.
         .route("/control", post(direct_control))
@@ -13478,6 +13479,8 @@ async fn agent_task_act(
             iphone_use_mcp::task::answer(&id, approve)
         }
         "cancel" => iphone_use_mcp::task::cancel(&id),
+        "pause" => iphone_use_mcp::task::pause(&id, true),
+        "resume" => iphone_use_mcp::task::pause(&id, false),
         _ => return agent_json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok": false, "error": "not_found"})),
     };
     match result {
@@ -21135,4 +21138,25 @@ mod unlock_before_action_tests {
         assert!(!should_unlock_before_action(Some(false), LockReport::Unknown));
         assert!(!should_unlock_before_action(None, LockReport::Unlocked));
     }
+}
+
+/// Independent encrypted Chrome grant: HTTP session credentials never unlock it.
+async fn browser_chrome(axum::Json(raw): axum::Json<serde_json::Value>) -> Response {
+    #[cfg(target_os = "macos")]
+    {
+        if raw.to_string().len()>512*1024 { return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"ok":false,"error":"request_too_large"}))).into_response(); }
+        let result=tokio::task::spawn_blocking(move || {
+            let file=ipu_browser_session::desktop::default_scope_file()?;
+            let home=std::env::var_os("HOME").ok_or("home_unavailable")?;
+            let sites=std::path::PathBuf::from(home).join(".chrome-use/sites");
+            ipu_browser_session::desktop::handle(&file,&sites,&raw,std::path::Path::new("chrome-use"))
+        }).await;
+        match result {
+            Ok(Ok(value))=>axum::Json(value).into_response(),
+            Ok(Err(code))=>(StatusCode::BAD_REQUEST,axum::Json(serde_json::json!({"ok":false,"error":code}))).into_response(),
+            Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,axum::Json(serde_json::json!({"ok":false,"error":"chrome_bridge_unavailable"}))).into_response(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _=raw; (StatusCode::NOT_IMPLEMENTED,axum::Json(serde_json::json!({"ok":false,"error":"chrome_requires_paired_mac"}))).into_response() }
 }

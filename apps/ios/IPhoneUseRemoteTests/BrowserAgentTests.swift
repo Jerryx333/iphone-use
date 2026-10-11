@@ -2,19 +2,28 @@ import XCTest
 @testable import IPhoneUseRemote
 
 @MainActor
-private final class ScriptedBrowserReasoning: BrowserReasoning {
+private final class ScriptedBrowserReasoning: BrowserReasoning, BrowserCompletionChecking {
     var requested = false
     var delay = false
     var mode = "complete"
     var count = 0
     var requests: [String] = []
 
+    func verifyCompletion(goal: String, page: BrowserPage, steps: [BrowserAgentStep], models: [ModelsPayload.Assist]) async throws -> Bool {
+        if mode == "premature" { return page.text.contains("Updated") && page.elements.first(where: { $0.label == "Name" })?.value == "Phone Use" }
+        return true
+    }
     func decide(goal: String, page: BrowserPage?, steps: [BrowserAgentStep], models: [ModelsPayload.Assist]) async throws -> BrowserDecision {
         requested = true
         requests.append(goal)
         if delay { try? await Task.sleep(for: .milliseconds(500)) }
         count += 1
         guard let page else { throw BrowserToolError.invalidResult }
+        if mode == "premature" {
+            if count == 2 { return .init(action: .fill, explanation: "填写测试名称", element: try XCTUnwrap(page.elements.first { $0.label == "Name" }).id, text: "Phone Use") }
+            if count == 3 { return .init(action: .click, explanation: "更新网页", element: try XCTUnwrap(page.elements.first { $0.label == "Continue" }).id) }
+            return .init(action: .done, explanation: "模型声称完成")
+        }
         if mode == "submit", !page.text.contains("Submitted") {
             return .init(action: .click, explanation: "提交测试表单", element: try XCTUnwrap(page.elements.first { $0.isSubmit }).id)
         }
@@ -36,8 +45,8 @@ final class BrowserAgentTests: XCTestCase {
         browser.hasPage = true
         browser.loading = true
         browser.webView.loadHTMLString("""
-        <h1>Ready</h1><label>Name<input id="name"></label>
-        <button onclick="document.querySelector('h1').textContent='Updated'">Continue</button>
+        <title>Ready</title><h1>Ready</h1><label>Name<input id="name"></label>
+        <button onclick="document.querySelector('h1').textContent='Updated';document.title='Updated'">Continue</button>
         <form onsubmit="event.preventDefault();document.querySelector('h1').textContent='Submitted'"><button type="submit">Submit</button></form>
         """, baseURL: URL(string: "https://example.com"))
         try await browser.waitUntilReady()
@@ -52,6 +61,18 @@ final class BrowserAgentTests: XCTestCase {
         XCTFail("Browser task did not reach the expected state")
     }
 
+    func testPrematureDoneIsRejectedUntilThePageActuallyMatches() async throws {
+        let browser = try await fixture(), reasoning = ScriptedBrowserReasoning()
+        reasoning.mode = "premature"
+        let agent = BrowserAgent(browser: browser, reasoning: reasoning)
+        agent.start("填写名称并更新网页", settings: ModelSettings())
+        try await waitFor { agent.state == .done || agent.state == .failed }
+        XCTAssertEqual(agent.state, .done, agent.message ?? "")
+        XCTAssertEqual(reasoning.count, 4)
+        XCTAssertTrue(agent.steps.first?.text.contains("核验未通过") == true)
+        let value = try await browser.webView.evaluateJavaScript("document.querySelector('#name').value") as? String
+        XCTAssertEqual(value, "Phone Use")
+    }
     func testObserveFillClickAndFinish() async throws {
         let browser = try await fixture()
         let agent = BrowserAgent(browser: browser, reasoning: ScriptedBrowserReasoning())

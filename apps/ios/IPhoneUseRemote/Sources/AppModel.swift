@@ -80,6 +80,7 @@ final class AppModel: ObservableObject {
 
     /// The Agent screen (a goal typed here, carried out by a daemon).
     @Published var agentOpen = false
+    @Published var assistantNavigationRequest: UUID?
     let agent: AgentController
     let voiceCall = AssistantVoiceCall()
 
@@ -378,6 +379,9 @@ final class AppModel: ObservableObject {
     }
 
     func handle(url: URL) {
+        if url.scheme == "iphoneuse", url.host == "assistant" {
+            agentOpen = false; assistantNavigationRequest = UUID(); return
+        }
         if url.scheme == "iphoneuse", url.host == "agent" {
             openAgent()
             agent.resume()

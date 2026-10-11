@@ -388,15 +388,13 @@ pub fn plist_scalar(value: Option<&Value>) -> String {
 
 /// `EnvironmentVariables:<key>` of a LaunchAgent plist; empty when absent.
 pub fn plist_env(path: &Path, key: &str) -> String {
-    read_plist(path)
-        .map(|plist| {
-            plist_scalar(
-                plist
-                    .get("EnvironmentVariables")
-                    .and_then(|env| env.get(key)),
-            )
-        })
-        .unwrap_or_default()
+    read_plist(path).map(|plist| {
+        let env=plist.get("EnvironmentVariables");
+        let branded=key.strip_prefix("PHONE_REMOTE_").map(|suffix|format!("IPHONE_USE_{suffix}"));
+        let value=branded.as_deref().and_then(|name|env.and_then(|values|values.get(name)))
+            .or_else(||env.and_then(|values|values.get(key)));
+        plist_scalar(value)
+    }).unwrap_or_default()
 }
 
 /// A top-level scalar (`Label`) or `ProgramArguments` item of a plist.
@@ -490,6 +488,14 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_reads_branded_ports_and_credentials_from_plists() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("fixture.plist");
+        std::fs::write(&path,r#"<?xml version="1.0"?><plist version="1.0"><dict><key>EnvironmentVariables</key><dict><key>IPHONE_USE_PORT</key><string>45432</string><key>PHONE_REMOTE_PORT</key><string>44321</string><key>IPHONE_USE_AGENT_TOKEN</key><string>synthetic-token</string><key>WDA_PORT</key><string>8100</string></dict></dict></plist>"#).unwrap();
+        assert_eq!(plist_env(&path,"PHONE_REMOTE_PORT"),"45432");
+        assert_eq!(plist_env(&path,"PHONE_REMOTE_AGENT_TOKEN"),"synthetic-token");
+        assert_eq!(plist_env(&path,"WDA_PORT"),"8100");
+    }
     /// devicectl can hang forever on a wedged tunnel; every call is bounded.
     #[test]
     fn a_hung_child_is_killed_at_its_deadline() {

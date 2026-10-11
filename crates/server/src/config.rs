@@ -68,7 +68,12 @@ impl Config {
     /// This is the testable core: `from_env` simply delegates here with
     /// `std::env::var`.  In tests, pass a closure over a `HashMap<&str,
     /// &str>` (or similar) to avoid side-effects on the real environment.
-    pub fn from_map(get: impl Fn(&str) -> Option<String>) -> Config {
+    pub fn from_map(lookup: impl Fn(&str) -> Option<String>) -> Config {
+        let get = |key: &str| {
+            key.strip_prefix("PHONE_REMOTE_")
+                .and_then(|suffix| lookup(&format!("IPHONE_USE_{suffix}")))
+                .or_else(|| lookup(key))
+        };
         let host = get("PHONE_REMOTE_HOST")
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_HOST.to_owned());
@@ -152,6 +157,14 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
     }
 
+    #[test]
+    fn branded_environment_aliases_preserve_legacy_configuration() {
+        let cfg=map_cfg(&[("IPHONE_USE_PORT","45432"),("PHONE_REMOTE_PORT","44321"),("IPHONE_USE_PASSWORD","synthetic-password"),("IPHONE_USE_AGENT_TOKEN","synthetic-token")]);
+        assert_eq!(cfg.port,45432);
+        assert_eq!(cfg.password.as_deref(),Some("synthetic-password"));
+        assert_eq!(cfg.agent_token.as_deref(),Some("synthetic-token"));
+        assert_eq!(map_cfg(&[("PHONE_REMOTE_PORT","9000")]).port,9000);
+    }
     #[test]
     fn port_override_valid() {
         let cfg = map_cfg(&[("PHONE_REMOTE_PORT", "9000")]);

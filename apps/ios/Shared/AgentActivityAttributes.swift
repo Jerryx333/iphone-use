@@ -13,4 +13,5 @@ struct AgentActivityAttributes: ActivityAttributes, Sendable {
   }
   var goal: String
   var device: String
+  var route: String? = nil
 }

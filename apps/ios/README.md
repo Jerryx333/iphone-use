@@ -9,6 +9,8 @@ Build with Xcode containing the iOS 26 SDK or newer. This is a build-time
 requirement for continued processing; the app's deployment target remains iOS 15.
 
 ```bash
+./scripts/build-browser-session.sh device
+./scripts/build-browser-session.sh simulator  # before Simulator tests
 cd apps/ios
 xcodegen generate          # writes IPhoneUseRemote.xcodeproj from project.yml
 open IPhoneUseRemote.xcodeproj
@@ -261,3 +263,43 @@ The selected physical QA device is iPhone 14. Real microphone recognition, acous
 cancellation, background capture while other apps are open, Bluetooth route changes, and
 actual incoming-call interruptions require that device's unlocked/authorized runner and audio
 permissions. A compile or mocked test does not establish these hardware results.
+
+## Unified assistant and Chrome handoff
+
+The 助手 tab owns an encrypted task plan. Browser and phone phases share redacted
+results. Phone work runs in the embedded service while the app is suspended;
+WebKit phases wait for foreground. Reopening queries existing native request IDs.
+An ambiguous write requires manual verification instead of replay.
+
+账号与网站资料 imports cookie-use v1/v2 `.cusession` files. Review accounts and
+Cookie/localStorage/bookmark/history/personal fields separately. The vault is
+AES-GCM encrypted with a Keychain key. iOS 17+ uses separate persistent WebKit
+stores; iOS 15/16 rebuilds isolated ephemeral stores from the encrypted vault.
+Chrome passwords, passkeys and device-bound sessions are not transferable.
+
+Site operations reuse actual chrome-use `@meta` and async function sources.
+Trust imported scripts explicitly. The local assistant plans only native phone, WebKit and mobile-compatible site
+phases; it never sends a goal to the computer. Desktop-only scripts and file
+inputs require separate execution on the computer.
+
+Install the helper from GitHub Releases (available after the next release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/scripts/install-browser-bridge.sh | sh
+# Development build:
+~/.local/bin/heavy-cargo build -p browser-session --features desktop --bin browser-use-bridge
+browser-use-bridge sites --out sites.json
+browser-use-bridge export --profile 'Profile 1' --sites example.com --out accounts.cusession --bookmarks --with-sites
+# Review the preview, then add --confirm; the transfer password is prompted privately.
+browser-use-bridge grant --profile 'Profile 1' --sites example.com --endpoint http://MAC:44321
+# Optional companion API, independent of the local phone assistant:
+# review scope, then add --confirm; keep the private link secret.
+# Add --writes only when needed; every write still requires phone confirmation.
+browser-use-bridge revoke --scope SCOPE_ID
+```
+
+Grants expire after seven days. Their independent key is paired privately, not
+derived from HTTP login credentials. Requests/results use AES-GCM with separate
+contexts. Encrypted execution records precede Chrome execution, preventing blind
+replay after a crash. Keep pairing links private. The Mac daemon must run this
+version, with chrome-use and the selected site scripts installed.

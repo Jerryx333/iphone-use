@@ -25,8 +25,12 @@ final class BrowserSession: NSObject, ObservableObject, WKNavigationDelegate, WK
     private var dialogResponse: ((Bool, String?) -> Void)?
     private var urlObservation: NSKeyValueObservation?
 
-    override init() {
-        webView = WKWebView(frame: .zero)
+    override convenience init() { self.init(dataStore: .default()) }
+
+    init(dataStore: WKWebsiteDataStore) {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = dataStore
+        webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -159,6 +163,8 @@ struct BrowserView: View {
     @ObservedObject var session: BrowserSession
     @ObservedObject var agent: BrowserAgent
     @ObservedObject var settings: AgentController
+    var workspace: BrowserWorkspace? = nil
+    @State private var libraryOpen = false
     @State private var input = ""
     @State private var pageText: String?
     @State private var reading = false
@@ -207,8 +213,9 @@ struct BrowserView: View {
                     startPage
                 }
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) { BrowserTaskBar(agent: agent, settings: settings, expanded: $conversationOpen) }
+            .safeAreaInset(edge: .bottom, spacing: 0) { BrowserTaskBar(agent: agent, settings: settings, expanded: $conversationOpen).disabled(workspace?.lockedForTask == true && !agent.active) }
             .background(Color(uiColor: .systemBackground))
+            .sheet(isPresented: $libraryOpen) { if let workspace { BrowserLibraryView(workspace: workspace) } }
             .navigationTitle("浏览器")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -219,6 +226,9 @@ struct BrowserView: View {
                         .disabled(!session.canGoForward || agent.active).accessibilityLabel("前进")
                 }
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    if workspace != nil {
+                        Button { libraryOpen = true } label: { Image(systemName: "person.crop.circle") }.accessibilityLabel("账号与网站资料")
+                    }
                     Button {
                         reading = true
                         Task {

@@ -19,7 +19,7 @@ final class MainTabsUITests: XCTestCase {
         app.launch()
         defer { app.terminate() }
 
-        for title in ["本机助手", "浏览器", "远程控制", "任务", "设置"] {
+        for title in ["助手", "浏览器", "远程控制", "任务", "设置"] {
             XCTAssertTrue(app.tabBars.buttons[title].waitForExistence(timeout: 10))
         }
         let field = app.textFields["browser-address"]
@@ -114,7 +114,7 @@ final class MainTabsUITests: XCTestCase {
             _ = app.buttons["browser-task-result"].waitForExistence(timeout: 1)
         }
         XCTAssertTrue(app.buttons["browser-task-result"].exists)
-        XCTAssertTrue(app.tabBars.buttons["本机助手"].isHittable, "Autofill must not leave the web keyboard toolbar over the tab bar")
+        XCTAssertTrue(app.tabBars.buttons["助手"].isHittable, "Autofill must not leave the web keyboard toolbar over the tab bar")
         capture("browser-task-completed")
         app.buttons["browser-open-chat"].tap()
         XCTAssertTrue(app.staticTexts["browser-assistant-message"].waitForExistence(timeout: 10))
@@ -149,7 +149,7 @@ final class MainTabsUITests: XCTestCase {
         capture("browser-conversation-draft")
         app.buttons["browser-close-chat"].tap()
         XCTAssertEqual(dock.value as? String, "帮我整理这个网页")
-        app.tabBars.buttons["本机助手"].tap()
+        app.tabBars.buttons["助手"].tap()
         XCTAssertTrue(app.buttons["pair-local-phone"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.textFields["local-agent-goal"].exists)
         capture("local-assistant")

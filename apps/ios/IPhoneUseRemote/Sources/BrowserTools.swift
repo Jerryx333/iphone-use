@@ -49,7 +49,11 @@ extension BrowserSession {
 
     func fill(element id: Int, token: String, text: String) async throws {
         _ = try await invoke(BrowserScripts.fill,
-            arguments: ["id": id, "token": token, "text": text])
+            arguments: ["id": id, "token": token, "text": text, "personal": false])
+        webView.endEditing(true)
+    }
+    func fillPersonal(element id: Int, token: String, text: String) async throws {
+        _ = try await invoke(BrowserScripts.fill, arguments: ["id": id, "token": token, "text": text, "personal": true])
         webView.endEditing(true)
     }
     func select(element id: Int, token: String, value: String) async throws {
@@ -81,7 +85,7 @@ private enum BrowserScripts {
       .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && getComputedStyle(e).visibility !== 'hidden' && !e.closest('[aria-hidden=true]'); })
       .slice(0, 200);
     const token = snapshotToken;
-    const sensitive = e => ['password', 'file'].includes(e.type) || /^(cc-|one-time-code|current-password|new-password)/.test(e.getAttribute('autocomplete') || '');
+    const sensitive = e => e.hasAttribute('data-phoneuse-sensitive') || ['password', 'file'].includes(e.type) || /^(cc-|one-time-code|current-password|new-password)/.test(e.getAttribute('autocomplete') || '');
     const signature = e => [e.tagName, e.type || '', e.getAttribute('href') || '', e.getAttribute('aria-label') || '', e.innerText || ''].join('|');
     globalThis.phoneUseSnapshot = { token, nodes, document, url: location.href, signatures: nodes.map(signature), signature };
     return JSON.stringify({ token, url: location.href, title: document.title,
@@ -107,6 +111,7 @@ private enum BrowserScripts {
     static let fill = resolve + """
     if (element.type === 'password' || element.type === 'file' || /^(cc-|one-time-code|current-password|new-password)/.test(element.getAttribute('autocomplete') || '')) throw new Error('HUMAN: Enter this field yourself.');
     element.focus();
+    if (personal) element.setAttribute('data-phoneuse-sensitive', 'true');
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
       const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
       Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, text);

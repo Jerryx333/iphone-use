@@ -9,6 +9,10 @@ struct AgentProgress: Equatable, Sendable {
     var terminal: Bool
     var succeeded: Bool
 
+    init(current: String, next: String, steps: Int, terminal: Bool = false, succeeded: Bool = false) {
+        self.current = current; self.next = next; self.steps = steps; self.terminal = terminal; self.succeeded = succeeded
+    }
+
     init(task: AgentTaskSnapshot) {
         steps = task.steps.count
         terminal = task.state.isTerminal
@@ -24,6 +28,7 @@ struct AgentProgress: Equatable, Sendable {
             next = String(localized: "读取新页面")
         } else {
             switch task.phase {
+            case "paused": current = String(localized: "已暂停"); next = String(localized: "继续后重新读取页面")
             case "flow": current = String(localized: "查找或执行流程"); next = String(localized: "检查流程结果")
             case "summary": current = String(localized: "核验任务结果"); next = String(localized: "返回任务结果")
             case "observing": current = String(localized: "读取当前页面"); next = String(localized: "选择下一步")

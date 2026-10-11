@@ -1,14 +1,114 @@
 import SwiftUI
 import Combine
+import WebKit
 
 @MainActor
-final class BrowserWorkspace: ObservableObject {
-    let browser: BrowserSession
-    let agent: BrowserAgent
-    init() {
-        let browser = BrowserSession()
+final class BrowserWorkspace: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
+    @Published private(set) var browser: BrowserSession
+    @Published private(set) var agent: BrowserAgent
+    let library: BrowserLibrary
+    @Published private(set) var switching = true
+    @Published var lockedForTask = false
+    private let reasoning: any BrowserReasoning
+    private var visits: AnyCancellable?
+    private var cookieCapture: Task<Void, Never>?
+    init(library: BrowserLibrary? = nil, reasoning: any BrowserReasoning = BrowserModelClient()) {
+        let library = library ?? BrowserLibrary()
+        self.library = library; self.reasoning = reasoning
+        let browser = BrowserSession(dataStore: Self.store(for: library.activeID))
         self.browser = browser
-        agent = BrowserAgent(browser: browser)
+        agent = BrowserAgent(browser: browser, reasoning: reasoning, library: library)
+        super.init()
+        bindVisits()
+        Task { await restore(); switching = false }
+    }
+    private static func store(for id: UUID) -> WKWebsiteDataStore {
+        if id == BrowserAccount.defaultID { return .default() }
+        if #available(iOS 17, *), !AppCompatibility.forceLegacyUI { return WKWebsiteDataStore(forIdentifier: id) }
+        return .nonPersistent()
+    }
+    private func bindVisits() {
+        browser.webView.configuration.websiteDataStore.httpCookieStore.add(self)
+        visits = browser.$loading.dropFirst().filter { !$0 }.sink { [weak self] _ in
+            guard let self, let url = self.browser.webView.url?.absoluteString else { return }
+            do { try self.library.recordVisit(url, title: self.browser.title) } catch { self.library.error = error.localizedDescription }
+        }
+    }
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        cookieCapture?.cancel()
+        cookieCapture = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 400_000_000) } catch { return }
+            guard let self, !self.switching else { return }
+            await self.capture()
+        }
+    }
+    func switchAccount(_ id: UUID) async throws {
+        guard !switching, !agent.active, !lockedForTask else { throw BrowserToolError.actionFailed("请先暂停或停止任务，再切换账号") }
+        switching = true
+        defer { switching = false }
+        if !library.active.needsApply { await capture() }
+        browser.webView.configuration.websiteDataStore.httpCookieStore.remove(self)
+        agent.stop()
+        try library.select(id)
+        browser = BrowserSession(dataStore: Self.store(for: id))
+        agent = BrowserAgent(browser: browser, reasoning: reasoning, library: library)
+        bindVisits()
+        await restore()
+    }
+    func removeAccount(_ id: UUID) async throws {
+        guard id != BrowserAccount.defaultID, !switching, !agent.active, !lockedForTask else { throw BrowserToolError.actionFailed("请先停止任务，再移除账号") }
+        if id == library.activeID { try await switchAccount(BrowserAccount.defaultID) }
+        if #available(iOS 17, *), !AppCompatibility.forceLegacyUI {
+            let store = WKWebsiteDataStore(forIdentifier: id)
+            await withCheckedContinuation { continuation in
+                store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { continuation.resume() }
+            }
+        }
+        try library.remove(id)
+    }
+    func capture() async {
+        let browser = self.browser
+        let accountID = library.activeID
+        guard !library.active.needsApply else { return }
+        let cookies = await withCheckedContinuation { continuation in
+            browser.webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { continuation.resume(returning: $0) }
+        }
+        var storage: [String: JSONValue]?
+        if let host = browser.webView.url?.host, host == library.active.domains.first {
+            if let raw = try? await browser.webView.callAsyncJavaScript("return JSON.stringify(Object.fromEntries(Object.entries(localStorage)));", arguments: [:], in: nil, contentWorld: .page),
+               let raw = raw as? String, raw.utf8.count <= 2_000_000, let data = raw.data(using: .utf8) {
+                storage = try? JSONDecoder().decode([String: JSONValue].self, from: data)
+            }
+        }
+        guard library.activeID == accountID, self.browser === browser, !library.active.needsApply else { return }
+        do { try library.saveSnapshot(cookies: cookies, url: browser.webView.url?.absoluteString, localStorage: storage) }
+        catch { library.error = error.localizedDescription }
+    }
+    func restore() async {
+        let account = library.active
+        let cookies = browser.webView.configuration.websiteDataStore.httpCookieStore
+        // Named stores preserve full website data on iOS 17+. Older versions
+        // rebuild an isolated ephemeral store from the encrypted account jar.
+        let apply: Bool
+        if #available(iOS 17, *), !AppCompatibility.forceLegacyUI { apply = account.needsApply } else { apply = account.id != BrowserAccount.defaultID || account.needsApply }
+        if account.needsApply, account.id != BrowserAccount.defaultID {
+            await withCheckedContinuation { continuation in
+                browser.webView.configuration.websiteDataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { continuation.resume() }
+            }
+        }
+        for item in apply ? account.cookies : [] {
+            if let cookie = item.cookie(allowedDomains: account.domains) {
+                await withCheckedContinuation { continuation in cookies.setCookie(cookie) { continuation.resume() } }
+            }
+        }
+        if apply, let host = account.domains.first, !account.localStorage.isEmpty,
+           let data = try? JSONEncoder().encode(account.localStorage), let json = String(data: data, encoding: .utf8),
+           let originData = try? JSONEncoder().encode("https://" + host), let origin = String(data: originData, encoding: .utf8) {
+            let script = "if (location.origin === " + origin + ") { const values = " + json + "; for (const [key,value] of Object.entries(values)) { if (!['__proto__','constructor','prototype'].includes(key)) localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value)); } }"
+            browser.webView.configuration.userContentController.addUserScript(.init(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
+        do { try library.markApplied(account.id) } catch { library.error = error.localizedDescription }
+        if let url = account.lastURL { browser.open(url) }
     }
 }
 
@@ -18,9 +118,9 @@ struct BrowserWorkspaceView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        BrowserView(session: workspace.browser, agent: workspace.agent, settings: settings)
+        BrowserView(session: workspace.browser, agent: workspace.agent, settings: settings, workspace: workspace)
             .appOnChange(of: scenePhase) { _, phase in
-                if phase != .active { workspace.agent.pause() }
+                if phase != .active { workspace.agent.pause(); Task { await workspace.capture() } }
             }
     }
 }
@@ -203,7 +303,8 @@ struct BrowserTaskDetail: View {
                         if let pending = agent.pending {
                             VStack(alignment: .leading, spacing: 12) {
                                 Label(browserChatString("需要你的确认"), systemImage: "hand.raised").font(.headline)
-                                Text(pending.explanation).textSelection(.enabled)
+                                Text(pending.explanation)
+                    Text(agent.confirmationDetails).font(.caption).privacySensitive().textSelection(.enabled)
                                 Button(browserChatString("允许这一步")) { agent.approve() }
                                     .buttonStyle(.borderedProminent).accessibilityIdentifier("browser-approve")
                                 Button(browserChatString("我来操作网页")) { agent.pause(); dismiss() }

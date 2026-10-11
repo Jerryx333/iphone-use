@@ -133,6 +133,8 @@ pub enum ConfirmPolicy {
 pub struct TaskRequest {
     pub goal: String,
     #[serde(default)]
+    pub client_request_id: Option<String>,
+    #[serde(default)]
     pub app: Option<String>,
     /// Start an explicitly opened app at its first screen, rather than a stale subpage.
     #[serde(default)]
@@ -156,6 +158,7 @@ pub struct TaskRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Running,
+    Paused,
     NeedsConfirm,
     Done,
     Blocked,
@@ -168,6 +171,7 @@ impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
             Status::Running => "running",
+            Status::Paused => "paused",
             Status::NeedsConfirm => "needs_confirm",
             Status::Done => "done",
             Status::Blocked => "blocked",
@@ -177,7 +181,7 @@ impl Status {
         }
     }
     pub fn finished(self) -> bool {
-        !matches!(self, Status::Running | Status::NeedsConfirm)
+        !matches!(self, Status::Running | Status::Paused | Status::NeedsConfirm)
     }
 }
 
@@ -185,6 +189,8 @@ impl Status {
 struct State {
     id: String,
     goal: String,
+    client_request_id: Option<String>,
+    request_fingerprint: String,
     status: Status,
     phase: &'static str,
     planned_action: Option<Value>,
@@ -225,6 +231,7 @@ impl State {
                 .filter(|s| s["n"].as_u64().unwrap_or(0) as usize > from)
                 .collect::<Vec<_>>());
         }
+        if let Some(id) = &self.client_request_id { value["client_request_id"] = json!(id); }
         value
     }
 }
@@ -232,6 +239,7 @@ impl State {
 pub struct Task {
     state: Mutex<State>,
     cancel: AtomicBool,
+    paused: AtomicBool,
     cancel_signal: tokio::sync::Notify,
     answer: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
 }
@@ -242,6 +250,21 @@ impl Task {
     }
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+    async fn wait_unpaused(&self, daemon: &DaemonClient, request: &TaskRequest) -> bool {
+        let mut waited = false;
+        while self.paused.load(Ordering::SeqCst) && !self.cancelled() {
+            if !waited {
+                self.with(|s| { s.status = Status::Paused; s.phase = "paused"; s.planned_action = None; });
+                if let Some(bundle) = &request.return_bundle {
+                    let _ = jev::act(daemon, json!({"type":"launch_app", "bundle":bundle})).await;
+                }
+            }
+            waited = true;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if waited && !self.cancelled() { self.with(|s| { s.status = Status::Running; s.phase = "observing"; }); }
+        waited
     }
     async fn wait_cancelled(&self) {
         loop {
@@ -338,11 +361,19 @@ pub fn start(
     if goal.chars().count() > 2_000 {
         return Err(StartError::Invalid("goal is longer than 2000 characters".into()));
     }
+    if request.client_request_id.as_ref().is_some_and(|id| id.is_empty() || id.len()>128 || !id.chars().all(|c|c.is_ascii_alphanumeric() || matches!(c,'-'|'_'))) {
+        return Err(StartError::Invalid("invalid client_request_id".into()));
+    }
+    use sha2::{Digest, Sha256};
+    // Keep only the digest; model keys and return parameters are never exposed.
+    let request_fingerprint = format!("{:x}", Sha256::digest(format!("{request:?}").as_bytes()));
     let id = new_id();
     let task = Arc::new(Task {
         state: Mutex::new(State {
             id: id.clone(),
             goal: goal.clone(),
+            client_request_id: request.client_request_id.clone(),
+            request_fingerprint: request_fingerprint.clone(),
             status: Status::Running,
             phase: "starting",
             planned_action: None,
@@ -357,13 +388,19 @@ pub fn start(
             models_used: json!({}),
         }),
         cancel: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
         cancel_signal: tokio::sync::Notify::new(),
         answer: Mutex::new(None),
     });
     let busy = registry(|r| {
+        if let Some(client_id) = &request.client_request_id {
+            if let Some(existing) = r.current.iter().chain(r.recent.iter()).find(|task| task.with(|s|s.client_request_id.as_ref()==Some(client_id))) {
+                return Some((existing.with(|s|s.id.clone()), true, existing.with(|s|s.request_fingerprint==request_fingerprint)));
+            }
+        }
         if let Some(running) = &r.current {
             if !running.with(|s| s.status.finished()) {
-                return Some(running.with(|s| s.id.clone()));
+                return Some((running.with(|s| s.id.clone()), false, false));
             }
             let done = r.current.take().expect("checked");
             r.recent.push_front(done);
@@ -372,8 +409,9 @@ pub fn start(
         r.current = Some(task.clone());
         None
     });
-    if let Some(running) = busy {
-        return Err(StartError::Busy(running));
+    if let Some((running, same_request, same_goal)) = busy {
+        if same_request && !same_goal { return Err(StartError::Invalid("client_request_id already belongs to a different request".into())); }
+        return if same_request { Ok(running) } else { Err(StartError::Busy(running)) };
     }
     let daemon = daemon_for(&format!("task-{id}"));
     let mut request = request;
@@ -430,6 +468,17 @@ pub fn cancel(id: &str) -> std::result::Result<(), &'static str> {
     if let Some(sender) = task.answer.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = sender.send(false);
     }
+    Ok(())
+}
+
+/// Pause at an action boundary; an in-flight action is allowed to settle.
+/// A running saved flow is atomic and must be stopped rather than replayed.
+pub fn pause(id: &str, pause: bool) -> std::result::Result<(), &'static str> {
+    let task = find(id).ok_or("not_found")?;
+    let status = task.with(|s| (s.status.finished(), s.phase, s.status));
+    if status.0 { return Err("finished"); }
+    if pause && (status.1 == "flow" || matches!(status.2, Status::NeedsConfirm)) { return Err("pause_not_available_for_this_step"); }
+    task.paused.store(pause, Ordering::SeqCst);
     Ok(())
 }
 
@@ -884,6 +933,9 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
         );
     }
 
+    task.wait_unpaused(daemon, request).await;
+    if task.cancelled() { finish(task, daemon, &chat, request, Status::Cancelled, None).await; return Ok(()); }
+
     if let Some(app) = request.app.as_deref().filter(|a| !a.trim().is_empty()) {
         task.with(|s| {
             s.phase = "acting";
@@ -931,6 +983,7 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
     let mut jev_misses = 0u32;
     let mut text_ms = 0u128;
     for _ in 0..max_steps {
+        if task.wait_unpaused(daemon, request).await && !task.cancelled() { screen = jev::read_screen(daemon).await?; }
         task.with(|s| s.planned_action = None);
         if task.cancelled() {
             finish(task, daemon, &chat, request, Status::Cancelled, None).await;
@@ -989,6 +1042,10 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             jev_misses = 0;
         }
         // A reply that raced Stop must never start another phone action.
+        if task.paused.load(Ordering::SeqCst) {
+            task.wait_unpaused(daemon, request).await;
+            if !task.cancelled() { screen = jev::read_screen(daemon).await?; continue; }
+        }
         if task.cancelled() {
             finish(task, daemon, &chat, request, Status::Cancelled, None).await;
             return Ok(());
@@ -1049,6 +1106,11 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             }
         }
 
+        if task.wait_unpaused(daemon, request).await {
+            if task.cancelled() { break; }
+            screen = jev::read_screen(daemon).await?;
+            continue; // Fresh model decision, including a new risky confirmation.
+        }
         let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text, &request.goal, &mut history, &mut text_ms, by, started, reason, confirmed).await?;
         if let Some((stop, why)) = step {
             if stop == Status::Blocked && by == "jev" && chat.available() {
@@ -1413,6 +1475,34 @@ pub fn plain_summary(status: Status, steps: usize, error: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_id_deduplicates_and_pause_is_nonterminal() {
+        let request=TaskRequest {goal:"synthetic goal".into(),client_request_id:Some("fixture-client".into()),..Default::default()};
+        use sha2::{Digest, Sha256};
+        let request_fingerprint=format!("{:x}",Sha256::digest(format!("{request:?}").as_bytes()));
+        let task=Arc::new(Task {
+            state: Mutex::new(State {request_fingerprint,id:"fixture-dedup".into(),goal:"synthetic goal".into(),client_request_id:Some("fixture-client".into()),status:Status::Running,phase:"observing",planned_action:None,flow:None,steps:vec![],confirm:None,summary:None,error:None,started_at_ms:unix_ms(),started:Instant::now(),finished_ms:None,models_used:json!({})}),
+            cancel:AtomicBool::new(false),paused:AtomicBool::new(false),cancel_signal:tokio::sync::Notify::new(),answer:Mutex::new(None),
+        });
+        registry(|r| { r.current=Some(task.clone());r.recent.clear(); });
+        assert_eq!(start(request.clone(), |_|panic!("duplicate must not instantiate a driver")).ok().as_deref(),Some("fixture-dedup"));
+        let mut different=request.clone();different.goal="different goal".into();
+        assert!(matches!(start(different, |_|panic!("must not drive")),Err(StartError::Invalid(_))));
+        let mut different_app=request.clone();different_app.app=Some("com.example.changed".into());
+        assert!(matches!(start(different_app, |_|panic!("must not drive")),Err(StartError::Invalid(_))));
+        pause("fixture-dedup",true).unwrap();
+        let driver=DaemonClient::new("http://127.0.0.1:1",None);
+        let waiting_task=task.clone();let waiting_request=request.clone();
+        let wait=tokio::spawn(async move {waiting_task.wait_unpaused(&driver,&waiting_request).await});
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(get("fixture-dedup",None).unwrap()["status"],"paused");
+        assert!(!Status::Paused.finished());pause("fixture-dedup",false).unwrap();assert!(wait.await.unwrap());
+        task.with(|s|s.status=Status::Done);
+        assert!(pause("fixture-dedup",true).is_err());
+        assert_eq!(start(request, |_|panic!("finished duplicate must not drive")).ok().as_deref(),Some("fixture-dedup"));
+        registry(|r|r.current=None);
+    }
 
     #[test]
     fn zen_stream_requires_completion_and_rejects_tools_and_errors() {

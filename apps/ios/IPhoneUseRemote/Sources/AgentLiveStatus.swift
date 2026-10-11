@@ -29,7 +29,7 @@ final class AgentLiveStatus {
     #endif
   }
 
-  func begin(goal: String, device: String, onCancel: @escaping @MainActor () async -> Void) {
+  func begin(goal: String, device: String, route: String = "iphoneuse://agent", onCancel: @escaping @MainActor () async -> Void) {
     finish(success: false, dismissImmediately: true)
     cancel = onCancel
     latest = AgentProgress(task: AgentTaskSnapshot(id: "pending", goal: goal, state: .running))
@@ -70,7 +70,7 @@ final class AgentLiveStatus {
       #endif
       guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
       let attributes = AgentActivityAttributes(
-        goal: String(goal.prefix(80)), device: String(device.prefix(48)))
+        goal: String(goal.prefix(80)), device: String(device.prefix(48)), route: route)
       do {
         if #available(iOS 16.2, *) {
           legacyActivity = try Activity.request(

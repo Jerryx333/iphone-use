@@ -57,7 +57,7 @@ enum AgentTaskState: Equatable, Sendable {
         case .cancelled: return String(localized: "已停止")
         case .maxSteps: return String(localized: "步数用完")
         case .unavailable: return String(localized: "结果未知")
-        case .other(let raw): return raw
+        case .other(let raw): return raw == "paused" ? String(localized: "已暂停") : raw
         }
     }
 }
@@ -163,6 +163,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
     var startedAtMs: Int
     var elapsedMs: Int
     var modelsUsed: [String: String]
+    var clientRequestID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, goal, status, phase, flow, steps, confirm, summary, error
@@ -170,6 +171,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
         case startedAtMs = "started_at_ms"
         case elapsedMs = "elapsed_ms"
         case modelsUsed = "models_used"
+        case clientRequestID = "client_request_id"
     }
 
     init(id: String, goal: String, state: AgentTaskState, phase: String? = nil, flow: Flow? = nil,
@@ -188,6 +190,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
         self.startedAtMs = startedAtMs
         self.elapsedMs = elapsedMs
         self.modelsUsed = modelsUsed
+        self.clientRequestID = nil
     }
 
     init(from decoder: Decoder) throws {
@@ -206,6 +209,7 @@ struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
         elapsedMs = (try? c.decodeIfPresent(Int.self, forKey: .elapsedMs)) ?? 0
         modelsUsed = ((try? c.decodeIfPresent([String: String?].self, forKey: .modelsUsed)) ?? [:])
             .compactMapValues { $0 }
+        clientRequestID = try c.decodeIfPresent(String.self, forKey: .clientRequestID)
     }
 
     /// The question to show while the task waits on the person; nil otherwise.
@@ -218,6 +222,7 @@ struct AgentTaskRequest: Encodable, Equatable, Sendable {
     var app: String?
     var maxSteps: Int?
     var models: ModelsPayload?
+    var clientRequestID: String?
     /// Always `risky` from the app: the person answers every risky step
     /// themselves (`never` is for Mac agents that accept every step).
     var confirm = "risky"
@@ -225,6 +230,7 @@ struct AgentTaskRequest: Encodable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case goal, app, models, confirm
         case maxSteps = "max_steps"
+        case clientRequestID = "client_request_id"
     }
 }
 
@@ -259,6 +265,13 @@ protocol AgentTaskAPI: Sendable {
     func answer(task id: String, approve: Bool) async throws
     func cancelTask(id: String) async throws
     func recentTasks() async throws -> [AgentTaskSnapshot]
+    func pauseTask(id: String) async throws
+    func resumeTask(id: String) async throws
+}
+
+extension AgentTaskAPI {
+    func pauseTask(id: String) async throws { throw AgentTaskError.unsupported }
+    func resumeTask(id: String) async throws { throw AgentTaskError.unsupported }
 }
 
 extension DaemonClient: AgentTaskAPI {
@@ -301,6 +314,14 @@ extension DaemonClient: AgentTaskAPI {
     /// `POST /agent/task/<id>/cancel`: stop after the current step.
     func cancelTask(id: String) async throws {
         let (data, response) = try await send(agentRequest("agent/task/\(id)/cancel", method: "POST"))
+        try Self.checkAgent(response, data)
+    }
+    func pauseTask(id: String) async throws {
+        let (data, response) = try await send(agentRequest("agent/task/\(id)/pause", method: "POST"), repeatable: false)
+        try Self.checkAgent(response, data)
+    }
+    func resumeTask(id: String) async throws {
+        let (data, response) = try await send(agentRequest("agent/task/\(id)/resume", method: "POST"), repeatable: false)
         try Self.checkAgent(response, data)
     }
 

@@ -2,7 +2,15 @@ import SwiftUI
 
 @main
 struct IPhoneUseRemoteApp: App {
-    @StateObject private var app = AppModel()
+    @StateObject private var app: AppModel
+    init() {
+        #if DEBUG
+        let defaults = BrowserDeviceAcceptanceView.requestedURL != nil ? UserDefaults(suiteName: "acceptance-main-" + UUID().uuidString)! : .standard
+        _app = StateObject(wrappedValue: AppModel(defaults: defaults))
+        #else
+        _app = StateObject(wrappedValue: AppModel())
+        #endif
+    }
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -45,14 +53,20 @@ struct RootView: View {
     @ObservedObject var app: AppModel
     @State private var manualAfterScan = false
 
+    @ViewBuilder private var normalContent: some View {
+        if let demo = app.demo { DemoView(session: demo) { app.demo = nil }.transition(.opacity) }
+        else { MainTabsView(app: app) }
+    }
+
     var body: some View {
         Group {
-            if let demo = app.demo {
-                DemoView(session: demo) { app.demo = nil }
-                    .transition(.opacity)
-            } else {
-                MainTabsView(app: app)
-            }
+            #if DEBUG
+            if let url = BrowserDeviceAcceptanceView.requestedURL {
+                BrowserDeviceAcceptanceView(address: url)
+            } else { normalContent }
+            #else
+            normalContent
+            #endif
         }
         .animation(.appSnappy(duration: 0.32), value: app.focusedID)
         .animation(.appSnappy(duration: 0.32), value: app.demo == nil)

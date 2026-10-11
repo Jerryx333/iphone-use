@@ -103,12 +103,14 @@ jobs:
         run: >-
           cargo build --release --locked
           --bin iphone-use --bin iphone-use-mcp --bin iphone-use-legacy-launch
+          --bin browser-use-bridge --features browser-session/desktop
           --target aarch64-apple-darwin
 
       - name: Build (x86_64)
         run: >-
           cargo build --release --locked
           --bin iphone-use --bin iphone-use-mcp --bin iphone-use-legacy-launch
+          --bin browser-use-bridge --features browser-session/desktop
           --target x86_64-apple-darwin
 
       - name: Create universal binary
@@ -126,6 +128,7 @@ jobs:
             target/aarch64-apple-darwin/release/iphone-use-legacy-launch \
             target/x86_64-apple-darwin/release/iphone-use-legacy-launch \
             -output target/universal-apple-darwin/release/iphone-use-legacy-launch
+          lipo -create target/aarch64-apple-darwin/release/browser-use-bridge target/x86_64-apple-darwin/release/browser-use-bridge -output target/universal-apple-darwin/release/browser-use-bridge
           chmod +x target/universal-apple-darwin/release/iphone-use
           chmod +x target/universal-apple-darwin/release/iphone-use-mcp
           chmod +x target/universal-apple-darwin/release/iphone-use-legacy-launch
@@ -362,6 +365,15 @@ jobs:
           test "$(tar -tzf iphone-use-mcp-macos-universal.tar.gz)" = "iphone-use-mcp"
           rm -rf "$package_dir"
 
+      - name: Package Chrome handoff helper
+        run: |
+          package_dir="$(mktemp -d)"
+          cp target/universal-apple-darwin/release/browser-use-bridge "$package_dir/"
+          codesign --force --sign - "$package_dir/browser-use-bridge"
+          tar -C "$package_dir" -czf browser-use-bridge-macos-universal.tar.gz browser-use-bridge
+          rm -rf "$package_dir"
+          shasum -a 256 browser-use-bridge-macos-universal.tar.gz > browser-use-bridge-macos-universal.tar.gz.sha256
+
       # The on-phone daemon (crates/ios-embed) as a static library for iOS
       # devices. It ships inside the runner sources as runner/embed/, where
       # setup links it into the runner (see runner/README.md).
@@ -426,6 +438,8 @@ jobs:
             iphone-use-mcp-macos-universal.tar.gz.sha256
             iphone-use-runner.tar.gz
             iphone-use-runner.tar.gz.sha256
+            browser-use-bridge-macos-universal.tar.gz
+            browser-use-bridge-macos-universal.tar.gz.sha256
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -444,4 +458,6 @@ jobs:
             iphone-use-mcp-macos-universal.tar.gz.sha256
             iphone-use-runner.tar.gz
             iphone-use-runner.tar.gz.sha256
+            browser-use-bridge-macos-universal.tar.gz
+            browser-use-bridge-macos-universal.tar.gz.sha256
           retention-days: 7
