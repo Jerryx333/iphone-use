@@ -23,8 +23,8 @@
 | 加密、授权与去重 | 7 通过，包括独立生成的 v1 互操作数据和禁止 `@file` 展开 |
 | iOS 基础相关回归 | 50 通过，含免费模型实际网页任务、旧版会话恢复、脚本执行、停止后的恢复边界 |
 | 独立提交树补充验证 | 18 项会话/恢复边界测试与 8 项浏览器测试通过，包含早报完成的反例和免费模型实际任务 |
-| iPhone 14 独立浏览器验收 | 真机通过：实际输入值 `Phone Use`，实际段落 `Form updated`，统一任务状态 `done` |
-| iPhone 14 会话解密 | 真机通过：合成 v1 会话解密约 128 ms；导入一个隔离账号及一个合成 Cookie |
+| iPhone 14 独立浏览器验收 | build 11 真机再次通过：实际输入值 `Phone Use`，实际段落 `Form updated`，统一任务状态 `done` |
+| iPhone 14 会话解密 | 真机通过：build 11 合成 v1 会话解密约 133 ms；导入一个隔离账号及一个合成 Cookie |
 | iPhone 17 本机任务 | 从 App 提交并完成读取电量；20.258 s，模型 `mimo-v2.6-flash-free`，原生请求 ID 有返回 |
 | iPhone 17 跨工具连续任务 | 未通过有效验收：另一 Mac MCP 会话持有设备，前台被切到 Self Host Probe，输入被截断；不能当成产品通过证据 |
 | iPhone 14 跨 App 自动化 | 等待 USB：Wi-Fi 启动 XCTest 返回 74，testmanagerd 未提供 IDE 通道；不要重复 Wi-Fi 重试 |
