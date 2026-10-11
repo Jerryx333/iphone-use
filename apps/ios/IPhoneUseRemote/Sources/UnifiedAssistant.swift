@@ -192,7 +192,7 @@ final class UnifiedAssistant: ObservableObject {
 
     private func run(_ id: UUID) async throws {
         guard let initial = task, let settings = app?.agent.settings else { return }
-        AgentLiveStatus.shared.begin(goal: initial.goal, device: "统一助手", route: "iphoneuse://assistant") { [weak self] in await self?.stop() }
+        AgentLiveStatus.shared.begin(goal: initial.goal, device: "统一助手", route: "iphoneuse://assistant", sessionID: initial.id.uuidString) { [weak self] in await self?.stop() }
         AgentLiveStatus.shared.update(.init(current: initial.phases.isEmpty ? "正在选择执行工具" : (current?.tool.title ?? "核验任务"), next: next, steps: initial.index))
         if initial.phases.isEmpty {
             let plan: AssistantPlan
@@ -226,8 +226,8 @@ final class UnifiedAssistant: ObservableObject {
                 showAssistant()
                 guard let local, local.phase == .connected, let api = local.client, task?.phoneDeviceID == nil || local.id == task?.phoneDeviceID else {
                     task?.state = .waitingForPhone; message = "手机执行服务未连接。浏览器任务可独立运行；这一步需要先配置本机服务。"; try save()
-                    AgentLiveStatus.shared.update(.init(current: "等待手机执行服务", next: "连接后继续本步骤", steps: task?.index ?? 0, terminal: true))
-                    AgentLiveStatus.shared.finish(success: false); return
+                    AgentLiveStatus.shared.update(.init(current: "等待手机执行服务", next: "连接后继续本步骤", steps: task?.index ?? 0))
+                    return
                 }
                 task?.phoneDeviceID = local.id
                 var nativeID = phase.nativeID
@@ -272,8 +272,8 @@ final class UnifiedAssistant: ObservableObject {
             case .browser:
                 guard foreground else {
                     task?.state = .paused; task?.automaticPause = true; try save()
-                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: phase.tool.title, steps: task?.index ?? 0, terminal: true))
-                    AgentLiveStatus.shared.finish(success: false); return
+                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: phase.tool.title, steps: task?.index ?? 0))
+                    return
                 }
                 message = "正在操作浏览器；下一步：\(next)"
                 showBrowser()
@@ -301,7 +301,9 @@ final class UnifiedAssistant: ObservableObject {
                     try await Task.sleep(nanoseconds: 300_000_000)
                 }
                 if workspace.agent.state == .paused {
-                    task?.state = .paused; message = workspace.agent.message; try save(); AgentLiveStatus.shared.finish(success: false, dismissImmediately: true); return
+                    task?.state = .paused; message = workspace.agent.message; try save()
+                    if task?.automaticPause != true { AgentLiveStatus.shared.finish(success: false, dismissImmediately: true) }
+                    return
                 }
                 guard workspace.agent.state == .done else { throw BrowserToolError.actionFailed(workspace.agent.message ?? "网页步骤未完成") }
                 result = workspace.agent.message ?? "网页步骤已完成"
@@ -309,8 +311,8 @@ final class UnifiedAssistant: ObservableObject {
             case .site, .desktop:
                 guard foreground else {
                     task?.state = .paused; task?.automaticPause = true; try save()
-                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: phase.tool.title, steps: task?.index ?? 0, terminal: true))
-                    AgentLiveStatus.shared.finish(success: false); return
+                    AgentLiveStatus.shared.update(.init(current: "等待回到助手", next: phase.tool.title, steps: task?.index ?? 0))
+                    return
                 }
                 guard let adapter = workspace.library.catalog.adapters.first(where: { $0.spec == phase.siteSpec }), adapter.fingerprint == phase.sourceHash else { throw BrowserToolError.actionFailed("网站操作内容已变化，请重新确认任务") }
                 if phase.tool == .desktop {

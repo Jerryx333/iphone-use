@@ -12,6 +12,7 @@ final class AgentLiveStatus {
   private let prefix = "com.leeguoo.iphone-use.remote.agent."
   private var systemTask: BGTask?
   private var requestID: String?
+  private var sessionID: String?
   private var legacyActivity: AnyObject?
   private var legacyKey: String?
   private var legacyUpdates: Task<Void, Never>?
@@ -23,14 +24,22 @@ final class AgentLiveStatus {
 
   private var useContinuedProcessing: Bool {
     #if DEBUG
-      return !UserDefaults.standard.bool(forKey: "legacyActivity")
+      return UserDefaults.standard.bool(forKey: "continuedProcessing") && !UserDefaults.standard.bool(forKey: "legacyActivity")
     #else
-      return true
+      // The phone daemon owns native execution; a system background-task expiration
+      // must not cancel it just because the companion switched apps.
+      return false
     #endif
   }
 
-  func begin(goal: String, device: String, route: String = "iphoneuse://agent", onCancel: @escaping @MainActor () async -> Void) {
+  func begin(goal: String, device: String, route: String = "iphoneuse://agent", sessionID: String? = nil, onCancel: @escaping @MainActor () async -> Void) {
+    if let sessionID, self.sessionID == sessionID,
+       legacyActivity != nil || systemTask != nil || requestID != nil {
+      cancel = onCancel
+      return
+    }
     finish(success: false, dismissImmediately: true)
+    self.sessionID = sessionID
     cancel = onCancel
     latest = AgentProgress(task: AgentTaskSnapshot(id: "pending", goal: goal, state: .running))
     if #available(iOS 26, *), useContinuedProcessing {
@@ -212,6 +221,7 @@ final class AgentLiveStatus {
     systemTask = nil
     if let id = requestID { BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: id) }
     requestID = nil
+    sessionID = nil
     cancel = nil
     if #available(iOS 16.1, *), let activity = legacyActivity as? Activity<AgentActivityAttributes>
     {

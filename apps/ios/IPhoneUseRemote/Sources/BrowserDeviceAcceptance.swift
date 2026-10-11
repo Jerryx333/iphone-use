@@ -1,6 +1,7 @@
 #if DEBUG
 import SwiftUI
 import CryptoKit
+import ActivityKit
 
 /// Explicit developer acceptance mode: isolated synthetic data, no production drafts.
 struct BrowserDeviceAcceptanceView: View {
@@ -61,8 +62,15 @@ struct BrowserDeviceAcceptanceView: View {
             let goal = withPhone
                 ? "按三个步骤依次完成：1 在内置浏览器读取当前网页标题。2 用手机打开设置读取当前电池电量，不修改任何设置。3 回到内置浏览器，在 Name 输入框填入 Phone Use，点击 Continue，核验段落 Form updated，再合并网页标题与电量结果。不要点击 Prompt fixture。"
                 : "在 Name 输入框填入 Phone Use，然后点击 Continue。段落显示 Form updated 后才完成。不要点击 Prompt fixture。"
+            var existingActivityIDs = Set<String>(), observedActivityIDs = Set<String>()
+            if #available(iOS 16.1, *) { existingActivityIDs = Set(Activity<AgentActivityAttributes>.activities.map(\.id)) }
             guard assistant.start(goal) else { throw BrowserToolError.actionFailed("合成任务未启动") }
             for _ in 0..<(withPhone ? 7200 : 2400) {
+                if #available(iOS 16.1, *) {
+                    for activity in Activity<AgentActivityAttributes>.activities where !existingActivityIDs.contains(activity.id) {
+                        observedActivityIDs.insert(activity.id)
+                    }
+                }
                 if assistant.task?.state == .done || assistant.task?.state == .failed || (assistant.task?.state == .paused && assistant.task?.automaticPause != true) || assistant.task?.state == .needsReview { break }
                 try await Task.sleep(for: .milliseconds(50))
             }
@@ -72,6 +80,7 @@ struct BrowserDeviceAcceptanceView: View {
             let nativeIDs = assistant.task?.phases.compactMap(\.nativeID) ?? []
             let crossToolsVerified = !withPhone || (tools == ["browser", "phone", "browser"] && nativeIDs.count == 1)
             let success = assistant.task?.state == .done && value == "Phone Use" && paragraph == "Form updated" && crossToolsVerified
+            report["live_activity_ids"] = .array(observedActivityIDs.sorted().map(JSONValue.string))
             report["cross_tools"] = .bool(withPhone)
             report["phase_tools"] = .array(tools.map(JSONValue.string))
             report["native_ids"] = .array(nativeIDs.map(JSONValue.string))
