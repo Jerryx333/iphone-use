@@ -6344,6 +6344,45 @@ fn delta_shows_no_visible_change(delta: &ElementRowsDelta, report: &SettleReport
         && delta.removed.is_empty()
 }
 
+const UNSETTLED_SCROLL_MIN_STILL_ANCHORS: usize = 3;
+
+/// Attach a progress hint only when a fresh, readable observation supports it.
+fn mark_no_scroll_progress(
+    body: &mut serde_json::Value,
+    action: &serde_json::Value,
+    baseline: &[crate::wda::ElementRow],
+    current: &[crate::wda::ElementRow],
+    report: &SettleReport,
+) {
+    if report.sparse
+        || report.stale
+        || body.get("app_changed").is_some()
+        || body.get("no_visible_change") == Some(&serde_json::Value::Bool(true))
+    {
+        return;
+    }
+    let number = |key: &str| action.get(key).and_then(serde_json::Value::as_f64);
+    let direction = match action.get("type").and_then(serde_json::Value::as_str) {
+        Some("scroll") => Some((number("dx").unwrap_or(0.0), number("dy").unwrap_or(0.0))),
+        Some("swipe" | "drag") => match (number("x1"), number("y1"), number("x2"), number("y2")) {
+            (Some(x1), Some(y1), Some(x2), Some(y2)) => Some((x1 - x2, y1 - y2)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if direction.is_some_and(|(dx, dy)| {
+        crate::scroll_progress::scroll_without_progress(baseline, current, dx, dy).is_some_and(
+            |still| match report.reason {
+                SettleReason::Stable => report.settled && still >= 1,
+                SettleReason::BudgetExhausted => still >= UNSETTLED_SCROLL_MIN_STILL_ANCHORS,
+                SettleReason::ObservationFailed => false,
+            },
+        )
+    }) {
+        body["no_scroll_progress"] = serde_json::Value::Bool(true);
+    }
+}
+
 /// Serialize a computed delta for the wire: `added`/`changed` carry the full
 /// current rows with their indexes (so a follow-up snapshot-bound action needs
 /// no re-read), `removed` is baseline indexes only.
@@ -11615,10 +11654,14 @@ async fn agent_actions_inner(
 struct RunnerPager<'a> {
     w: &'a mut crate::wda::WdaClient,
     screen: Option<(f64, f64)>,
+    first_page: Option<crate::collect::Page>,
 }
 
 impl crate::collect::Pager for RunnerPager<'_> {
     async fn read(&mut self) -> anyhow::Result<crate::collect::Page> {
+        if let Some(page) = self.first_page.take() {
+            return Ok(page);
+        }
         // Source reads are idempotent: one more try on a fresh session, as a
         // failed read on /agent/elements gets.
         let rows = match self.w.elements().await {
@@ -11755,6 +11798,41 @@ fn first_read_failed(state: &AppState, error: &anyhow::Error) -> Response {
     )
 }
 
+/// Pure comparison: missing or unnamed applications never refuse a swipe.
+fn collect_app_guard(expected: Option<&str>, app: Option<&str>) -> Option<serde_json::Value> {
+    let (expected, app) = (
+        expected.filter(|s| !s.is_empty())?,
+        app.filter(|s| !s.is_empty())?,
+    );
+    (expected != app).then(|| {
+        serde_json::json!({
+            "ok": false, "error": "app_changed", "outcome": "not_sent", "retry_safe": true,
+            "expected_app": expected, "app": app, "swipes": 0
+        })
+    })
+}
+
+fn expected_collect_app(state: &AppState, snapshot: Option<&str>) -> Option<String> {
+    snapshot
+        .and_then(|id| lookup_element_snapshot(state, id))
+        .and_then(|rows| active_application(&rows))
+        .filter(|app| !app.is_empty())
+}
+
+fn list_app_refusal(
+    state: &AppState,
+    headers: &HeaderMap,
+    expected: Option<&str>,
+    page: &crate::collect::Page,
+) -> Option<Response> {
+    let app = active_application(&page.rows);
+    let mut body = collect_app_guard(expected, app.as_deref())?;
+    if let Some(snapshot) = remember_page(state, headers, page.rows.clone()) {
+        body["snapshot"] = snapshot.into();
+    }
+    Some(json_response(StatusCode::CONFLICT, body))
+}
+
 /// `POST /agent/collect` — read rows of one kind across pages:
 /// `{"row_kind":"Cell","region":[x,y,w,h],"max_pages":6,"end_label":"…","direction":"down"}`
 /// (all optional). See [`crate::collect`] for the stop rules; `complete` is
@@ -11776,6 +11854,7 @@ async fn agent_collect(
         Ok(request) => request,
         Err(detail) => return invalid_list_request(detail),
     };
+    let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
     let Some(wda) = state.wda.clone() else {
         return ControlRefusal::wda_not_configured().into_response();
     };
@@ -11788,7 +11867,17 @@ async fn agent_collect(
     let mut pager = RunnerPager {
         w: &mut w,
         screen: None,
+        first_page: None,
     };
+    use crate::collect::Pager as _;
+    let page = match pager.read().await {
+        Ok(page) => page,
+        Err(error) => return first_read_failed(&state, &error),
+    };
+    if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
+        return refusal;
+    }
+    pager.first_page = Some(page);
     let result = crate::collect::collect(&mut pager, &request, deadline).await;
     drop(w);
     match result {
@@ -11800,12 +11889,16 @@ async fn agent_collect(
                 collection.stop,
                 crate::collect::StopReason::ReadFailed | crate::collect::StopReason::SwipeFailed
             );
+            let app = active_application(&collection.last.rows).filter(|app| !app.is_empty());
             let rows = std::mem::take(&mut collection.last.rows);
-            let snapshot = current.then(|| remember_page(&state, &headers, rows)).flatten();
-            json_response(
-                StatusCode::OK,
-                crate::collect::collection_json(&collection, snapshot.as_deref()),
-            )
+            let snapshot = current
+                .then(|| remember_page(&state, &headers, rows))
+                .flatten();
+            let mut body = crate::collect::collection_json(&collection, snapshot.as_deref());
+            if let Some(app) = app {
+                body["app"] = app.into();
+            }
+            json_response(StatusCode::OK, body)
         }
     }
 }
@@ -11885,6 +11978,7 @@ async fn agent_scroll_find(
         Ok(request) => request,
         Err(detail) => return invalid_list_request(detail),
     };
+    let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
     let Some(wda) = state.wda.clone() else {
         return ControlRefusal::wda_not_configured().into_response();
     };
@@ -11897,6 +11991,7 @@ async fn agent_scroll_find(
     let mut pager = RunnerPager {
         w: &mut w,
         screen: None,
+        first_page: None,
     };
     use crate::collect::Pager as _;
     let mut page = match pager.read().await {
@@ -11906,6 +12001,9 @@ async fn agent_scroll_find(
             return first_read_failed(&state, &error);
         }
     };
+    if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
+        return refusal;
+    }
     let mut swipes = 0u32;
     let mut stop_error: Option<(&'static str, String)> = None;
     let verdict = loop {
@@ -11945,6 +12043,9 @@ async fn agent_scroll_find(
     };
     drop(w);
     let mut body = serde_json::json!({"swipes": swipes, "max_swipes": request.max_swipes});
+    if let Some(app) = active_application(&page.rows).filter(|app| !app.is_empty()) {
+        body["app"] = app.into();
+    }
     match &verdict {
         FindVerdict::Found(index) => {
             body["ok"] = true.into();
@@ -12940,6 +13041,9 @@ async fn agent_input_inner(
                                         body["no_visible_change"] =
                                             serde_json::Value::Bool(true);
                                     }
+                                    mark_no_scroll_progress(
+                                        &mut body, &value, &baseline_rows, &rows, &report,
+                                    );
                                     body
                                 }
                                 None => serde_json::json!({
@@ -17923,6 +18027,384 @@ mod tests {
                 !PERFORM_VERBS_WITH_FRAME_FALLBACK.contains(&verb),
                 "{verb} must still require a real locator"
             );
+        }
+    }
+
+    #[test]
+    fn collect_app_guard_mismatch_not_sent_with_fields() {
+        block(async {
+            let state = readiness_test_state();
+            let rows = vec![delta_row("Application", "Settings", 0.0)];
+            let page = crate::collect::Page { rows, screen: None };
+            let response =
+                list_app_refusal(&state, &HeaderMap::new(), Some("Music"), &page).unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"], "app_changed");
+            assert_eq!(body["outcome"], "not_sent");
+            assert_eq!(body["retry_safe"], true);
+            assert_eq!(body["expected_app"], "Music");
+            assert_eq!(body["app"], "Settings");
+            assert_eq!(body["swipes"], 0);
+            assert_eq!(
+                expected_collect_app(&state, body["snapshot"].as_str()),
+                Some("Settings".into())
+            );
+        });
+    }
+
+    #[test]
+    fn collect_app_guard_same_or_unknown_passes() {
+        for (expected, app) in [
+            (Some("Music"), Some("Music")),
+            (None, Some("Music")),
+            (Some("Music"), None),
+            (Some(""), Some("Music")),
+            (Some("Music"), Some("")),
+        ] {
+            assert!(collect_app_guard(expected, app).is_none());
+        }
+        assert!(
+            expected_collect_app(&readiness_test_state(), Some("missing-cache-token")).is_none()
+        );
+    }
+
+    #[test]
+    fn collect_app_guard_collect_accepts_snapshot_rejects_empty() {
+        use crate::collect::CollectRequest;
+        assert_eq!(
+            CollectRequest::from_json(&serde_json::json!({"snapshot":"S1"}))
+                .unwrap()
+                .snapshot
+                .as_deref(),
+            Some("S1")
+        );
+        assert!(CollectRequest::from_json(&serde_json::json!({}))
+            .unwrap()
+            .snapshot
+            .is_none());
+        for invalid in [
+            serde_json::json!(""),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            assert!(CollectRequest::from_json(&serde_json::json!({"snapshot":invalid})).is_err());
+        }
+    }
+
+    #[test]
+    fn collect_app_guard_scroll_find_accepts_snapshot() {
+        use crate::collect::FindRequest;
+        assert_eq!(
+            FindRequest::from_json(&serde_json::json!({"label":"Target","snapshot":"S1"}))
+                .unwrap()
+                .snapshot
+                .as_deref(),
+            Some("S1")
+        );
+        assert!(
+            FindRequest::from_json(&serde_json::json!({"label":"Target","snapshot":""})).is_err()
+        );
+    }
+
+    fn unsettled_scroll_body(count: usize, reason: SettleReason, gate: &str) -> serde_json::Value {
+        let baseline: Vec<_> = (0..count)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut current = baseline.clone();
+        current[0].value = Some("00:42.13".into());
+        if gate == "moved" {
+            current[0].rect[1] -= 20.0;
+        }
+        let mut report = SettleReport::new(1000);
+        report.reason = reason;
+        report.sparse = gate == "sparse";
+        report.stale = gate == "stale";
+        let mut body = serde_json::json!({});
+        if gate == "app_changed" {
+            body[gate] = serde_json::json!({"from":"a","to":"b"});
+        }
+        if gate == "no_visible_change" {
+            body[gate] = serde_json::json!(true);
+        }
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        body
+    }
+
+    #[test]
+    fn scroll_progress_origin_move_with_resize_is_progress() {
+        let baseline = vec![delta_row("Cell", "item", 100.0)];
+        let mut current = baseline.clone();
+        current[0].rect[1] -= 20.0;
+        current[0].rect[2] += 5.0;
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::Stable;
+        report.settled = true;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert!(body.get("no_scroll_progress").is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_not_flagged_for_moved_buttons_or_paged_swap() {
+        // Button rows scrolled under a fixed title, and a paged feed whose
+        // author/caption were replaced in place while chrome stayed.
+        let title = delta_row("StaticText", "Settings", 50.0);
+        let mut baseline = vec![title.clone()];
+        let mut current = vec![title];
+        for i in 0..5 {
+            baseline.push(delta_row("Button", &format!("Row {i}"), 100.0 + i as f64 * 44.0));
+            current.push(delta_row("Button", &format!("Row {i}"), 56.0 + i as f64 * 44.0));
+        }
+        let chrome = vec![
+            delta_row("StaticText", "For You", 60.0),
+            delta_row("Button", "Like", 500.0),
+            delta_row("Button", "Share", 580.0),
+        ];
+        let mut feed_before = chrome.clone();
+        feed_before.push(delta_row("StaticText", "@alice", 700.0));
+        feed_before.push(delta_row("StaticText", "Sunset at the beach", 740.0));
+        let mut feed_after = chrome;
+        feed_after.push(delta_row("StaticText", "@bob", 700.0));
+        feed_after.push(delta_row("StaticText", "Three-minute noodles", 740.0));
+        for (before, after) in [(&baseline, &current), (&feed_before, &feed_after)] {
+            for reason in [SettleReason::Stable, SettleReason::BudgetExhausted] {
+                let mut report = SettleReport::new(1000);
+                report.reason = reason;
+                report.settled = true;
+                let mut body = serde_json::json!({});
+                mark_no_scroll_progress(
+                    &mut body,
+                    &serde_json::json!({"type":"scroll","dy":100}),
+                    before,
+                    after,
+                    &report,
+                );
+                assert!(body.get("no_scroll_progress").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn no_scroll_progress_stable_requires_all_common_still() {
+        for count in [1, 4] {
+            let baseline: Vec<_> = (0..count)
+                .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+                .collect();
+            for (dx, dy, expected) in [(0.0, 0.0, true), (2.1, 0.0, false), (0.0, 5.0, false)] {
+                let mut current = baseline.clone();
+                current[count - 1].rect[0] += dx;
+                current[count - 1].rect[1] += dy;
+                current[count - 1].rect[2] += 5.0;
+                let mut report = SettleReport::new(1000);
+                report.reason = SettleReason::Stable;
+                report.settled = true;
+                let mut body = serde_json::json!({});
+                mark_no_scroll_progress(
+                    &mut body,
+                    &serde_json::json!({"type":"scroll","dy":100}),
+                    &baseline,
+                    &current,
+                    &report,
+                );
+                assert_eq!(
+                    body.get("no_scroll_progress").is_some(),
+                    expected,
+                    "count={count}, dx={dx}, dy={dy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_three_anchors_changing_value() {
+        for count in [3, 5] {
+            assert_eq!(
+                unsettled_scroll_body(count, SettleReason::BudgetExhausted, "")
+                    ["no_scroll_progress"],
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_two_anchors() {
+        assert!(unsettled_scroll_body(2, SettleReason::BudgetExhausted, "")
+            .get("no_scroll_progress")
+            .is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_moving_and_resizing_anchors() {
+        let baseline: Vec<_> = (0..3)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut current = baseline.clone();
+        for row in &mut current {
+            row.rect[1] -= 20.0;
+            row.rect[2] += 5.0;
+        }
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::BudgetExhausted;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert!(body.get("no_scroll_progress").is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_three_still_and_one_moving_resizing_anchor() {
+        let baseline: Vec<_> = (0..4)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut current = baseline.clone();
+        current[3].rect[1] -= 5.0;
+        current[3].rect[2] += 5.0;
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::BudgetExhausted;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert!(body.get("no_scroll_progress").is_none());
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_three_still_and_one_growing_anchor() {
+        let mut baseline: Vec<_> = (0..3)
+            .map(|i| delta_row("Cell", &format!("anchor {i}"), 100.0 + i as f64 * 40.0))
+            .collect();
+        let mut container = delta_row("Other", "主要", 59.0);
+        container.rect = [0.0, 59.0, 393.0, 289.0];
+        baseline.push(container);
+        let mut current = baseline.clone();
+        current[3].rect[3] += 41.0;
+        let mut report = SettleReport::new(1000);
+        report.reason = SettleReason::BudgetExhausted;
+        let mut body = serde_json::json!({});
+        mark_no_scroll_progress(
+            &mut body,
+            &serde_json::json!({"type":"scroll","dy":100}),
+            &baseline,
+            &current,
+            &report,
+        );
+        assert_eq!(body["no_scroll_progress"], true);
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_observation_failed() {
+        assert!(
+            unsettled_scroll_body(3, SettleReason::ObservationFailed, "")
+                .get("no_scroll_progress")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_scroll_progress_unsettled_suppression_gates() {
+        for gate in [
+            "sparse",
+            "stale",
+            "app_changed",
+            "no_visible_change",
+            "moved",
+        ] {
+            assert!(
+                unsettled_scroll_body(3, SettleReason::BudgetExhausted, gate)
+                    .get("no_scroll_progress")
+                    .is_none(),
+                "{gate}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_progress_body_gates_and_gesture_directions() {
+        let baseline = vec![delta_row("Cell", "item", 100.0)];
+        let mut current = baseline.clone();
+        current[0].value = Some("updated".into());
+        let mut report = SettleReport::new(1000);
+        report.settled = true;
+        report.reason = SettleReason::Stable;
+        let actions = [
+            serde_json::json!({"type":"scroll", "dy":100}),
+            serde_json::json!({"type":"scroll", "page":true, "dy":100}),
+            serde_json::json!({"type":"scroll", "element":0, "snapshot":"S1", "dy":100}),
+            serde_json::json!({"type":"swipe", "x1":0.5,"x2":0.5,"y1":0.8,"y2":0.2}),
+            serde_json::json!({"type":"drag", "x1":0.5,"x2":0.5,"y1":0.8,"y2":0.2}),
+        ];
+        for action in &actions {
+            let mut body = serde_json::json!({});
+            mark_no_scroll_progress(&mut body, action, &baseline, &current, &report);
+            assert_eq!(body["no_scroll_progress"], true);
+            let mut moved = current.clone();
+            moved[0].rect[1] -= 20.0;
+            let mut body = serde_json::json!({});
+            mark_no_scroll_progress(&mut body, action, &baseline, &moved, &report);
+            assert!(body.get("no_scroll_progress").is_none());
+        }
+        for gate in [
+            "unsettled",
+            "sparse",
+            "stale",
+            "app_changed",
+            "no_visible_change",
+            "no_anchor",
+            "tap",
+            "zero",
+            "missing_endpoint",
+        ] {
+            let mut report = SettleReport::new(1000);
+            report.settled = gate != "unsettled";
+            report.reason = SettleReason::Stable;
+            report.sparse = gate == "sparse";
+            report.stale = gate == "stale";
+            let mut body = serde_json::json!({});
+            if gate == "app_changed" {
+                body[gate] = serde_json::json!({"from":"a","to":"b"});
+            }
+            if gate == "no_visible_change" {
+                body[gate] = serde_json::json!(true);
+            }
+            let action = match gate {
+                "tap" => serde_json::json!({"type":"tap", "dy":100}),
+                "zero" => serde_json::json!({"type":"scroll"}),
+                "missing_endpoint" => serde_json::json!({"type":"swipe", "y1":0.8,"y2":0.2}),
+                _ => actions[0].clone(),
+            };
+            let rows = if gate == "no_anchor" {
+                &[][..]
+            } else {
+                &current
+            };
+            mark_no_scroll_progress(&mut body, &action, &baseline, rows, &report);
+            assert!(body.get("no_scroll_progress").is_none(), "{gate}");
         }
     }
 

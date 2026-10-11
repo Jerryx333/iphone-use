@@ -645,7 +645,9 @@ impl DaemonClient {
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
-        read_response(req.send().await?).await
+        let response = read_response(req.send().await?).await?;
+        self.remember_snapshot(response.json.as_ref());
+        Ok(response)
     }
 
     /// `GET /agent/flow/draft` — the daemon's recorded action trail as a flow
