@@ -32,6 +32,19 @@ struct LocalControlSetupView: View {
                         busy = false
                     }
                 }.disabled(busy || starting || tunnel.nativePhase == "running" || !DeviceStore.supportsStandaloneControl || ProtectedStore.read("pair_record") == nil)
+                Button("重新启动本机控制") {
+                    Task {
+                        if let api = app.thisPhoneSession?.client,
+                           let tasks = try? await api.recentTasks(), tasks.contains(where: { !$0.state.isTerminal }) {
+                            message = "请先停止当前手机任务，再重新启动本机控制。"
+                            return
+                        }
+                        app.voiceCall.end()
+                        busy = true
+                        await tunnel.startAndCommand("restart")
+                        busy = false
+                    }
+                }.disabled(busy || starting || tunnel.state != "已启用")
                 Button("停止本机控制", role: .destructive) {
                     Task {
                         busy = true

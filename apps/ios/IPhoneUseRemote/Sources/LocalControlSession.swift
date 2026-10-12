@@ -56,7 +56,7 @@ import UIKit
         nativeError = ""
     }
     func startAndCommand(_ command: String) async {
-        if command == "launch" {
+        if command == "launch" || command == "restart" {
             do {
                 try ProtectedStore.write("foreground_launch_requested", Data(String(Date().timeIntervalSince1970).utf8))
             } catch { nativeError = "无法保存启动请求"; return }
