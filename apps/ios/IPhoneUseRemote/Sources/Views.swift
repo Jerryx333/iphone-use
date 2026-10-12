@@ -80,7 +80,10 @@ struct IPhoneUseRemoteApp: App {
                     if ProtectedStore.read("session_enabled") == Data([1]) {
                         for _ in 0..<30 {
                             if Task.isCancelled { return }
-                            if await app.connectStandaloneControlIfReady() { break }
+                            if await app.connectStandaloneControlIfReady() {
+                                await LocalTunnel.completeForegroundLaunchIfNeeded()
+                                break
+                            }
                             try? await Task.sleep(nanoseconds: 2_000_000_000)
                         }
                     }
