@@ -377,7 +377,20 @@ pub fn run_auth(target: &Target, path: &str, body: Value) -> Result<i32> {
         .ok()
         .filter(|owner| !owner.trim().is_empty())
         .unwrap_or_else(|| "iphone-use-auth".to_string());
-    let (code, value) = daemon.call(reqwest::Method::POST, path, Some(body))?;
+    run_auth_with_daemon(&daemon, path, body)
+}
+
+fn run_auth_with_daemon(daemon: &Daemon<'_>, path: &str, body: Value) -> Result<i32> {
+    let response = daemon.call(reqwest::Method::POST, path, Some(body));
+    // A completed response ends this one-shot CLI's phone work. A transport
+    // error does not prove that the server stopped filling credentials, so
+    // leave that lease to expire; never act on another owner's refusal.
+    let owned_by_other = matches!(&response, Ok((409, value))
+        if value.get("error").and_then(Value::as_str) == Some("phone_owned"));
+    if response.is_ok() && !owned_by_other {
+        daemon.release();
+    }
+    let (code, value) = response?;
     if code == 409 && value.get("error").and_then(Value::as_str) == Some("phone_owned") {
         bail!("{}", owned_message(&value));
     }
@@ -710,6 +723,117 @@ fn terminal_qr(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn auth_releases_its_lease_after_success_and_failure_but_not_another_owner() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        for (status, reply, expected_requests, expected_exit) in [
+            (200, json!({"ok": true}), 2, Some(0)),
+            (
+                400,
+                json!({"ok": false, "error": "phone_number_required"}),
+                2,
+                Some(1),
+            ),
+            (
+                409,
+                json!({"ok": false, "error": "phone_owned", "owner": "other"}),
+                1,
+                None,
+            ),
+            (0, Value::Null, 1, None), // Drop the connection after accepting the request.
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (finished, caller_finished) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut requests = Vec::new();
+                for index in 0..expected_requests {
+                    let (mut stream, _) = loop {
+                        match listener.accept() {
+                            Ok(connection) => break connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "missing auth cleanup request");
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut raw = Vec::new();
+                    loop {
+                        let mut buffer = [0; 1024];
+                        let size = stream.read(&mut buffer).unwrap();
+                        assert!(size > 0);
+                        raw.extend_from_slice(&buffer[..size]);
+                        if let Some(header_end) =
+                            raw.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let headers =
+                                String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= header_end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    requests.push(String::from_utf8(raw).unwrap());
+                    if status == 0 {
+                        drop(stream);
+                        loop {
+                            assert!(matches!(listener.accept(), Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock),
+                                "an unknown credential write must not release its lease");
+                            if caller_finished.try_recv().is_ok() {
+                                return requests;
+                            }
+                            assert!(Instant::now() < deadline, "auth caller did not finish");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    let (code, value) = if index == 0 {
+                        (status, reply.clone())
+                    } else {
+                        (200, json!({"ok": true}))
+                    };
+                    let body = value.to_string();
+                    write!(stream, "HTTP/1.1 {code} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+                requests
+            });
+            let target = Target {
+                instance: Instance::derive("", "/tmp/auth-fixture", None).unwrap(),
+                base: format!("http://{address}"),
+                token: Some("synthetic-auth-token".to_string()),
+            };
+            let mut daemon = Daemon::new(&target).unwrap();
+            daemon.owner = "auth-fixture-owner".to_string();
+            let result =
+                run_auth_with_daemon(&daemon, "/agent/login", json!({"item": "synthetic-item"}));
+            let _ = finished.send(());
+            assert_eq!(result.ok(), expected_exit);
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("POST /agent/login "));
+            if expected_requests == 2 {
+                assert!(requests[1].starts_with("POST /agent/owner "));
+                assert!(requests[1]
+                    .to_ascii_lowercase()
+                    .contains("x-phone-owner: auth-fixture-owner"));
+                assert!(requests[1].contains("\"release\":true"));
+            }
+        }
+    }
     #[test]
     fn status_names_a_phone_that_will_lock() {
         let hint = json!({"en": "Set Auto-Lock to Never.", "zh": "把自动锁定设为永不。"});
