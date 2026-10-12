@@ -27,4 +27,10 @@
 
 网络扩展回复恢复：新增 ProviderMessageRequest 的一次完成保护，覆盖超时、取消、重复/晚到回调、同步发送失败和空回复。状态读取限时 8 秒，控制命令限时 30 秒；命令进行时不发状态轮询，旧请求结果不能覆盖更新请求。超时/不完整回复进入 awaiting_status，仅只读核对，不自动重发启动，保留停止入口。
 
+完整工程构建验证：已合入语音会话已提交的 `b778987`，整合提交 `99e46e9`，没有覆盖其未提交代码。主 App build、控制 bundle build-for-testing、单包组装和签名通过；主工程完整测试目标 build-for-testing 也通过。未安装或运行设备测试。
+
+封存候选 `/tmp/iphone-experience-candidate/PhoneUse.app`：标识 `com.leeguoo.iphone-use.remote`、build18、MinimumOSVersion15.0、IPUSingleAppControl=true；含两个扩展和唯一 PhoneUse.xctest，没有嵌套 .app，deep/strict 签名校验通过。验证 JSON 同目录，记录二进制 SHA256 及未安装状态。后续测试目标构建没有改变封存候选哈希。
+
+固定原生库位于 `/tmp/iphone-experience-native-libs-01a12715`，来源及哈希见 inputs.json；现有开发镜像及浏览器库只读引用。日志 `/tmp/iphone-experience-single-app-build.log`、工程 main-build.log/control-build.log、`/tmp/iphone-experience-test-build.log`。这些结果不代替二维码视觉、网络恢复、语音、冷启动和旧系统真机安装验收；没有操作17或启动旧 normal 服务。
+
 真实新增 XCTest 文件在独立无依赖 Swift Package 中执行 6 项通过（复制的源码/测试与提交文件相同），日志 `/tmp/iphone-provider-xctest.log`。实际 LocalTunnel + 设置页完成 Swift6/iOS15 局部类型检查，日志 `/tmp/iphone-provider-ios15-typecheck.log`；不是完整 App XCTest 或真机故障注入。未操作17、未部署候选。
