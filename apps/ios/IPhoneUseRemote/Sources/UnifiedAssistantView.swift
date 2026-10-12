@@ -151,6 +151,12 @@ struct UnifiedAssistantView: View {
                             guard let local = app.thisPhoneSession,
                                   local.status?.drivable == true else { throw BrowserToolError.actionFailed("本机控制尚未就绪") }
                             app.agent.targetID = local.id
+                            for _ in 0..<120 {
+                                if Task.isCancelled { return }
+                                if UIApplication.shared.applicationState == .active { break }
+                                try await Task.sleep(nanoseconds: 500_000_000)
+                            }
+                            guard UIApplication.shared.applicationState == .active else { throw BrowserToolError.actionFailed("请先回到助手再验收语音") }
                             // Resolve microphone/recognition permission sheets before
                             // launching Settings, so they cannot obscure the readback.
                             await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant))
@@ -227,7 +233,7 @@ struct UnifiedAssistantView: View {
                                         let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("voice-runtime-qa.json")
                                         try? data.write(to: file, options: [.atomic, .completeFileProtection])
                                     }
-                                    if !call.active && !call.connecting { break }
+                                    if !call.active && !call.connecting && assistant.task?.active != true { break }
                                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                                 }
                             }

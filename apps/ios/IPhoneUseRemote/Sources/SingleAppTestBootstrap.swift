@@ -6,7 +6,7 @@ import Foundation
 /// only these short-lived QA switches across that handoff, never credentials.
 enum DeviceQAOptions {
     private static let key = "single-app-device-qa"
-    private static let allowed: Set<String> = ["--voice-runtime-qa", "--phone-tools-qa", "--phone-screen-qa", "--local-control-status"]
+    private static let allowed: Set<String> = ["--voice-runtime-qa", "--phone-tools-qa", "--phone-screen-qa", "--local-control-status", "--local-control-qa-access"]
     static func capture() {
         let flags = ProcessInfo.processInfo.arguments.filter { allowed.contains($0) }
         guard !flags.isEmpty else { return }

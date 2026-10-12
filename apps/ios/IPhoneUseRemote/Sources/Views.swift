@@ -60,6 +60,22 @@ struct IPhoneUseRemoteApp: App {
                             try? data.write(to: file, options: [.atomic, .completeFileProtection])
                         }
                     }
+                    if DeviceQAOptions.contains("--local-control-qa-access") {
+                        // Explicit DEBUG-only handoff to the paired QA Mac. Never
+                        // include this credential in diagnostics, logs or release builds.
+                        let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                            .appendingPathComponent("private-local-control-qa-access.json")
+                        if let token = ProtectedStore.read("daemon_token"),
+                           let value = String(data: token, encoding: .utf8),
+                           let data = try? JSONSerialization.data(withJSONObject: ["token": value]) {
+                            try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                            Task {
+                                try? await Task.sleep(nanoseconds: 90_000_000_000)
+                                try? FileManager.default.removeItem(at: file)
+                            }
+                        }
+                    }
                     #endif
                     if ProtectedStore.read("session_enabled") == Data([1]) {
                         for _ in 0..<30 {
