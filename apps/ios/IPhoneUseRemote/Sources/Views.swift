@@ -599,7 +599,9 @@ struct RemoteView: View {
         }
         .sheet(isPresented: $showSettings) { SettingsSheet(app: app, session: session) }
         .sheet(isPresented: $showFlows) { FlowsHubView(session: session) }
-        .sheet(item: $recorder.draft) { draft in SaveFlowSheet(session: session, draft: draft) }
+        .sheet(item: $recorder.draft) { draft in
+            SaveFlowSheet(session: session, draft: draft) { _ in recorder.finishDraft(draft) }
+        }
         .task(id: session.phase == .connected) { await recorder.sync() }
         .onDisappear { recorder.leave() }
         .onAppear {
@@ -686,6 +688,8 @@ struct RemoteMenu: View {
                 ? Label("检查录制状态", systemImage: "arrow.clockwise")
                 : recorder.recording
                 ? Label("停止录制（\(recorder.steps) 步）", systemImage: "stop.circle")
+                : recorder.pendingDraft != nil
+                ? Label("继续保存录制", systemImage: "square.and.arrow.down")
                 : Label("录制 flow", systemImage: "record.circle")
         }
         .disabled(session.phase != .connected || recorder.busy)

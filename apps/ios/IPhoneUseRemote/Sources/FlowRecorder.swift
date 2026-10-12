@@ -10,6 +10,7 @@ final class FlowRecorder: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var statusKnown = false
     @Published var draft: FlowDraft?
+    @Published private(set) var pendingDraft: FlowDraft?
 
     private let read: () async throws -> RecordingState
     private let begin: () async throws -> Void
@@ -20,6 +21,7 @@ final class FlowRecorder: ObservableObject {
     private var generation = 0
     private var visible = true
     private var recoverStoppedDraft = false
+    private var acknowledgedFlow: Data?
 
     init(read: @escaping () async throws -> RecordingState,
          start: @escaping () async throws -> Void,
@@ -42,6 +44,7 @@ final class FlowRecorder: ObservableObject {
     func toggle() async {
         if !statusKnown { await sync() }
         else if recording { await stop() }
+        else if pendingDraft != nil { offerDraft() }
         else { await start() }
     }
 
@@ -52,8 +55,10 @@ final class FlowRecorder: ObservableObject {
         defer { busy = false; pollIfNeeded() }
         // A view's cached false state must not reset a recording started elsewhere.
         guard await refresh(), !recording else { return }
+        guard pendingDraft == nil else { offerDraft(); return }
         do {
             try await begin()
+            acknowledgedFlow = nil
             recoverStoppedDraft = false
             recording = true; steps = 0; statusKnown = true
             show(String(localized: "开始录制：接下来的操作会记成 flow"))
@@ -88,11 +93,27 @@ final class FlowRecorder: ObservableObject {
         invalidatePoll()
     }
 
+    func offerDraft() { draft = pendingDraft }
+
+    func finishDraft(_ saved: FlowDraft) {
+        guard pendingDraft?.flow == saved.flow else { return }
+        acknowledgedFlow = saved.flow
+        pendingDraft = nil
+    }
+
+    func skipDraft() {
+        acknowledgedFlow = pendingDraft?.flow
+        pendingDraft = nil
+        draft = nil
+    }
+
     @discardableResult
     private func refresh() async -> Bool {
         do {
             let state = try await read()
             recording = state.recording; steps = state.steps; statusKnown = true
+            if state.recording { acknowledgedFlow = nil }
+            if !state.recording { remember(state.draft) }
             if recoverStoppedDraft, !state.recording {
                 if let recovered = state.draft {
                     accept(recovered)
@@ -113,10 +134,19 @@ final class FlowRecorder: ObservableObject {
 
     private func accept(_ stopped: FlowDraft?) {
         if let stopped, stopped.flow != nil, stopped.steps > 0 {
+            pendingDraft = stopped
             draft = stopped; steps = stopped.steps
         } else {
             show(String(localized: "这次没有录到步骤"))
         }
+    }
+
+    private func remember(_ stopped: FlowDraft?) {
+        guard let stopped, let flow = stopped.flow, stopped.steps > 0,
+              flow != acknowledgedFlow else { return }
+        // A reopened remote view offers the draft without interrupting the
+        // user with an automatic save sheet.
+        if pendingDraft == nil { pendingDraft = stopped }
     }
 
     private func invalidatePoll() {
@@ -137,7 +167,9 @@ final class FlowRecorder: ObservableObject {
                     let state = try await self.read()
                     guard !Task.isCancelled, self.generation == epoch else { break }
                     self.recording = state.recording; self.steps = state.steps; self.statusKnown = true
+                    if state.recording { self.acknowledgedFlow = nil }
                     if !state.recording {
+                        self.remember(state.draft)
                         if self.recoverStoppedDraft {
                             if let recovered = state.draft { self.accept(recovered) }
                             else { self.show(String(localized: "录制已停止，但未能取回草稿；请检查手机助手版本")) }

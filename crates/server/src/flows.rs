@@ -411,9 +411,10 @@ pub struct FlowTrail {
     /// An explicit recording (`POST /agent/flow/record`): every applied step
     /// lands here too, across apps and pauses, until it is stopped or saved.
     recording: Option<Trail>,
-    /// Keep the stopped draft until the next recording so a lost stop reply
+    /// Keep the stopped draft until saved or replaced so a lost stop reply
     /// can be recovered by a read-only status request.
     stopped_recording: Option<Value>,
+    recording_revision: u64,
 }
 
 /// Single actions in a row before the agent is told to batch.
@@ -610,6 +611,7 @@ impl FlowTrail {
 
     /// Start an explicit recording, dropping one in progress.
     pub fn start_recording(&mut self) {
+        self.recording_revision = self.recording_revision.wrapping_add(1);
         self.stopped_recording = None;
         self.recording = Some(Trail::default());
     }
@@ -632,7 +634,7 @@ impl FlowTrail {
         draft
     }
 
-    /// The active draft, or the last stopped draft until a new recording starts.
+    /// The active draft, or the unsaved stopped draft until a new recording starts.
     pub fn recording_draft(&self) -> Option<Value> {
         let Some(recording) = self.recording.as_ref() else {
             return self.stopped_recording.clone();
@@ -644,6 +646,20 @@ impl FlowTrail {
     /// stopped one whose response was lost, before an unrelated task trail.
     pub fn draft_for_save(&mut self) -> Option<Value> {
         self.stop_recording().or_else(|| self.recording_draft()).or_else(|| self.draft())
+    }
+
+    pub fn recording_revision(&self) -> u64 {
+        self.recording_revision
+    }
+
+    /// A successful save acknowledges only the exact stopped document that
+    /// was saved. Another recording started during the write stays intact.
+    pub fn acknowledge_recording(&mut self, flow: &Value, revision: u64) {
+        if revision == self.recording_revision
+            && self.stopped_recording.as_ref().and_then(|draft| draft.get("flow")) == Some(flow)
+        {
+            self.stopped_recording = None;
+        }
     }
 
     fn record_into_recording(&mut self, converted: &Converted, now: Instant) {
@@ -981,7 +997,14 @@ mod tests {
         assert_eq!(trail.recording_draft(), Some(draft.clone()), "recover a lost stop reply");
         assert!(trail.stop_recording().is_none());
         assert_eq!(trail.draft_for_save(), Some(draft.clone()), "save the stopped recording, not the recent task");
-        assert_eq!(trail.recording_draft(), Some(draft), "a duplicate stop must not erase it");
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "a duplicate stop must not erase it");
+        let revision = trail.recording_revision();
+        trail.acknowledge_recording(&json!({"steps": []}), revision);
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "saving another document must not discard it");
+        trail.acknowledge_recording(&draft["flow"], revision.wrapping_sub(1));
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "an old save must not acknowledge a later recording");
+        trail.acknowledge_recording(&draft["flow"], revision);
+        assert!(trail.recording_draft().is_none(), "a successfully saved draft is no longer pending");
         trail.start_recording();
         assert!(trail.recording_draft().is_none(), "a new recording clears the old draft");
     }

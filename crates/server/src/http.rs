@@ -14031,13 +14031,13 @@ async fn agent_flow_save(
             serde_json::json!({"ok": false, "error": "id_required", "hint": "an id like \"myapp/daily-check\""}),
         );
     };
-    let flow = match request.get("flow") {
-        Some(flow) => Some(flow.clone()),
-        None => {
-            let mut trail = recover(state.flow_trail.lock());
-            let draft = trail.draft_for_save();
-            draft.and_then(|draft| draft.get("flow").cloned())
-        }
+    let (flow, recording_revision) = {
+        let mut trail = recover(state.flow_trail.lock());
+        let flow = match request.get("flow") {
+            Some(flow) => Some(flow.clone()),
+            None => trail.draft_for_save().and_then(|draft| draft.get("flow").cloned()),
+        };
+        (flow, trail.recording_revision())
     };
     let Some(mut flow) = flow else {
         return agent_json_response(
@@ -14045,6 +14045,7 @@ async fn agent_flow_save(
             serde_json::json!({"ok": false, "error": "no_trail", "hint": "record first (POST /agent/flow/record {\"action\":\"start\"}) or send \"flow\""}),
         );
     };
+    let recorded_flow = flow.clone();
     for key in ["name", "description"] {
         if let Some(value) = request.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
             flow[key] = value.clone();
@@ -14052,7 +14053,10 @@ async fn agent_flow_save(
     }
     let result = tokio::task::spawn_blocking(move || save_local_flow(&id, &flow)).await;
     match result {
-        Ok(Ok(saved)) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "saved": saved})),
+        Ok(Ok(saved)) => {
+            recover(state.flow_trail.lock()).acknowledge_recording(&recorded_flow, recording_revision);
+            agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "saved": saved}))
+        }
         Ok(Err(error)) => agent_json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             serde_json::json!({"ok": false, "error": "invalid_flow", "message": format!("{error:#}")}),

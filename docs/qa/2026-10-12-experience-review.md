@@ -42,3 +42,7 @@
 保存链路继续修复：不传 flow 的保存现在优先使用停止后保留的录制，避免误存最近任务；提供了 flow 但 JSON 损坏时会报错，不会悄悄改存其他步骤。成功回复必须包含与请求相同的 saved.id，缺失或错误回复不能显示已保存。保存页读取失败可以重试，重复保存有进行中保护，空白名称校验覆盖换行。
 
 新增 5 项真实 FlowSavePayload XCTest，与录制恢复 8 项共同执行 13 项通过，日志 `/tmp/iphone-flow-recorder-tests.log`；完整 App 和测试目标 build-for-testing 通过，日志 `/tmp/iphone-recording-save-test-build.log`。Rust 保留草稿测试补充了停止后隐式保存的断言，仍等待同一 heavy-cargo 队列执行。已核对并合入语音会话已提交的 3fd3815，整合提交5bc65d7；不覆盖其工作区。上述源码尚未更新到签名包或17，最终验收矩阵仍未完成。
+
+取消保存后的草稿入口：关闭保存页保留 pendingDraft，遥控页和菜单可继续保存；新录制前必须先保存或明确忽略已有草稿。重新打开遥控页时只读取回服务端停止草稿，以按钮提示，不自动弹页。成功保存会按原文档及录制版本清除服务端待保存状态，避免后台写入期间把新录制清掉；保存其他文档和失败写入都不清除它。
+
+新增 4 项 FlowRecorder XCTest 覆盖关闭重开、阻止覆盖、重新进入遥控页和保存后再次同步，当前独立 Package 共 17 项通过，源码/测试复制文件均一致；当前日志 `/tmp/iphone-flow-recorder-tests.log`。完整 App/test build-for-testing 通过，日志 `/tmp/iphone-recording-pending-test-build.log`。Rust 对同一保留草稿测试补充成功保存/错误文档/旧版本断言，尚未执行完成；同一个 heavy-cargo session 持续存活，没有因观察超时重启。签名、部署和真机录制重放均未宣称完成。

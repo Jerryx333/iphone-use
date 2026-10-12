@@ -21,6 +21,7 @@ extension FlowRecorder {
 /// The red pill over the remote view while recording: step count and Stop.
 struct RecordingPill: View {
     @ObservedObject var recorder: FlowRecorder
+    @State private var confirmSkip = false
 
     var body: some View {
         if !recorder.statusKnown {
@@ -45,6 +46,18 @@ struct RecordingPill: View {
             .disabled(recorder.busy)
             .accessibilityIdentifier("flow-recording")
             .padding(.bottom, Theme.Space.s)
+        } else if let pending = recorder.pendingDraft {
+            HStack {
+                Button("继续保存录制 · \(pending.steps) 步") { recorder.offerDraft() }
+                    .accessibilityIdentifier("flow-recording-save-draft")
+                Button("忽略") { confirmSkip = true }
+                    .accessibilityIdentifier("flow-recording-skip-draft")
+            }
+            .font(.footnote).disabled(recorder.busy)
+            .confirmationDialog("忽略这份草稿，允许开始新的录制？", isPresented: $confirmSkip, titleVisibility: .visible) {
+                Button("忽略草稿", role: .destructive) { recorder.skipDraft() }
+                Button("取消", role: .cancel) {}
+            }
         }
     }
 }

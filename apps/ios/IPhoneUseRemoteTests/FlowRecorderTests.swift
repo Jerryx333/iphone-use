@@ -120,4 +120,54 @@ final class FlowRecorderTests: XCTestCase {
         XCTAssertTrue(recorder.recording)
         recorder.leave()
     }
+
+    func testCancelSaveKeepsDraftAndCanReopenIt() async {
+        let recorder = FlowRecorder(read: { RecordingState(recording: false, steps: 0) },
+                                    start: {}, stop: { [saved] in saved })
+        await recorder.stop()
+        recorder.draft = nil // SwiftUI dismisses the sheet binding.
+        XCTAssertEqual(recorder.pendingDraft, saved)
+        recorder.offerDraft()
+        XCTAssertEqual(recorder.draft, saved)
+        recorder.leave()
+    }
+
+    func testUnsavedDraftPreventsAnotherStartUntilExplicitlySkipped() async {
+        var starts = 0
+        let recorder = FlowRecorder(read: { [saved] in
+            RecordingState(recording: false, steps: 0, draft: saved)
+        }, start: { starts += 1 }, stop: { nil })
+        await recorder.start()
+        XCTAssertEqual(starts, 0)
+        XCTAssertEqual(recorder.pendingDraft, saved)
+        XCTAssertEqual(recorder.draft, saved)
+        recorder.skipDraft()
+        await recorder.start()
+        XCTAssertEqual(starts, 1)
+        XCTAssertTrue(recorder.recording)
+        recorder.leave()
+    }
+
+    func testReopenedViewOffersRemoteDraftWithoutPresentingSheet() async {
+        let recorder = FlowRecorder(read: { [saved] in
+            RecordingState(recording: false, steps: 0, draft: saved)
+        }, start: {}, stop: { nil })
+        await recorder.sync()
+        XCTAssertEqual(recorder.pendingDraft, saved)
+        XCTAssertNil(recorder.draft)
+        recorder.leave()
+    }
+
+    func testSavedDraftDoesNotBecomePendingAgainOnSync() async {
+        let recorder = FlowRecorder(read: { [saved] in
+            RecordingState(recording: false, steps: 0, draft: saved)
+        }, start: {}, stop: { [saved] in saved })
+        await recorder.stop()
+        recorder.finishDraft(saved)
+        recorder.draft = nil
+        await recorder.sync()
+        XCTAssertNil(recorder.pendingDraft)
+        XCTAssertNil(recorder.draft)
+        recorder.leave()
+    }
 }
