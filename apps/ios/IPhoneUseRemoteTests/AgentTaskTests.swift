@@ -52,6 +52,14 @@ final class AgentStartFailureTests: XCTestCase {
 }
 
 final class AgentTaskDecodingTests: XCTestCase {
+    func testUncertainWriteRequiresReview() {
+        let uncertain = AgentTaskSnapshot(id: "fixture", goal: "fixture", state: .failed,
+            steps: [.init(n: 1, action: "TYPE_TEXT", ok: false, error: #"{"error":"outcome_unknown","retry_safe":false}"#)])
+        XCTAssertTrue(uncertain.hasUncertainAction)
+        let retryable = AgentTaskSnapshot(id: "fixture", goal: "fixture", state: .failed,
+            steps: [.init(n: 1, action: "CLICK", ok: false, error: #"{"error":"stale_element","retry_safe":true}"#)])
+        XCTAssertFalse(retryable.hasUncertainAction)
+    }
     private func decode(_ json: String) throws -> AgentTaskSnapshot {
         try JSONDecoder().decode(AgentTaskSnapshot.self, from: Data(json.utf8))
     }
@@ -303,6 +311,18 @@ private actor SleepLog {
 }
 
 final class ModelsPayloadTests: XCTestCase {
+    @MainActor func testPrivateModelProfileValidatesWithoutEmbeddingCredentialsInProvider() throws {
+        let profile = PrivateModelProfile(name: "Fixture", baseURL: "https://fixture.example/v1", model: "fixture", key: "synthetic")
+        let provider = try profile.provider()
+        XCTAssertEqual(provider.kind, .custom)
+        let stored = String(decoding: try JSONEncoder().encode(provider), as: UTF8.self)
+        XCTAssertFalse(stored.contains("synthetic"))
+        var invalid = profile
+        invalid.baseURL = "https://user:password@fixture.example/v1"
+        XCTAssertThrowsError(try invalid.provider())
+        invalid = profile; invalid.baseURL = "http://fixture.example/v1"
+        XCTAssertThrowsError(try invalid.provider())
+    }
     private func json(_ payload: ModelsPayload?) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]

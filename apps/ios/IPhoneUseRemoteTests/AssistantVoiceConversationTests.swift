@@ -35,6 +35,11 @@ private final class VoicePhoneFixture: AssistantPhoneControlling {
     var startError = false
     var disconnected = false
     var keepingConnection = false
+    var screenReads = 0
+    func readScreen() async throws -> String {
+        screenReads += 1
+        return "当前屏幕文字：设置，WLAN，蓝牙"
+    }
     func start(goal: String) async -> Bool {
         starts.append(goal)
         if startError { state.error = "提交失败"; return false }
@@ -69,6 +74,14 @@ private final class VoiceModelFixture: AssistantVoiceReasoning {
 
 @MainActor
 final class AssistantVoiceConversationTests: XCTestCase {
+    func testExplicitScreenReadUsesActualReadWithoutStartingTaskOrCallingModel() async {
+        let (call, audio, phone, model) = await rig()
+        audio.say("读取当前屏幕文字")
+        await ready { phone.screenReads == 1 && call.reply.contains("蓝牙") }
+        XCTAssertTrue(phone.starts.isEmpty)
+        XCTAssertTrue(model.requests.isEmpty)
+        call.end()
+    }
     private func ready(_ condition: @escaping () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
         for _ in 0..<100 {
             if condition() { return }
@@ -174,6 +187,8 @@ final class AssistantVoiceConversationTests: XCTestCase {
     func testTaskProgressAnswersFromCurrentEvidenceInsteadOfModelClaims() async {
         let (call, audio, phone, model) = await rig()
         phone.update { $0.busy = true; $0.task = .init(id: "one", goal: "打开设置", state: .running, phase: "assist") }
+        await ready { call.taskStatus.contains("打开设置") }
+        XCTAssertFalse(call.taskStatus.contains("完成"))
         audio.say("做到哪了？")
         XCTAssertTrue(call.reply.contains("打开设置"))
         XCTAssertFalse(call.reply.contains("任务完成"))

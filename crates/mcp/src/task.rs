@@ -1211,7 +1211,9 @@ async fn execute(
             step["ok"] = json!(false);
             step["error"] = json!(message);
             entry["error"] = json!(message);
-            None
+            if uncertain_action_error(&message) {
+                Some((Status::Blocked, Some("the phone action outcome is unknown; verify the phone before retrying".into())))
+            } else { None }
         }
     };
     if stop.is_none() {
@@ -1221,6 +1223,11 @@ async fn execute(
         task.push_step(step);
     }
     Ok(stop)
+}
+
+fn uncertain_action_error(message: &str) -> bool {
+    let compact: String = message.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("outcome_unknown") || compact.contains("\"retry_safe\":false")
 }
 
 /// Read the screen after a step, noting in the history whether it changed.
@@ -1477,6 +1484,12 @@ pub fn plain_summary(status: Status, steps: usize, error: Option<&str>) -> Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uncertain_action_requires_review_instead_of_replay() {
+        assert!(uncertain_action_error(r#"the phone refused: {"error":"outcome_unknown","retry_safe":false}"#));
+        assert!(uncertain_action_error(r#"{"retry_safe": false, "outcome":"unknown"}"#));
+        assert!(!uncertain_action_error(r#"{"error":"stale_element","retry_safe":true}"#));
+    }
     use super::*;
 
     #[tokio::test]

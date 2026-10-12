@@ -140,6 +140,12 @@ struct AgentConfirm: Decodable, Equatable, Sendable {
 /// A task as `GET /agent/task/<id>` reports it (and, without steps, each
 /// row of `GET /agent/tasks`). Every field but `id` may be missing or null.
 struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
+    var hasUncertainAction: Bool {
+        steps.contains { step in
+            let error = step.error ?? ""
+            return error.contains("outcome_unknown") || error.range(of: #""retry_safe"\s*:\s*false"#, options: .regularExpression) != nil
+        }
+    }
     struct PlannedAction: Decodable, Equatable, Sendable {
         var action: String
         var target: String?

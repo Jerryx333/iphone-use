@@ -1,5 +1,23 @@
 import Foundation
 
+#if DEBUG
+struct PrivateModelProfile: Decodable {
+    var name: String
+    var baseURL: String
+    var model: String
+    var key: String
+    @MainActor func provider() throws -> ModelProvider {
+        guard let url = URL(string: baseURL), url.scheme == "https", url.host != nil,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw BrowserToolError.invalidResult
+        }
+        return ModelProvider(kind: .custom, name: name, baseURL: baseURL, model: model)
+    }
+}
+#endif
+
 // Which models a task may use, chosen by the person once for every device:
 // an ordered list of "assist" chat models (the first that answers wins), and
 // optionally Jev (TypeSafe) with its text model. Sent with each task as

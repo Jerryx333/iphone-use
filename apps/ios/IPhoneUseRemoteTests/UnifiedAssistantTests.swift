@@ -6,8 +6,13 @@ import UIKit
 @MainActor
 private final class FixturePlanner: AssistantReasoning {
     var calls = 0
+    var fails = false
     var phases: [AssistantPhase] = [.init(tool: .browser, goal: "Read fixture")]
-    func plan(goal: String, phoneAvailable: Bool, sites: [BrowserSiteAdapter], models: [ModelsPayload.Assist]) async throws -> AssistantPlan { calls += 1; return AssistantPlan(phases: phases) }
+    func plan(goal: String, phoneAvailable: Bool, sites: [BrowserSiteAdapter], models: [ModelsPayload.Assist]) async throws -> AssistantPlan {
+        calls += 1
+        if fails { throw BrowserToolError.actionFailed("Fixture API failed") }
+        return AssistantPlan(phases: phases)
+    }
     func summarize(goal: String, results: [String], models: [ModelsPayload.Assist]) async throws -> String { results.joined(separator: "; ") }
 }
 @MainActor
@@ -21,6 +26,27 @@ private final class FixtureReader: BrowserReasoning {
 
 @MainActor
 final class UnifiedAssistantTests: XCTestCase {
+    func testConsecutivePhoneStepsKeepOneExecutionWithoutChangingToolBoundaries() throws {
+        let plan = AssistantPlan(phases: [.init(tool: .browser, goal: "Read web"), .init(tool: .phone, goal: "打开设置"), .init(tool: .phone, goal: "读取当前页面文字"), .init(tool: .browser, goal: "Compare web")])
+        let merged = try plan.coalescingPhonePhases()
+        XCTAssertEqual(merged.phases.map(\.tool), [.browser, .phone, .browser])
+        XCTAssertEqual(merged.phases[1].goal, "打开设置\n随后：读取当前页面文字")
+        let tooLong = AssistantPlan(phases: [.init(tool: .phone, goal: String(repeating: "x", count: 1500)), .init(tool: .phone, goal: String(repeating: "y", count: 1500))])
+        XCTAssertThrowsError(try tooLong.coalescingPhonePhases())
+    }
+    func testPlanningFailureIsReportedAsFailedWithoutPhoneExecution() async throws {
+        let defaults = defaults(), app = AppModel(defaults: defaults), planner = FixturePlanner()
+        planner.fails = true
+        let (workspace, _) = try await workspace()
+        let assistant = UnifiedAssistant(app: app, workspace: workspace, defaults: defaults, file: file(), key: Data(repeating: 8, count: 32), reasoning: planner)
+        let voice = UnifiedVoiceControl(assistant: assistant)
+        XCTAssertTrue(assistant.start("Synthetic instruction"))
+        try await wait { assistant.task?.state == .failed }
+        XCTAssertEqual(voice.state.task?.state, .failed)
+        XCTAssertEqual(voice.state.error, "Fixture API failed")
+        XCTAssertNil(assistant.native)
+        XCTAssertTrue(assistant.task?.phases.isEmpty == true)
+    }
     private var files: [URL] = []
     private var suites: [String] = []
     override func tearDown() { for file in files { try? FileManager.default.removeItem(at: file) }; for suite in suites { UserDefaults.standard.removePersistentDomain(forName: suite) } }

@@ -18,6 +18,7 @@ final class AssistantVoiceCall: ObservableObject {
     @Published private(set) var level: Float = 0
     @Published private(set) var startedAt: Date?
     @Published var showing = false
+    @Published private(set) var taskStatus = ""
 
     private let audio: any AssistantVoiceAudio
     private let reasoning: any AssistantVoiceReasoning
@@ -86,6 +87,7 @@ final class AssistantVoiceCall: ObservableObject {
             transcript = ""; reply = ""; messages = []
             announced.removeAll(); pendingAnnouncements.removeAll()
             latestPhone = phone.state
+            taskStatus = phone.state.spokenStatus
             if let task = phone.state.task, task.state.isTerminal { announced.insert(Self.announcementKey(task)) }
             phone.onChange = { [weak self] in self?.updatePhone() }
             phone.maintainConnection(true)
@@ -189,6 +191,10 @@ final class AssistantVoiceCall: ObservableObject {
             return
         }
         if Self.isStatus(text) { say(phone.state.spokenStatus); return }
+        if Self.isScreenRead(text) {
+            run = Task { [weak self] in await self?.inspectScreen(token: token, session: session) }
+            return
+        }
         error = nil
         thinking = true
         refreshStatus()
@@ -213,6 +219,7 @@ final class AssistantVoiceCall: ObservableObject {
         guard current(token, session), let phone, phone.state.valid else { return }
         thinking = false
         switch decision.action {
+        case .inspect: await inspectScreen(token: token, session: session)
         case .reply: say(decision.reply)
         case .status: say(phone.state.spokenStatus)
         case .stop:
@@ -269,7 +276,7 @@ final class AssistantVoiceCall: ObservableObject {
             guard current(token, session) else { return }
             if !accepted { say(phone.state.error ?? "任务没有被执行服务接受，请查看本机连接。") }
             else if phone.state.task?.state.isTerminal == true || phone.state.task?.pendingConfirm != nil { updatePhone(); flushAnnouncements() }
-            else { say("收到，开始操作：" + String(goal.prefix(120))) }
+            else { say("任务已提交，正在准备执行。") }
         }
         refreshStatus()
         flushAnnouncements()
@@ -291,9 +298,23 @@ final class AssistantVoiceCall: ObservableObject {
         say(phone.state.error ?? "已请求停止，等待执行服务确认。")
     }
 
+    private func inspectScreen(token: UUID, session: UUID) async {
+        guard current(token, session), let phone else { return }
+        thinking = true; status = "正在读取当前屏幕"
+        do {
+            let text = try await phone.readScreen()
+            guard current(token, session) else { return }
+            thinking = false; error = nil; say(text)
+        } catch {
+            guard current(token, session) else { return }
+            thinking = false; self.error = error.localizedDescription; say(error.localizedDescription)
+        }
+    }
+
     private func updatePhone() {
         guard active, let phone else { return }
         let state = phone.state
+        taskStatus = state.spokenStatus
         guard state.valid else { end(); error = "本机设备已切换，语音通话已结束。"; return }
         defer { latestPhone = state }
         if let note = state.linkNote, note != latestPhone.linkNote {
@@ -341,7 +362,7 @@ final class AssistantVoiceCall: ObservableObject {
         else if hearing { status = "正在听你说" }
         else if thinking { status = "正在思考，可以打断" }
         else if speaking { status = "助手正在说话，可以打断" }
-        else if phone?.state.busy == true { status = "正在操作手机，也在听你说" }
+        else if phone?.state.busy == true { status = "任务处理中，也在听你说" }
         else { status = "正在听" }
     }
     private func invalidate() { generation = UUID(); run?.cancel(); run = nil; thinking = false }
@@ -352,6 +373,9 @@ final class AssistantVoiceCall: ObservableObject {
     }
     nonisolated static func isStatus(_ text: String) -> Bool {
         ["现在怎么样了", "做到哪了", "做完了吗", "任务进度", "现在什么进度"].contains(AssistantVoiceEchoGate.normalized(text))
+    }
+    nonisolated static func isScreenRead(_ text: String) -> Bool {
+        ["读取当前屏幕", "读取当前屏幕文字", "读一下当前屏幕", "读一下屏幕", "看看当前屏幕", "当前屏幕有哪些文字", "屏幕上有什么", "屏幕上有哪些文字"].contains(AssistantVoiceEchoGate.normalized(text))
     }
     nonisolated static func announcementKey(_ task: AgentTaskSnapshot) -> String {
         "\(task.id)|\(String(describing: task.state))|\(String(describing: task.confirm))"
@@ -373,6 +397,10 @@ struct AssistantVoiceCallView: View {
                         .scaleEffect(1 + CGFloat(call.level) * 0.12)
                         .animation(.easeOut(duration: 0.12), value: call.level)
                     Text(call.status).font(.headline).accessibilityIdentifier("voice-call-status")
+                    if !call.taskStatus.isEmpty {
+                        Text(call.taskStatus).font(.footnote).foregroundStyle(.secondary)
+                            .accessibilityIdentifier("voice-call-task-status")
+                    }
                     if let date = call.startedAt { Text(date, style: .timer).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                 }.padding(.top)
                 ScrollViewReader { proxy in

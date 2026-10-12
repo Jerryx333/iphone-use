@@ -430,6 +430,34 @@ final class DaemonClient: @unchecked Sendable {
         return (data, response.value(forHTTPHeaderField: "X-Capture-Redacted") == "1")
     }
 
+    func readScreenText() async throws -> String {
+        guard try await status().drivable else { throw BrowserToolError.actionFailed("手机当前不可读屏，请先恢复执行服务") }
+        var request = request("agent/elements"); request.timeoutInterval = 45
+        let (data, response) = try await send(request)
+        guard response.statusCode == 200, data.count <= 4_194_304 else { throw BrowserToolError.actionFailed("当前屏幕读取失败") }
+        return try Self.screenText(data)
+    }
+
+    static func screenText(_ data: Data) throws -> String {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["elements"] as? [[String: Any]] else { throw BrowserToolError.invalidResult }
+        let visible = rows.filter { $0["visible"] as? Bool != false }
+        guard !visible.contains(where: { ($0["kind"] as? String ?? "").lowercased().contains("secure") }) else {
+            throw BrowserToolError.actionFailed("当前页面有私密输入区域，请在手机上查看")
+        }
+        var labels: [String] = [], seen = Set<String>()
+        for row in visible {
+            let kind = (row["kind"] as? String ?? "").lowercased()
+            guard !kind.contains("textfield"), !kind.contains("textview"),
+                  let label = row["label"] as? String else { continue }
+            let text = String(label.trimmingCharacters(in: .whitespacesAndNewlines).prefix(180))
+            if !text.isEmpty && seen.insert(text).inserted { labels.append(text) }
+            if labels.count == 24 { break }
+        }
+        guard !labels.isEmpty else { throw BrowserToolError.actionFailed("当前页面没有读到可见文字，不能推测页面内容") }
+        return "当前屏幕文字：" + String(labels.joined(separator: "，").prefix(900))
+    }
+
     // MARK: routes
 
     /// The first LAN address that proves, within the probe timeout, that it

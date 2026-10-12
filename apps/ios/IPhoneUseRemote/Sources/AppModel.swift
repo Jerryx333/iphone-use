@@ -138,6 +138,21 @@ final class AppModel: ObservableObject {
         agent = AgentController(defaults: defaults)
         agent.app = self
         #if DEBUG
+        // Device QA imports credentials privately, never as launch arguments
+        // or source constants. Consume and remove the temporary file once.
+        if ProcessInfo.processInfo.arguments.contains("--private-model-import") {
+            let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("private-model-import.json")
+            defer { try? FileManager.default.removeItem(at: file) }
+            do {
+                let profile = try JSONDecoder().decode(PrivateModelProfile.self, from: Data(contentsOf: file))
+                let provider = try profile.provider()
+                ModelSettingsStore.setSecret(profile.key, for: provider.keyAccount)
+                agent.settings.assist.insert(provider, at: 0)
+                agent.settings.allowModelFallback = false
+                agent.settings.sendModels = true
+            } catch { toast = "私有模型配置导入失败，原有模型配置已保留。" }
+        }
         // Screenshots: `-demo YES [-demoScreen <id>]` opens the demo directly.
         if defaults.bool(forKey: "demo") {
             demo = DemoSession(startingAt: defaults.string(forKey: "demoScreen"))
