@@ -22,3 +22,5 @@
 连接码改动用 Swift 6、iOS 15 Simulator target 完成局部类型检查，使用真实 ProtectedStore/RunnerSigning 源码及抽出的现有导航容器，日志 `/tmp/iphone-qr-ios15-typecheck.log`。此结果不是完整 App 构建或真机视觉验收，尚未安装到 17。
 
 未改动语音会话正在修改的 AgentLiveStatus.swift、AppModel.swift、UnifiedAssistantView.swift；也未操作 17、启动正常 Mac 服务、改 VPN 或读取真实凭据。
+
+本机设置补充：组件不完整时禁止启用，缺少配对时明确提示导入；旧系统与不完整版本分别说明能力。网络正在启用时禁止重复启动，控制活跃期间禁止更换配对记录，导入回调再次检查；文件授权失败有提示，取消选择不显示失败。使用真实 LocalTunnel、DeviceStore、ProtectedStore、PairRecordImport 和 RunnerSigning 源码完成 Swift6/iOS15 局部类型检查；导航和 AppModel 仅用类型检查适配器，未做完整 App/真机 UI 验收。日志 `/tmp/iphone-setup-ios15-typecheck.log`。
