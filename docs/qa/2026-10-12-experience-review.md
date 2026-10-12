@@ -70,3 +70,9 @@
 录制服务端定向回归现已执行通过：原 heavy-cargo session57764 正常退出0，1项通过、821项过滤，运行0.17秒，冷编译29分钟。该原始测试新增断言实际验证停止后保留、重复停止、隐式保存、错误文档/旧版本不确认、正确保存清除及新录制无旧草稿。结果与当前 Rust 源文件哈希记录在 `/tmp/iphone-experience-recording-rust-result.json`。这不是822项完整回归；完整 `heavy-cargo test -p server --lib` 已排队，日志 `/tmp/iphone-experience-server-full-regression.log`，将在当前 iOS 嵌入库构建后执行。
 
 当前新嵌入库已进入实际 Cargo/rustc 编译，沿用 session88521；不因没有即时输出重启。尚无新库完成/签名安装证据。语音会话2bb607e已明确其 build19 候选尚未安装且后续读屏出现 wda_source_failed，记录中的 ready/serving 不替代控制结果；本分支不把该报告作为已完成真机验收。
+
+原生库与完整服务端回归现在均完成：iOS release 构建24分16秒成功，库60944280字节，已固定至 `/tmp/iphone-experience-native-libs-1a31311/libipu_embed.a`，来源/哈希见同目录 native-build.json；录制 Rust 源哈希与定向通过时一致。完整 server lib 回归821通过、0失败、1忽略（redaction::sample::render_sample），日志 `/tmp/iphone-experience-server-full-regression.log`。尚未组装或安装使用这份新库的最终签名包。
+
+默认 Zen 的实时兼容问题：官方目录当前仍列 Big Pickle 免费（https://opencode.ai/docs/zen/），仅用合成提示和 public 预设执行真实工具调用，HTTP200返回完整 fixture_result，但终态 tool_calls 没有 index，旧 collapse 因而报 invalidResult。现在仅在明确 tool_calls 终态、完整 id/type/name/对象参数齐全时兼容完整列表；无终态、缺标识、参数截断或与旧片段冲突继续拒绝。5项真实 ZenStreamTests 在独立 Package 通过；刚才捕获的真实响应经新源码离线重放可返回正确工具结果，没有再次执行 API 调用或工具。
+
+相关证据：原始实时调用 `/tmp/iphone-zen-live-probe.json`（HTTP200、旧解析失败），修复后的捕获响应验证 `/tmp/iphone-zen-captured-response-validation.json`（passed=true、replayed_captured_response=true），测试 `/tmp/iphone-zen-stream-tests.log`，完整 App/test build-for-testing `/tmp/iphone-zen-stream-test-build.log` 通过。仅发合成文本，没有手机/浏览器资料，也未使用个人密钥。这证明该实时响应可兼容，不代替 iPhone 原生模型转发或整套真机任务验收。
