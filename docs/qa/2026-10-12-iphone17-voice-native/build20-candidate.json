@@ -9,5 +9,6 @@
   "native_unknown_outcome_guard_present": true,
   "control_sha256": "7f261bb31b063a466ecb99ba529a1c17b10f1c6eaed1992ea94cda32a1e7dd3d",
   "installed_on_iphone17": false,
-  "supersedes_build": 19
+  "supersedes_build": 19,
+  "superseded_by_build": 21
 }

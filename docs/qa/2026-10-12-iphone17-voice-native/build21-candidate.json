@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "build": "21",
+  "app_source_commit": "a2a01d601292b1a72e373f2bacf8c3b1f7c2a3f9",
+  "native_source_commit": "1a31311",
+  "native_embed_sha256": "387bb9bb3f354fffa19211fcda6f48f24acfb7b90b3a7107ed02ad51b4bababc",
+  "native_source_hashes_verified": true,
+  "single_app": true,
+  "extensions": [
+    "AgentActivityWidget.appex",
+    "PhoneLocalControlTunnel.appex"
+  ],
+  "control_bundles": [
+    "PhoneUse.xctest"
+  ],
+  "deep_signature_verified": true,
+  "control_sha256": "73903bf5dace68dab6e8781817ac6707879601a64468a26492a1baae5d1fba12",
+  "ios_tests_passed": 114,
+  "server_tests_passed": 821,
+  "server_tests_failed": 0,
+  "server_tests_ignored": 1,
+  "installed_on_iphone17": false,
+  "physical_acceptance": false
+}
