@@ -46,6 +46,7 @@ import Foundation
         // disable automatic reconnect before the extension shuts the host down.
         do { try ProtectedStore.write("session_enabled", Data([0])) }
         catch { self.error = error.localizedDescription; return }
+        try? ProtectedStore.write("foreground_launch_requested", Data())
         manager.isOnDemandEnabled = false
         do { try await manager.saveToPreferences() }
         catch { self.error = error.localizedDescription; return }
@@ -54,6 +55,11 @@ import Foundation
         nativeError = ""
     }
     func startAndCommand(_ command: String) async {
+        if command == "launch" {
+            do {
+                try ProtectedStore.write("foreground_launch_requested", Data(String(Date().timeIntervalSince1970).utf8))
+            } catch { nativeError = "无法保存启动请求"; return }
+        }
         if manager?.connection.status != .connected { await start() }
         for _ in 0..<60 {
             if Task.isCancelled { return }
@@ -104,5 +110,49 @@ import Foundation
         }
         guard manager.connection.status == .connected, let session = manager.connection as? NETunnelProviderSession else { return }
         await receive(session, command: "status")
+    }
+
+    /// Only a fresh, explicit enable request brings the relaunched main app
+    /// forward. Automatic recovery must leave the user's current app alone.
+    static func completeForegroundLaunchIfNeeded() async {
+        guard SingleAppTestBootstrap.requested,
+              let data = ProtectedStore.read("foreground_launch_requested"),
+              let text = String(data: data, encoding: .utf8), let timestamp = Double(text),
+              (0..<120).contains(Date().timeIntervalSince1970 - timestamp),
+              let bundle = Bundle.main.bundleIdentifier else { return }
+        do { try ProtectedStore.write("foreground_launch_requested", Data()) }
+        catch { return }
+        var succeeded = false
+        do {
+            let token = try ProtectedStore.token("daemon_token")
+            var request = URLRequest(url: URL(string: DeviceStore.standalonePhoneAddress + "/agent/input")!)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 40
+            request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+            request.setValue("1", forHTTPHeaderField: "X-Phone-Control")
+            request.setValue("iphone-local-startup", forHTTPHeaderField: "X-Phone-Owner")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["type": "launch_app", "bundle": bundle])
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                succeeded = (response as? HTTPURLResponse)?.statusCode == 200
+            } catch { }
+            var release = request
+            release.url = URL(string: DeviceStore.standalonePhoneAddress + "/agent/owner")!
+            release.timeoutInterval = 5
+            release.httpBody = Data("{\"release\":true}".utf8)
+            _ = try? await URLSession.shared.data(for: release)
+        } catch { }
+        #if DEBUG
+        if let report = try? JSONSerialization.data(withJSONObject: [
+            "observed_at": ISO8601DateFormatter().string(from: Date()),
+            "executor": "on-device app activating itself through its native service",
+            "activation_accepted": succeeded
+        ]) {
+            let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("local-control-foreground.json")
+            try? report.write(to: file, options: [.atomic, .completeFileProtection])
+        }
+        #endif
     }
 }
