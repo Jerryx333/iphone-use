@@ -71,7 +71,7 @@ final class BrowserLibraryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: file), original)
     }
     func testMetadataOnlyReimportWithChangedSiteDropsFormerSessionScope() throws {
-        let (library, file, _) = fixture()
+        let (library, file, key) = fixture()
         defer { try? FileManager.default.removeItem(at: file) }
         try library.importPayload(payload("work", secret: "synthetic-old-cookie"), selected: ["work"],
                                   includeCookies: true, includeStorage: true, includeBookmarks: false,
@@ -87,6 +87,12 @@ final class BrowserLibraryTests: XCTestCase {
         XCTAssertTrue(changed.cookies.isEmpty)
         XCTAssertTrue(changed.localStorage.isEmpty)
         XCTAssertTrue(changed.needsApply)
+        let reopened = BrowserLibrary(file: file, key: key)
+        let persisted = try XCTUnwrap(reopened.accounts.first { $0.id == id })
+        XCTAssertEqual(persisted.domains, ["new.test"])
+        XCTAssertTrue(persisted.cookies.isEmpty)
+        XCTAssertTrue(persisted.localStorage.isEmpty)
+        XCTAssertTrue(persisted.needsApply)
     }
     func testDesktopPairingAndEncryptedVaultBinding() throws {
         let (library, file, key) = fixture(); defer { try? FileManager.default.removeItem(at: file) }

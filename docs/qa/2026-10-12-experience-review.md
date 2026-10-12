@@ -56,3 +56,5 @@
 账号范围改变的导入保护：同一个外部账号 ID 换了网站范围，会过滤旧 Cookie 并重新应用所选账号的网站数据；首个 HTTPS 网站改变时清除旧 localStorage，不把原网站的登录数据写入新网站。超出新范围的启动地址不再恢复。范围未变时保留现有会话，不触发额外清理；确认导入页说明范围变化的处理。
 
 真实 BrowserAccountScope 源码及 5 项 XCTest 在独立 Package 通过，BrowserAccount/BrowserCookie/JSONValue/域名检查从源码提取，均用合成数据，日志 `/tmp/iphone-browser-scope-tests.log`。另新增完整 BrowserLibrary 的“只导入书签但网站范围改变”回归，完整 iOS App/test build-for-testing 通过，日志 `/tmp/iphone-browser-scope-test-build.log`；此资料库回归仅编译，尚未在 App XCTest 或手机运行。没有读取真实账号或修改其他会话的浏览器资料。签名候选与当前真机均未包含本次改动。
+
+资料库运行回归补强：实际 BrowserLibrary、BrowserAccountScope、网站目录和 ChromeBinding 源码在 macOS 独立 Package 中运行 3 项 XCTest 通过，包括损坏文件保留、范围更改后加密写入并重新加载、合成 Chrome 配对密钥加密持久化，日志 `/tmp/iphone-browser-vault-tests.log`。测试方法从 App 的 BrowserLibraryTests 提取；只排除未使用的原生包解密桥，Keychain 适配器会在任何读写时立即失败，测试始终显式提供合成密钥，未访问用户 Keychain。使用真实 CryptoKit/AES-GCM 和临时文件。该结果覆盖资料库实际导入/保存/读回，仍不等于 WebKit 账号切换或手机真实登录验收。
