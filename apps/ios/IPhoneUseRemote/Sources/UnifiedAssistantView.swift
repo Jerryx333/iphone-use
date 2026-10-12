@@ -110,6 +110,13 @@ struct UnifiedAssistantView: View {
                     if assistant.busy { ProgressView() }
                 }.padding(20)
             }
+            .onAppear {
+                guard let id = assistant.task?.id else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    reader.scrollTo(id, anchor: .bottom)
+                }
+            }
             .appOnChange(of: assistant.task?.id) { _, id in
                 guard let id else { return }
                 Task { @MainActor in
