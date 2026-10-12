@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-12T02:34:20Z",
+  "candidate": "PhoneUse-handoff.app",
+  "application_bundle": "com.leeguoo.iphone-use.remote",
+  "build": 17,
+  "nested_applications": 0,
+  "main_executable_sha256": "8d53f3a25d3adae920dc1f4b475c1c742d967af91782b5b126e676c5b3b2b773",
+  "signed_package_verified": true,
+  "installed": true,
+  "own_obsolete_apps_removed": [
+    "com.leeguoo.iphone-use.selfhost-probe",
+    "com.leeguoo.iphone-use.selfhost-runner.xctrunner"
+  ],
+  "normal_mac_daemon_loaded": false,
+  "normal_mac_supervisor_loaded": false,
+  "local_control_state": "stopped before installation",
+  "recipient": "codex-01a128dc",
+  "cold_boot_accepted": false,
+  "remaining_project_app_cleanup": true
+}

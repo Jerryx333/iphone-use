@@ -177,6 +177,11 @@ enum DeviceStore {
     static let thisPhoneAddress = "http://127.0.0.1:8787"
     static let standalonePhoneAddress = "http://127.0.0.1:18787"
 
+    static var supportsStandaloneControl: Bool {
+        guard #available(iOS 17.4, *) else { return false }
+        return Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true
+    }
+
     static func isThisPhone(_ address: String) -> Bool {
         same(address, thisPhoneAddress) || same(address, "http://localhost:8787")
             || same(address, standalonePhoneAddress) || same(address, "http://localhost:18787")

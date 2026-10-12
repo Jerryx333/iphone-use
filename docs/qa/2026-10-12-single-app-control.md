@@ -15,12 +15,20 @@
 
 ## 本轮发现与修复
 
-后台返回后的第二次合成控件验收，点击通过但输入后置条件失败，见 [原始报告](2026-10-12-single-app-control/after-background-control.json)。验收页已在每轮重新创建输入控件并退出旧焦点，修改后待复测，不将失败记录改写为通过。
+后台返回后的第二次合成控件验收，点击通过但输入后置条件失败，见 [原始报告](2026-10-12-single-app-control/after-background-control.json)。验收页在每轮重新创建输入控件并退出旧焦点后，连续两轮真实点击、输入、AX 和截图均通过，分别 1.83 / 1.87 秒，见 [第一轮](2026-10-12-single-app-control/revised-control-first.json)与[重复轮](2026-10-12-single-app-control/revised-control-repeat.json)。原失败证据保留。
 
-停止本机控制会结束同进程的 XCTest 主 App。原顺序可能让关闭网络扩展的后续代码无法执行；改为先保存停止意图、禁用自动重连，再停止网络扩展，由扩展收尾控制会话。修订候选 `PhoneUse-verified.app` 已签名安装，当前手机锁屏，系统拒绝启动，等待人解锁后验收。
+停止本机控制会结束同进程的 XCTest 会话。原顺序可能让关闭网络扩展的后续代码无法执行；改为先保存停止意图、禁用自动重连，再停止网络扩展，由扩展收尾控制会话。`PhoneUse-verified.app` 的实际停止按钮已验证：网络扩展进程退出，18100 先关闭，18787 随会话收尾关闭。见 [stop.json](2026-10-12-single-app-control/stop.json)。随后补充停用后的页面状态复位，避免旧的 running 状态禁用启用按钮。
+
+本机自主控制入口限制为 iOS 17.4+，主 App 部署目标仍是 iOS 15；旧系统继续使用电脑托管入口。旧系统真机兼容性尚未验收，不以编译结果代替。
 
 ## 尚待验收
 
-最终修订的重复输入验收、完整重启后的独立恢复、停止/重新启用，以及删除旧自有实验 App 后的最终状态。先前两 App 实验的验收不能代替这些项目。
+最终页面状态复位后的启用操作、完整重启后的独立恢复，以及删除旧自有实验 App 后的最终状态。先前两 App 实验的验收不能代替这些项目。协调会话已请求将 iPhone 17 交给 `codex-01a128dc` 完成单 App 的语音与真实执行验收，本轮不再重启手机。
 
 源码位于 `feat/single-app-control` 独立 worktree。协调会话更新的 `db9897c/libipu_embed.a` 与 loopback 配置原样保留；不修改 Mac 的代理出口。正常 Mac supervisor 当前暂停，恢复它会重新安装旧 runner，须与最终只留一个 App 的迁移一起处理。
+
+## 交接状态
+
+`PhoneUse-handoff.app`（主 App build 17）已签名安装，含最后的停用状态复位和旧系统入口限制。停止后的控制会话、daemon 与网络扩展均退出，租约随进程退出释放；正常 Mac daemon 和 supervisor 仍未加载。最新包仅完成构建/签名/安装，不能套用上一修订的全部运行证据。
+
+已删除本会话的 `selfhost-probe` 与 `selfhost-runner.xctrunner`。还留有其他会话的 `voiceqa` 与两个旧正常 runner；交接时逐项说明，由接手会话处理设置迁移和最终单 App 清理。原主 App 的用户数据与共享 Keychain 配对记录保留。临时 Mac 控制令牌和二维码文件在交接前删除，不进入报告。见 [handoff.json](2026-10-12-single-app-control/handoff.json)。

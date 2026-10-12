@@ -50,6 +50,8 @@ import Foundation
         do { try await manager.saveToPreferences() }
         catch { self.error = error.localizedDescription; return }
         manager.connection.stopVPNTunnel()
+        nativePhase = "stopped"
+        nativeError = ""
     }
     func startAndCommand(_ command: String) async {
         if manager?.connection.status != .connected { await start() }
@@ -95,7 +97,10 @@ import Foundation
         case .connected: state = "已启用"
         case .connecting: state = "正在启用"
         case .disconnecting: state = "正在停止"
-        default: state = "未启用"
+        default:
+            state = "未启用"
+            nativePhase = "stopped"
+            nativeError = ""
         }
         guard manager.connection.status == .connected, let session = manager.connection as? NETunnelProviderSession else { return }
         await receive(session, command: "status")

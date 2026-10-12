@@ -236,7 +236,7 @@ struct UnifiedAssistantView: View {
                 }
             }
             .sheet(isPresented: $pairing) {
-                if Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true {
+                if DeviceStore.supportsStandaloneControl {
                     AppNavigationStack { LocalControlSetupView(app: app) }
                 } else { PairThisPhoneSheet(app: app) }
             }

@@ -206,7 +206,7 @@ final class AgentController: ObservableObject {
     static func describe(_ error: Error, onThisPhone: Bool) -> String {
         if onThisPhone, case .unreachable = ConnectProblem(error),
            error is DaemonError || error is URLError {
-            if Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true {
+            if DeviceStore.supportsStandaloneControl {
                 return String(localized: "本机控制未连接。请在「设置 › 本机控制」中启用，再重试。")
             }
             return String(localized: "本机执行服务未连接。请从 Mac 启动这台 iPhone 的执行服务，再重试。")

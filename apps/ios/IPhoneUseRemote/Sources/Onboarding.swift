@@ -7,7 +7,7 @@ struct WelcomeView: View {
     @State private var scanning = false
     @State private var manual = false
     @State private var manualAfterScan = false
-    private var standalone: Bool { Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true }
+    private var standalone: Bool { DeviceStore.supportsStandaloneControl }
 
     var body: some View {
         AppNavigationStack {

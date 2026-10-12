@@ -30,14 +30,18 @@ any nested `.app`. It keeps the main app identifier/data and seals the final app
 with the exact certificate used by the main build. Signed builds and package
 checks have passed. Unified-process real tap/type/source/screenshot, 169-second
 background source access with Calculator foreground, and the main app's QR
-pairing have passed without USB or a running Mac supervisor. The final stop and
-repeat-input fixes, cold reboot and removal of obsolete owned apps remain pending.
+pairing have passed without USB or a running Mac supervisor. Revised repeat-input
+checks passed twice, and the stop button shuts down the extension/control endpoints.
+The final stop-state UI, cold reboot and removal of obsolete owned apps remain pending.
 See [the current acceptance record](../../docs/qa/2026-10-12-single-app-control.md).
 The earlier two-app prototype's acceptance does not cover these new conditions.
 Final acceptance must install only this candidate, remove the owned obsolete
 probe/runner products after success, verify voice/browser/phone control and QR
 connection, then repeat independent background, stop/restart and cold-boot tests.
 The existing Mac-backed client remains supported by ordinary app builds.
+The main app's deployment target remains iOS 15. Standalone hosting requires
+iOS 17.4 or newer; older systems keep the existing Mac-backed entry points.
+Older-device physical acceptance remains separate.
 
 Native iOS app (SwiftUI, iOS 15+) for driving a phone that the iphone-use daemon serves.
 It logs in with the daemon's control password, shows the screen as H.264 from

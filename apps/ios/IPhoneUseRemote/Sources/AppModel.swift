@@ -107,7 +107,7 @@ final class AppModel: ObservableObject {
     /// Attach the phone's own authenticated service without asking for an
     /// address/password or creating a second companion-app workflow.
     func connectStandaloneControlIfReady() async -> Bool {
-        guard Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true,
+        guard DeviceStore.supportsStandaloneControl,
               !connectingStandalone else { return false }
         if let record = devices.first(where: { $0.address == DeviceStore.standalonePhoneAddress }),
            sessions[record.id]?.phase == .connected { return true }

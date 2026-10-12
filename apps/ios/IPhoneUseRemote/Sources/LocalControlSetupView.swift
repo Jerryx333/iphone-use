@@ -31,7 +31,7 @@ struct LocalControlSetupView: View {
                         await tunnel.startAndCommand("launch")
                         busy = false
                     }
-                }.disabled(busy || starting || tunnel.nativePhase == "running" || !completePackage || ProtectedStore.read("pair_record") == nil)
+                }.disabled(busy || starting || tunnel.nativePhase == "running" || !DeviceStore.supportsStandaloneControl || ProtectedStore.read("pair_record") == nil)
                 Button("停止本机控制", role: .destructive) {
                     Task {
                         busy = true
@@ -44,6 +44,9 @@ struct LocalControlSetupView: View {
                 if busy { ProgressView("正在设置") }
                 if let message { Text(message).foregroundStyle(.secondary) }
                 if !completePackage { Text("此版本尚未包含完整的本机控制组件。") }
+                else if !DeviceStore.supportsStandaloneControl {
+                    Text("本机独立控制需要 iOS 17.4 或更新版本。当前系统仍可连接电脑托管的控制服务。")
+                }
                 if !tunnel.error.isEmpty || !tunnel.nativeError.isEmpty {
                     Text("本机控制尚未就绪。请保持手机解锁并连接 Wi-Fi，再尝试启用；首次使用请先完成配对和系统网络授权。")
                         .foregroundStyle(.secondary)
