@@ -47,6 +47,7 @@ struct UnifiedAssistantView: View {
 
     var body: some View {
         AppNavigationStack {
+            ScrollViewReader { reader in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     if assistant.history.isEmpty && assistant.task == nil {
@@ -60,7 +61,7 @@ struct UnifiedAssistantView: View {
                     }
                     ForEach(assistant.history.reversed()) { task in taskCard(task) }
                     if let task = assistant.task {
-                        taskCard(task)
+                        taskCard(task).id(task.id)
                         if assistant.task?.stopRequested != true, let native = assistant.native, let prompt = native.pendingConfirm {
                             VStack(alignment: .leading, spacing: 10) {
                                 Label("需要确认手机操作", systemImage: "hand.raised")
@@ -108,6 +109,21 @@ struct UnifiedAssistantView: View {
                     if let message = assistant.message { Text(message).foregroundStyle(Theme.attention).font(.footnote) }
                     if assistant.busy { ProgressView() }
                 }.padding(20)
+            }
+            .appOnChange(of: assistant.task?.id) { _, id in
+                guard let id else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    reader.scrollTo(id, anchor: .bottom)
+                }
+            }
+            .appOnChange(of: assistant.task?.state) { _, state in
+                guard let state, [.done, .stopped, .failed].contains(state), let id = assistant.task?.id else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    reader.scrollTo(id, anchor: .bottom)
+                }
+            }
             }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 8) {
