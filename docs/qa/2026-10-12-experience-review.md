@@ -66,3 +66,7 @@
 最终包前的结构核对：用真实 build19 主 App 与现有控制产品执行 assemble/validate_main，确认 IPUSingleAppControl=true、唯一 PhoneUse.xctest、两个扩展、没有嵌套 runner App；报告 `/tmp/iphone-experience-build19-packaging-check.json`。主可执行文件及控制测试 binary 的 LC_BUILD_VERSION 均为 minos15.0/sdk27.0。这只验证组装和最低链接目标，控制产品仍是旧嵌入库；临时组装包已删除，未签名或安装，不能作为包含录制修复的最终候选。
 
 原生更新以干净源码1a31311提交到 heavy-cargo 队列：`IPHONEOS_DEPLOYMENT_TARGET=15.0 heavy-cargo build -p ios-embed --release --target aarch64-apple-ios`，独立 target 在本 worktree，日志 `/tmp/iphone-experience-native-build19.log`。原定向 Rust 测试已进入实际编译，沿用原 session；原生库排在其后，不并行启动重型构建。旧系统实机型号/版本已向用户询问，尚未确认设备；最低链接版本不是旧系统实机安装证据。
+
+录制服务端定向回归现已执行通过：原 heavy-cargo session57764 正常退出0，1项通过、821项过滤，运行0.17秒，冷编译29分钟。该原始测试新增断言实际验证停止后保留、重复停止、隐式保存、错误文档/旧版本不确认、正确保存清除及新录制无旧草稿。结果与当前 Rust 源文件哈希记录在 `/tmp/iphone-experience-recording-rust-result.json`。这不是822项完整回归；完整 `heavy-cargo test -p server --lib` 已排队，日志 `/tmp/iphone-experience-server-full-regression.log`，将在当前 iOS 嵌入库构建后执行。
+
+当前新嵌入库已进入实际 Cargo/rustc 编译，沿用 session88521；不因没有即时输出重启。尚无新库完成/签名安装证据。语音会话2bb607e已明确其 build19 候选尚未安装且后续读屏出现 wda_source_failed，记录中的 ready/serving 不替代控制结果；本分支不把该报告作为已完成真机验收。
