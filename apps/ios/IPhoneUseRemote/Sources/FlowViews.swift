@@ -3,91 +3,18 @@ import SwiftUI
 
 // MARK: - Recording
 
-/// A recording in the remote view: started and stopped on the device's
-/// daemon, its step count read every 2 s while it runs, its draft kept for
-/// the save sheet. The daemon owns the recording; this only mirrors it, so
-/// a remote view opened later shows one still running.
-@MainActor
-final class FlowRecorder: ObservableObject {
-    @Published private(set) var recording = false
-    @Published private(set) var steps = 0
-    @Published private(set) var busy = false
-    /// Set when a recording stops with something in it: the save sheet.
-    @Published var draft: FlowDraft?
-    @Published var message: String?
-
-    private weak var session: DeviceSession?
-    private var pollTask: Task<Void, Never>?
-
-    init(session: DeviceSession) {
-        self.session = session
-    }
-
-    /// Read whether a recording already runs there (the view appeared).
-    func sync() async {
-        guard let client = session?.client, let state = try? await client.recordingState() else { return }
-        apply(state)
-    }
-
-    func toggle() async {
-        recording ? await stop() : await start()
-    }
-
-    func start() async {
-        guard let client = session?.client, !busy else { return }
-        busy = true
-        defer { busy = false }
-        do {
+extension FlowRecorder {
+    convenience init(session: DeviceSession) {
+        self.init(read: { [weak session] in
+            guard let client = session?.client else { throw URLError(.notConnectedToInternet) }
+            return try await client.recordingState()
+        }, start: { [weak session] in
+            guard let client = session?.client else { throw URLError(.notConnectedToInternet) }
             try await client.startRecording()
-            apply(RecordingState(recording: true, steps: 0))
-            session?.show(String(localized: "开始录制：接下来的操作会记成 flow"))
-        } catch {
-            session?.show(error.localizedDescription)
-        }
-    }
-
-    func stop() async {
-        guard let client = session?.client, !busy else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let draft = try await client.stopRecording()
-            apply(RecordingState(recording: false, steps: steps))
-            if let draft, draft.flow != nil, draft.steps > 0 {
-                self.draft = draft
-            } else {
-                session?.show(String(localized: "这次没有录到步骤"))
-            }
-        } catch {
-            session?.show(error.localizedDescription)
-        }
-    }
-
-    func leave() {
-        pollTask?.cancel()
-        pollTask = nil
-    }
-
-    private func apply(_ state: RecordingState) {
-        recording = state.recording
-        steps = state.steps
-        if recording, pollTask == nil {
-            pollTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(2))
-                    guard let self, let client = self.session?.client else { return }
-                    if let state = try? await client.recordingState() {
-                        self.recording = state.recording
-                        self.steps = state.steps
-                        if !state.recording { break }
-                    }
-                }
-                self?.pollTask = nil
-            }
-        } else if !recording {
-            pollTask?.cancel()
-            pollTask = nil
-        }
+        }, stop: { [weak session] in
+            guard let client = session?.client else { throw URLError(.notConnectedToInternet) }
+            return try await client.stopRecording()
+        }, show: { [weak session] in session?.show($0) })
     }
 }
 
@@ -96,7 +23,11 @@ struct RecordingPill: View {
     @ObservedObject var recorder: FlowRecorder
 
     var body: some View {
-        if recorder.recording {
+        if !recorder.statusKnown {
+            Button("录制状态未确认 · 点击检查") { Task { await recorder.sync() } }
+                .font(.footnote).disabled(recorder.busy)
+                .accessibilityIdentifier("flow-recording-recover")
+        } else if recorder.recording {
             Button {
                 Task { await recorder.stop() }
             } label: {

@@ -411,6 +411,9 @@ pub struct FlowTrail {
     /// An explicit recording (`POST /agent/flow/record`): every applied step
     /// lands here too, across apps and pauses, until it is stopped or saved.
     recording: Option<Trail>,
+    /// Keep the stopped draft until the next recording so a lost stop reply
+    /// can be recovered by a read-only status request.
+    stopped_recording: Option<Value>,
 }
 
 /// Single actions in a row before the agent is told to batch.
@@ -607,6 +610,7 @@ impl FlowTrail {
 
     /// Start an explicit recording, dropping one in progress.
     pub fn start_recording(&mut self) {
+        self.stopped_recording = None;
         self.recording = Some(Trail::default());
     }
 
@@ -623,12 +627,16 @@ impl FlowTrail {
     /// recording or it holds no step).
     pub fn stop_recording(&mut self) -> Option<Value> {
         let recording = self.recording.take()?;
-        (!recording.steps.is_empty()).then(|| draft_json(&recording, "recording"))
+        let draft = (!recording.steps.is_empty()).then(|| draft_json(&recording, "recording"));
+        self.stopped_recording = draft.clone();
+        draft
     }
 
-    /// The recording's draft so far, without stopping it.
+    /// The active draft, or the last stopped draft until a new recording starts.
     pub fn recording_draft(&self) -> Option<Value> {
-        let recording = self.recording.as_ref()?;
+        let Some(recording) = self.recording.as_ref() else {
+            return self.stopped_recording.clone();
+        };
         (!recording.steps.is_empty()).then(|| draft_json(recording, "recording"))
     }
 
@@ -964,7 +972,11 @@ mod tests {
         );
         assert!(draft.to_string().contains("a pinch"), "unsupported steps become todo: {draft}");
         assert!(!trail.is_recording());
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "recover a lost stop reply");
         assert!(trail.stop_recording().is_none());
+        assert_eq!(trail.recording_draft(), Some(draft), "a duplicate stop must not erase it");
+        trail.start_recording();
+        assert!(trail.recording_draft().is_none(), "a new recording clears the old draft");
     }
 
     fn store(dir: &Path) -> PathBuf {

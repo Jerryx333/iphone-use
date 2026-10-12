@@ -34,3 +34,7 @@
 固定原生库位于 `/tmp/iphone-experience-native-libs-01a12715`，来源及哈希见 inputs.json；现有开发镜像及浏览器库只读引用。日志 `/tmp/iphone-experience-single-app-build.log`、工程 main-build.log/control-build.log、`/tmp/iphone-experience-test-build.log`。这些结果不代替二维码视觉、网络恢复、语音、冷启动和旧系统真机安装验收；没有操作17或启动旧 normal 服务。
 
 真实新增 XCTest 文件在独立无依赖 Swift Package 中执行 6 项通过（复制的源码/测试与提交文件相同），日志 `/tmp/iphone-provider-xctest.log`。实际 LocalTunnel + 设置页完成 Swift6/iOS15 局部类型检查，日志 `/tmp/iphone-provider-ios15-typecheck.log`；不是完整 App XCTest 或真机故障注入。未操作17、未部署候选。
+
+手动录制恢复修复：服务端保留最后一次停止的录制草稿，直到新录制开始，GET 状态可以读回；重复停止不会清掉保留草稿。App 不自动重发录制 POST，开始前先读取远端状态，避免清空已有录制。停止回复丢失后只读恢复草稿，断线显示状态未确认并保留检查入口；旧轮询回复不能覆盖停止结果，已关闭的保存页不会因再次同步重复弹出。
+
+真实 FlowRecorder 源码及 XCTest 在独立 Swift Package 执行 8 项通过，模型直接从 Flows.swift 提取，日志 `/tmp/iphone-flow-recorder-tests.log`。完整主 App 和测试目标 build-for-testing 通过，日志 `/tmp/iphone-recording-test-build.log`；这仍是编译证据。服务端定向测试已提交 heavy-cargo 机器限流队列，当前等待执行，不能记作通过。封存的99e46e9签名包不含本轮录制修复；需要更新原生嵌入库后重新组装、安装及真机录制/保存/重放验收。没有操作17、没有重新启用正常服务。
