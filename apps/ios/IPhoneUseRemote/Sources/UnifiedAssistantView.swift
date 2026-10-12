@@ -151,15 +151,17 @@ struct UnifiedAssistantView: View {
                             guard let local = app.thisPhoneSession,
                                   local.status?.drivable == true else { throw BrowserToolError.actionFailed("本机控制尚未就绪") }
                             app.agent.targetID = local.id
+                            // Resolve microphone/recognition permission sheets before
+                            // launching Settings, so they cannot obscure the readback.
+                            await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant))
+                            if DeviceQAOptions.contains("--phone-tools-qa"), !app.voiceCall.muted {
+                                app.voiceCall.toggleMute()
+                            }
                             if DeviceQAOptions.contains("--phone-tools-qa") {
                                 if assistant.task?.active == true { await assistant.stop() }
                                 await assistant.archiveInterruptedDeviceQA(goal: "打开设置，读取当前屏幕标题和至少三个可见项目，把这些实际文字告诉我，然后返回助手。不要更改任何设置。")
                                 toolQAStarted = assistant.start("打开设置，读取当前屏幕标题和至少三个可见项目，把这些实际文字告诉我，然后返回助手。不要更改任何设置。", mode: .phone)
                                 if toolQAStarted { toolQATaskID = assistant.task?.id }
-                            }
-                            await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant))
-                            if DeviceQAOptions.contains("--phone-tools-qa"), !app.voiceCall.muted {
-                                app.voiceCall.toggleMute()
                             }
                             if DeviceQAOptions.contains("--phone-screen-qa"), let api = assistant.local?.client {
                                 Task { @MainActor in
@@ -192,6 +194,8 @@ struct UnifiedAssistantView: View {
                                         var report: [String: Any] = ["observed_at": ISO8601DateFormatter().string(from: Date()), "qa_started": toolQAStarted, "model_count": assistant.models.count, "primary_model": assistant.models.first?.model ?? "none", "state": assistant.task?.state.rawValue ?? "none", "native_phase": assistant.native?.phase ?? "none", "native_steps": assistant.native?.steps.map { ["action": $0.action, "ok": $0.ok, "error": $0.error ?? ""] as [String: Any] } ?? [], "error": assistant.message ?? assistant.native?.error ?? "", "result": assistant.task?.reply ?? assistant.native?.summary ?? ""]
                                         if #available(iOS 16.1, *) {
                                             report["live_activity_enabled"] = ActivityAuthorizationInfo().areActivitiesEnabled
+                                            report["live_activity_error_code"] = AgentLiveStatus.shared.activityFailureCode ?? ""
+                                            report["app_state"] = UIApplication.shared.applicationState.rawValue
                                             report["live_activity_count"] = Activity<AgentActivityAttributes>.activities.count
                                             peakLiveActivities = max(peakLiveActivities, Activity<AgentActivityAttributes>.activities.count)
                                             report["peak_live_activity_count"] = peakLiveActivities
