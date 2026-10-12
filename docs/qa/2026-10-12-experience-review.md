@@ -62,3 +62,7 @@
 整合 e0ad3a1 的本机重启入口时补齐正式接线：该提交只更新实验目录的 PhoneTunnelProvider，正式 App 当时编译独立旧副本。正式工程现直接编译统一的 experiments/phone-self-host/Tunnel/PhoneTunnelProvider.swift，删除重复副本，后续更新不会漏进正式扩展。主 App/test build-for-testing 通过，日志 `/tmp/iphone-restart-canonical-test-build.log` 明确记录 PhoneLocalControlTunnel 目标编译统一源文件。
 
 重启检查不会再忽略任务查询失败：进入操作即设 busy，当前服务不可连接或任务读取失败时保留服务并显示原因，只有成功读取且所列任务全部终态时才发 restart。任务列表客户端不再把坏 JSON 当空列表、也不再丢弃无法解码的行。真实 AgentTaskList 和现有任务模型提取到独立 Package，4 项 XCTest 通过，日志 `/tmp/iphone-agent-task-list-tests.log`。完整 App/test 编译覆盖该入口与之前的资料库读回测试，但本轮未签名安装或执行真机重启。Rust 录制回归仍是原来的排队 session，未报通过。
+
+最终包前的结构核对：用真实 build19 主 App 与现有控制产品执行 assemble/validate_main，确认 IPUSingleAppControl=true、唯一 PhoneUse.xctest、两个扩展、没有嵌套 runner App；报告 `/tmp/iphone-experience-build19-packaging-check.json`。主可执行文件及控制测试 binary 的 LC_BUILD_VERSION 均为 minos15.0/sdk27.0。这只验证组装和最低链接目标，控制产品仍是旧嵌入库；临时组装包已删除，未签名或安装，不能作为包含录制修复的最终候选。
+
+原生更新以干净源码1a31311提交到 heavy-cargo 队列：`IPHONEOS_DEPLOYMENT_TARGET=15.0 heavy-cargo build -p ios-embed --release --target aarch64-apple-ios`，独立 target 在本 worktree，日志 `/tmp/iphone-experience-native-build19.log`。原定向 Rust 测试已进入实际编译，沿用原 session；原生库排在其后，不并行启动重型构建。旧系统实机型号/版本已向用户询问，尚未确认设备；最低链接版本不是旧系统实机安装证据。
