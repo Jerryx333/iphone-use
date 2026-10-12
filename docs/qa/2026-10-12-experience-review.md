@@ -8,7 +8,7 @@
 | 手机与内置浏览器连续执行 | 最终包中真实 browser → phone → browser，结果与恢复均可读回 | 旧 build 15 通过不代替新包 |
 | 免费模型开箱可用 | 新配置下无需私有密钥，真实执行与模型记录，网络失败能恢复 | 原免费模型任务已通过；新转发路径需跟候选复验 |
 | chrome-use site 深度复用 | 手机更新目录、脚本校验、真实网站操作；不隐式转电脑 | 目录/合成任务通过；真实登录网站与最终包需补验 |
-| Cookie 与资料隔离同步 | 用户选择账号/站点后导入，跨账号无泄漏、重启后恢复 | 本轮只使用合成资料，不自动迁移真实凭据 |
+| Cookie 与资料隔离同步 | 用户选择账号/站点后导入，跨账号无泄漏、重启后恢复 | build21模拟器合成账号隔离、Legacy回退及资料库读回通过；真机仍待验收 |
 | 连续中文语音 | 识别、真实执行、播报、中断/换任务、后台与重连 | 由语音会话占用 17 继续验收 |
 | 灵动岛及旧设备状态 | 当前/下一步、暂停/风险提示、无重复活动；无岛设备有 App 内状态 | 新最终包需复验，不能只看源码 |
 | 风险允许/拒绝 | 提示匹配任务，拒绝 0 步、允许只执行对应步骤，回前台可操作 | 原 build 17 两分支通过，新包仍需覆盖 |
@@ -96,3 +96,8 @@ build21 使用已通过821项 server 回归的新1a31311嵌入库及既有固定
 6. 测试结束清理仅本轮 qa/record-fixture-* 流及合成输入，确认两端配对/会话停止或按交接要求保留，设备租约释放。收集目标 build/包哈希、设备型号/系统、配对结果、录制前后计数与文字、保存 ID/步骤/参数、重放后置条件、断线恢复和清理结果；不公开原始图片、连接码或凭据。
 
 独立复核语音会话 build21：现场 codesign deep/strict 校验通过，实际控制二进制 SHA256 73903bf5dace68dab6e8781817ac6707879601a64468a26492a1baae5d1fba12 与其已提交 build21-candidate.json 一致，唯一控制 bundle、无嵌套 App。对方仍保留17且明确未安装。报告声称114项合并回归，原始执行日志/xcresult路径已请求，尚未取得，当前只记为待范围核对，不用该数字证明手机端完成。
+
+
+build21 原始 iOS 回归已独立核对：日志 `/tmp/iphone17-build21-regression.log` 包含 only-testing 的15个测试类和114项0失败/TEST SUCCEEDED；xcresult `/Users/leo/github.com/iphone-voice-single-app/apps/ios/build-single-voice-sim/Logs/Test/Test-IPhoneUseRemote-2026.10.12_14-29-16-+0900.xcresult` 经当前 xcresulttool 读取为114通过、0失败、0跳过。平台明确为 iOS Simulator 26.5，模拟型号iPhone14（Phone Voice Regression），不是实机14，也不是iOS15/16。
+
+重点运行用例实际 Passed：BrowserLibrary 的加密导入与账号隔离、Legacy ephemeral恢复、只导入书签但网站范围改变；FlowRecorder 的晚到轮询保护与未知停止后恢复；ZenStream 的完整终态工具调用缺index兼容。其余选择范围为模型转发、统一助手、语音会话/通话、模型payload、任务解码、设备身份、任务列表、provider超时、账号scope、storage恢复、录制和保存。独立导出的 summary/tests JSON 在 `/tmp/iphone-experience-build21-xctest-summary.json` 与 `/tmp/iphone-experience-build21-xctest-tests.json`。这将对应App运行测试从未核对升级为已核对；不改变设备安装、声音/麦克风实机、连续读屏、最终风险确认、两机互控和旧系统安装均未完成的边界。
