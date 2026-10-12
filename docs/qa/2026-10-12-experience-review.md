@@ -52,3 +52,7 @@
 真实 BrowserStorageRestore 源码和 3 项 XCTest 在 macOS 独立 Package 中执行通过，使用 WebKit 的真实 WKUserContentController 和 JavaScriptCore 运行合成状态；JSONValue 从现有源码提取，没有读取用户浏览器、Cookie 或 Keychain。日志 `/tmp/iphone-browser-storage-tests.log`。完整 App/test build-for-testing 通过，日志 `/tmp/iphone-browser-storage-test-build.log`；这不代替手机真实网站登录/退出和 iOS15/16 安装验收。封存签名包尚未更新。
 
 已核对并合入语音会话已提交的 f107594/d3d04c9，本分支整合提交 b766fdb，版本变为 build19。显式启动返回前台及实际前台状态记录，与本分支已有的 ProviderMessageRequest 超时/取消/旧回复保护共存。重新生成工程后完整 App/test build-for-testing 通过，日志 `/tmp/iphone-experience-build19-test-build.log`；未安装这个整合版本，封存 build18 包仍是旧候选。Rust 定向回归继续等待原队列，不能宣称这批录制服务端修改已通过或已进入当前真机嵌入库。
+
+账号范围改变的导入保护：同一个外部账号 ID 换了网站范围，会过滤旧 Cookie 并重新应用所选账号的网站数据；首个 HTTPS 网站改变时清除旧 localStorage，不把原网站的登录数据写入新网站。超出新范围的启动地址不再恢复。范围未变时保留现有会话，不触发额外清理；确认导入页说明范围变化的处理。
+
+真实 BrowserAccountScope 源码及 5 项 XCTest 在独立 Package 通过，BrowserAccount/BrowserCookie/JSONValue/域名检查从源码提取，均用合成数据，日志 `/tmp/iphone-browser-scope-tests.log`。另新增完整 BrowserLibrary 的“只导入书签但网站范围改变”回归，完整 iOS App/test build-for-testing 通过，日志 `/tmp/iphone-browser-scope-test-build.log`；此资料库回归仅编译，尚未在 App XCTest 或手机运行。没有读取真实账号或修改其他会话的浏览器资料。签名候选与当前真机均未包含本次改动。
