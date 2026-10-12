@@ -3,3 +3,6 @@
 /Tools/.mock-stream-*
 /build-phone-runtime/
 /build-phone-runtime-sim/
+
+/build-single-voice-check/
+/build-single-voice-sim/

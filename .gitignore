@@ -24,3 +24,7 @@ url.txt
 /apps/ios/build-single-app/
 /iPhoneUse.app/
 assets/icon-1024-old.png
+
+# Local build inputs may be immutable symlinks, never source artifacts.
+/apps/ios/SessionLibraries
+/experiments/phone-self-host/Resources/

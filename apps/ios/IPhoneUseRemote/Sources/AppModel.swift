@@ -203,12 +203,6 @@ final class AppModel: ObservableObject {
     }
 
     var focused: DeviceSession? { focusedID.flatMap { sessions[$0] } }
-    var thisPhoneSession: DeviceSession? {
-        let local = devices.filter(\.isThisPhone)
-        let preferred = local.first { $0.address == DeviceStore.standalonePhoneAddress }
-            ?? local.first
-        return preferred.flatMap { sessions[$0.id] }
-    }
 
     func session(_ id: UUID) -> DeviceSession? { sessions[id] }
 
