@@ -30,6 +30,36 @@ struct IPhoneUseRemoteApp: App {
                         await tunnel.load()
                         await tunnel.startAndCommand("launch")
                     }
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-status") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        for _ in 0..<3 {
+                            await tunnel.refresh()
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        }
+                        var report: [String: Any] = [
+                            "observed_at": ISO8601DateFormatter().string(from: Date()),
+                            "native_phase": tunnel.nativePhase,
+                            "native_error": tunnel.nativeError,
+                            "drivable": await app.connectStandaloneControlIfReady()
+                        ]
+                        do {
+                            let response = try await PhoneRunnerClient().request("GET", "/status")
+                            if let value = response["value"] as? [String: Any] {
+                                report["runner_ready"] = value["ready"] as? Bool ?? false
+                                if let daemon = value["daemon"] as? [String: Any] {
+                                    report["daemon_linked"] = daemon["linked"] as? Bool ?? false
+                                    report["daemon_state"] = daemon["state"] as? String ?? "unknown"
+                                    report["daemon_error"] = daemon["error"] as? String ?? ""
+                                }
+                            }
+                        } catch { report["runner_status_error"] = "authenticated_runner_status_unavailable" }
+                        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+                            let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                                .appendingPathComponent("local-control-diagnostics.json")
+                            try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                        }
+                    }
                     #endif
                     if ProtectedStore.read("session_enabled") == Data([1]) {
                         for _ in 0..<30 {

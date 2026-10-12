@@ -140,7 +140,16 @@ struct UnifiedAssistantView: View {
                     voiceQAStarted = true
                     if #available(iOS 17.4, *) {
                         do {
-                            guard await app.connectStandaloneControlIfReady(), let local = app.thisPhoneSession else { throw BrowserToolError.actionFailed("本机控制尚未就绪") }
+                            // The native launcher and this view start concurrently.
+                            // Wait for the authenticated service rather than failing QA
+                            // before the runner has had a chance to finish launching.
+                            for _ in 0..<45 {
+                                if Task.isCancelled { return }
+                                if await app.connectStandaloneControlIfReady() { break }
+                                try await Task.sleep(nanoseconds: 1_000_000_000)
+                            }
+                            guard let local = app.thisPhoneSession,
+                                  local.status?.drivable == true else { throw BrowserToolError.actionFailed("本机控制尚未就绪") }
                             app.agent.targetID = local.id
                             if ProcessInfo.processInfo.arguments.contains("--phone-tools-qa") {
                                 if assistant.task?.active == true { await assistant.stop() }
