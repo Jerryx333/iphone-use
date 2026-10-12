@@ -46,3 +46,7 @@
 取消保存后的草稿入口：关闭保存页保留 pendingDraft，遥控页和菜单可继续保存；新录制前必须先保存或明确忽略已有草稿。重新打开遥控页时只读取回服务端停止草稿，以按钮提示，不自动弹页。成功保存会按原文档及录制版本清除服务端待保存状态，避免后台写入期间把新录制清掉；保存其他文档和失败写入都不清除它。
 
 新增 4 项 FlowRecorder XCTest 覆盖关闭重开、阻止覆盖、重新进入遥控页和保存后再次同步，当前独立 Package 共 17 项通过，源码/测试复制文件均一致；当前日志 `/tmp/iphone-flow-recorder-tests.log`。完整 App/test build-for-testing 通过，日志 `/tmp/iphone-recording-pending-test-build.log`。Rust 对同一保留草稿测试补充成功保存/错误文档/旧版本断言，尚未执行完成；同一个 heavy-cargo session 持续存活，没有因观察超时重启。签名、部署和真机录制重放均未宣称完成。
+
+浏览器 localStorage 恢复：此前导入脚本一直留在 WebView 中，后续导航可能把新登录或退出后的状态改回旧备份。现在选定 HTTPS 原站点（默认端口）第一次加载完成后移除本次恢复脚本，保留其他用户脚本；错误站点、子域、HTTP 或其他端口不会提前消耗恢复。账号选择持久化失败时不再先移除旧浏览器的 Cookie 观察器和停止其任务。
+
+真实 BrowserStorageRestore 源码和 3 项 XCTest 在 macOS 独立 Package 中执行通过，使用 WebKit 的真实 WKUserContentController 和 JavaScriptCore 运行合成状态；JSONValue 从现有源码提取，没有读取用户浏览器、Cookie 或 Keychain。日志 `/tmp/iphone-browser-storage-tests.log`。完整 App/test build-for-testing 通过，日志 `/tmp/iphone-browser-storage-test-build.log`；这不代替手机真实网站登录/退出和 iOS15/16 安装验收。封存签名包尚未更新。

@@ -12,6 +12,7 @@ final class BrowserWorkspace: NSObject, ObservableObject, WKHTTPCookieStoreObser
     private let reasoning: any BrowserReasoning
     private var visits: AnyCancellable?
     private var cookieCapture: Task<Void, Never>?
+    private var storageRestore: BrowserStorageRestore?
     init(library: BrowserLibrary? = nil, reasoning: any BrowserReasoning = BrowserModelClient()) {
         let library = library ?? BrowserLibrary()
         self.library = library; self.reasoning = reasoning
@@ -36,6 +37,7 @@ final class BrowserWorkspace: NSObject, ObservableObject, WKHTTPCookieStoreObser
         browser.webView.configuration.websiteDataStore.httpCookieStore.add(self)
         visits = browser.$loading.dropFirst().filter { !$0 }.sink { [weak self] _ in
             guard let self, let url = self.browser.webView.url?.absoluteString else { return }
+            if let destination = self.browser.webView.url { self.storageRestore?.completedNavigation(to: destination) }
             do { try self.library.recordVisit(url, title: self.browser.title) } catch { self.library.error = error.localizedDescription }
         }
     }
@@ -52,9 +54,10 @@ final class BrowserWorkspace: NSObject, ObservableObject, WKHTTPCookieStoreObser
         switching = true
         defer { switching = false }
         if !library.active.needsApply { await capture() }
+        try library.select(id)
         browser.webView.configuration.websiteDataStore.httpCookieStore.remove(self)
         agent.stop()
-        try library.select(id)
+        storageRestore = nil
         browser = BrowserSession(dataStore: Self.store(for: id))
         agent = BrowserAgent(browser: browser, reasoning: reasoning, library: library)
         bindVisits()
@@ -106,11 +109,11 @@ final class BrowserWorkspace: NSObject, ObservableObject, WKHTTPCookieStoreObser
                 await withCheckedContinuation { continuation in cookies.setCookie(cookie) { continuation.resume() } }
             }
         }
-        if apply, let host = account.domains.first, !account.localStorage.isEmpty,
-           let data = try? JSONEncoder().encode(account.localStorage), let json = String(data: data, encoding: .utf8),
-           let originData = try? JSONEncoder().encode("https://" + host), let origin = String(data: originData, encoding: .utf8) {
-            let script = "if (location.origin === " + origin + ") { const values = " + json + "; for (const [key,value] of Object.entries(values)) { if (!['__proto__','constructor','prototype'].includes(key)) localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value)); } }"
-            browser.webView.configuration.userContentController.addUserScript(.init(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        if apply, let host = account.domains.first, !account.localStorage.isEmpty {
+            do {
+                storageRestore = try BrowserStorageRestore(controller: browser.webView.configuration.userContentController,
+                                                           host: host, values: account.localStorage)
+            } catch { library.error = error.localizedDescription }
         }
         do { try library.markApplied(account.id) } catch { library.error = error.localizedDescription }
         if let url = account.lastURL { browser.open(url) }
