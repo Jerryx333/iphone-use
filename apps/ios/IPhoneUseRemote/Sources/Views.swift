@@ -16,6 +16,29 @@ struct IPhoneUseRemoteApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(app: app)
+                .task {
+                    do { try SingleAppTestBootstrap.startIfRequested() }
+                    catch { app.show(String(localized: "本机控制组件无法启动，请重新安装完整版本")) }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-stop") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        await tunnel.stop()
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-launch") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        await tunnel.startAndCommand("launch")
+                    }
+                    #endif
+                    if ProtectedStore.read("session_enabled") == Data([1]) {
+                        for _ in 0..<30 {
+                            if Task.isCancelled { return }
+                            if await app.connectStandaloneControlIfReady() { break }
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        }
+                    }
+                }
                 // The landing page a scanned QR opens hands off here.
                 .onOpenURL { app.handle(url: $0) }
                 .appOnChange(of: scenePhase) { _, phase in

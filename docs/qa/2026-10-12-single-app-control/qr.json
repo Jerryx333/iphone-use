@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-12T01:18:50Z",
+  "generated_by": "main application LocalControlConnectionCodeView",
+  "qr_decoded": true,
+  "remote_pairing_ok": true,
+  "connection_code_persisted": false,
+  "normal_mac_daemon_loaded": false,
+  "normal_mac_supervisor_loaded": false,
+  "usb_device_present": false
+}

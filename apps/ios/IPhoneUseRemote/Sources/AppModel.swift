@@ -85,6 +85,36 @@ final class AppModel: ObservableObject {
     let voiceCall = AssistantVoiceCall()
 
     private let defaults: UserDefaults
+    private var connectingStandalone = false
+
+    /// Attach the phone's own authenticated service without asking for an
+    /// address/password or creating a second companion-app workflow.
+    func connectStandaloneControlIfReady() async -> Bool {
+        guard Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true,
+              !connectingStandalone else { return false }
+        if let record = devices.first(where: { $0.address == DeviceStore.standalonePhoneAddress }),
+           sessions[record.id]?.phase == .connected { return true }
+        connectingStandalone = true
+        defer { connectingStandalone = false }
+        do {
+            let token = try ProtectedStore.token("daemon_token")
+            var request = URLRequest(url: URL(string: DeviceStore.standalonePhoneAddress + "/agent/status")!)
+            request.timeoutInterval = 3
+            request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 1_048_576,
+                  let status = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  status["drivable"] as? Bool == true else { return false }
+            let priorFocus = focusedID
+            let chooseLocal = agent.target == nil || agent.target?.record.isThisPhone == true
+            let outcome = await add(address: DeviceStore.standalonePhoneAddress,
+                                    password: try ProtectedStore.token("daemon_password"))
+            guard case let .connected(id) = outcome else { return false }
+            if chooseLocal { agent.targetID = id }
+            else { focusedID = priorFocus }
+            return true
+        } catch { return false }
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -141,6 +171,12 @@ final class AppModel: ObservableObject {
     }
 
     var focused: DeviceSession? { focusedID.flatMap { sessions[$0] } }
+    var thisPhoneSession: DeviceSession? {
+        let local = devices.filter(\.isThisPhone)
+        let preferred = local.first { $0.address == DeviceStore.standalonePhoneAddress }
+            ?? local.first
+        return preferred.flatMap { sessions[$0.id] }
+    }
 
     func session(_ id: UUID) -> DeviceSession? { sessions[id] }
 

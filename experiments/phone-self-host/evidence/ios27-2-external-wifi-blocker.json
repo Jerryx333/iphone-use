@@ -1,0 +1,10 @@
+{
+  "observed_at": "2026-10-11T05:48:01.800424+00:00",
+  "executor": "existing Mac-managed iPhone 14 instance",
+  "scope": "external Wi-Fi XCTest startup, not on-device RSD startup",
+  "drivable": false,
+  "owner": null,
+  "reconnecting": false,
+  "setup_blocked_on": "wifi_automation_refused",
+  "hint": "over Wi-Fi the iPhone did not authorize the device runner's UI-automation session (code 74, testmanagerd refused the IDE channel after waiting; setup_message has the wait) \u2014 iOS cannot show the passcode prompt over Wi-Fi, and some iOS versions refuse it entirely; connect the iPhone by USB and have a person enter the passcode when it asks, and keep it on USB if Wi-Fi still fails afterwards; retrying over Wi-Fi cannot fix this (the managed service waits 15 minutes between attempts and retries at once when the phone is plugged in), so do not send another reconnect request"
+}

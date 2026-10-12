@@ -156,7 +156,7 @@ final class UnifiedAssistant: ObservableObject {
         }.store(in: &observations)
     }
 
-    var local: DeviceSession? { app?.devices.first(where: \.isThisPhone).flatMap { app?.session($0.id) } }
+    var local: DeviceSession? { app?.thisPhoneSession }
     var phoneAvailable: Bool { local?.phase == .connected }
     var current: AssistantPhase? { task.flatMap { $0.phases.indices.contains($0.index) ? $0.phases[$0.index] : nil } }
     var next: String { guard let task, task.phases.indices.contains(task.index + 1) else { return "核验并返回结果" }; return String(task.phases[task.index + 1].goal.prefix(100)) }

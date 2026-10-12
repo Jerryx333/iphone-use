@@ -1,0 +1,11 @@
+{
+  "executor": "Mac USB control",
+  "result": {
+    "errno": null,
+    "error_type": "ConnectionError",
+    "outcome": "handshake_failed"
+  },
+  "schema": 1,
+  "scope": "unauthenticated RemotePairing handshake only",
+  "timestamp": "2026-10-11T04:35:21.156282+00:00"
+}

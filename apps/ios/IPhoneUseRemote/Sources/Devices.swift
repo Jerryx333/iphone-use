@@ -175,9 +175,11 @@ enum DeviceStore {
     /// The address the phone's own daemon answers on, inside its device
     /// runner (docs/agent-task.md); its pairing link carries exactly this.
     static let thisPhoneAddress = "http://127.0.0.1:8787"
+    static let standalonePhoneAddress = "http://127.0.0.1:18787"
 
     static func isThisPhone(_ address: String) -> Bool {
         same(address, thisPhoneAddress) || same(address, "http://localhost:8787")
+            || same(address, standalonePhoneAddress) || same(address, "http://localhost:18787")
     }
 
     /// `host:port`, which tells two instances on one Mac apart; 本机 for

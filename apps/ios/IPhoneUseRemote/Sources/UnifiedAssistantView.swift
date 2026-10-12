@@ -133,13 +133,17 @@ struct UnifiedAssistantView: View {
                     Menu {
                         Button("模型设置") { models = true }
                         Button("账号与网站资料") { library = true }
-                        Button("配置手机执行服务") { pairing = true }
+                        Button("本机控制") { pairing = true }
                         Button("流程与定时") { flows = true }.disabled(assistant.local?.client == nil)
                         Button("语音通话") { Task { await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant)) } }
                     } label: { Image(systemName: "ellipsis.circle") }.accessibilityLabel("更多")
                 }
             }
-            .sheet(isPresented: $pairing) { PairThisPhoneSheet(app: app) }
+            .sheet(isPresented: $pairing) {
+                if Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true {
+                    AppNavigationStack { LocalControlSetupView(app: app) }
+                } else { PairThisPhoneSheet(app: app) }
+            }
             .sheet(isPresented: $models) { AppNavigationStack { ModelSettingsView(agent: app.agent) } }
             .sheet(isPresented: $library) { BrowserLibraryView(workspace: workspace, onBrowse: openBrowser) }
             .sheet(isPresented: $flows) { if let local = assistant.local { FlowsHubView(session: local) } }

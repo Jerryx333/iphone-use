@@ -1,0 +1,46 @@
+{
+  "executor" : "on-device app reading its own Network Extension",
+  "native" : {
+    "build_id" : "5860c0c6b56164e77539f1c3355dadc7390545cbc0534b0bc1e836499fbe406c",
+    "developer_services" : false,
+    "error_code" : "pairing_approval_failed",
+    "ios" : null,
+    "linked" : true,
+    "pair_record_available" : false,
+    "phase" : "failed",
+    "test_plan_started" : false
+  },
+  "observed_at" : "2026-10-11T14:59:36Z",
+  "probes" : [
+    {
+      "detail" : "POSIXErrorCode(rawValue: 54): Connection reset by peer",
+      "elapsedMilliseconds" : 7,
+      "endpoint" : {
+        "host" : "127.0.0.1",
+        "port" : 49152,
+        "purpose" : "extension direct RemotePairing"
+      },
+      "outcome" : "handshake_receive_failed"
+    },
+    {
+      "detail" : "No completed probe within 5 seconds",
+      "elapsedMilliseconds" : 5314,
+      "endpoint" : {
+        "host" : "10.7.0.1",
+        "port" : 49152,
+        "purpose" : "extension direct RemotePairing"
+      },
+      "outcome" : "probe_timeout"
+    },
+    {
+      "detail" : "RemotePairing handshake received; wire protocol 26; pairing and authorization not attempted",
+      "elapsedMilliseconds" : 21,
+      "endpoint" : {
+        "host" : "10.7.0.1",
+        "port" : 49152,
+        "purpose" : "extension through-tunnel RemotePairing"
+      },
+      "outcome" : "remote_pairing_handshake"
+    }
+  ]
+}

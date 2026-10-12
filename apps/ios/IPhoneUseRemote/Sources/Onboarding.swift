@@ -7,31 +7,42 @@ struct WelcomeView: View {
     @State private var scanning = false
     @State private var manual = false
     @State private var manualAfterScan = false
+    private var standalone: Bool { Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true }
 
     var body: some View {
         AppNavigationStack {
             ScrollView {
                 VStack(spacing: Theme.Space.xl) {
-                    PairingIllustration()
-                        .frame(height: 170)
-                        .padding(.top, Theme.Space.l)
+                    Group {
+                        if standalone { Image(systemName: "iphone.radiowaves.left.and.right").font(.system(size: 88)).foregroundStyle(Theme.accent) }
+                        else { PairingIllustration() }
+                    }.frame(height: 170).padding(.top, Theme.Space.l)
                     VStack(spacing: Theme.Space.s) {
                         Text("Phone Use Remote")
                             .font(.largeTitle.weight(.bold))
                             .multilineTextAlignment(.center)
-                        Text("在这里看到并操作连在你 Mac 上的 iPhone：点按、滑动、打字，就像拿在手里。")
+                        Text(LocalizedStringKey(standalone ? "连接你要操作的 iPhone，在这里看屏、点按、滑动和打字。" : "在这里看到并操作连在你 Mac 上的 iPhone：点按、滑动、打字，就像拿在手里。"))
                             .font(.body)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     VStack(alignment: .leading, spacing: Theme.Space.l) {
+                        if standalone {
+                            StepRow(number: 1, title: "在被控 iPhone 上启用本机控制",
+                                    detail: "在 Phone Use 的「设置 › 本机控制」中启用。")
+                            StepRow(number: 2, title: "显示连接码",
+                                    detail: "在同一页面点「让其他设备连接」。")
+                            StepRow(number: 3, title: "用这里扫码连接",
+                                    detail: "两台设备连接同一 Wi-Fi，运行期间不用 Mac 托管。")
+                        } else {
                         StepRow(number: 1, title: "在 Mac 上装好 iphone-use",
                                 detail: "它在 Mac 上运行，用线或 Wi‑Fi 连着要操作的 iPhone。")
                         StepRow(number: 2, title: "打开它的网页，点「扫码」",
                                 detail: "页面会显示一个二维码，5 分钟内有效。")
                         StepRow(number: 3, title: "用这里扫一下",
                                 detail: "自动配对，不用输入地址和密码。iPhone 自带相机扫也可以。")
+                        }
                     }
                     .padding(Theme.Space.l)
                     .frame(maxWidth: .infinity, alignment: .leading)

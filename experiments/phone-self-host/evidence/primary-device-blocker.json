@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-11 05:49:21 UTC",
+  "executor": "existing Mac-managed primary phone",
+  "scope": "physical-device readiness, not independent-control acceptance",
+  "device_state": "blocked",
+  "drivable": false,
+  "setup_blocked_on": "not_connected",
+  "hint": "the iPhone isn't connected to this Mac — plug it in over USB (or join the same Wi-Fi) and unlock it; usbmuxd and CoreDevice both report it absent, so nothing is rebuilt or relaunched until it is back, and the managed service reconnects on its own — the relays are not the problem, so do not send another reconnect request"
+}
