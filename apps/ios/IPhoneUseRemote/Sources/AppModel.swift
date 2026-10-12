@@ -140,7 +140,8 @@ final class AppModel: ObservableObject {
         #if DEBUG
         // Device QA imports credentials privately, never as launch arguments
         // or source constants. Consume and remove the temporary file once.
-        DeviceQAOptions.capture()
+        if ProcessInfo.processInfo.arguments.contains("--local-control-stop") { DeviceQAOptions.clear() }
+        else { DeviceQAOptions.capture() }
         if ProcessInfo.processInfo.arguments.contains("--private-model-import") {
             let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("private-model-import.json")

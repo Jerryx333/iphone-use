@@ -20,6 +20,7 @@ final class AgentLiveStatus {
   private var latest = AgentProgress(
     task: AgentTaskSnapshot(id: "pending", goal: "", state: .running))
   private var loggedStep = -1
+  private(set) var activityFailureCode: String?
   private init() {}
 
   private var useContinuedProcessing: Bool {
@@ -39,6 +40,7 @@ final class AgentLiveStatus {
       return
     }
     finish(success: false, dismissImmediately: true)
+    activityFailureCode = nil
     self.sessionID = sessionID
     cancel = onCancel
     latest = AgentProgress(task: AgentTaskSnapshot(id: "pending", goal: goal, state: .running))
@@ -110,6 +112,8 @@ final class AgentLiveStatus {
         #endif
       } catch {
         legacyActivity = nil
+        let failure = error as NSError
+        activityFailureCode = "\(failure.domain):\(failure.code)"
         #if DEBUG
           print("[AgentLiveStatus] activity failed: \(error)")
         #endif
