@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "device": "iPhone 17 Pro Max",
+  "entry": "physical microphone; user turn visible in assistant voice conversation",
+  "goal_category": "inspect unread messages in WeChat",
+  "task_id": "t-2cc08f257e",
+  "status": "blocked",
+  "action_counts": {
+    "LAUNCH": 1,
+    "CLICK": 1,
+    "SCROLL_DOWN": 8,
+    "SCROLL_UP": 5,
+    "DONE": 1
+  },
+  "voice_to_native_tools_confirmed": true,
+  "goal_completed": false,
+  "raw_voice_text_published": false,
+  "chat_contents_published": false
+}
