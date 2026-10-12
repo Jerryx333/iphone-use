@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 @preconcurrency import NetworkExtension
 
 @MainActor final class LocalTunnel: ObservableObject {
@@ -143,11 +144,18 @@ import Foundation
             release.httpBody = Data("{\"release\":true}".utf8)
             _ = try? await URLSession.shared.data(for: release)
         } catch { }
+        if succeeded {
+            for _ in 0..<10 {
+                if UIApplication.shared.applicationState == .active { break }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
         #if DEBUG
         if let report = try? JSONSerialization.data(withJSONObject: [
             "observed_at": ISO8601DateFormatter().string(from: Date()),
             "executor": "on-device app activating itself through its native service",
-            "activation_accepted": succeeded
+            "activation_accepted": succeeded,
+            "foreground_observed": UIApplication.shared.applicationState == .active
         ]) {
             let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("local-control-foreground.json")
