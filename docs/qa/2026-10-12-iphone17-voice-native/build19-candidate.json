@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "build": "19",
+  "source_commit": "e0ad3a1c30ba8f2a4469615ab912295f21682ff6",
+  "single_app": true,
+  "signature_deep_strict_verified": true,
+  "native_unknown_outcome_guard_present": true,
+  "control_sha256": "a3aed95d84e532e38e85848b2ba3faae38dca6992f2393c2c2779a74684cf832",
+  "installed_on_iphone17": false,
+  "installation_blocker": "CoreDevice device unavailable",
+  "startup_and_restart_device_acceptance": false,
+  "superseded_by_build": 20,
+  "restart_provider_wired": false
+}
