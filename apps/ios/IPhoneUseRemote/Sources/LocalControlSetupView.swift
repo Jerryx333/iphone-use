@@ -45,6 +45,30 @@ struct LocalControlSetupView: View {
                         busy = false
                     }
                 }.disabled(busy || starting || tunnel.nativePhase == "running" || !completePackage || !DeviceStore.supportsStandaloneControl || !hasPairing)
+                Button("重新启动本机控制") {
+                    Task {
+                        guard !busy else { return }
+                        busy = true
+                        message = nil
+                        defer { busy = false }
+                        guard let api = app.thisPhoneSession?.client else {
+                            message = "尚未连接本机服务，无法确认当前任务；请先检查连接。"
+                            return
+                        }
+                        do {
+                            let tasks = try await api.recentTasks()
+                            guard tasks.allSatisfy({ $0.state.isTerminal }) else {
+                                message = "请先停止当前手机任务，再重新启动本机控制。"
+                                return
+                            }
+                        } catch {
+                            message = "无法核对当前手机任务，暂未重启；请检查连接后再试。"
+                            return
+                        }
+                        app.voiceCall.end()
+                        await tunnel.startAndCommand("restart")
+                    }
+                }.disabled(busy || starting || tunnel.state != "已启用" || !completePackage || !DeviceStore.supportsStandaloneControl || !hasPairing)
                 Button("停止本机控制", role: .destructive) {
                     Task {
                         busy = true

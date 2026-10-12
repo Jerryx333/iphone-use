@@ -46,7 +46,8 @@ targets:
     deploymentTarget: "17.4"
     sources:
       - path: LocalControlTunnel
-        excludes: [Info.plist]
+        excludes: [Info.plist, PhoneTunnelProvider.swift]
+      - ../../experiments/phone-self-host/Tunnel/PhoneTunnelProvider.swift
       - LocalControlShared
       - path: ../../experiments/phone-self-host/Resources/DeveloperImage
         type: folder

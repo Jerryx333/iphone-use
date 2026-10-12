@@ -30,6 +30,11 @@ struct IPhoneUseRemoteApp: App {
                         await tunnel.load()
                         await tunnel.startAndCommand("launch")
                     }
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-restart") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        await tunnel.startAndCommand("restart")
+                    }
                     if DeviceQAOptions.contains("--local-control-status") {
                         let tunnel = LocalTunnel()
                         await tunnel.load()

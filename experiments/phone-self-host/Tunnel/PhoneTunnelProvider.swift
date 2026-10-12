@@ -110,7 +110,7 @@ final class PhoneTunnelProvider: NEPacketTunnelProvider {
         let timer = DispatchSource.makeTimerSource(queue: stateQueue)
         timer.schedule(deadline: .now() + 2, repeating: 5)
         timer.setEventHandler { [weak self] in
-            guard let self, self.running else { return }
+            guard let self, self.running, !self.stoppingHost else { return }
             if self.bridge == nil { self.ensureBridge(); return }
             guard let bridge = self.bridge, let port = bridge.port else { return }
             let status = NativeHost.status()
@@ -154,6 +154,25 @@ final class PhoneTunnelProvider: NEPacketTunnelProvider {
                 let error = NativeHost.start(mode: command!, bridgePort: port, bridgeToken: bridge.token)
                 hostError = error
             } else { hostError = "bridge_not_ready" }
+        } else if command == "restart" {
+            guard !stoppingHost else {
+                completionHandler?(try? JSONSerialization.data(withJSONObject: ["error_code": "independent_stop_in_progress"]))
+                return
+            }
+            do {
+                try ProtectedStore.write("session_enabled", Data([1]))
+                // Keep automatic recovery out until the old process has
+                // released its control ports. The persisted intent stays on.
+                sessionRequested = false
+            } catch { hostError = "keychain_unavailable"; completionHandler?(nil); return }
+            // The main app exits with XCTest. Finish and relaunch inside the
+            // extension, which stays alive without any Mac supervisor.
+            stopHost {
+                self.stateQueue.asyncAfter(deadline: .now() + 1) {
+                    self.respondToMessage(Data("launch".utf8), completionHandler: completionHandler)
+                }
+            }
+            return
         } else if command == "stop-host" {
             sessionRequested = false
             do { try ProtectedStore.write("session_enabled", Data([0])) }

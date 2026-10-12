@@ -58,3 +58,7 @@
 真实 BrowserAccountScope 源码及 5 项 XCTest 在独立 Package 通过，BrowserAccount/BrowserCookie/JSONValue/域名检查从源码提取，均用合成数据，日志 `/tmp/iphone-browser-scope-tests.log`。另新增完整 BrowserLibrary 的“只导入书签但网站范围改变”回归，完整 iOS App/test build-for-testing 通过，日志 `/tmp/iphone-browser-scope-test-build.log`；此资料库回归仅编译，尚未在 App XCTest 或手机运行。没有读取真实账号或修改其他会话的浏览器资料。签名候选与当前真机均未包含本次改动。
 
 资料库运行回归补强：实际 BrowserLibrary、BrowserAccountScope、网站目录和 ChromeBinding 源码在 macOS 独立 Package 中运行 3 项 XCTest 通过，包括损坏文件保留、范围更改后加密写入并重新加载、合成 Chrome 配对密钥加密持久化，日志 `/tmp/iphone-browser-vault-tests.log`。测试方法从 App 的 BrowserLibraryTests 提取；只排除未使用的原生包解密桥，Keychain 适配器会在任何读写时立即失败，测试始终显式提供合成密钥，未访问用户 Keychain。使用真实 CryptoKit/AES-GCM 和临时文件。该结果覆盖资料库实际导入/保存/读回，仍不等于 WebKit 账号切换或手机真实登录验收。
+
+整合 e0ad3a1 的本机重启入口时补齐正式接线：该提交只更新实验目录的 PhoneTunnelProvider，正式 App 当时编译独立旧副本。正式工程现直接编译统一的 experiments/phone-self-host/Tunnel/PhoneTunnelProvider.swift，删除重复副本，后续更新不会漏进正式扩展。主 App/test build-for-testing 通过，日志 `/tmp/iphone-restart-canonical-test-build.log` 明确记录 PhoneLocalControlTunnel 目标编译统一源文件。
+
+重启检查不会再忽略任务查询失败：进入操作即设 busy，当前服务不可连接或任务读取失败时保留服务并显示原因，只有成功读取且所列任务全部终态时才发 restart。任务列表客户端不再把坏 JSON 当空列表、也不再丢弃无法解码的行。真实 AgentTaskList 和现有任务模型提取到独立 Package，4 项 XCTest 通过，日志 `/tmp/iphone-agent-task-list-tests.log`。完整 App/test 编译覆盖该入口与之前的资料库读回测试，但本轮未签名安装或执行真机重启。Rust 录制回归仍是原来的排队 session，未报通过。

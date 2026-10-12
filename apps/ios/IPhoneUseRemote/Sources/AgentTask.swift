@@ -335,13 +335,7 @@ extension DaemonClient: AgentTaskAPI {
     func recentTasks() async throws -> [AgentTaskSnapshot] {
         let (data, response) = try await send(request("agent/tasks"))
         try Self.checkAgent(response, data)
-        let json = try? JSONSerialization.jsonObject(with: data)
-        // A bare list, or `{"tasks": [...]}`.
-        let list = (json as? [[String: Any]]) ?? ((json as? [String: Any])?["tasks"] as? [[String: Any]]) ?? []
-        return list.compactMap { item in
-            guard let row = try? JSONSerialization.data(withJSONObject: item) else { return nil }
-            return try? JSONDecoder().decode(AgentTaskSnapshot.self, from: row)
-        }
+        return try AgentTaskList.decode(data)
     }
 
     /// A write to the agent API: JSON, with `X-Phone-Control: 1`.
