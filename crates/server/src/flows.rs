@@ -640,6 +640,12 @@ impl FlowTrail {
         (!recording.steps.is_empty()).then(|| draft_json(recording, "recording"))
     }
 
+    /// Saving without an explicit document uses the recording, including a
+    /// stopped one whose response was lost, before an unrelated task trail.
+    pub fn draft_for_save(&mut self) -> Option<Value> {
+        self.stop_recording().or_else(|| self.recording_draft()).or_else(|| self.draft())
+    }
+
     fn record_into_recording(&mut self, converted: &Converted, now: Instant) {
         let Some(recording) = self.recording.as_mut() else {
             return;
@@ -974,6 +980,7 @@ mod tests {
         assert!(!trail.is_recording());
         assert_eq!(trail.recording_draft(), Some(draft.clone()), "recover a lost stop reply");
         assert!(trail.stop_recording().is_none());
+        assert_eq!(trail.draft_for_save(), Some(draft.clone()), "save the stopped recording, not the recent task");
         assert_eq!(trail.recording_draft(), Some(draft), "a duplicate stop must not erase it");
         trail.start_recording();
         assert!(trail.recording_draft().is_none(), "a new recording clears the old draft");

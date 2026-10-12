@@ -446,14 +446,10 @@ extension DaemonClient {
     @discardableResult
     func saveFlow(id: String, name: String, description: String?, flow: Data?) async throws -> String {
         var urlRequest = agentRequest("agent/flow/save", method: "POST")
-        var body: [String: Any] = ["id": id, "name": name]
-        if let description, !description.isEmpty { body["description"] = description }
-        if let flow, let object = try? JSONSerialization.jsonObject(with: flow) { body["flow"] = object }
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+        urlRequest.httpBody = try FlowSavePayload.encode(id: id, name: name, description: description, flow: flow)
         let (data, response) = try await send(urlRequest, repeatable: false)
         try Self.checkAgent(response, data)
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        return ((json?["saved"] as? [String: Any])?["id"] as? String) ?? id
+        return try FlowSavePayload.savedID(from: data, expectedID: id)
     }
 
     /// `GET /agent/schedules`.

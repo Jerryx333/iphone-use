@@ -14035,7 +14035,7 @@ async fn agent_flow_save(
         Some(flow) => Some(flow.clone()),
         None => {
             let mut trail = recover(state.flow_trail.lock());
-            let draft = trail.stop_recording().or_else(|| trail.draft());
+            let draft = trail.draft_for_save();
             draft.and_then(|draft| draft.get("flow").cloned())
         }
     };

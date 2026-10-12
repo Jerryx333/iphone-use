@@ -102,6 +102,9 @@ struct SaveFlowSheet: View {
                 }
                 if let error {
                     Section { Text(error).foregroundStyle(Theme.down).font(.footnote) }
+                    if shown == nil {
+                        Section { Button("重新读取步骤") { Task { await loadDraft() } }.disabled(loading || saving) }
+                    }
                 } else if loading {
                     Section { ProgressView("读取流程步骤…") }
                 } else if shown?.flow == nil {
@@ -115,23 +118,28 @@ struct SaveFlowSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { Task { await save() } }
-                        .disabled(loading || shown?.flow == nil || saving || !FlowID.isValid(id) || name.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(loading || shown?.flow == nil || saving || !FlowID.isValid(id) || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             .disabled(saving)
             .appOnChange(of: name) { _, _ in deriveID() }
-            .task {
-                loading = true
-                defer { loading = false }
-                do {
-                    if let draft { shown = draft }
-                    else { shown = try await session.client?.lastDraft() }
-                } catch {
-                    self.error = error.localizedDescription
-                }
-                deriveID()
-            }
+            .task { await loadDraft() }
         }
+    }
+
+    private func loadDraft() async {
+        guard !loading, !saving else { return }
+        loading = true
+        error = nil
+        defer { loading = false }
+        do {
+            if let draft { shown = draft }
+            else {
+                guard let client = session.client else { throw URLError(.notConnectedToInternet) }
+                shown = try await client.lastDraft()
+            }
+            deriveID()
+        } catch { self.error = error.localizedDescription }
     }
 
     private func deriveID() {
@@ -140,14 +148,16 @@ struct SaveFlowSheet: View {
     }
 
     private func save() async {
+        guard !saving else { return }
         guard let client = session.client else {
             error = String(localized: "设备没有连上")
             return
         }
         saving = true
+        error = nil
         defer { saving = false }
         do {
-            let saved = try await client.saveFlow(id: id, name: name.trimmingCharacters(in: .whitespaces),
+            let saved = try await client.saveFlow(id: id, name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                                                   description: detail.trimmingCharacters(in: .whitespacesAndNewlines),
                                                   flow: shown?.flow)
             session.show(String(localized: "已保存 flow \(saved)"))
