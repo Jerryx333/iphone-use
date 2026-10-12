@@ -1,6 +1,28 @@
 import Darwin
 import Foundation
 
+#if DEBUG
+/// A single-app XCTest launch replaces the initial SwiftUI process. Carry
+/// only these short-lived QA switches across that handoff, never credentials.
+enum DeviceQAOptions {
+    private static let key = "single-app-device-qa"
+    private static let allowed: Set<String> = ["--voice-runtime-qa", "--phone-tools-qa", "--phone-screen-qa", "--local-control-status"]
+    static func capture() {
+        let flags = ProcessInfo.processInfo.arguments.filter { allowed.contains($0) }
+        guard !flags.isEmpty else { return }
+        UserDefaults.standard.set(["flags": flags, "expires": Date().addingTimeInterval(600).timeIntervalSince1970], forKey: key)
+    }
+    static func contains(_ flag: String) -> Bool {
+        if ProcessInfo.processInfo.arguments.contains(flag) { return true }
+        guard let saved = UserDefaults.standard.dictionary(forKey: key),
+              let expires = saved["expires"] as? Double,
+              expires > Date().timeIntervalSince1970 else { return false }
+        return (saved["flags"] as? [String])?.contains(flag) == true
+    }
+    static func clear() { UserDefaults.standard.removeObject(forKey: key) }
+}
+#endif
+
 /// The regular SwiftUI app also hosts its embedded control test bundle when
 /// its own on-device launcher supplies an authorized XCTest session.
 /// Ordinary launches and the app's normal unit/UI tests never enter this path.

@@ -30,7 +30,7 @@ struct IPhoneUseRemoteApp: App {
                         await tunnel.load()
                         await tunnel.startAndCommand("launch")
                     }
-                    if ProcessInfo.processInfo.arguments.contains("--local-control-status") {
+                    if DeviceQAOptions.contains("--local-control-status") {
                         let tunnel = LocalTunnel()
                         await tunnel.load()
                         for _ in 0..<3 {
