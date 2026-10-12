@@ -8,6 +8,8 @@ import Foundation
     @Published var nativePhase = "未启动"
     @Published var nativeError = ""
     private var manager: NETunnelProviderManager?
+    private var latestMessage = UUID()
+    private var pendingCommands = 0
     static var bundle: String {
         Bundle.main.object(forInfoDictionaryKey: "IPUTunnelBundle") as? String
             ?? "com.leeguoo.iphone-use.selfhost-probe.tunnel"
@@ -70,11 +72,34 @@ import Foundation
         await receive(session, command: command)
     }
     private func receive(_ session: NETunnelProviderSession, command: String) async {
-        let response: Data? = await withCheckedContinuation { continuation in
-            do { try session.sendProviderMessage(Data(command.utf8)) { continuation.resume(returning: $0) } }
-            catch { continuation.resume(returning: nil) }
+        if command == "status", pendingCommands > 0 { return }
+        let messageID = UUID()
+        latestMessage = messageID
+        if command != "status" { pendingCommands += 1 }
+        defer { if command != "status" { pendingCommands -= 1 } }
+        let outcome = await ProviderMessageRequest.receive(
+            timeoutNanoseconds: command == "status" ? 8_000_000_000 : 30_000_000_000
+        ) { callback in
+            try session.sendProviderMessage(Data(command.utf8), responseHandler: callback)
         }
-        if let response, let result = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any] {
+        guard latestMessage == messageID, !Task.isCancelled else { return }
+        let response: Data?
+        switch outcome {
+        case .response(let data): response = data
+        case .cancelled: return
+        case .timedOut:
+            nativePhase = "awaiting_status"
+            nativeError = "本机控制暂未响应，正在核对状态。请等待，或先停止控制后再启动。"
+            return
+        case .sendFailed:
+            nativePhase = "awaiting_status"
+            nativeError = "暂时无法联系本机控制，正在核对连接状态。"
+            return
+        }
+        if let response, response.count <= 262_144,
+           let result = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
+           let native = result["native"] as? [String: Any],
+           let phase = native["phase"] as? String, !phase.isEmpty {
             var report = result
             report["observed_at"] = ISO8601DateFormatter().string(from: Date())
             report["executor"] = "on-device app reading its own Network Extension"
@@ -84,11 +109,12 @@ import Foundation
             }
             if let data = try? JSONSerialization.data(withJSONObject: result["probes"] ?? []),
                let decoded = try? JSONDecoder().decode([ResultRow].self, from: data) { rows = decoded }
-            if let native = result["native"] as? [String: Any] {
-                nativePhase = native["phase"] as? String ?? "unknown"
-                nativeError = native["error_code"] as? String ?? ""
-            }
+            nativePhase = phase
+            nativeError = native["error_code"] as? String ?? ""
             if let error = result["error_code"] as? String { nativeError = error }
+        } else {
+            nativePhase = "awaiting_status"
+            nativeError = "本机控制返回的状态不完整，正在重新核对。"
         }
     }
     func refresh() async {

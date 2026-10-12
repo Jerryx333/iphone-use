@@ -24,3 +24,7 @@
 未改动语音会话正在修改的 AgentLiveStatus.swift、AppModel.swift、UnifiedAssistantView.swift；也未操作 17、启动正常 Mac 服务、改 VPN 或读取真实凭据。
 
 本机设置补充：组件不完整时禁止启用，缺少配对时明确提示导入；旧系统与不完整版本分别说明能力。网络正在启用时禁止重复启动，控制活跃期间禁止更换配对记录，导入回调再次检查；文件授权失败有提示，取消选择不显示失败。使用真实 LocalTunnel、DeviceStore、ProtectedStore、PairRecordImport 和 RunnerSigning 源码完成 Swift6/iOS15 局部类型检查；导航和 AppModel 仅用类型检查适配器，未做完整 App/真机 UI 验收。日志 `/tmp/iphone-setup-ios15-typecheck.log`。
+
+网络扩展回复恢复：新增 ProviderMessageRequest 的一次完成保护，覆盖超时、取消、重复/晚到回调、同步发送失败和空回复。状态读取限时 8 秒，控制命令限时 30 秒；命令进行时不发状态轮询，旧请求结果不能覆盖更新请求。超时/不完整回复进入 awaiting_status，仅只读核对，不自动重发启动，保留停止入口。
+
+真实新增 XCTest 文件在独立无依赖 Swift Package 中执行 6 项通过（复制的源码/测试与提交文件相同），日志 `/tmp/iphone-provider-xctest.log`。实际 LocalTunnel + 设置页完成 Swift6/iOS15 局部类型检查，日志 `/tmp/iphone-provider-ios15-typecheck.log`；不是完整 App XCTest 或真机故障注入。未操作17、未部署候选。

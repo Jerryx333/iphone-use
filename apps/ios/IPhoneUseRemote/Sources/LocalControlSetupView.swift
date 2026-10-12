@@ -16,7 +16,7 @@ struct LocalControlSetupView: View {
 
     private var starting: Bool {
         tunnel.state == "正在启用" ||
-        ["starting", "connecting", "pairing", "resolving_runner", "starting_runner"].contains(tunnel.nativePhase)
+        ["starting", "connecting", "pairing", "resolving_runner", "starting_runner", "awaiting_status"].contains(tunnel.nativePhase)
     }
 
     private var hasPairing: Bool { ProtectedStore.read("pair_record") != nil }
@@ -34,7 +34,7 @@ struct LocalControlSetupView: View {
     var body: some View {
         Form {
             Section {
-                Label(tunnel.nativePhase == "running" ? "本机控制已启动" : starting ? "本机控制正在启动" : "本机控制未启动",
+                Label(tunnel.nativePhase == "awaiting_status" ? "正在核对本机控制状态" : tunnel.nativePhase == "running" ? "本机控制已启动" : starting ? "本机控制正在启动" : "本机控制未启动",
                       systemImage: "iphone")
                 Text(capabilityDescription)
                     .foregroundStyle(.secondary)
@@ -65,7 +65,9 @@ struct LocalControlSetupView: View {
                         .foregroundStyle(.secondary)
                 }
                 if !tunnel.error.isEmpty || !tunnel.nativeError.isEmpty {
-                    Text("本机控制尚未就绪。请保持手机解锁并连接 Wi-Fi，再尝试启用；首次使用请先完成配对和系统网络授权。")
+                    Text(tunnel.nativePhase == "awaiting_status"
+                         ? "正在等待本机控制确认状态。请保持手机解锁并连接 Wi-Fi；若仍无响应，先停止控制后再启动。"
+                         : "本机控制尚未就绪。请保持手机解锁并连接 Wi-Fi，再尝试启用；首次使用请先完成配对和系统网络授权。")
                         .foregroundStyle(.secondary)
                 }
             }
