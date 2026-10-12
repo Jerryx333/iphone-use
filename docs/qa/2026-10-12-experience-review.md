@@ -50,3 +50,5 @@
 浏览器 localStorage 恢复：此前导入脚本一直留在 WebView 中，后续导航可能把新登录或退出后的状态改回旧备份。现在选定 HTTPS 原站点（默认端口）第一次加载完成后移除本次恢复脚本，保留其他用户脚本；错误站点、子域、HTTP 或其他端口不会提前消耗恢复。账号选择持久化失败时不再先移除旧浏览器的 Cookie 观察器和停止其任务。
 
 真实 BrowserStorageRestore 源码和 3 项 XCTest 在 macOS 独立 Package 中执行通过，使用 WebKit 的真实 WKUserContentController 和 JavaScriptCore 运行合成状态；JSONValue 从现有源码提取，没有读取用户浏览器、Cookie 或 Keychain。日志 `/tmp/iphone-browser-storage-tests.log`。完整 App/test build-for-testing 通过，日志 `/tmp/iphone-browser-storage-test-build.log`；这不代替手机真实网站登录/退出和 iOS15/16 安装验收。封存签名包尚未更新。
+
+已核对并合入语音会话已提交的 f107594/d3d04c9，本分支整合提交 b766fdb，版本变为 build19。显式启动返回前台及实际前台状态记录，与本分支已有的 ProviderMessageRequest 超时/取消/旧回复保护共存。重新生成工程后完整 App/test build-for-testing 通过，日志 `/tmp/iphone-experience-build19-test-build.log`；未安装这个整合版本，封存 build18 包仍是旧候选。Rust 定向回归继续等待原队列，不能宣称这批录制服务端修改已通过或已进入当前真机嵌入库。
