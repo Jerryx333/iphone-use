@@ -2,7 +2,7 @@
 
 ## 已确认
 
-- 在隔离分支 `integrate/voice-single-app-20261012` 整合单 App 本机控制、用户选择模型、私有模型转发、读屏与语音修复；合并回归 61 项通过。
+- 在隔离分支 `integrate/voice-single-app-20261012` 整合单 App 本机控制、用户选择模型、私有模型转发、读屏与语音修复；合并回归 61 项通过；最后一轮执行、语音和模型转发回归 14 项通过。
 - 签名包内只有一个 App，含 `PhoneUse.xctest`、网络扩展及实时活动扩展，深度签名验证通过。主 App build 18 已安装到用户指定的 iPhone 17 Pro Max。
 - 本机网络扩展报告 `running`，签名 runner `ready=true`，嵌入 daemon `serving`，本机 API `drivable=true`。正常 Mac 托管 runner 未启动。
 - 使用 iphone-use 原生 agent API 看屏并操作正常助手输入界面，提交只读设置任务。任务 `t-868437539f` 由用户配置的私有模型执行，实际工具为 `LAUNCH`、`DONE`，终态 `done`，无错误。
