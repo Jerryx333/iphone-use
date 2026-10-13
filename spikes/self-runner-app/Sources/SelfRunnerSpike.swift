@@ -45,6 +45,14 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
     @Published var keepLocation = true
+    // The device runner's 8100/9100 API served from this process (RunnerCore.bundle), once ready.
+    @Published var runnerCore = false {
+        didSet {
+            UserDefaults.standard.set(runnerCore, forKey: "runnerCore")
+            if runnerCore { startRunnerCore() } else { stopRunnerCore() }
+        }
+    }
+    private var runnerCoreHost: AnyObject?
     @Published var interfaceIP = UserDefaults.standard.string(forKey: "rpInterfaceIP") ?? "10.7.1.1"
     @Published var peerIP = UserDefaults.standard.string(forKey: "rpPeerIP") ?? "10.7.0.1"
     @Published var automaticPort = UserDefaults.standard.object(forKey: "rpAutomaticPort") as? Bool ?? true
@@ -121,9 +129,12 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             if argument == "--auto-session-off" { UserDefaults.standard.set(false, forKey: "autoSession") }
             if argument == "--auto-mount-on" { UserDefaults.standard.set(true, forKey: "autoMount") }
             if argument == "--auto-mount-off" { UserDefaults.standard.set(false, forKey: "autoMount") }
+            if argument == "--runner-core-on" { UserDefaults.standard.set(true, forKey: "runnerCore") }
+            if argument == "--runner-core-off" { UserDefaults.standard.set(false, forKey: "runnerCore") }
         }
         autoMount = UserDefaults.standard.bool(forKey: "autoMount")
         autoSession = UserDefaults.standard.bool(forKey: "autoSession")
+        runnerCore = UserDefaults.standard.bool(forKey: "runnerCore")
         location.delegate = self
         location.desiredAccuracy = kCLLocationAccuracyThreeKilometers
         location.distanceFilter = kCLDistanceFilterNone
@@ -243,7 +254,43 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         return ["transport": "online", "xctest_ready": ready && !needsRelaunch,
             "needs_passcode": needsPasscode, "needs_relaunch": needsRelaunch,
             "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
-            "orientation": portrait ? "portrait" : "other", "last_action_ok_at": lastActionOKAt as Any? ?? NSNull()]
+            "orientation": portrait ? "portrait" : "other", "last_action_ok_at": lastActionOKAt as Any? ?? NSNull(),
+            "runner_core": runnerCoreStatus()]
+    }
+    private func loadRunnerCore() -> AnyObject? {
+        if let host = runnerCoreHost { return host }
+        guard let url = Bundle.main.builtInPlugInsURL?.appendingPathComponent("RunnerCore.bundle"),
+              let bundle = Bundle(url: url) else { log("runner core: RunnerCore.bundle missing"); return nil }
+        do { try bundle.loadAndReturnError() } catch { log("runner core: load failed: \(error)"); return nil }
+        guard let host: AnyObject = bundle.principalClass ?? NSClassFromString("IPURunnerCoreHost") else {
+            log("runner core: IPURunnerCoreHost missing from the bundle"); return nil
+        }
+        runnerCoreHost = host
+        return host
+    }
+    /// Main only, once the daemon session is ready. Needs the gateway pairing: the token is derived from its PSK.
+    func startRunnerCore() {
+        guard runnerCore, ready else { return }
+        guard let pairing = remotePairing else { log("runner core: no gateway pairing to derive the token from; not started"); return }
+        guard let host = loadRunnerCore() else { return }
+        let arguments = ProcessInfo.processInfo.arguments
+        if !arguments.contains("--runner-core-uiconfig-off"), let identifier = processSessionIdentifier {
+            let ui = host.perform(NSSelectorFromString("installUITestingConfiguration:"), with: identifier)?.takeUnretainedValue()
+            log("runner core: UI testing configuration \(ui.map { String(describing: $0) } ?? "nil")")
+        }
+        let options: NSDictionary = ["token": pairing.runnerToken]
+        let result = host.perform(NSSelectorFromString("start:"), with: options)?.takeUnretainedValue()
+        log("runner core: start \(result.map { String(describing: $0) } ?? "nil")")
+    }
+    func stopRunnerCore() {
+        guard let host = runnerCoreHost else { return }
+        _ = host.perform(NSSelectorFromString("stop"))
+        log("runner core: stopped")
+    }
+    private func runnerCoreStatus() -> [String: Any] {
+        var value = (runnerCoreHost?.perform(NSSelectorFromString("status"))?.takeUnretainedValue() as? [String: Any]) ?? ["running": false]
+        value["enabled"] = runnerCore
+        return value
     }
     private func configureAutoSession() {
         autoEpoch += 1
@@ -331,7 +378,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             "state": state, "ready": ready, "bootState": bootState, "bootDisconnected": bootDisconnected,
             "needs_passcode": needsPasscode, "needs_relaunch": needsRelaunch || SpikeBridge.needsRelaunch(),
             "axLoad": ["variant": axLoadVariant as Any? ?? NSNull(), "success": axLoadSuccess as Any? ?? NSNull()],
-            "checks": autoChecks, "lastCheck": lastAutoCheck, "lastScreenshot": lastAutoScreenshot]
+            "runnerCore": runnerCoreStatus(), "checks": autoChecks, "lastCheck": lastAutoCheck, "lastScreenshot": lastAutoScreenshot]
         do {
             let data = try JSONSerialization.data(withJSONObject: status, options: [.sortedKeys])
             try data.write(to: documents.appendingPathComponent("auto-status.json"), options: .atomic)
@@ -687,6 +734,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
                 self.log("quiescence bypass installed: \(SpikeBridge.installQuiescenceBypass())")
                 self.autoMountFailed = false
                 self.ready = true; self.busy = false; self.state = "ready"
+                self.startRunnerCore()
                 self.log("ready: automation enabled; no test plan or explicit UI testing initialization. E0/E1 are manual experiments.")
                 self.mailbox?.finish(self.startCommandID, result: "ready")
                 self.startCommandID = nil
@@ -743,6 +791,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         stopping = true; generation += 1; ready = false; busy = true; state = "stopping"
         bootDisconnected = false; bootDisconnectedAt = 0; bootState = "unknown"
         timer?.invalidate(); timer = nil; discovery.cancel(); if !remoteMode { location.stopUpdatingLocation() }
+        stopRunnerCore()
         SpikeBridge.reset()
         if axInFlight { log("AX call still running; Stop cannot cancel it. AX remains disabled until return; relaunch for a fresh experiment.") }
         worker.async {
@@ -990,6 +1039,7 @@ struct ContentView: View {
             Button("重新配对") { model.rePair() }.disabled(model.busy)
             Toggle("自动会话（开机即连）", isOn: $model.autoSession)
             Toggle("自动挂载 DDI（实验）", isOn: $model.autoMount)
+            Toggle("Runner API 8100/9100（实验）", isOn: $model.runnerCore)
             Toggle("后台定位保活（不记录位置）", isOn: $model.keepLocation)
                 .onChange(of: model.keepLocation) { _, _ in
                     if model.state != "idle" && model.state != "stopping" { model.updateLocation() }

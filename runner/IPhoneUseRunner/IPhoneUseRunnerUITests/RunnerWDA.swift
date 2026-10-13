@@ -6,7 +6,7 @@ import Foundation
 import UIKit
 import XCTest
 
-extension RunnerTests {
+extension RunnerCore {
   /// POSTs that can change what is on screen (everything except session setup, settings and finds).
   static func mayChangeScreen(_ path: String) -> Bool {
     !(path == "/session" || path.hasSuffix("/appium/settings") || path.hasSuffix("/elements")

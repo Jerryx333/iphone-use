@@ -1,5 +1,5 @@
-// iphone-use native runner: a single long-running XCTest method that serves a small WDA-shaped
-// HTTP API for the iphone-use daemon.
+// iphone-use native runner capability layer: state, actions and a small WDA-shaped HTTP API
+// for the iphone-use daemon, independent of the XCTestCase host.
 //
 // The overall shape (one test method hosting an NWListener, blocking in XCTWaiter, swallowing
 // recorded issues so the runner survives XCTest failures) is adapted from callstack/agent-device
@@ -9,7 +9,7 @@ import Network
 import UIKit
 import XCTest
 
-final class RunnerTests: XCTestCase {
+final class RunnerCore: NSObject {
   static let springBoardBundleID = "com.apple.springboard"
   /// WDA's ports, so existing relays and daemon config work unchanged.
   static let defaultPort: UInt16 = 8100
@@ -22,7 +22,9 @@ final class RunnerTests: XCTestCase {
   /// This launch's request authentication (both ports).
   var auth: RunnerAuth?
   var mjpeg: RunnerMJPEGServer?
-  var serveExpectation: XCTestExpectation?
+  var onShutdown: (() -> Void)?
+  var onListenFailure: ((Error) -> Void)?
+  private(set) var port: UInt16 = RunnerCore.defaultPort
   /// Why the command listener stopped, when it failed rather than being shut down.
   var listenFailure: Error?
   let busyLock = NSLock()
@@ -56,46 +58,26 @@ final class RunnerTests: XCTestCase {
   /// appium/settings values, accepted and echoed (the runner never waits for idle anyway).
   var wdaSettings: [String: Any] = ["waitForIdleTimeout": 0, "animationCoolOffTimeout": 0]
 
-  override func setUp() {
-    continueAfterFailure = true
-    // Only enforced when xcodebuild runs with -test-timeouts-enabled YES; keep it out of reach
-    // anyway so a timeout-enabled launch does not kill the server after the default 10 minutes.
-    executionTimeAllowance = 365 * 24 * 60 * 60
+  /// Log and attach an XCTest issue to the request that caused it.
+  func noteIssue(_ description: String) {
+    NSLog("ipu-runner: xctest issue suppressed: %@", description)
+    recordedIssues.append(description)
   }
 
-  /// The runner must outlive any XCTest failure: a recorded issue would otherwise end the serving
-  /// test case. Issues are logged and attached to the request that caused them.
-  override func record(_ issue: XCTIssue) {
-    if serveEnded {
-      super.record(issue)
-      return
-    }
-    NSLog("ipu-runner: xctest issue suppressed: %@", issue.compactDescription)
-    recordedIssues.append(issue.compactDescription)
-  }
-
-  /// Set once the serve loop is over: from then on a failure is the test's own verdict (a listener
-  /// that never came up), not a request's, and must reach xcodebuild.
-  var serveEnded = false
-
-  func testServe() throws {
+  func start(environment: [String: String]) throws {
     let patched = IPURBridge.installQuiescenceBypass()
     NSLog("ipu-runner: quiescence bypass installed on %@", patched.joined(separator: ", "))
     NSLog("ipu-runner: private AX client %@, event synthesis %@",
           IPURBridge.axClient() == nil ? "MISSING" : "available",
           IPURBridge.eventSynthesisAvailable() ? "available" : "MISSING")
 
-    let environment = ProcessInfo.processInfo.environment
-    let port = environment["IPU_RUNNER_PORT"].flatMap { UInt16($0) } ?? Self.defaultPort
+    port = environment["IPU_RUNNER_PORT"].flatMap { UInt16($0) } ?? Self.defaultPort
     // Never logged: only whether there is one.
     let auth = RunnerAuth(token: environment["IPU_RUNNER_TOKEN"])
     self.auth = auth
     NSLog("ipu-runner: request signing %@", auth.configured
           ? "required (per-launch token)"
           : "required, but no IPU_RUNNER_TOKEN was given: every request will be refused")
-    let expectation = XCTestExpectation(description: "ipu-runner serves until /shutdown")
-    serveExpectation = expectation
-
     let server = try RunnerHTTPServer(
       port: port,
       auth: auth,
@@ -109,7 +91,7 @@ final class RunnerTests: XCTestCase {
     server.onFailure = { [weak self] error in
       DispatchQueue.main.async {
         self?.listenFailure = error
-        self?.serveExpectation?.fulfill()
+        self?.onListenFailure?(error)
       }
     }
     self.server = server
@@ -130,28 +112,11 @@ final class RunnerTests: XCTestCase {
 
     // The agent API on the phone itself, when the daemon library is linked (RunnerDaemon.swift).
     RunnerDaemon.start(environment: environment, runnerPort: port, mjpegPort: mjpegPort)
+  }
 
-    // Block this test (and keep the main run loop spinning for the request handlers) for a year,
-    // or until POST /shutdown.
-    let result = XCTWaiter.wait(for: [expectation], timeout: 365 * 24 * 60 * 60)
-    NSLog("ipu-runner: serve loop ended (%@)", String(describing: result))
-    server.stop()
+  func stop() {
+    server?.stop()
     mjpeg?.stop()
-    // A runner that never served must not end as a passing test: xcodebuild would print
-    // "TEST EXECUTE SUCCEEDED" for a phone nobody can drive. The usual cause is another runner
-    // still holding the port on the phone.
-    if let failure = listenFailure {
-      let busy = (failure as? NWError).map { error -> Bool in
-        if case .posix(let code) = error { return code == .EADDRINUSE }
-        return false
-      } ?? false
-      let message = busy
-        ? "ipu-runner: port \(port) on the phone is already in use — another runner (or a previous one still exiting) holds it"
-        : "ipu-runner: could not listen on port \(port): \(failure)"
-      NSLog("%@", message)
-      serveEnded = true
-      XCTFail(message)
-    }
   }
 
   // MARK: - Dispatch
@@ -235,7 +200,7 @@ final class RunnerTests: XCTestCase {
     busyLock.lock()
     let busySince = self.busySince
     busyLock.unlock()
-    let bundle = Bundle(for: RunnerTests.self)
+    let bundle = Bundle(for: RunnerCore.self)
     let bundleID = bundle.bundleIdentifier ?? "com.leeguoo.iphone-use.runner"
     let version = bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     // Ready only when the screen can be read: without the AX client every tree read fails, so an
@@ -338,7 +303,7 @@ final class RunnerTests: XCTestCase {
     case ("POST", "/alert"): return try alertTap(request)
     case ("GET", "/window/size"): return windowSize()
     case ("POST", "/shutdown"):
-      DispatchQueue.main.async { [weak self] in self?.serveExpectation?.fulfill() }
+      DispatchQueue.main.async { [weak self] in self?.onShutdown?() }
       return .value(["shutdown": true])
     default:
       return .error(404, "unknown command", "\(request.method) \(request.path) is not a runner endpoint")
@@ -356,7 +321,7 @@ final class RunnerTests: XCTestCase {
     /// built from the bundle id, else SpringBoard.
     var application: XCUIApplication {
       if let app = IPURBridge.application(forPID: pid) { return app }
-      return XCUIApplication(bundleIdentifier: bundleID ?? RunnerTests.springBoardBundleID)
+      return XCUIApplication(bundleIdentifier: bundleID ?? RunnerCore.springBoardBundleID)
     }
   }
 
@@ -831,7 +796,7 @@ final class RunnerTests: XCTestCase {
 
 // MARK: - Keep awake
 
-extension RunnerTests {
+extension RunnerCore {
   /// `POST /wda/keepawake {"secs": N}` keeps the phone from auto-locking for the next N seconds
   /// (0 stops at once, at most 900); the daemon renews it while someone is driving the phone, so
   /// a daemon that dies or goes idle lets Auto-Lock take over again on its own.

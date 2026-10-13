@@ -44,7 +44,9 @@ runner/
   IPhoneUseRunner/project.yml      XcodeGen spec (the generated .xcodeproj is checked in)
   IPhoneUseRunner/IPhoneUseRunner.xcodeproj
   IPhoneUseRunner/IPhoneUseRunnerUITests/  the UI-test bundle (no host app), product name iPhoneUse
-    RunnerTests.swift    testServe, dispatch, native routes
+    RunnerXCTestShell.swift  XCTest shell: RunnerTests.testServe starts RunnerCore, blocks in XCTWaiter
+    RunnerTests.swift    RunnerCore: runner state, service lifecycle, dispatch, native routes
+                         (no XCTestCase, so Self Runner hosts it too; the file keeps its old name)
     RunnerWDA.swift      WDA-compatible routes
     RunnerElements.swift element tree, locators (predicate / class chain / …), id registry
     RunnerActions.swift  W3C pointer actions → touch paths

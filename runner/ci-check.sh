@@ -24,7 +24,7 @@ grep -q '^pub const RUNNER_SCHEME: &str = "IPhoneUseRunner";$' "$SETUP_CTX" \
     || fail "the setup engine does not build the IPhoneUseRunner scheme"
 grep -q '^pub const RUNNER_TEST_ID: &str = "IPhoneUseRunnerUITests/RunnerTests/testServe";$' "$SETUP_CTX" \
     || fail "the setup engine does not launch IPhoneUseRunnerUITests/RunnerTests/testServe"
-grep -q 'func testServe()' runner/IPhoneUseRunner/IPhoneUseRunnerUITests/RunnerTests.swift \
+grep -q 'func testServe()' runner/IPhoneUseRunner/IPhoneUseRunnerUITests/RunnerXCTestShell.swift \
     || fail "RunnerTests.testServe, the method setup-wda.sh launches, is missing"
 grep -q '^pub const RUNNER_APP_NAME: &str = "iPhoneUse-Runner.app";$' "$SETUP_CTX" \
     || fail "the setup engine expects a different runner app name"

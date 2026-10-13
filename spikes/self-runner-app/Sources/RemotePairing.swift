@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 struct RemotePairing: Codable {
     let v: Int
@@ -14,6 +15,12 @@ struct RemotePairing: Codable {
             let start = cert_sha256.index(cert_sha256.startIndex, offsetBy: offset)
             return UInt8(cert_sha256[start..<cert_sha256.index(start, offsetBy: 2)], radix: 16)!
         })
+    }
+    /// Request-signing token for the in-app runner API (RunnerCore.bundle), derived from the PSK so
+    /// the Mac side can compute it without it ever crossing the network (scripts/selfrunner-runner-token.py).
+    var runnerToken: String {
+        let mac = HMAC<SHA256>.authenticationCode(for: Data("selfrunner-runner-token-v1".utf8), using: SymmetricKey(data: key))
+        return mac.map { String(format: "%02x", $0) }.joined()
     }
     private static let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "dev.iphoneuse.selfrunner.gateway", kSecAttrAccount as String: "pairing"]

@@ -52,6 +52,41 @@ targets:
       - sdk: CoreLocation.framework
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
+      # The runner capability layer, loaded at run time after the daemon session (RunnerCore/).
+      - target: RunnerCore
+        embed: true
+        link: false
+        copy:
+          destination: plugins
+  RunnerCore:
+    type: bundle
+    platform: iOS
+    sources:
+      - path: ../../runner/IPhoneUseRunner/IPhoneUseRunnerUITests
+        excludes:
+          # The XCTest shell; this bundle has its own (RunnerCore/RunnerCoreHost.swift).
+          - RunnerXCTestShell.swift
+      - RunnerCore
+    settings:
+      base:
+        PRODUCT_NAME: RunnerCore
+        PRODUCT_BUNDLE_IDENTIFIER: dev.iphoneuse.selfrunner.spike.runnercore
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSPrincipalClass: IPURunnerCoreHost
+        SWIFT_OBJC_BRIDGING_HEADER: ../../runner/IPhoneUseRunner/IPhoneUseRunnerUITests/IPhoneUseRunnerUITests-Bridging-Header.h
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF: NO
+        # XCTest is linked from the SDK but resolved on the phone from the mounted DDI, where the
+        # app already loaded it; the app never links XCTest itself.
+        ENABLE_TESTING_SEARCH_PATHS: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - '$(inherited)'
+          - /System/Developer/Library/Frameworks
+          - /System/Developer/Library/PrivateFrameworks
+          - /System/Developer/usr/lib
+          - /Developer/Library/Frameworks
+          - /Developer/Library/PrivateFrameworks
+        OTHER_LDFLAGS: '$(inherited) -framework XCTest -framework XCUIAutomation'
 schemes:
   SelfRunnerSpike:
     build:

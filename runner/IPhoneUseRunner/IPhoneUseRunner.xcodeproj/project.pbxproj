@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		075A08DD9BA77808A042E207 /* RunnerElements.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70866DAEACF7115FC193101 /* RunnerElements.swift */; };
 		27EDCFAE3E699437A5C156C9 /* RunnerH264.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D45CD0277AA9A24C681156E /* RunnerH264.swift */; };
+		4E3C76E0B65564003302A0D9 /* RunnerXCTestShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35BA49A18C605B2D263FC499 /* RunnerXCTestShell.swift */; };
 		603A181324BE3D2D3D9CEF19 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 470393750BF9CDEBE680ECF3 /* RunnerTests.swift */; };
 		6DE77AA9E758F2E53FDAC651 /* RunnerWDA.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7994977E24197EBB0129A53F /* RunnerWDA.swift */; };
 		70CDE4345DB673547F97FC7F /* RunnerHTTP.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94BDD3F0E1278AAB2988DB12 /* RunnerHTTP.swift */; };
@@ -21,6 +22,7 @@
 /* Begin PBXFileReference section */
 		0D45CD0277AA9A24C681156E /* RunnerH264.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerH264.swift; sourceTree = "<group>"; };
 		22C008827A2AAC16D203432E /* RunnerDaemon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerDaemon.swift; sourceTree = "<group>"; };
+		35BA49A18C605B2D263FC499 /* RunnerXCTestShell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerXCTestShell.swift; sourceTree = "<group>"; };
 		3C28F51DDB8C8EDC604DA1F4 /* IPhoneUseRunnerUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = IPhoneUseRunnerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		470393750BF9CDEBE680ECF3 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
 		74BD68A60C7ABD17C9DCEB07 /* IPURBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IPURBridge.h; sourceTree = "<group>"; };
@@ -60,6 +62,7 @@
 				F4DD8C426E23E9EBDBA0F0FE /* RunnerMJPEG.swift */,
 				470393750BF9CDEBE680ECF3 /* RunnerTests.swift */,
 				7994977E24197EBB0129A53F /* RunnerWDA.swift */,
+				35BA49A18C605B2D263FC499 /* RunnerXCTestShell.swift */,
 			);
 			path = IPhoneUseRunnerUITests;
 			sourceTree = "<group>";
@@ -140,6 +143,7 @@
 				985FD83F33DC0CB4D8E76A6D /* RunnerMJPEG.swift in Sources */,
 				603A181324BE3D2D3D9CEF19 /* RunnerTests.swift in Sources */,
 				6DE77AA9E758F2E53FDAC651 /* RunnerWDA.swift in Sources */,
+				4E3C76E0B65564003302A0D9 /* RunnerXCTestShell.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
