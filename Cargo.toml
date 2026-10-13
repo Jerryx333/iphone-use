@@ -7,6 +7,8 @@ members = [
     "crates/mcp",
     "crates/legacy-launch",
     "crates/ios-embed",
+    "crates/self-boot",
+    "crates/phone-gateway",
     "crates/browser-session",
 ]
 

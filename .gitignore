@@ -23,3 +23,9 @@ url.txt
 /apps/ios/SessionLibraries/
 /iPhoneUse.app/
 assets/icon-1024-old.png
+
+# S0b generated project and build/pairing artifacts
+/spikes/self-runner-app/build/
+/spikes/self-runner-app/SelfRunnerSpike.xcodeproj/
+# Apple DDI research assets (stage locally; never commit)
+/spikes/self-runner-app/Resources/DDI/

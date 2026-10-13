@@ -1,0 +1,61 @@
+name: SelfRunnerSpike
+options:
+  deploymentTarget:
+    iOS: '17.0'
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: dev.iphoneuse.selfrunner.spike
+    SWIFT_VERSION: '5.0'
+    TARGETED_DEVICE_FAMILY: '1'
+    SUPPORTS_MACCATALYST: NO
+    CODE_SIGN_STYLE: Automatic
+    HEADER_SEARCH_PATHS: '$(SRCROOT)/../../crates/self-boot/include'
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging-Header.h
+    LD_RUNPATH_SEARCH_PATHS:
+      - '$(inherited)'
+      - '@executable_path/Frameworks'
+      - /System/Developer/Library/Frameworks
+      - /System/Developer/Library/PrivateFrameworks
+      - /System/Developer/usr/lib
+    LIBRARY_SEARCH_PATHS: '$(inherited) $(SRCROOT)/build'
+    OTHER_LDFLAGS: '$(inherited) -lsystem -lresolv -liconv'
+targets:
+  SelfRunnerSpike:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      # Required folder: run bash scripts/research-stage-ddi.sh before xcodegen.
+      - path: Resources/DDI
+        type: folder
+        buildPhase: resources
+        optional: false
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Self Runner
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSLocalNetworkUsageDescription: Connect to the paired gateway on your local network and to this phone through LocalDevVPN for UI automation.
+        NSBonjourServices: ['_iphoneuse._tcp', '_remotepairing._tcp']
+        UIBackgroundModes: [location]
+        NSLocationWhenInUseUsageDescription: Keep the local automation connection alive while this app is in the background. Location is not stored or sent.
+        NSLocationAlwaysAndWhenInUseUsageDescription: Keep the local automation connection alive in the background. Location is not stored or sent.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    dependencies:
+      - framework: build/libself_boot.a
+        embed: false
+      - sdk: UIKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: CoreLocation.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+schemes:
+  SelfRunnerSpike:
+    build:
+      targets:
+        SelfRunnerSpike: all
+    run:
+      config: Debug
