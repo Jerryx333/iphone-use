@@ -33,7 +33,9 @@ gateway 每 15 秒发 `{"t":"ping","seq":N}`；仅未确认序号对应的 pong 
 
 叶证书钉扎算法及 Swift 对照见 `src/fake_phone.rs:Pin::verify_server_cert` 文档注释：对**叶证书完整 DER** 做 SHA-256，比较配对文件 cert_sha256，不使用系统 CA、hostname 或 SPKI 替代。测试客户端还校验 TLS 1.3 握手签名。
 
-`cmd <action> [--endpoint HOST:PORT] [--target foreground|system] [--args JSON] [--deadline-ms N] [--save-screenshot PATH] [--format json|compact]`：默认 `json` 保留完整响应。协议 `ok:true` 与 `ok:false` 均沿用原有退出码 **0**（包括本地 `invalid_args`）；命令行参数解析错误（含无效 endpoint、target、JSON 和 target 冲突）退出 **64**；HTTP/文件/解码等运行错误退出非零。调用方应检查 JSON 的 `ok` 或 compact 首行的 `ok/error`，不能仅凭退出码判断动作成功。
+`cmd <action> [--endpoint HOST:PORT] [--target foreground|system] [--args JSON] [--deadline-ms N] [--save-screenshot PATH] [--format json|compact] [--then-read]`：默认 `json` 保留完整响应。协议 `ok:true` 与 `ok:false` 均沿用原有退出码 **0**（包括本地 `invalid_args`）；命令行参数解析错误（含无效 endpoint、target、JSON 和 target 冲突）退出 **64**；HTTP/文件/解码等运行错误退出非零。调用方应检查 JSON 的 `ok` 或 compact 首行的 `ok/error`，不能仅凭退出码判断动作成功。
+
+`--then-read` 仅适用于 `tap` / `swipe` / `type` / `press` / `launch` / `unlock`，且必须使用 `--format compact`；其它组合报错退出 64，在读取 client-token 前拒绝。动作收到协议响应后（包括 `ok:false`）先照常输出动作结果，等待 400 ms，再向同一 endpoint 发送 args 为空、deadline 为 8000 ms 的前台 `read`。随后输出分隔行 `--- screen after <action>` 和与 `cmd read --format compact` 相同的读屏内容。跟随 read 的 HTTP 调用或渲染失败时，分隔行后输出 `error read_unavailable 0ms`，仍退出 0，不改变动作结果。本地 `invalid_args` 或动作 HTTP 调用失败时不跟随读屏；unlock 沿用闭合响应，跟随 read 不携带密码相关字段。
 
 `--target` 仅支持 `read` / `wait_for`，等价于向 args 加入 `"target":"foreground"` 或 `"target":"system"`。与 `--args` 合并并保留其它字段；已有 target 同值可合并，异值（包括非字符串）报错退出 64。与 `--target` 同用时 `--args` 必须为 JSON 对象。其它动作使用 `--target` 或传入其它 target 值也退出 64。
 

@@ -653,6 +653,13 @@ fn cmd_usage_errors_exit_64_before_loading_token() {
     let missing_home =
         std::env::temp_dir().join(format!("gateway-missing-{}", uuid::Uuid::new_v4()));
     for args in [
+        vec!["tap", "--then-read", "--format", "json"],
+        vec!["tap", "--then-read"],
+        vec!["read", "--then-read", "--format", "compact"],
+        vec!["status", "--then-read", "--format", "compact"],
+        vec!["screenshot", "--then-read", "--format", "compact"],
+        vec!["wait_for", "--then-read", "--format", "compact"],
+        vec!["unknown", "--then-read", "--format", "compact"],
         vec!["read", "--endpoint", "192.0.2.1:7382"],
         vec!["read", "--endpoint", "0.0.0.0:7382"],
         vec!["read", "--endpoint", "[::]:7382"],
@@ -715,4 +722,175 @@ fn cmd_endpoint_env_and_default_without_network() {
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(response["error"]["code"], "invalid_args");
     }
+}
+
+#[tokio::test]
+async fn cmd_then_read_success_action_error_and_http_failure() {
+    use axum::{middleware, response::IntoResponse};
+    use std::sync::{Arc, Mutex};
+
+    for (action_ok, read_http_failure) in [(true, false), (false, false), (true, true)] {
+        let f = Fixture::new();
+        let (g, p, phone_task) = f.start().await;
+        let mut stream = fake_phone::connect(&p).await.unwrap();
+        wait_online(&g, "online").await;
+        // Record the CLI request before the gateway subtracts queue time from the deadline.
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let router = g.router().layer(middleware::from_fn(
+            move |request: Request<Body>, next: middleware::Next| {
+                let recorded = recorded.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((value.clone(), std::time::Instant::now()));
+                    if read_http_failure && value["action"] == "read" {
+                        // A 200 HTTP response with invalid JSON makes call return Err.
+                        return "invalid JSON".into_response();
+                    }
+                    next.run(Request::from_parts(parts, Body::from(bytes)))
+                        .await
+                }
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let http_task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let phone = tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                let frame = protocol::read_frame(&mut stream, protocol::FRAME_LIMIT)
+                    .await
+                    .unwrap();
+                if frame["t"] == "ping" {
+                    protocol::write_frame(&mut stream, &json!({"t":"pong","seq":frame["seq"]}))
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let is_read = frame["action"] == "read";
+                assert_eq!(
+                    frame["action"],
+                    if received.is_empty() { "tap" } else { "read" }
+                );
+                if is_read {
+                    assert_eq!(frame["args"], json!({}));
+                    let deadline = frame["deadline_ms"].as_u64().unwrap();
+                    assert!((1..=8000).contains(&deadline));
+                }
+                let response = if is_read {
+                    json!({"t":"res","id":frame["id"],"ok":true,"result":{
+                        "pid":37,"snapshot_id":"after","truncated":false,
+                        "nodes":[{"i":5,"type":9,"label":"Ready","frame":{"x":1,"y":2,"w":3,"h":4}}]
+                    }})
+                } else if action_ok {
+                    json!({"t":"res","id":frame["id"],"ok":true})
+                } else {
+                    json!({"t":"res","id":frame["id"],"ok":false,"error":{"code":"no_effect"}})
+                };
+                protocol::write_frame(&mut stream, &response).await.unwrap();
+                received.push(frame);
+                if is_read || read_http_failure {
+                    return received;
+                }
+            }
+        });
+        let dir = f.dir.clone();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                std::process::Command::new(env!("CARGO_BIN_EXE_phone-gateway"))
+                    .env("PHONE_GATEWAY_HOME", dir)
+                    .env_remove("PHONE_GATEWAY_ENDPOINT")
+                    .args([
+                        "cmd",
+                        "tap",
+                        "--args",
+                        r#"{"label":"Go"}"#,
+                        "--format",
+                        "compact",
+                        "--then-read",
+                        "--endpoint",
+                    ])
+                    .arg(endpoint.to_string())
+                    .output()
+                    .unwrap()
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let out = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = out.lines().collect();
+        assert!(lines[0].starts_with(if action_ok {
+            "ok tap "
+        } else {
+            "error no_effect "
+        }));
+        assert!(lines[0].ends_with("ms"));
+        assert_eq!(lines[1], "--- screen after tap");
+        if read_http_failure {
+            assert_eq!(&lines[2..], &["error read_unavailable 0ms"]);
+        } else {
+            assert!(lines[2].starts_with("ok read "));
+            assert!(lines[2].ends_with("ms"));
+            assert_eq!(
+                lines[3],
+                "pid=37 snapshot=after truncated=false nodes=1 shown=1"
+            );
+            assert_eq!(lines[4], "[5] Button \"Ready\" id= val=\"\" @1,2,3,4");
+            assert_eq!(lines.len(), 5);
+        }
+        let received = phone.await.unwrap();
+        assert_eq!(received.len(), if read_http_failure { 1 } else { 2 });
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].0,
+            json!({"action":"read","args":{},"deadline_ms":8000})
+        );
+        assert!(requests[1].1.duration_since(requests[0].1) >= Duration::from_millis(400));
+        http_task.abort();
+        phone_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn cmd_then_read_invalid_args_sends_no_requests() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_phone-gateway"))
+        .env("PHONE_GATEWAY_HOME", &f.dir)
+        .env_remove("PHONE_GATEWAY_ENDPOINT")
+        .args([
+            "cmd",
+            "type",
+            "--then-read",
+            "--format",
+            "compact",
+            "--endpoint",
+        ])
+        .arg(endpoint.to_string())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"error invalid_args 0ms\n");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
 }

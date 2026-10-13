@@ -53,6 +53,8 @@ enum Commands {
         save_screenshot: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
+        #[arg(long)]
+        then_read: bool,
     },
 }
 fn usage_error(message: impl std::fmt::Display) -> ! {
@@ -187,7 +189,17 @@ async fn main() -> Result<()> {
             deadline_ms,
             save_screenshot,
             format,
+            then_read,
         } => {
+            if then_read
+                && (format != OutputFormat::Compact
+                    || !matches!(
+                        action.as_str(),
+                        "tap" | "swipe" | "type" | "press" | "launch" | "unlock"
+                    ))
+            {
+                usage_error("--then-read requires --format compact and action tap/swipe/type/press/launch/unlock");
+            }
             let endpoint = endpoint.unwrap_or_else(|| {
                 std::env::var("PHONE_GATEWAY_ENDPOINT").unwrap_or_else(|error| match error {
                     std::env::VarError::NotPresent => "127.0.0.1:7382".into(),
@@ -215,6 +227,26 @@ async fn main() -> Result<()> {
                 "{}",
                 render(&action, response, format, ms, save_screenshot.as_deref())?
             );
+            if then_read {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let body = json!({"action":"read","args":{},"deadline_ms":8000});
+                let started = std::time::Instant::now();
+                let screen = match call(&endpoint, token.trim(), &body).await {
+                    Ok(response) => render(
+                        "read",
+                        response,
+                        OutputFormat::Compact,
+                        started.elapsed().as_millis(),
+                        None,
+                    ),
+                    Err(error) => Err(error),
+                };
+                println!("--- screen after {action}");
+                println!(
+                    "{}",
+                    screen.unwrap_or_else(|_| "error read_unavailable 0ms".into())
+                );
+            }
         }
     }
     Ok(())
