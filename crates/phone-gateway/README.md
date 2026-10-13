@@ -27,6 +27,8 @@ token 在读取 body 前校验，body 最大 1 MiB。FIFO 排队上限 8（不�
 
 协议：4 字节大端长度 + UTF-8 JSON，认证前最大 4096 字节、认证后最大 16 MiB。仅 TLS 1.3；未认证连接最多 2，包含 TLS 握手在内限时 5 秒。challenge 为每连接独立的 32 字节随机 nonce（base64），一次性消费。
 
+手机入口 accept 的暂时性错误会记录一行 stderr 日志并继续监听：ECONNABORTED/EINTR 立即重试，EMFILE/ENFILE/ENOBUFS/ENOMEM（以及 WouldBlock）退避 100 ms；不可恢复的监听错误才会从 accept 循环上抛并使服务退出。
+
 HMAC 消息字节顺序为 ASCII `selfrunner-v1` + 解码 nonce 的 32 字节 + 配对文件中 device_id 的 **32 字符 UTF-8 hex 文本**（不再 hex 解码）；key 是解码 PSK 的 32 字节。hello 必须带 `t=hello`、`v=1`、匹配的 `device_id`、base64 `mac`；成功后回 welcome，才替换旧连接。每来源连接尝试至少间隔 100 ms，来源跟踪最大 1024 条。
 
 gateway 每 15 秒发 `{"t":"ping","seq":N}`；仅未确认序号对应的 pong 能更新活性，已确认序号不能重放。45 秒未确认则断开。手机主动 ping 也回同序号 pong，但不会刷新 gateway 判活。
@@ -54,7 +56,7 @@ pid=37 snapshot=snap-1 truncated=false nodes=2 shown=1
 
 截图结果图片字段尚未在设计里命名，CLI 支持 `result.image/base64/png/data` 的 base64 字符串。json 下指定保存路径后替换为 `{"saved":"路径","bytes":N}`，未指定路径时保持原始 JSON。compact 成功截图总会保存，未指定 `--save-screenshot` 时保存到 `$TMPDIR/phone-gateway/shot-<随机UUID>.png`（TMPDIR 未设时使用系统临时目录），自动目录 0700、图片 0600；可用 `--save-screenshot PATH` 指定已有父目录内的路径。compact 只输出 `ok screenshot <ms>ms saved=<path> <width>x<height>`，绝不打印 base64；compact 失败截图只按常规 error 格式输出，不尝试保存。json 加 `--save-screenshot` 的失败响应沿用原行为：缺少图片 result 时 CLI 报错并退出非零。
 
-日志到 stderr，只记录白名单动作、id、耗时和经筛选的结果码，不记录 args、PSK、token、截图或读屏文本。unlock 在两种输出格式下都沿用网关闭合响应，只转发固定布尔字段及允许的错误码，绝不输出密码或手机自由文本。
+日志到 stderr，记录白名单动作、id、耗时、经筛选的结果码，以及 accept 的系统错误和重试退避时间，不记录 args、PSK、token、截图或读屏文本。unlock 在两种输出格式下都沿用网关闭合响应，只转发固定布尔字段及允许的错误码，绝不输出密码或手机自由文本。
 
 离线验收（heavy-cargo 存在时 build/test 请用它；否则裸 cargo）：
 

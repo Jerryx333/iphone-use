@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
+    io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -58,6 +59,31 @@ struct Inner {
     last_pong: Option<u128>,
 }
 type PasscodeReader = dyn Fn(&str) -> std::result::Result<String, ()> + Send + Sync;
+
+// None means the listener cannot recover; Some is the delay before retrying.
+fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
+    match error.kind() {
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted => {
+            return Some(Duration::ZERO);
+        }
+        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory => {
+            return Some(Duration::from_millis(100));
+        }
+        _ => {}
+    }
+    // No libc dependency: ENOMEM=12, ENFILE=23, EMFILE=24 on macOS and Linux.
+    // ENOBUFS differs: 55 on macOS, 105 on Linux (including Android).
+    #[cfg(target_vendor = "apple")]
+    let resource_errors = [12, 23, 24, 55];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let resource_errors = [12, 23, 24, 105];
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    let resource_errors: [i32; 0] = [];
+    error
+        .raw_os_error()
+        .filter(|code| resource_errors.contains(code))
+        .map(|_| Duration::from_millis(100))
+}
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -180,7 +206,19 @@ impl Gateway {
         // Bound source tracking; throttle connection attempts, including failed authentication.
         let mut sources: HashMap<IpAddr, Instant> = HashMap::new();
         loop {
-            let (tcp, peer) = listener.accept().await?;
+            let (tcp, peer) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let Some(delay) = accept_retry_delay(&error) else {
+                        return Err(error.into());
+                    };
+                    tracing::warn!(%error, retry_ms = delay.as_millis() as u64, "phone accept failed; retrying");
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    continue;
+                }
+            };
             if sources
                 .get(&peer.ip())
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(100))
@@ -626,6 +664,68 @@ fn log_result_code(code: &str) -> &str {
         code
     } else {
         "error"
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::accept_retry_delay;
+    use std::{io, time::Duration};
+
+    #[test]
+    fn transient_error_kinds_retry_with_the_expected_delay() {
+        for kind in [io::ErrorKind::ConnectionAborted, io::ErrorKind::Interrupted] {
+            assert_eq!(accept_retry_delay(&kind.into()), Some(Duration::ZERO));
+        }
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::OutOfMemory] {
+            assert_eq!(
+                accept_retry_delay(&kind.into()),
+                Some(Duration::from_millis(100))
+            );
+        }
+    }
+
+    #[test]
+    fn unrecoverable_error_kinds_are_propagated() {
+        for kind in [
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(accept_retry_delay(&kind.into()), None);
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    fn raw_os_errors_distinguish_transient_failures_from_invalid_listeners() {
+        #[cfg(target_vendor = "apple")]
+        let (aborted, no_buffers, not_socket) = (53, 55, 38);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (aborted, no_buffers, not_socket) = (103, 105, 88);
+        for code in [4, aborted] {
+            // EINTR, ECONNABORTED
+            assert_eq!(
+                accept_retry_delay(&io::Error::from_raw_os_error(code)),
+                Some(Duration::ZERO)
+            );
+        }
+        for code in [12, 23, 24, no_buffers] {
+            // ENOMEM, ENFILE, EMFILE, ENOBUFS
+            assert_eq!(
+                accept_retry_delay(&io::Error::from_raw_os_error(code)),
+                Some(Duration::from_millis(100))
+            );
+        }
+        for code in [9, 22, not_socket] {
+            // EBADF, EINVAL, ENOTSOCK
+            assert_eq!(
+                accept_retry_delay(&io::Error::from_raw_os_error(code)),
+                None
+            );
+        }
     }
 }
 
