@@ -41,6 +41,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         didSet {
             UserDefaults.standard.set(remoteMode, forKey: "remoteMode")
             remoteLink.configure(enabled: remoteMode, pairing: remotePairing)
+            configureTunnel()
             if remoteMode { updateLocation() }
         }
     }
@@ -53,6 +54,8 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
     private var runnerCoreHost: AnyObject?
+    /// Data connections that carry the gateway's 8100/9100 forwards to RunnerCore (P1).
+    private let remoteTunnel = RemoteTunnel()
     @Published var interfaceIP = UserDefaults.standard.string(forKey: "rpInterfaceIP") ?? "10.7.1.1"
     @Published var peerIP = UserDefaults.standard.string(forKey: "rpPeerIP") ?? "10.7.0.1"
     @Published var automaticPort = UserDefaults.standard.object(forKey: "rpAutomaticPort") as? Bool ?? true
@@ -148,6 +151,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             pollMailbox()
             mailboxTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollMailbox() }
         }
+        remoteTunnel.log = { [weak self] in self?.log($0) }
         remoteLink.ready = { [weak self] in self?.ready ?? false }
         remoteLink.request = { [weak self] frame, reply in self?.executeRemote(frame, reply: reply) }
         importRemotePairing()
@@ -172,6 +176,8 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         } catch RemotePairing.Failure.code(let code) { log("pairing: \(code)") }
         catch { log("pairing: reset_failed") }
         remoteLink.configure(enabled: remoteMode, pairing: remotePairing)
+        // The runner token and the tunnels both come from the pairing.
+        stopRunnerCore(); startRunnerCore()
     }
     private func executeRemote(_ frame: [String: Any], reply: @escaping ([String: Any]) -> Void) {
         guard let id = frame["id"] as? String, !id.isEmpty, id.utf8.count <= 128,
@@ -255,7 +261,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             "needs_passcode": needsPasscode, "needs_relaunch": needsRelaunch,
             "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
             "orientation": portrait ? "portrait" : "other", "last_action_ok_at": lastActionOKAt as Any? ?? NSNull(),
-            "runner_core": runnerCoreStatus()]
+            "runner_core": runnerCoreStatus(), "runner_tunnel": remoteTunnel.status]
     }
     private func loadRunnerCore() -> AnyObject? {
         if let host = runnerCoreHost { return host }
@@ -281,11 +287,23 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         let options: NSDictionary = ["token": pairing.runnerToken]
         let result = host.perform(NSSelectorFromString("start:"), with: options)?.takeUnretainedValue()
         log("runner core: start \(result.map { String(describing: $0) } ?? "nil")")
+        configureTunnel()
     }
+    /// Tunnels only while remote mode is on and RunnerCore serves: otherwise there is nothing to forward to.
+    private func configureTunnel() {
+        let running = runnerCoreStatus()["running"] as? Bool ?? false
+        let enabled = remoteMode && running
+        guard enabled != tunnelEnabled else { return }
+        tunnelEnabled = enabled
+        remoteTunnel.configure(enabled: enabled, pairing: remotePairing)
+        log("runner tunnel: \(enabled ? "on" : "off")")
+    }
+    private var tunnelEnabled = false
     func stopRunnerCore() {
         guard let host = runnerCoreHost else { return }
         _ = host.perform(NSSelectorFromString("stop"))
         log("runner core: stopped")
+        configureTunnel()
     }
     private func runnerCoreStatus() -> [String: Any] {
         var value = (runnerCoreHost?.perform(NSSelectorFromString("status"))?.takeUnretainedValue() as? [String: Any]) ?? ["running": false]
