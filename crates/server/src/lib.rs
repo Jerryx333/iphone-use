@@ -37,6 +37,7 @@ pub mod schedules;
 pub mod scope;
 pub mod scroll_progress;
 pub mod setup;
+pub mod selfrunner;
 pub mod simulator;
 pub mod syslog;
 pub mod telemetry;

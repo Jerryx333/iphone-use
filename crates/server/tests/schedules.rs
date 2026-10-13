@@ -380,7 +380,9 @@ fn on_the_phone_a_due_flow_runs_in_process_as_its_own_owner() {
     let run = last_run(&s);
     assert_ne!(run["state"], "due", "{run}");
     assert!(
-        run["error"].as_str().map_or(true, |e| !e.contains("iphone-use-mcp")),
+        run["error"]
+            .as_str()
+            .is_none_or(|e| !e.contains("iphone-use-mcp")),
         "never reaches for the binary: {run}"
     );
     let seen = daemon.seen.lock().unwrap().join("\n");

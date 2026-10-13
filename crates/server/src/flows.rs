@@ -903,6 +903,41 @@ pub fn mcp_binary() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Kinds a person's tap means to hit (the smallest one under the finger wins).
+const TAPPABLE: [&str; 15] = [
+    "Button",
+    "Cell",
+    "Link",
+    "Key",
+    "Switch",
+    "Toggle",
+    "TextField",
+    "SecureTextField",
+    "SearchField",
+    "TextView",
+    "Tab",
+    "Icon",
+    "MenuItem",
+    "SegmentedControl",
+    "StaticText",
+];
+
+/// What a person's tap at `(x, y)` (points) hit, as a durable locator: the
+/// smallest visible, tappable element under the point that has a label or an
+/// identifier. `None` falls back to recording the coordinate.
+pub fn locator_at(rows: &[crate::wda::ElementRow], x: f64, y: f64) -> Option<Value> {
+    rows.iter()
+        .filter(|row| TAPPABLE.contains(&row.kind.as_str()))
+        .filter(|row| row.visible != Some(false))
+        .filter(|row| {
+            let [rx, ry, rw, rh] = row.rect;
+            rw > 0.0 && rh > 0.0 && x >= rx && x <= rx + rw && y >= ry && y <= ry + rh
+        })
+        .filter_map(|row| locator_for_row(row).map(|locator| (row.rect[2] * row.rect[3], locator)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, locator)| locator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,26 +1221,4 @@ mod tests {
             assert!(write_app_notes(&notes, bad, "x").is_err(), "{bad}");
         }
     }
-}
-
-/// Kinds a person's tap means to hit (the smallest one under the finger wins).
-const TAPPABLE: [&str; 15] = [
-    "Button", "Cell", "Link", "Key", "Switch", "Toggle", "TextField", "SecureTextField",
-    "SearchField", "TextView", "Tab", "Icon", "MenuItem", "SegmentedControl", "StaticText",
-];
-
-/// What a person's tap at `(x, y)` (points) hit, as a durable locator: the
-/// smallest visible, tappable element under the point that has a label or an
-/// identifier. `None` falls back to recording the coordinate.
-pub fn locator_at(rows: &[crate::wda::ElementRow], x: f64, y: f64) -> Option<Value> {
-    rows.iter()
-        .filter(|row| TAPPABLE.contains(&row.kind.as_str()))
-        .filter(|row| row.visible != Some(false))
-        .filter(|row| {
-            let [rx, ry, rw, rh] = row.rect;
-            rw > 0.0 && rh > 0.0 && x >= rx && x <= rx + rw && y >= ry && y <= ry + rh
-        })
-        .filter_map(|row| locator_for_row(row).map(|locator| (row.rect[2] * row.rect[3], locator)))
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, locator)| locator)
 }

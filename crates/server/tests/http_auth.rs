@@ -592,6 +592,7 @@ fn agent_status_reports_freshness_only_for_the_requested_mjpeg_stream() {
         let state = build_state_with_wda("http://127.0.0.1:9");
         state.wda_actionable.store(true, Ordering::Release);
         *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked: Some(false),
@@ -879,6 +880,7 @@ fn pending_managed_target_is_reported_as_unconfigured() {
         state.mjpeg_url = Some(base_url);
         state.wda_actionable.store(true, Ordering::Release);
         *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked: Some(false),
@@ -2241,6 +2243,7 @@ fn failed_element_read_revokes_cached_actionability() {
         let state = build_state_with_wda(&base);
         state.wda_actionable.store(true, Ordering::Release);
         *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked: Some(false),
@@ -2302,6 +2305,7 @@ fn failed_screenshot_read_revokes_cached_actionability() {
         let state = build_state_with_wda(&base);
         state.wda_actionable.store(true, Ordering::Release);
         *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked: Some(false),

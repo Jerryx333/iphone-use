@@ -261,3 +261,34 @@ opened 成功后双向原样复制字节，正确传播半关闭（单侧 EOF �
 Mac 联调（2026-10-13，未接真机）：真实 gateway + 在 macOS 上编译的 `RemoteTunnel.swift` + 本地 echo / 流式服务，5 轮 4MB 往返与 8MB 服务端推流、4 路 echo 并发 + 1 路推流均逐字节一致；端口不在映射里时本地连接在 `tunnel_wait` 后关闭；gateway 重启期间手机侧按 1/2/4s 退避，恢复后补满空闲池并可正常转发。
 
 部署注意：Mac 本机 8100 可能已被其他程序占用（at-mac 上是 palpod 的 mic_bridge.py），转发端口不要默认用 8100/9100，daemon 侧用 `IPHONE_USE_WDA_URL` / `IPHONE_USE_WDA_MJPEG_URL` 指向实际转发地址。
+
+
+## 14. daemon 外部托管模式（P2）
+
+设置 `IPHONE_USE_WDA_MANAGED=false`，并用 `IPHONE_USE_SELFRUNNER_GATEWAY=http://127.0.0.1:7382` 指向本机 phone-gateway。只接受 loopback HTTP 地址；无效配置会告警并忽略。未配置 gateway 时保留原有外部托管行为。
+
+`IPHONE_USE_SELFRUNNER_GATEWAY_TOKEN_FILE` 可覆盖 token 文件路径。默认读取 `$PHONE_GATEWAY_HOME/client-token`；未设置 `PHONE_GATEWAY_HOME` 时读取 `~/.config/phone-gateway/client-token`。每次请求重新读取 token，不在日志、status 或错误中输出它。daemon 不读取或处理手机密码，解锁密码由 gateway 从 Mac 钥匙串取得。
+
+runner 不可驱动时，status 可增加 `self_runner`：
+
+```json
+{"gateway":"up","transport":"online","needs_passcode":false,"needs_relaunch":false,"runner_core_running":true,"vpn":true,"tunnels_idle":2,"tunnels_active":0}
+```
+
+取不到的字段为 null，gateway 连不上时为 `"down"`。诊断总预算 2 秒，缓存 5 秒；只有 transport=online 才查询 command status。可驱动时不查询 gateway，也不输出 `self_runner`。
+
+`hint` 和双语 `next_step` 按以下优先级提供恢复建议：
+
+1. gateway 不可达：启动本机 phone-gateway。
+2. transport=offline：在手机打开 Self Runner App，确认 LocalDevVPN 已开。
+3. needs_passcode 或 needs_relaunch：有人在手机上输一次密码以重启自动化会话，不能远程完成。
+4. runner_core 未运行，或空闲和使用中的通道都为 0：打开「Runner API 8100/9100」，或等待通道建立。
+5. runner 可达但锁屏：调用一次 phone_reconnect，通过 gateway 使用 Mac 钥匙串密码远程解锁。
+
+此模式下 phone_reconnect 只读取无会话锁屏状态、必要时调用 gateway unlock，然后重新探测 health；不运行本地 setup 或 launchctl。unlock 的失败错误码原样返回；仍不可驱动时附诊断建议，但不会再建议调用 phone_reconnect。未配置 gateway 时 reconnect 行为不变。
+
+health 缓存超过 5 秒时，status 最多等待后台探测 2.5 秒；动作前另用最多 1 秒查询无会话锁屏状态。发现锁屏会在发送动作前拒绝（not_sent、retry_safe=true）。
+
+元素点击（tap_locator、tap_label、tap_element）把顶部 NavigationBar 上方的状态栏区域算作遮挡：目标中心落在状态栏或导航栏下时，沿用已有的「先滚到屏幕中部再点」逻辑，不再点到状态栏左上角的返回链接。导航栏自身的按钮不受影响；没有导航栏的页面不加这条遮挡。
+
+wait_for 为最后一次整树读取预留 `min(2.5 秒, timeout/3)`。快速探测成功但没有匹配时，最终读取失败的 observation 保留 `probe_misses` 和 `probes_answered`，避免把已读到屏幕误报为从未读到。批次中 swipe、scroll、drag 之后的第一个点击或 longpress（中间隔着 pause 也算）先等 settle，最多 1.5 秒；超时继续。

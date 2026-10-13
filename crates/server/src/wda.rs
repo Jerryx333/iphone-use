@@ -508,6 +508,7 @@ impl WdaClient {
         if unattached_locked == Some(true) {
             self.invalidate_session();
             return WdaHealth {
+                updated_at: std::time::Instant::now(),
                 up: true,
                 actionable: false,
                 locked: Some(true),
@@ -521,6 +522,7 @@ impl WdaClient {
             Err(_) => {
                 self.invalidate_session();
                 WdaHealth {
+                    updated_at: std::time::Instant::now(),
                     up: true,
                     actionable: false,
                     locked: unattached_locked,
@@ -536,6 +538,7 @@ impl WdaClient {
             Ok(s) => s.to_string(),
             Err(_) => {
                 return WdaHealth {
+                    updated_at: std::time::Instant::now(),
                     up: true,
                     actionable: false,
                     locked: None,
@@ -564,6 +567,7 @@ impl WdaClient {
             self.invalidate_session();
         }
         WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable,
             locked,
@@ -3039,6 +3043,8 @@ fn parse_keep_awake(value: &serde_json::Value) -> KeepAwakeReport {
 /// runner that merely answers `/status` from one that can actually act.
 #[derive(Debug, Clone, Copy)]
 pub struct WdaHealth {
+    /// Monotonic time this health observation was published.
+    pub updated_at: std::time::Instant,
     /// `/status` answered 2xx (runner process + HTTP server alive).
     pub up: bool,
     /// A real UI-test action succeeded — the testmanagerd connection is live.
@@ -3053,6 +3059,7 @@ impl WdaHealth {
     /// Nothing reachable — WDA not configured or `/status` down.
     pub fn down() -> Self {
         Self {
+            updated_at: std::time::Instant::now(),
             up: false,
             actionable: false,
             locked: None,

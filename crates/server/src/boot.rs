@@ -64,6 +64,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
                 .with_port(inputs.cfg.port),
         ),
         wda_health: Arc::new(Mutex::new(crate::wda::WdaHealth::down())),
+        selfrunner_gateway: crate::selfrunner::Gateway::from_env().map(Arc::new),
         wda_death: Arc::new(Mutex::new(Default::default())),
         wda_health_probe: Arc::new(Mutex::new(None)),
         settled_frame_prefetch: Arc::new(Mutex::new(None)),

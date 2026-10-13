@@ -397,12 +397,13 @@ pub struct AppState {
     /// the control client is busy, so a slow health check never queues behind or
     /// blocks a time-sensitive browser gesture indefinitely.
     pub wda_health: Arc<Mutex<crate::wda::WdaHealth>>,
+    pub selfrunner_gateway: Option<Arc<crate::selfrunner::Gateway>>,
     /// Why WDA last stopped being drivable, captured at the transition (#26 §2).
     /// Without this, a mid-session `wda:true -> false` is indistinguishable from
     /// a human picking the phone up, and agents blame the wrong thing.
     pub wda_death: Arc<Mutex<WdaDeath>>,
-    /// Single in-flight background health probe. Status requests return the
-    /// cache immediately; a control request aborts this task before taking the
+    /// Single in-flight background health probe. Fresh status requests return
+    /// immediately; stale requests wait up to 2.5 seconds; a control request aborts this task before taking the
     /// WDA mutex so a cold/slow probe cannot delay an input action.
     pub wda_health_probe: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// The background capture of the settled screen after an observed action
@@ -2033,6 +2034,27 @@ fn target_not_configured_response() -> Response {
 /// for the shared WDA client, and the pending counter prevents a replacement
 /// probe from racing in behind it.
 async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
+    let stale =
+        recover(state.wda_health.lock()).updated_at.elapsed() > std::time::Duration::from_secs(5);
+    start_health_probe(state);
+    if stale {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(2500), async {
+            loop {
+                let running = recover(state.wda_health_probe.lock())
+                    .as_ref()
+                    .is_some_and(|p| !p.is_finished());
+                if !running {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+    *recover(state.wda_health.lock())
+}
+
+fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
     let cached = *recover(state.wda_health.lock());
     let Some(wda) = &state.wda else {
         return crate::wda::WdaHealth::down();
@@ -2230,7 +2252,10 @@ fn apply_wda_health_probe_tracked(
         }
     }
 
-    *recover(health_slot.lock()) = health;
+    *recover(health_slot.lock()) = crate::wda::WdaHealth {
+        updated_at: Instant::now(),
+        ..health
+    };
     actionable.store(health.actionable, Ordering::Release);
     if health.up {
         released.store(false, Ordering::Release);
@@ -2771,8 +2796,25 @@ async fn agent_status(
     // Hints name commands and ports for the default instance; a second
     // phone has its own relay ports and needs `--instance NAME`.
     let hint = hint_for_this_daemon(hint, crate::instance::current(), &relay_ports_label());
+    let self_runner = if !state.managed_wda && !state.managed_wda_pending && !drivable {
+        match &state.selfrunner_gateway {
+            Some(gateway) => Some(gateway.status().await),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let guidance = self_runner.as_ref().and_then(|value| {
+        crate::selfrunner::guidance(value, health.up && health.locked == Some(true))
+    });
+    let hint = guidance.map(|(_, en)| en.to_string()).unwrap_or(hint);
+    let self_runner_field = self_runner
+        .as_ref()
+        .map(|value| format!(",\"self_runner\":{value}"))
+        .unwrap_or_default();
     let hint_json = serde_json::to_string(&hint).unwrap_or_else(|_| "\"\"".into());
-    let next_step_json = human_next_step(advice, &setup_blocked_on, wda_died_reason)
+    let next_step_json = guidance
+        .or_else(|| human_next_step(advice, &setup_blocked_on, wda_died_reason))
         .map(|(zh, en)| {
             let instance = crate::instance::current();
             serde_json::json!({
@@ -2874,7 +2916,7 @@ async fn agent_status(
     // The daemon inside the runner on the phone, as its last /status said.
     let phone_daemon = crate::phone_daemon::status_json(wda);
     let body = format!(
-        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
+        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}{self_runner_field}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&status_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -5603,6 +5645,86 @@ async fn agent_mode_inner(
     match mode.as_str() {
         "agent" => {
             if !state.managed_wda {
+                if let Some(gateway) = &state.selfrunner_gateway {
+                    let mut unlock_error = None;
+                    if let Some(wda) = &state.wda {
+                        let _priority = state.begin_wda_control();
+                        let Ok(mut client) =
+                            tokio::time::timeout(std::time::Duration::from_secs(10), wda.lock())
+                                .await
+                        else {
+                            return json_response(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                serde_json::json!({"ok": false, "error": "client_busy"}),
+                            );
+                        };
+                        let locked = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            client.locked_unattached(),
+                        )
+                        .await;
+                        if matches!(locked, Ok(Ok(true))) {
+                            unlock_error = gateway.unlock().await.err();
+                            // Self Runner judges the lock by what is on screen and
+                            // can miss one (hardware, 14 Pro: the Sleep Focus lock
+                            // screen answered already_unlocked); the runner's
+                            // lock state has the last word.
+                            if unlock_error.is_none()
+                                && matches!(
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(1),
+                                        client.locked_unattached(),
+                                    )
+                                    .await,
+                                    Ok(Ok(true))
+                                )
+                            {
+                                unlock_error = Some("unlock_unconfirmed".into());
+                            }
+                        }
+                        if let Ok(health) = tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            client.probe_health(),
+                        )
+                        .await
+                        {
+                            apply_wda_health_probe(
+                                &state.wda_health,
+                                &state.wda_actionable,
+                                &state.released,
+                                health,
+                            );
+                        }
+                    }
+                    let health = *recover(state.wda_health.lock());
+                    let mut result = serde_json::json!({"ok": unlock_error.is_none(), "recovery_owner":"external", "wda": health.up, "wda_actionable":health.actionable, "wda_locked":health.locked, "drivable":health.actionable});
+                    if let Some(error) = &unlock_error {
+                        result["error"] = serde_json::json!(error);
+                    }
+                    if unlock_error.is_some() || !health.actionable {
+                        let diagnostics = gateway.status().await;
+                        // This call was the remote unlock: never send the
+                        // caller back to it.
+                        let locked = health.locked == Some(true) && unlock_error.is_none();
+                        let guidance = crate::selfrunner::guidance(&diagnostics, locked).or(
+                            unlock_error.as_ref().map(|_| {
+                                (
+                                    "远程解锁失败，请有人在手机上解锁",
+                                    "The remote unlock failed; someone has to unlock the phone in hand",
+                                )
+                            }),
+                        );
+                        if let Some((zh, en)) = guidance {
+                            result["hint"] = serde_json::json!(en);
+                            result["next_step"] = serde_json::json!({"zh":zh,"en":en});
+                        }
+                        result["self_runner"] = diagnostics;
+                    }
+                    return json_response(StatusCode::OK, result);
+                }
+            }
+
+            if !state.managed_wda {
                 return with_security_headers(
                     Response::builder()
                         .status(StatusCode::CONFLICT)
@@ -8137,7 +8259,7 @@ fn clear_tap_point(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64
     };
     // Covers, grown by the margin, of the controls over the target's centre
     // column (descendants and ancestors are the target itself).
-    let covers: Vec<(f64, f64)> = rows
+    let mut covers: Vec<(f64, f64)> = rows
         .iter()
         .enumerate()
         .filter(|(j, row)| {
@@ -8168,6 +8290,7 @@ fn clear_tap_point(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64
         .filter(|grown| grown[0] <= cx && cx <= grown[0] + grown[2])
         .map(|grown| (grown[1], grown[1] + grown[3]))
         .collect();
+    covers.extend(status_bar_band(rows, index));
     if !covers
         .iter()
         .any(|(top, bottom)| *top <= cy && cy <= *bottom)
@@ -8197,6 +8320,41 @@ fn clear_tap_point(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64
         .max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
         .map(|(a, b)| (cx, (a + b) / 2.0))
 }
+
+/// The status bar above the app's top navigation bar, as a cover. It is not
+/// in the app's tree, yet content scrolled under a translucent bar is: a tap
+/// there reaches the status bar instead. Hardware, 14 Pro, Settings: a
+/// locator tap on 显示与亮度, scrolled to y 18–70 under the bars, hit the
+/// status bar's "◀ Self Runner" back link and switched apps.
+fn status_bar_band(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64, f64)> {
+    let [tx, ty, tw, th] = rows.get(index)?.rect;
+    let top = screen_rect(rows).map_or(0.0, |screen| screen[1]);
+    let bars = rows.iter().filter(|row| {
+        row.kind == "NavigationBar"
+            && row.visible != Some(false)
+            && row.rect[3] > 0.0
+            && row.rect[3] <= MAX_BAR_HEIGHT
+    });
+    // A bar's own item (the back button) is drawn over the band. Judged by
+    // geometry: the tree's rows are filtered, so depth does not tell which
+    // bar a row belongs to (Settings' list rows read as the bar's children).
+    let mut bar_top = None::<f64>;
+    for bar in bars {
+        let [bx, by, bw, bh] = bar.rect;
+        if tx >= bx && ty >= by && tx + tw <= bx + bw && ty + th <= by + bh {
+            return None;
+        }
+        if by > top && by <= top + STATUS_BAR_MAX_HEIGHT {
+            bar_top = Some(bar_top.map_or(by, |current| current.min(by)));
+        }
+    }
+    // From above the screen: nothing up there is a place to tap either.
+    Some((f64::MIN, bar_top?))
+}
+
+/// The tallest status bar (Dynamic Island phones, ~59 pt) with headroom; a
+/// navigation bar lower than this is not the screen's top bar.
+const STATUS_BAR_MAX_HEIGHT: f64 = 70.0;
 
 /// The target's centre sits under another control (grown by
 /// [`OCCLUDER_MARGIN`]).
@@ -9693,6 +9851,9 @@ async fn direct_control(
             );
         }
     };
+    if let Some(refusal) = stale_action_lock_refusal(&state).await {
+        return refusal.into_response();
+    }
     let lifecycle = state.wda_lifecycle.current();
     let releasing = lifecycle == WdaLifecycleTransition::Releasing;
     let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
@@ -9780,6 +9941,7 @@ async fn direct_control(
         state.touch_activity();
         let locked = recover(state.wda_health.lock()).locked;
         *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked,
@@ -9795,6 +9957,7 @@ async fn direct_control(
     if outcome == WdaControlOutcome::Failed {
         let locked = recover(state.wda_health.lock()).locked;
         *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: false,
             locked,
@@ -10098,6 +10261,7 @@ async fn unlock_before_action(
                 &state.wda_actionable,
                 &state.released,
                 crate::wda::WdaHealth {
+                    updated_at: std::time::Instant::now(),
                     up: true,
                     actionable: true,
                     locked: Some(false),
@@ -10107,6 +10271,41 @@ async fn unlock_before_action(
         Ok(Err(error)) => tracing::info!("the phone is locked and could not be unlocked: {error:#}"),
         Err(_) => tracing::info!("unlocking the phone took longer than {}s", budget.as_secs()),
     }
+}
+
+async fn stale_action_lock_refusal(state: &AppState) -> Option<ControlRefusal> {
+    if recover(state.wda_health.lock()).updated_at.elapsed() <= std::time::Duration::from_secs(5) {
+        return None;
+    }
+    let wda = state.wda.as_ref()?;
+    let _priority = state.begin_wda_control();
+    let locked = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        wda.lock().await.locked_unattached().await
+    })
+    .await;
+    if matches!(locked, Ok(Ok(true))) {
+        let health = *recover(state.wda_health.lock());
+        apply_wda_health_probe(
+            &state.wda_health,
+            &state.wda_actionable,
+            &state.released,
+            crate::wda::WdaHealth {
+                locked: Some(true),
+                actionable: false,
+                ..health
+            },
+        );
+        let hint = if !state.managed_wda && state.selfrunner_gateway.is_some() {
+            "the phone is locked; call phone_reconnect once to unlock it remotely, then retry"
+        } else {
+            "the phone is locked; unlock it before sending an action"
+        };
+        return Some(
+            ControlRefusal::new(StatusCode::CONFLICT, "device_locked", true)
+                .with("hint", serde_json::json!(hint)),
+        );
+    }
+    None
 }
 
 fn control_readiness_refusal(state: &Arc<AppState>) -> Option<ControlRefusal> {
@@ -10508,14 +10707,15 @@ fn validate_agent_action_value(
                 return invalid("perform action name is unsupported");
             };
             match action.get("value") {
-                Some(value) if name == "adjust" => {
-                    if !value
-                        .as_str()
-                        .is_some_and(|value| !value.is_empty() && value.chars().count() <= 500)
-                    {
-                        return invalid("perform adjust value must be a JSON string of 1 to 500 characters: a picker option's text, or a slider position such as \"0.5\"");
-                    }
+                Some(value)
+                    if name == "adjust"
+                        && !value.as_str().is_some_and(|value| {
+                            !value.is_empty() && value.chars().count() <= 500
+                        }) =>
+                {
+                    return invalid("perform adjust value must be a JSON string of 1 to 500 characters: a picker option's text, or a slider position such as \"0.5\"");
                 }
+                Some(_) if name == "adjust" => {}
                 Some(_) => return invalid("perform value is only accepted with action adjust"),
                 None if name == "adjust" => {
                     return invalid("perform adjust requires a value");
@@ -10867,6 +11067,22 @@ fn agent_wait_observation(
     value
 }
 
+fn wait_probe_observation(
+    misses: u64,
+    answered: u64,
+    mut observation: serde_json::Value,
+) -> serde_json::Value {
+    if answered > 0 {
+        observation["probe_misses"] = misses.into();
+        observation["probes_answered"] = answered.into();
+        observation["hint"] = serde_json::json!(format!(
+            "the screen was read: {misses} of {answered} quick checks found the targets absent; \
+             only the final full-tree read did not complete in the window"
+        ));
+    }
+    observation
+}
+
 #[derive(Debug)]
 enum AgentWaitReadError {
     Failed(anyhow::Error),
@@ -10923,17 +11139,17 @@ async fn wait_probe_missed(
     w: &mut crate::wda::WdaClient,
     probes: &[String],
     deadline: tokio::time::Instant,
-) -> bool {
+) -> Option<bool> {
     for predicate in probes {
         match tokio::time::timeout_at(deadline, w.find_elements("predicate string", predicate))
             .await
         {
-            Ok(Ok(found)) if found.is_empty() => return true,
+            Ok(Ok(found)) if found.is_empty() => return Some(true),
             Ok(Ok(_)) => {}
-            _ => return false,
+            _ => return None,
         }
     }
-    false
+    Some(false)
 }
 
 async fn agent_wait_elements(
@@ -11070,6 +11286,24 @@ async fn agent_actions(
     agent_actions_inner(state, headers, body).await
 }
 
+/// A tap right after a swipe or scroll — pauses between them included — lands
+/// on a list still moving under momentum, and only stops it. Hardware, 14 Pro:
+/// swipe, `pause 600`, tap_locator answered ok and nothing opened.
+fn needs_scroll_settle(earlier: &[AgentActionStep], current: &serde_json::Value) -> bool {
+    let previous = earlier
+        .iter()
+        .rev()
+        .find(|step| !matches!(step, AgentActionStep::Pause { .. }));
+    let Some(AgentActionStep::Action { action, .. }) = previous else {
+        return false;
+    };
+    matches!(action["type"].as_str(), Some("swipe" | "scroll" | "drag"))
+        && matches!(
+            current["type"].as_str(),
+            Some("tap" | "tap_label" | "tap_locator" | "longpress")
+        )
+}
+
 async fn agent_actions_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -11126,6 +11360,9 @@ async fn agent_actions_inner(
         recover(state.flow_trail.lock()).flow_ran();
     }
     // Refused before the first step: zero actions, certainly.
+    if let Some(refusal) = stale_action_lock_refusal(&state).await {
+        return refusal.for_batch().into_response();
+    }
     if let Some(refusal) = control_readiness_refusal(&state) {
         return refusal.for_batch().into_response();
     }
@@ -11238,6 +11475,20 @@ async fn agent_actions_inner(
 
         match step {
             AgentActionStep::Action { action, after_ms } => {
+                if needs_scroll_settle(&request.steps[..index], action) {
+                    let budget = std::time::Duration::from_millis(1500);
+                    let deadline = batch_deadline.min(tokio::time::Instant::now() + budget);
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        w.device_settle(
+                            budget,
+                            std::time::Duration::from_millis(150),
+                            std::time::Duration::ZERO,
+                        ),
+                    )
+                    .await;
+                }
+
                 if let Err(refusal) = guard_foreground(&mut w, action).await {
                     let mut body = agent_actions_failure_body(
                         index,
@@ -11475,6 +11726,9 @@ async fn agent_actions_inner(
                         &step_results,
                         None,
                     );
+                    if let WdaControlOutcome::Refused(_, hint) = outcome {
+                        body["hint"] = serde_json::json!(hint);
+                    }
                     // The runner's own reason for a refused or failed step.
                     if let Some(runner_error) =
                         step_detail.as_ref().and_then(|d| d.get("runner_error"))
@@ -11559,6 +11813,8 @@ async fn agent_actions_inner(
                 let mut reads = 0_u64;
                 let probes = wait_probe_predicates(expect);
                 let mut probe_misses = 0_u64;
+                let mut probes_answered = 0_u64;
+                let reserve = std::time::Duration::from_millis((*timeout_ms / 3).min(2500));
                 loop {
                     attempts += 1;
                     // While the targets are not there yet, ask WDA for just
@@ -11568,9 +11824,17 @@ async fn agent_actions_inner(
                     // exactly what they always were.
                     if let Some(probes) = &probes {
                         let poll = std::time::Duration::from_millis(*poll_ms);
-                        if tokio::time::Instant::now() + poll < wait_deadline
-                            && wait_probe_missed(&mut w, probes, wait_deadline).await
-                        {
+                        let miss = if tokio::time::Instant::now() + poll + reserve < wait_deadline {
+                            let answer =
+                                wait_probe_missed(&mut w, probes, wait_deadline - reserve).await;
+                            if answer.is_some() {
+                                probes_answered += 1;
+                            }
+                            answer == Some(true)
+                        } else {
+                            false
+                        };
+                        if miss {
                             probe_misses += 1;
                             // Never sleep through the window: with less than a
                             // poll left, go straight to the final full read.
@@ -11603,16 +11867,24 @@ async fn agent_actions_inner(
                                     index,
                                     completed,
                                     applied_actions,
-                                    "wda_source_failed",
+                                    if probes_answered > 0 {
+                                        "expectation_timeout"
+                                    } else {
+                                        "wda_source_failed"
+                                    },
                                     "not_sent",
                                     applied_actions == 0,
                                     &step_results,
-                                    Some(agent_wait_observation(
-                                        last_observation,
-                                        attempts,
-                                        reads,
-                                        true,
-                                        Some(&error),
+                                    Some(wait_probe_observation(
+                                        probe_misses,
+                                        probes_answered,
+                                        agent_wait_observation(
+                                            last_observation,
+                                            attempts,
+                                            reads,
+                                            true,
+                                            Some(&error),
+                                        ),
                                     )),
                                 );
                             }
@@ -11650,12 +11922,16 @@ async fn agent_actions_inner(
                                 "not_sent",
                                 applied_actions == 0,
                                 &step_results,
-                                Some(agent_wait_observation(
-                                    last_observation,
-                                    attempts,
-                                    reads,
-                                    true,
-                                    Some(&timeout_error),
+                                Some(wait_probe_observation(
+                                    probe_misses,
+                                    probes_answered,
+                                    agent_wait_observation(
+                                        last_observation,
+                                        attempts,
+                                        reads,
+                                        true,
+                                        Some(&timeout_error),
+                                    ),
                                 )),
                             );
                         }
@@ -11712,6 +11988,7 @@ async fn agent_actions_inner(
     state.touch_activity();
     let locked = recover(state.wda_health.lock()).locked;
     *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+        updated_at: std::time::Instant::now(),
         up: true,
         actionable: true,
         locked,
@@ -11834,6 +12111,9 @@ async fn begin_list_control<'a>(
     deadline: tokio::time::Instant,
 ) -> Result<tokio::sync::MutexGuard<'a, crate::wda::WdaClient>, Response> {
     claim_phone_owner(state, headers)?;
+    if let Some(refusal) = stale_action_lock_refusal(state).await {
+        return Err(refusal.into_response());
+    }
     if let Some(refusal) = control_readiness_refusal(state) {
         return Err(refusal.into_response());
     }
@@ -12919,6 +13199,9 @@ async fn agent_input_inner(
                 }
             };
         }
+    }
+    if let Some(refusal) = stale_action_lock_refusal(&state).await {
+        return refusal.into_response();
     }
     if let Some(refusal) = control_readiness_refusal(&state) {
         return refusal.into_response();
@@ -15128,7 +15411,11 @@ fn mark_wda_read_path_unactionable(state: &AppState) {
     state
         .wda_read_degraded
         .store(true, std::sync::atomic::Ordering::Release);
-    recover(state.wda_health.lock()).actionable = false;
+    {
+        let mut health = recover(state.wda_health.lock());
+        health.actionable = false;
+        health.updated_at = Instant::now();
+    }
 }
 
 /// Keep a runner whose screen reads failed out of `drivable` until a light
@@ -21729,6 +22016,7 @@ mod tests {
 
     fn health(up: bool, actionable: bool, locked: Option<bool>) -> crate::wda::WdaHealth {
         crate::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up,
             actionable,
             locked,
@@ -22370,6 +22658,7 @@ mod tests {
             .try_begin_reconnecting()
             .expect("reconnect begins");
         let locked = crate::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: false,
             locked: Some(true),
@@ -22762,6 +23051,7 @@ mod tests {
                 &state.wda_actionable,
                 &state.released,
                 crate::wda::WdaHealth {
+                    updated_at: std::time::Instant::now(),
                     up: true,
                     actionable: true,
                     locked: Some(false),
@@ -23440,6 +23730,7 @@ mod tests {
         let actionable = AtomicBool::new(false);
         let released = AtomicBool::new(true);
         let stale = crate::wda::WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked: Some(false),
@@ -24609,6 +24900,7 @@ mod read_path_gate_tests {
 
     fn up() -> WdaHealth {
         WdaHealth {
+            updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
             locked: Some(false),
@@ -24669,4 +24961,352 @@ async fn browser_chrome(axum::Json(raw): axum::Json<serde_json::Value>) -> Respo
     }
     #[cfg(not(target_os = "macos"))]
     { let _=raw; (StatusCode::NOT_IMPLEMENTED,axum::Json(serde_json::json!({"ok":false,"error":"chrome_requires_paired_mac"}))).into_response() }
+}
+
+#[cfg(test)]
+mod selfrunner_p2_tests {
+    use super::*;
+    use crate as srv;
+    include!("../tests/fixtures/app_state.rs");
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    async fn mock_gateway(
+        status: serde_json::Value,
+        command: serde_json::Value,
+    ) -> (
+        Arc<crate::selfrunner::Gateway>,
+        tempfile::NamedTempFile,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::post, Json};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_calls = calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/status",
+                post(move || {
+                    let value = status.clone();
+                    async move { Json(value) }
+                }),
+            )
+            .route(
+                "/v1/command",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let value = command.clone();
+                    let calls = command_calls.clone();
+                    async move {
+                        if body["action"] == "unlock" {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Json(value)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "synthetic-test-token").unwrap();
+        let gateway = Arc::new(crate::selfrunner::Gateway::new(&base, file.path().into()).unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (gateway, file, calls, task)
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        use http_body_util::BodyExt;
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[test]
+    fn gateway_status_and_guidance_cover_all_five_priorities() {
+        block(async {
+            for case in 0..5 {
+                let transport = if case == 1 { "offline" } else { "online" };
+                let command = serde_json::json!({"ok":true,"result":{"needs_passcode":case==2,"needs_relaunch":false,"runner_core":{"running":case!=3},"runner_tunnel":{"idle":2},"vpn":true}});
+                let (gateway, _file, _, task) = mock_gateway(
+                    serde_json::json!({"transport":transport,"tunnels":{"idle":2}}),
+                    command,
+                )
+                .await;
+                if case == 0 {
+                    task.abort();
+                }
+                let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
+                state.selfrunner_gateway = Some(gateway);
+                *state.wda_health.lock().unwrap() = crate::wda::WdaHealth {
+                    updated_at: Instant::now(),
+                    up: case == 4,
+                    actionable: false,
+                    locked: Some(case == 4),
+                };
+                // Keep status on the cache, independent of a runner mock.
+                let _ = state.wda_lifecycle.try_begin_reconnecting();
+                let body = response_json(
+                    agent_status(
+                        State(Arc::new(state)),
+                        Query(MjpegStreamQuery::default()),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await;
+                assert!(body.get("self_runner").is_some(), "{body}");
+                let expected = [
+                    "not running",
+                    "LocalDevVPN",
+                    "passcode on the phone once",
+                    "Runner API",
+                    "phone_reconnect",
+                ][case];
+                assert!(body["hint"].as_str().unwrap().contains(expected), "{body}");
+                assert!(body["next_step"]["zh"].is_string(), "{body}");
+                assert!(!body.to_string().contains("synthetic-test-token"));
+                task.abort();
+            }
+            let body = response_json(
+                agent_status(
+                    State(fixture_app_state(None)),
+                    Query(MjpegStreamQuery::default()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert!(body.get("self_runner").is_none());
+        });
+    }
+
+    async fn locked_runner() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        runner_locked_for(usize::MAX).await
+    }
+
+    /// A runner whose first `reads` lock reads answer locked, then unlocked.
+    async fn runner_locked_for(
+        reads: usize,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::get, Json};
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = mutations.clone();
+        let lock_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/wda/locked",
+                get(move || {
+                    let n = lock_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Json(serde_json::json!({"value": n < reads})) }
+                }),
+            )
+            .route(
+                "/status",
+                get(|| async { Json(serde_json::json!({"value":{"ready":true}})) }),
+            )
+            .fallback(move |request: axum::extract::Request| {
+                let calls = calls.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({"value":null}))
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, mutations, task)
+    }
+
+    #[test]
+    fn stale_status_waits_for_a_new_health_probe() {
+        block(async {
+            let (base, _, task) = locked_runner().await;
+            let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
+            state.wda = Some(Arc::new(tokio::sync::Mutex::new(crate::wda::WdaClient::new(&base).unwrap())));
+            state.wda_health.lock().unwrap().updated_at = Instant::now() - std::time::Duration::from_secs(6);
+            let health = cached_wda_health(&state).await;
+            assert!(health.up);
+            assert_eq!(health.locked, Some(true));
+            assert!(!health.actionable);
+            task.abort();
+        });
+    }
+
+    #[test]
+    fn stale_action_refuses_locked_phone_without_dispatch() {
+        block(async {
+            let (base, mutations, task) = locked_runner().await;
+            let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
+            state.wda = Some(Arc::new(tokio::sync::Mutex::new(
+                crate::wda::WdaClient::new(&base).unwrap(),
+            )));
+            state.wda_health.lock().unwrap().updated_at =
+                Instant::now() - std::time::Duration::from_secs(6);
+            let refusal = stale_action_lock_refusal(&state).await.unwrap();
+            let body = response_json(refusal.into_response()).await;
+            assert_eq!(body["error"], "device_locked");
+            assert_eq!(body["outcome"], "not_sent");
+            assert_eq!(body["retry_safe"], true);
+            assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(state.wda_health.lock().unwrap().locked, Some(true));
+            task.abort();
+        });
+    }
+
+    #[test]
+    fn reconnect_unlocks_and_preserves_gateway_error_code() {
+        block(async {
+            // (gateway ok, lock reads before the phone opens, expected error)
+            for (success, locked_reads, expected) in [
+                (true, 1, None),
+                // Self Runner answered already_unlocked on the Sleep Focus
+                // lock screen; the runner still read locked.
+                (true, usize::MAX, Some("unlock_unconfirmed")),
+                (false, usize::MAX, Some("passcode_unavailable")),
+            ] {
+                let (gateway,_file,calls,gateway_task) = mock_gateway(serde_json::json!({"transport":"online","tunnels":{"idle":2}}),serde_json::json!({"ok":success,"error":"passcode_unavailable","result":{"unlocked":true}})).await;
+                let (base, mutations, runner_task) = runner_locked_for(locked_reads).await;
+                let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
+                state.selfrunner_gateway = Some(gateway);
+                state.wda = Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::wda::WdaClient::new(&base).unwrap(),
+                )));
+                let mut headers = HeaderMap::new();
+                headers.insert("x-phone-control", HeaderValue::from_static("1"));
+                let body = response_json(
+                    agent_mode(
+                        State(Arc::new(state)),
+                        headers,
+                        r#"{"mode":"agent"}"#.into(),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "{body}");
+                assert_eq!(body["ok"], expected.is_none(), "{body}");
+                match expected {
+                    Some(error) => {
+                        assert_eq!(body["error"], error, "{body}");
+                        let hint = body["hint"].as_str().unwrap();
+                        assert!(!hint.contains("phone_reconnect"), "{body}");
+                    }
+                    // The open phone's health probe opens a session (POSTs).
+                    None => assert_ne!(body["wda_locked"], true, "{body}"),
+                }
+                if expected.is_some() {
+                    assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+                }
+                gateway_task.abort();
+                runner_task.abort();
+            }
+        });
+    }
+    #[test]
+    fn stale_cache_waits_for_existing_probe_but_fresh_cache_does_not() {
+        block(async {
+            for stale in [false, true] {
+                let state = fixture_app_state(None);
+                state.wda_health.lock().unwrap().updated_at =
+                    Instant::now() - std::time::Duration::from_secs(if stale { 6 } else { 0 });
+                let cache = state.wda_health.clone();
+                *state.wda_health_probe.lock().unwrap() = Some(tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let mut health = cache.lock().unwrap();
+                    health.up = true;
+                    health.updated_at = Instant::now();
+                }));
+                assert_eq!(cached_wda_health(&state).await.up, stale);
+            }
+        });
+    }
+    #[test]
+    fn missed_probes_are_evidence_even_without_a_tree() {
+        let observation = wait_probe_observation(
+            3,
+            3,
+            agent_wait_observation(serde_json::Value::Null, 4, 0, true, Some("timeout")),
+        );
+        assert_eq!(observation["probe_misses"], 3);
+        assert_eq!(observation["probes_answered"], 3);
+        assert!(!observation.to_string().contains("no readable element tree"));
+    }
+    #[test]
+    fn settle_after_scroll_even_across_pauses() {
+        let swipe = || AgentActionStep::Action {
+            action: serde_json::json!({"type":"swipe"}),
+            after_ms: 0,
+        };
+        let pause = || AgentActionStep::Pause { ms: 600 };
+        let tap = serde_json::json!({"type":"tap"});
+        assert!(needs_scroll_settle(&[swipe()], &tap));
+        assert!(needs_scroll_settle(&[swipe(), pause()], &tap));
+        assert!(!needs_scroll_settle(
+            &[swipe()],
+            &serde_json::json!({"type":"pause"})
+        ));
+        assert!(!needs_scroll_settle(&[pause()], &tap));
+        assert!(!needs_scroll_settle(&[], &tap));
+    }
+
+    fn row(kind: &str, rect: [f64; 4], depth: u32) -> crate::wda::ElementRow {
+        crate::wda::ElementRow {
+            kind: kind.into(),
+            label: kind.into(),
+            rect,
+            depth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_target_under_the_status_bar_is_covered() {
+        // Hardware, 14 Pro, Settings: 显示与亮度 scrolled under both bars.
+        let rows = vec![
+            row("Application", [0., 0., 393., 852.], 0),
+            row("NavigationBar", [0., 59., 393., 54.], 1),
+            row("Button", [8., 62., 44., 44.], 2),
+            row("Toolbar", [0., 0., 393., 852.], 1),
+            row("Button", [16., 17.7, 361., 52.3], 2),
+            row("Button", [16., 200., 361., 52.], 2),
+        ];
+        assert!(center_covered(&rows, 4));
+        assert!(!center_covered(&rows, 5));
+        // The bar's own back button is drawn over the status bar's band.
+        assert!(!center_covered(&rows, 2));
+        // No navigation bar, no band: a full-screen app keeps its top.
+        let bare = vec![
+            row("Application", [0., 0., 393., 852.], 0),
+            row("Button", [16., 17.7, 361., 52.3], 1),
+        ];
+        assert!(!center_covered(&bare, 1));
+        // The tree as the daemon reads it on hardware: rows are filtered, so
+        // the list's rows sit deeper than the bar right after it.
+        let settings = vec![
+            row("Application", [0., 0., 393., 852.], 0),
+            row("NavigationBar", [0., 59., 393., 54.], 11),
+            row("StaticText", [179., 70., 34., 21.], 12),
+            row("CollectionView", [0., 0., 393., 852.], 15),
+            row("Cell", [16., -7., 361., 52.], 16),
+            row("Button", [16., -7., 361., 52.], 20),
+            row("Button", [16., 377., 361., 52.], 20),
+        ];
+        assert!(center_covered(&settings, 5));
+        assert!(!center_covered(&settings, 6));
+    }
 }

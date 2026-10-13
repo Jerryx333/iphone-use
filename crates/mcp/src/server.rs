@@ -1252,7 +1252,8 @@ impl PhoneHandler {
         For status/health checks, report the state and stop. Idle release \
         is intentional: reconnect (phone_reconnect, once) only when a current \
         user-requested task needs the phone, recovery_owner=daemon, and no blocker or \
-        reconnect is in progress; then poll until drivable=true."
+        reconnect is in progress; then poll until drivable=true. With a configured Self Runner gateway, \
+        follow self_runner/next_step: phone_reconnect can remotely unlock a locked phone."
     )]
     async fn phone_status(&self) -> CallToolResult {
         match self.daemon.status().await {
@@ -1572,7 +1573,8 @@ impl PhoneHandler {
         then poll phone_status until reconnecting=false and drivable=true; while it is \
         reconnecting, report setup_phase/setup_message and obey setup_blocked_on. This tool \
         never accepts a UDID and cannot switch devices. \
-        An externally managed runner returns an operator-owned recovery error."
+        An externally managed runner returns an operator-owned recovery error, except with a configured \
+        Self Runner gateway: when status advises it, call once to unlock via the Mac Keychain."
     )]
     async fn phone_reconnect(&self) -> CallToolResult {
         self.progress_reset();
