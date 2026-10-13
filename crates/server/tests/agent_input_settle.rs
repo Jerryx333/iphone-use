@@ -789,11 +789,11 @@ fn a_sample_cut_off_by_the_budget_marks_the_returned_tree_stale() {
 /// one read: every caller got `captures: 0` and a bare `budget_exhausted`, with
 /// nothing in the answer to say the budget was simply too small for this phone.
 ///
-/// With a 15s default the same phone gets two reads — so the default call can
-/// still reach `stable`, which is the point: the fix is a budget that matches
-/// real hardware, not a feature that gives up on observing.
+/// The default test scales delays and supplies a 1.2 s request budget.
+/// IPHONE_USE_SLOW_TESTS=1 reproduces the measured delays and production budget.
 #[test]
-fn a_seven_second_read_still_settles_on_the_default_budget() {
+fn a_slow_read_still_settles_with_two_reads() {
+    let full = std::env::var_os("IPHONE_USE_SLOW_TESTS").is_some();
     block(async {
         let wda = mock_wda(move |request, _| {
             if is_session(request) {
@@ -803,27 +803,41 @@ fn a_seven_second_read_still_settles_on_the_default_budget() {
                 return Some((Duration::ZERO, r#"{"value":null}"#.to_string()));
             }
             if is_source(request) {
-                // The measured cost on the phone that exposed this.
-                return Some((Duration::from_millis(6_500), simple_tree("搜索")));
+                // Scale the slow-phone regression to an explicit test budget.
+                return Some((
+                    Duration::from_millis(if full { 6500 } else { 150 }),
+                    simple_tree("搜索"),
+                ));
             }
             None
         });
 
         let started = std::time::Instant::now();
-        let (status, json, _) = press_home(wda.url(), "?return=delta").await;
+        let (status, json, _) = press_home(
+            wda.url(),
+            if full {
+                "?return=delta"
+            } else {
+                "?return=delta&settle_ms=1200"
+            },
+        )
+        .await;
         let elapsed = started.elapsed();
 
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["ok"], true);
         assert_eq!(
             json["settle"]["captures"], 2,
-            "two reads of a slow tree must fit the default budget: {json}"
+            "two reads of a slow tree must fit the test budget: {json}"
         );
         assert_eq!(json["settle"]["settled"], true, "{json}");
         assert_eq!(json["settle"]["reason"], "stable");
         assert!(json["snapshot"].is_string());
         // It really did take the reads, rather than answering from nothing.
-        assert!(elapsed >= Duration::from_millis(13_000), "{elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(if full { 13000 } else { 300 }),
+            "{elapsed:?}"
+        );
     });
 }
 
@@ -832,6 +846,7 @@ fn a_seven_second_read_still_settles_on_the_default_budget() {
 /// starts once the action is confirmed.
 #[test]
 fn a_slow_action_still_gets_its_own_observation_window() {
+    let full = std::env::var_os("IPHONE_USE_SLOW_TESTS").is_some();
     block(async {
         let wda = mock_wda(move |request, _| {
             if is_session(request) {
@@ -839,15 +854,29 @@ fn a_slow_action_still_gets_its_own_observation_window() {
             }
             if is_mutation(request) {
                 // Most of the action deadline spent before we can even look.
-                return Some((Duration::from_millis(11_000), r#"{"value":null}"#.to_string()));
+                return Some((
+                    Duration::from_millis(if full { 11000 } else { 1500 }),
+                    r#"{"value":null}"#.to_string(),
+                ));
             }
             if is_source(request) {
-                return Some((Duration::from_millis(1_000), simple_tree("搜索")));
+                return Some((
+                    Duration::from_millis(if full { 1000 } else { 150 }),
+                    simple_tree("搜索"),
+                ));
             }
             None
         });
 
-        let (status, json, _) = press_home(wda.url(), "?return=delta").await;
+        let (status, json, _) = press_home(
+            wda.url(),
+            if full {
+                "?return=delta"
+            } else {
+                "?return=delta&settle_ms=1200"
+            },
+        )
+        .await;
 
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["ok"], true);
@@ -1425,6 +1454,8 @@ fn the_next_action_cancels_the_background_capture_of_the_settled_screen() {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
         let sources = Arc::new(AtomicUsize::new(0));
         let seen = sources.clone();
+        let capturing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture_started = capturing.clone();
         let base = concurrent_runner(move |request| {
             let reply = |body: &str| (Duration::ZERO, body.to_string());
             if is_session(request) {
@@ -1440,6 +1471,7 @@ fn the_next_action_cancels_the_background_capture_of_the_settled_screen() {
                 if seen.load(Ordering::Acquire) < 2 {
                     return reply(r#"{"value":{"error":"unable to capture","message":"no"}}"#);
                 }
+                capture_started.store(true, Ordering::Release);
                 return (
                     Duration::from_millis(2500),
                     format!(r#"{{"value":"{encoded}"}}"#),
@@ -1467,8 +1499,14 @@ fn the_next_action_cancels_the_background_capture_of_the_settled_screen() {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["settle"]["reason"], "stable", "{json}");
-        // Let the background capture take the client.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait until the background capture has actually taken the client.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !capturing.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background capture started");
 
         let (status, json, elapsed) =
             request_json(&state, "POST", "/agent/input", Some(r#"{"type":"home"}"#)).await;

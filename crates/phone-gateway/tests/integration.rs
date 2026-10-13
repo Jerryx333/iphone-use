@@ -227,9 +227,8 @@ async fn authentication_pin_limits_and_timeout() {
             2 => {
                 stream.write_u32(4097).await.unwrap();
             }
-            _ => {
-                tokio::time::sleep(Duration::from_millis(240)).await;
-            }
+            // Reading below polls the socket until the hello deadline closes it.
+            _ => {}
         }
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
@@ -350,7 +349,7 @@ async fn fifo_capacity_and_queue_deadline() {
         }));
         tokio::time::timeout(Duration::from_secs(1), async {
             while g.snapshot().await["queue_length"] != i + 1 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -386,7 +385,7 @@ async fn matching_pong_refreshes_only_once() {
     protocol::write_frame(&mut stream, &pong).await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while g.snapshot().await["last_pong_at"].is_null() {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -455,7 +454,7 @@ async fn network_fifo_and_one_inflight() {
         } else {
             tokio::time::timeout(Duration::from_secs(1), async {
                 while g.snapshot().await["queue_length"] != i {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
