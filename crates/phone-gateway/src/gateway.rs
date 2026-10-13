@@ -31,6 +31,9 @@ pub struct Timing {
     pub hello: Duration,
     pub ping: Duration,
     pub offline: Duration,
+    pub tunnel_open: Duration,
+    pub tunnel_wait: Duration,
+    pub tunnel_idle: Duration,
 }
 impl Default for Timing {
     fn default() -> Self {
@@ -38,6 +41,9 @@ impl Default for Timing {
             hello: Duration::from_secs(5),
             ping: Duration::from_secs(15),
             offline: Duration::from_secs(45),
+            tunnel_open: Duration::from_secs(2),
+            tunnel_wait: Duration::from_secs(5),
+            tunnel_idle: Duration::from_secs(120),
         }
     }
 }
@@ -66,6 +72,8 @@ pub struct Gateway {
     notify: Arc<Notify>,
     timing: Timing,
     passcode_reader: Arc<PasscodeReader>,
+    tunnels: crate::tunnel::Tunnels,
+    forwards: [Option<SocketAddr>; 2],
 }
 // Never propagate security's stdout/stderr or an OS error: either can contain secrets.
 fn keychain_passcode(device_id: &str) -> std::result::Result<String, ()> {
@@ -146,7 +154,30 @@ impl Gateway {
             notify: Arc::new(Notify::new()),
             timing,
             passcode_reader: Arc::new(reader),
+            tunnels: crate::tunnel::Tunnels::default(),
+            forwards: [None, None],
         }
+    }
+    pub fn with_forwards(
+        mut self,
+        runner: Option<SocketAddr>,
+        mjpeg: Option<SocketAddr>,
+    ) -> Result<Self> {
+        crate::tunnel::validate_forwards(runner, mjpeg)?;
+        self.forwards = [runner, mjpeg];
+        Ok(self)
+    }
+    /// Listen on a pre-bound loopback socket using the configured runner or MJPEG port.
+    pub async fn listen_forward(&self, listener: TcpListener, port: u16) -> Result<()> {
+        if !listener.local_addr()?.ip().is_loopback()
+            || !matches!(port, 8100 | 9100)
+            || self.forwards[usize::from(port == 9100)].is_none()
+        {
+            return Err("forward listener rejected".into());
+        }
+        self.tunnels
+            .listen(listener, port, self.timing.clone())
+            .await
     }
     pub fn router(&self) -> Router {
         Router::new()
@@ -160,7 +191,26 @@ impl Gateway {
         }
         let phone = TcpListener::bind(phone).await?;
         let http = TcpListener::bind(http).await?;
-        tokio::try_join!(self.listen(phone), async {
+        let mut forwards = Vec::new();
+        for (address, port) in self.forwards.into_iter().zip([8100, 9100]) {
+            if let Some(address) = address {
+                forwards.push((TcpListener::bind(address).await?, port));
+            }
+        }
+        let forwarding = async {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (listener, port) in forwards {
+                let gateway = self.clone();
+                tasks.spawn(async move { gateway.listen_forward(listener, port).await });
+            }
+            if let Some(result) = tasks.join_next().await {
+                result??;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            Ok::<(), crate::Error>(())
+        };
+        tokio::try_join!(forwarding, self.listen(phone), async {
             axum::serve(http, self.router()).await.map_err(Into::into)
         })?;
         Ok(())
@@ -205,16 +255,26 @@ impl Gateway {
                     let mut challenge = Challenge::new()?;
                     protocol::write_frame(&mut stream, &challenge.frame()).await?;
                     let hello = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
-                    if !challenge.verify(&hello, &gateway.config.psk, &gateway.config.device_id) {
+                    let tunnel = hello.get("role").is_some_and(|role| role == "tunnel");
+                    if (tunnel && gateway.forwards.iter().all(Option::is_none))
+                        || !challenge.verify(&hello, &gateway.config.psk, &gateway.config.device_id)
+                    {
                         return Err("authentication rejected".into());
                     }
                     protocol::write_frame(&mut stream, &json!({"t":"welcome"})).await?;
-                    Ok::<_, crate::Error>(stream)
+                    Ok::<_, crate::Error>((stream, tunnel))
                 };
                 let result = timeout(gateway.timing.hello, handshake).await;
                 drop(permit);
-                if let Ok(Ok(stream)) = result {
-                    gateway.connected(stream).await;
+                if let Ok(Ok((stream, tunnel))) = result {
+                    if tunnel {
+                        gateway
+                            .tunnels
+                            .insert(stream, gateway.timing.tunnel_idle)
+                            .await;
+                    } else {
+                        gateway.connected(stream).await;
+                    }
                 }
             });
         }
@@ -398,7 +458,8 @@ impl Gateway {
     }
     pub async fn snapshot(&self) -> Value {
         let s = self.inner.lock().await;
-        json!({"transport":if s.online {"online"} else {"offline"},"last_pong_at":s.last_pong,"device_id":&self.config.device_id[..8],"queue_length":s.queue.len()})
+        let tunnels = self.tunnels.snapshot().await;
+        json!({"tunnels":tunnels,"transport":if s.online {"online"} else {"offline"},"last_pong_at":s.last_pong,"device_id":&self.config.device_id[..8],"queue_length":s.queue.len()})
     }
 }
 fn authorized(g: &Gateway, r: &Request) -> bool {

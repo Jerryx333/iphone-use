@@ -101,3 +101,61 @@ pub async fn connect(pair: &Pairing) -> Result<TlsStream<TcpStream>> {
     }
     Ok(stream)
 }
+
+pub fn tunnel_hello(pair: &Pairing, challenge: &Value) -> Result<Value> {
+    let nonce = STANDARD.decode(challenge["nonce"].as_str().ok_or("missing nonce")?)?;
+    if nonce.len() != 32 {
+        return Err("bad nonce".into());
+    }
+    Ok(
+        json!({"t":"hello","v":1,"role":"tunnel","device_id":pair.device_id,
+        "mac":STANDARD.encode(protocol::tunnel_mac(&STANDARD.decode(&pair.psk)?, &nonce, &pair.device_id))}),
+    )
+}
+pub async fn connect_tunnel(pair: &Pairing) -> Result<TlsStream<TcpStream>> {
+    let mut stream = tls(
+        &format!("{}:{}", pair.host, pair.port),
+        pair.cert_sha256.clone(),
+    )
+    .await?;
+    let challenge = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
+    protocol::write_frame(&mut stream, &tunnel_hello(pair, &challenge)?).await?;
+    if protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?["t"] != "welcome" {
+        return Err("welcome missing".into());
+    }
+    Ok(stream)
+}
+#[derive(Default)]
+pub struct TunnelOptions {
+    pub targets: std::collections::HashMap<u16, std::net::SocketAddr>,
+    pub reject: Option<u16>,
+    pub stall: bool,
+}
+/// Handle one open, then switch to raw bytes. Missing targets are rejected.
+pub async fn tunnel(mut stream: TlsStream<TcpStream>, options: TunnelOptions) -> Result<()> {
+    let frame = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
+    if frame["t"] != "open" {
+        return Err("open missing".into());
+    }
+    if options.stall {
+        // Keep the connection alive until the gateway closes it.
+        let mut byte = [0];
+        use tokio::io::AsyncReadExt;
+        let _ = stream.read(&mut byte).await;
+        return Ok(());
+    }
+    let port = frame["port"].as_u64().and_then(|p| u16::try_from(p).ok());
+    let target = match port {
+        Some(port) if options.reject != Some(port) => options.targets.get(&port),
+        _ => None,
+    };
+    let mut target = match target {
+        Some(address) => TcpStream::connect(address).await.ok(),
+        None => None,
+    };
+    protocol::write_frame(&mut stream, &json!({"t":"opened","ok":target.is_some()})).await?;
+    if let Some(target) = target.as_mut() {
+        tokio::io::copy_bidirectional(&mut stream, target).await?;
+    }
+    Ok(())
+}

@@ -40,6 +40,7 @@ impl Fixture {
                 hello: Duration::from_millis(200),
                 ping: Duration::from_millis(50),
                 offline: Duration::from_millis(250),
+                ..Timing::default()
             },
         )
     }

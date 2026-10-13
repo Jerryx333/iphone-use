@@ -241,3 +241,23 @@ bash scripts/research-banner-occlusion.sh
 ```
 
 每轮 launch 设置 → tap「通用」（index 0，expect「关于本机」）→ 执行 PUSH_CMD → 最多 10 秒轮询 `read target=system`，匹配 label 恰为「通知」、frame 与屏幕相交且 0≤x<屏宽、y<屏高/3 的节点 → tap `BackButton`（expect「通用」）。屏宽高取前台 AX depth 0 的屏幕 frame（点坐标）；轮间最多等 10 秒直到系统树无「通知」节点，超时该轮记 fail。每轮输出 ok/code/ms/occlusion.cleared_by、横幅观察状态及分类，最后汇总 pass/not_exercised/fail 计数：tap ok、已见横幅、occlusion 存在且 cleared_by 有值且不为 none 才算 pass；tap ok 但无 occlusion 或横幅未出现算 not_exercised；其他算 fail。有 fail 退出 1，全部 not_exercised 退出 2，否则退出 0；未提供 PUSH_CMD 打印用法并退出 64。PUSH_CMD 由 bash 执行且输出不转发；不自动重试失败的 tap。设备/系统版本、构建号、USB/调试器、锁屏、VPN、定位权限、网络及原始结果仍需按 §11.F 在真机回归记录中保留。
+
+## 13. runner 转发通道（P1）
+
+本节定义转发通道的协议与两端实现。gateway 侧见 `crates/phone-gateway/src/tunnel.rs`，手机侧见 `spikes/self-runner-app/Sources/RemoteTunnel.swift`（分支 `Jerry/selfrunner-tunnel-phone`）；真机互通尚未核实。控制链路线上格式和行为不变，不增加控制帧。daemon 经 Mac loopback 转发端口访问手机本机 runner（127.0.0.1:8100）与 MJPEG/H.264（9100）；gateway 不解析 WDA，不修改 runner 自带的端到端 IPU-HMAC 签名。
+
+`serve --runner-forward <ADDR> --mjpeg-forward <ADDR>` 两个参数均可选，默认不开，只接受 IPv4/IPv6 loopback 地址，非 loopback 报错退出。参数地址是 Mac 监听地址；对应手机端口固定为 8100 / 9100，不能由本地调用者指定任意目标端口。
+
+手机主动连接同一个 phone TLS 端口、使用同一证书和 challenge。数据连接回应 `{"t":"hello","v":1,"role":"tunnel","device_id":...,"mac":...}`，mac 为 base64(HMAC-SHA256(psk, `"selfrunner-tunnel-v1" || nonce || device_id`))。认证成功回 `{"t":"welcome"}`，加入空闲池，不调用 `connected()`，不改控制 generation、online、inflight。无 role 的 hello 保持原控制路径和 `selfrunner-v1` 上下文；其他 role、上下文交叉使用、未启用任何 forward 时的 tunnel hello 均拒绝并关闭，不回 welcome。两类连接共用原有握手超时、两个握手槽位、同 IP 100ms 节流。
+
+空闲池最多 8 条，满时关闭新通道，空闲超过 `Timing::tunnel_idle`（默认 120s）关闭。每条 Mac 本地 TCP 连接按 FIFO 领用最老空闲通道，发 `{"t":"open","port":8100}` 或 9100，等待 `{"t":"opened","ok":true}`。读帧限制为 `PRE_AUTH_LIMIT`，无额外 BufReader，避免读走紧随帧后的原始数据。`Timing::tunnel_open` 默认 2s，覆盖发 open 与读 opened；超时、帧错误或 ok 不为 true 时关闭该通道并继续尝试下一条。池空等待新通道；自本地 accept 起总等待不超过 `Timing::tunnel_wait`（默认 5s），失败关闭本地连接。Timing 可在测试中缩短。
+
+opened 成功后双向原样复制字节，正确传播半关闭（单侧 EOF 后可继续接收反向数据），完成或出错后释放两端。全局最多 16 条并发转发连接（包含等待通道的本地连接），超过立即关闭。`/v1/status` 快照只增加 `"tunnels":{"idle":n,"active":m}`，保留已有字段与 CLI compact 输出。日志仅包含 open/close、端口、字节数、耗时及固定失败原因码，不记录内容、psk、mac；复制中途失败仍记录已成功写入的字节数。
+
+离线 fake_phone 支持 tunnel 握手、端口到测试目标地址映射、拒绝端口与不回应 open；`tests/tunnel.rs` 覆盖两端口小包及超过 1MB 数据、半关闭、控制连接共存、认证隔离、等待与打开超时、FIFO 回退、空闲超时、池与并发上限、loopback 限制。
+
+手机侧（`RemoteTunnel`，状态都在 main，接口仿 `RemoteLink`：`configure(enabled:pairing:)`）：远程模式开启且 RunnerCore 在跑时保持 2 条空闲通道（握手中的也算），总数上限 6，MJPEG 这类长连接不占空闲名额。拨号间隔至少 0.3s（gateway 对同一 IP 有 100ms 握手节流，也避免挤掉控制链路重连）；认证失败或连不上时指数退避 1s→30s，gateway 120s 空闲回收、流结束属正常回收，按 0.3s 间隔补池，不退避。`ports` 映射决定 gateway 可打开的端口及实际连接的本机端口（默认 8100→8100、9100→9100），不在映射里的回 `{"t":"opened","ok":false}`；本机端口 1.5s 内连不上同样回 ok:false（早于 gateway 的 2s）。对拷时 Mac 侧的半关闭转成对 runner 的 TCP 半关闭；runner 侧 EOF 则在剩余字节发完后优雅关闭整条通道（Network.framework 的 TLS 连接不支持只关写方向）。
+
+Mac 联调（2026-10-13，未接真机）：真实 gateway + 在 macOS 上编译的 `RemoteTunnel.swift` + 本地 echo / 流式服务，5 轮 4MB 往返与 8MB 服务端推流、4 路 echo 并发 + 1 路推流均逐字节一致；端口不在映射里时本地连接在 `tunnel_wait` 后关闭；gateway 重启期间手机侧按 1/2/4s 退避，恢复后补满空闲池并可正常转发。
+
+部署注意：Mac 本机 8100 可能已被其他程序占用（at-mac 上是 palpod 的 mic_bridge.py），转发端口不要默认用 8100/9100，daemon 侧用 `IPHONE_USE_WDA_URL` / `IPHONE_USE_WDA_MJPEG_URL` 指向实际转发地址。

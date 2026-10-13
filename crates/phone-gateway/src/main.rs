@@ -38,6 +38,10 @@ enum Commands {
         bind: SocketAddr,
         #[arg(long, default_value = "127.0.0.1:7382")]
         http: SocketAddr,
+        #[arg(long)]
+        runner_forward: Option<SocketAddr>,
+        #[arg(long)]
+        mjpeg_forward: Option<SocketAddr>,
     },
     Cmd {
         action: String,
@@ -176,8 +180,14 @@ async fn main() -> Result<()> {
             config::pair(&dir, rotate, host, port, &out)?;
             println!("{}", json!({"paired":true,"out":out}));
         }
-        Commands::Serve { bind, http } => {
+        Commands::Serve {
+            bind,
+            http,
+            runner_forward,
+            mjpeg_forward,
+        } => {
             Gateway::new(Config::load(&dir)?, Timing::default())
+                .with_forwards(runner_forward, mjpeg_forward)?
                 .serve(bind, http)
                 .await?
         }

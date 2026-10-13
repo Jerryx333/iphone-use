@@ -27,8 +27,14 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, value: &Value) -> Res
     Ok(())
 }
 pub fn mac(psk: &[u8], challenge: &[u8], device_id: &str) -> Vec<u8> {
+    context_mac(psk, challenge, device_id, b"selfrunner-v1")
+}
+pub fn tunnel_mac(psk: &[u8], challenge: &[u8], device_id: &str) -> Vec<u8> {
+    context_mac(psk, challenge, device_id, b"selfrunner-tunnel-v1")
+}
+fn context_mac(psk: &[u8], challenge: &[u8], device_id: &str, context: &[u8]) -> Vec<u8> {
     let mut h = Hmac::<Sha256>::new_from_slice(psk).expect("HMAC accepts any key length");
-    h.update(b"selfrunner-v1");
+    h.update(context);
     h.update(challenge);
     h.update(device_id.as_bytes());
     h.finalize().into_bytes().to_vec()
@@ -70,9 +76,47 @@ impl Challenge {
             return false;
         };
         let mut h = Hmac::<Sha256>::new_from_slice(psk).unwrap();
-        h.update(b"selfrunner-v1");
+        let context: &[u8] = match hello.get("role") {
+            None => b"selfrunner-v1",
+            Some(role) if role == "tunnel" => b"selfrunner-tunnel-v1",
+            _ => return false,
+        };
+        h.update(context);
         h.update(&self.nonce);
         h.update(device.as_bytes());
         h.verify_slice(&tag).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::*;
+    #[test]
+    fn hello_contexts_roles_and_single_use() {
+        for (role, tunnel, accepted) in [
+            (None, false, true),
+            (Some(json!("tunnel")), true, true),
+            (Some(json!("tunnel")), false, false),
+            (None, true, false),
+            (Some(json!("other")), false, false),
+            (Some(Value::Null), false, false),
+        ] {
+            let mut challenge = Challenge::new().unwrap();
+            let nonce = STANDARD
+                .decode(challenge.frame()["nonce"].as_str().unwrap())
+                .unwrap();
+            let tag = if tunnel {
+                tunnel_mac(b"psk", &nonce, "device")
+            } else {
+                mac(b"psk", &nonce, "device")
+            };
+            let mut hello =
+                json!({"t":"hello","v":1,"device_id":"device","mac":STANDARD.encode(tag)});
+            if let Some(role) = role {
+                hello["role"] = role;
+            }
+            assert_eq!(challenge.verify(&hello, b"psk", "device"), accepted);
+            assert!(!challenge.verify(&hello, b"psk", "device"));
+        }
     }
 }
