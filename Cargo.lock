@@ -3520,3 +3520,13 @@ checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
 dependencies = [
  "zune-core",
 ]
+
+[[package]]
+name = "phone-control"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
