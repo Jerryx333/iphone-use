@@ -100,7 +100,7 @@ pub enum Action {
         snapshot: Option<String>,
         label: Option<String>,
         /// Optional exact UI kind to disambiguate a label (for example StaticText versus Switch).
-        kind: Option<String>,
+        kind: Option<String>, // profile-use: allow; UI element type declaration
     },
     Longpress {
         x: f64,
