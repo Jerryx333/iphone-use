@@ -6119,11 +6119,7 @@ enum WdaControlOutcome {
 }
 
 fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String> {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-
-    let encoded = serde_json::to_vec(rows)?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(encoded)))
+    Ok(core::control::snapshot_id(rows)?)
 }
 
 /// Read-only usability statistics for one flattened element tree, reported as
@@ -6313,19 +6309,7 @@ fn lookup_element_snapshot(
 }
 
 /// Index-level diff between two element trees (see [`diff_element_rows`]).
-#[derive(Debug, PartialEq, Eq)]
-struct ElementRowsDelta {
-    /// Indexes into the CURRENT tree of rows with no identity match in the
-    /// baseline — directly usable as `element` with the new snapshot token.
-    added: Vec<usize>,
-    /// Indexes into the CURRENT tree of rows whose identity exists in the
-    /// baseline but whose state or geometry differs (value, rect, flags, depth).
-    changed: Vec<usize>,
-    /// Indexes into the BASELINE tree of rows that are gone from the current one.
-    removed: Vec<usize>,
-    /// Rows identical in both trees.
-    unchanged: usize,
-}
+type ElementRowsDelta = core::control::ElementDelta;
 
 /// Diff two flattened element trees for `?since=` responses.
 ///
@@ -6339,57 +6323,14 @@ fn diff_element_rows(
     baseline: &[crate::wda::ElementRow],
     current: &[crate::wda::ElementRow],
 ) -> ElementRowsDelta {
-    use std::collections::HashMap;
-
-    type IdentityKey<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
-    fn identity(row: &crate::wda::ElementRow) -> IdentityKey<'_> {
+    core::control::diff_rows(baseline, current, |row| {
         (
             row.kind.as_str(),
             row.label.as_str(),
             row.identifier.as_deref(),
             row.placeholder.as_deref(),
         )
-    }
-
-    let mut baseline_by_identity: HashMap<IdentityKey<'_>, std::collections::VecDeque<usize>> =
-        HashMap::new();
-    for (index, row) in baseline.iter().enumerate() {
-        baseline_by_identity
-            .entry(identity(row))
-            .or_default()
-            .push_back(index);
-    }
-
-    let mut delta = ElementRowsDelta {
-        added: Vec::new(),
-        changed: Vec::new(),
-        removed: Vec::new(),
-        unchanged: 0,
-    };
-    let mut matched_baseline = vec![false; baseline.len()];
-    for (index, row) in current.iter().enumerate() {
-        match baseline_by_identity
-            .get_mut(&identity(row))
-            .and_then(std::collections::VecDeque::pop_front)
-        {
-            Some(baseline_index) => {
-                matched_baseline[baseline_index] = true;
-                if baseline[baseline_index] == *row {
-                    delta.unchanged += 1;
-                } else {
-                    delta.changed.push(index);
-                }
-            }
-            None => delta.added.push(index),
-        }
-    }
-    delta.removed = matched_baseline
-        .iter()
-        .enumerate()
-        .filter(|(_, matched)| !**matched)
-        .map(|(index, _)| index)
-        .collect();
-    delta
+    })
 }
 
 /// `ok:true` means the action was dispatched and WDA acknowledged it, not
@@ -7407,11 +7348,7 @@ async fn perform_snapshot_element(
 /// Shared swipe-travel curve: how far a scroll gesture actually moves for a
 /// requested delta `d` along an axis of the given size.
 fn swipe_travel(d: f64, axis: f64) -> f64 {
-    if d == 0.0 {
-        0.0
-    } else {
-        (d.abs() * 1.5).clamp(0.15 * axis, 0.75 * axis) * d.signum()
-    }
+    core::control::swipe_travel(d, axis)
 }
 
 /// Is at least half of `rect` inside a `width` × `height` window?
