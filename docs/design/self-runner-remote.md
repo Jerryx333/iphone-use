@@ -298,7 +298,7 @@ wait_for 为最后一次整树读取预留 `min(2.5 秒, timeout/3)`。快速探
 目标：手机只要能上网（蜂窝、热点、别处 Wi‑Fi，LocalDevVPN 常开），pal / daemon 就能经 Mac 上的 phone-gateway 控制它；在家仍可局域网直连。控制链路（§2–4、§11.C）与转发通道（§13）**在字节流之上的线上格式一律不变**，只是多了一种承载它们的传输：
 
 ```
-手机 ──wss://phone.hiyinni.cn/selfrunner/v1/<route>──▶ Cloudflare 边缘 ──Tunnel──▶ cloudflared(Mac)
+手机 ──wss://<你的域名>/selfrunner/v1/<route>──▶ Cloudflare 边缘 ──Tunnel──▶ cloudflared(Mac)
      ──http://127.0.0.1:7383（WebSocket upgrade）──▶ phone-gateway WS 入口
 WS binary 消息 = E2E 加密记录；记录解开后是一条有序字节流，上面照旧跑长度前缀 JSON 帧、challenge/hello/welcome、open/opened 与原始字节对拷
 ```
@@ -309,7 +309,7 @@ Cloudflare 边缘会解开 TLS，§11.C 的证书指纹钉扎在这条路上不�
 
 ### 15.2 配对信息
 
-`gateway-pair.json` 仍是 `v:1`，新增可选字段 `ws_url`（不带路径，例如 `"wss://phone.hiyinni.cn"`）。`host`/`port`/`cert_sha256` 保留，作为局域网直连（7381，TLS + 钉扎）。
+`gateway-pair.json` 仍是 `v:1`，新增可选字段 `ws_url`（不带路径，例如 `"wss://phone.example.com"`）。`host`/`port`/`cert_sha256` 保留，作为局域网直连（7381，TLS + 钉扎）。
 
 - `phone-gateway pair --ws-url <URL>`：写入该字段；不传则不写（旧格式）。gateway 与 App 对它的校验相同：只接受 `wss://<主机名>[:端口]`（主机名字符集同 `host`，≤253），或仅用于本机联调的 `ws://127.0.0.1[:端口]` / `ws://localhost[:端口]`；不得含路径（单个结尾 `/` 可忽略）、查询、片段、用户信息，总长 ≤ 512。不合规则整份配对无效（`invalid_pairing`）。
 - 旧 App 读到带 `ws_url` 的文件会忽略该字段（Codable 未知键），行为不变。
@@ -377,8 +377,8 @@ Cloudflare 文档称会断开 100 秒无数据的 WebSocket（未实测）。gat
 
 ### 15.7 cloudflared（Mac，运维）
 
-- 单独配置文件 `~/.cloudflared/phone-gateway.yml`：`tunnel` = `be9c57e2-d34d-41b3-b08c-ddb21f41b5af`，`credentials-file` 指向同名 json，ingress `phone.hiyinni.cn` → `http://127.0.0.1:7383`，其余 `http_status:404`。**不改** `~/.cloudflared/config.yml`（ycodepro 旧配置），账号里其他隧道不动。
-- launchd 用户代理 `com.at.cloudflared-phone`：`cloudflared tunnel --no-autoupdate --config ~/.cloudflared/phone-gateway.yml run`，RunAtLoad + KeepAlive，日志 `~/Library/Logs/cloudflared-phone.log`。
+- 单独配置文件（例如 `~/.cloudflared/phone-gateway.yml`）：`tunnel` = 为 phone-gateway 新建的隧道 UUID，`credentials-file` 指向同名 json，ingress `<你的域名>` → `http://127.0.0.1:7383`，其余 `http_status:404`。不要改动已有的 `~/.cloudflared/config.yml` 和账号里的其他隧道。
+- 用一个 launchd 用户代理常驻：`cloudflared tunnel --no-autoupdate --config ~/.cloudflared/phone-gateway.yml run`，RunAtLoad + KeepAlive，日志 `~/Library/Logs/cloudflared-phone.log`。
 - gateway 的 launchd 参数加 `--ws-bind 127.0.0.1:7383`。
 
 ### 15.8 App（手机）

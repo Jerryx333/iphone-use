@@ -35,7 +35,7 @@ func pair(_ url: String?) throws -> RemotePairing {
 let legacy = try pair(nil)
 guard legacy.ws_url == nil, legacy.route == "e285a22ef3cf3f7b6c09bb2188bc75ee" else { fatalError("route/legacy") }
 print("route ok")
-for url in ["wss://phone.hiyinni.cn", "wss://example.com:443/", "ws://127.0.0.1:7383", "ws://localhost", "wss://a_b:1"] {
+for url in ["wss://phone.example.com", "wss://example.com:443/", "ws://127.0.0.1:7383", "ws://localhost", "wss://a_b:1"] {
     let p = try pair(url)
     guard p.webSocketURL?.path == "/selfrunner/v1/" + p.route else { fatalError("full URL") }
 }
