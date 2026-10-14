@@ -68,6 +68,8 @@ struct Inner {
     queue: VecDeque<Pending>,
     inflight: Option<Pending>,
     last_pong: Option<u128>,
+    // Last moment the current (or previous) control link was known to be alive.
+    last_alive: Option<Instant>,
 }
 type PasscodeReader = dyn Fn(&str) -> std::result::Result<String, ()> + Send + Sync;
 
@@ -483,7 +485,7 @@ impl Gateway {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let generation = {
+        let (generation, stale_before) = {
             let mut s = self.inner.lock().await;
             if let Some(p) = s.inflight.take() {
                 let _ = p.reply.send(error(&p.id, "unknown"));
@@ -492,8 +494,13 @@ impl Gateway {
             s.online = true;
             s.link = Some(link);
             s.last_pong = None;
-            s.generation
+            (s.generation, s.last_alive.replace(Instant::now()))
         };
+        // Idle tunnels that joined before the previous control link was last heard from were dialled
+        // over the path that link used; after a network change they are dead without any notice.
+        if let Some(before) = stale_before {
+            self.tunnels.drop_idle_before(before).await;
+        }
         self.notify.notify_waiters();
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::channel(2);
@@ -608,7 +615,7 @@ impl Gateway {
                                 if let Some(index) = outstanding.iter().position(|s| *s == seq) {
                                     outstanding.drain(..=index); last_ack = Instant::now();
                                     let mut s = self.inner.lock().await;
-                                    if s.generation == generation { s.last_pong = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()); }
+                                    if s.generation == generation { s.last_alive = Some(last_ack); s.last_pong = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()); }
                                 }
                             }
                         },

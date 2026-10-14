@@ -329,12 +329,19 @@ async fn idle_pool_limit_eight() {
     f.count("idle", 8).await;
     sleep(Duration::from_millis(110)).await;
     let mut extra = fake_phone::connect_tunnel(&f.pair).await.unwrap();
+    // The oldest is evicted (closed); the newest arrival stays in the pool.
     assert!(timeout(
         Duration::from_secs(1),
-        protocol::read_frame(&mut extra, protocol::PRE_AUTH_LIMIT)
+        protocol::read_frame(&mut streams[0], protocol::PRE_AUTH_LIMIT)
     )
     .await
     .unwrap()
+    .is_err());
+    assert!(timeout(
+        Duration::from_millis(300),
+        protocol::read_frame(&mut extra, protocol::PRE_AUTH_LIMIT)
+    )
+    .await
     .is_err());
     f.count("idle", 8).await;
 }
@@ -421,4 +428,20 @@ async fn malformed_opened_skips_channel_without_consuming_raw_bytes() {
         .unwrap()
         .unwrap();
     assert_eq!(received, b"immediate raw bytes");
+}
+
+#[tokio::test]
+async fn control_reconnect_drops_tunnels_from_before_the_previous_link() {
+    let f = Fixture::new(true, Duration::from_secs(10)).await;
+    let _stale = fake_phone::connect_tunnel(&f.pair).await.unwrap();
+    f.count("idle", 1).await;
+    sleep(Duration::from_millis(110)).await;
+    let _first = fake_phone::connect(&f.pair).await.unwrap();
+    sleep(Duration::from_millis(110)).await;
+    let _fresh = fake_phone::connect_tunnel(&f.pair).await.unwrap();
+    f.count("idle", 2).await;
+    sleep(Duration::from_millis(110)).await;
+    // A new control link: the tunnel that joined before the previous link was last alive goes.
+    let _second = fake_phone::connect(&f.pair).await.unwrap();
+    f.count("idle", 1).await;
 }

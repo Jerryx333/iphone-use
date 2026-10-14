@@ -250,7 +250,7 @@ bash scripts/research-banner-occlusion.sh
 
 手机主动连接同一个 phone TLS 端口、使用同一证书和 challenge。数据连接回应 `{"t":"hello","v":1,"role":"tunnel","device_id":...,"mac":...}`，mac 为 base64(HMAC-SHA256(psk, `"selfrunner-tunnel-v1" || nonce || device_id`))。认证成功回 `{"t":"welcome"}`，加入空闲池，不调用 `connected()`，不改控制 generation、online、inflight。无 role 的 hello 保持原控制路径和 `selfrunner-v1` 上下文；其他 role、上下文交叉使用、未启用任何 forward 时的 tunnel hello 均拒绝并关闭，不回 welcome。两类连接共用原有握手超时、两个握手槽位、同 IP 100ms 节流。
 
-空闲池最多 8 条，满时关闭新通道，空闲超过 `Timing::tunnel_idle`（默认 120s）关闭。每条 Mac 本地 TCP 连接按 FIFO 领用最老空闲通道，发 `{"t":"open","port":8100}` 或 9100，等待 `{"t":"opened","ok":true}`。读帧限制为 `PRE_AUTH_LIMIT`，无额外 BufReader，避免读走紧随帧后的原始数据。`Timing::tunnel_open` 默认 2s，覆盖发 open 与读 opened；超时、帧错误或 ok 不为 true 时关闭该通道并继续尝试下一条。池空等待新通道；自本地 accept 起总等待不超过 `Timing::tunnel_wait`（默认 5s），失败关闭本地连接。Timing 可在测试中缩短。
+空闲池最多 8 条，满时淘汰最老的一条、保留新来的（2026-10-14 前为关闭新通道）；控制链路重连时，关闭在上一条控制链路最后一次确认存活之前进池的空闲通道（切网后它们走的是已死的路径），空闲超过 `Timing::tunnel_idle`（默认 120s）关闭。每条 Mac 本地 TCP 连接按 FIFO 领用最老空闲通道，发 `{"t":"open","port":8100}` 或 9100，等待 `{"t":"opened","ok":true}`。读帧限制为 `PRE_AUTH_LIMIT`，无额外 BufReader，避免读走紧随帧后的原始数据。`Timing::tunnel_open` 默认 2s，覆盖发 open 与读 opened；超时、帧错误或 ok 不为 true 时关闭该通道并继续尝试下一条。池空等待新通道；自本地 accept 起总等待不超过 `Timing::tunnel_wait`（默认 5s），失败关闭本地连接。Timing 可在测试中缩短。
 
 opened 成功后双向原样复制字节，正确传播半关闭（单侧 EOF 后可继续接收反向数据），完成或出错后释放两端。全局最多 16 条并发转发连接（包含等待通道的本地连接），超过立即关闭。`/v1/status` 快照只增加 `"tunnels":{"idle":n,"active":m}`，保留已有字段与 CLI compact 输出。日志仅包含 open/close、端口、字节数、耗时及固定失败原因码，不记录内容、psk、mac；复制中途失败仍记录已成功写入的字节数。
 

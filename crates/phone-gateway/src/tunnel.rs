@@ -89,9 +89,11 @@ impl Tunnels {
     }
     pub(crate) async fn insert(&self, stream: BoxStream, lifetime: Duration) {
         let mut pool = self.idle.lock().await;
+        // A full pool keeps the newest arrival: after a network change the oldest entries are the
+        // ones most likely to be dead without notice.
         if pool.len() == 8 {
-            tracing::info!(event = "close", code = "pool_full");
-            return;
+            pool.pop_front();
+            tracing::info!(event = "close", code = "pool_full_evicted_oldest");
         }
         let id = uuid::Uuid::new_v4();
         let since = Instant::now();
@@ -113,6 +115,21 @@ impl Tunnels {
                 }
             }
         });
+    }
+    /// Close idle tunnels that joined before `before`. Used when the control link reconnects:
+    /// tunnels from the path the old link died on cannot be told apart from live ones otherwise.
+    pub(crate) async fn drop_idle_before(&self, before: Instant) {
+        let mut pool = self.idle.lock().await;
+        let count = pool.len();
+        pool.retain(|entry| entry.since >= before);
+        let dropped = count - pool.len();
+        if dropped > 0 {
+            tracing::info!(
+                event = "close",
+                code = "stale_after_reconnect",
+                count = dropped
+            );
+        }
     }
     pub(crate) async fn listen(
         &self,
