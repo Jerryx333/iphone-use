@@ -15,6 +15,10 @@ final class RemoteTunnel {
     private static let preAuthLimit = 4096
     private static let dialSpacing = 0.3
     private static let localConnectTimeout = 1.5
+    // The gateway drops idle tunnels after 120 s. Recycling a little earlier on our side bounds how long
+    // a tunnel whose path died silently (Wi‑Fi -> cellular: the gateway's FIN never arrives) can sit
+    // in the pool looking idle while the gateway has none.
+    private static let idleRecycle = 110.0
 
     private enum Phase { case connecting, challenge, welcome, idle, opening, piping }
     private final class Tunnel {
@@ -51,9 +55,16 @@ final class RemoteTunnel {
         return ["idle": idle, "active": tunnels.count - idle]
     }
 
-    init() { routes.changed = { [weak self] in self?.fill() } }
+    init() { routes.changed = { [weak self] in self?.pathChanged() } }
+
+    // Idle tunnels were dialled over the old path and may be dead without any notice; replace them.
+    private func pathChanged() {
+        for tunnel in tunnels.values where tunnel.phase == .idle { close(tunnel, reason: "path_changed") }
+        fill()
+    }
 
     func configure(enabled: Bool, pairing: RemotePairing?) {
+        routes.reset()
         self.enabled = enabled; self.pairing = pairing
         epoch += 1
         scheduled?.cancel(); scheduled = nil
@@ -150,6 +161,11 @@ final class RemoteTunnel {
             guard t == "welcome" else { return false }
             tunnel.budget?.cancel(); tunnel.budget = nil
             tunnel.phase = .idle
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleRecycle) { [weak self, weak tunnel] in
+                guard let self, let tunnel, token == self.epoch, self.tunnels[tunnel.id] === tunnel,
+                      tunnel.phase == .idle else { return }
+                self.close(tunnel, reason: "idle_recycle")
+            }
             dialing = false; backoff = 0
             fill()
             return true
@@ -291,7 +307,7 @@ final class RemoteTunnel {
             dialing = false
             backoff = min(30, max(1, backoff * 2))
             log("tunnel \(tunnel.id): \(reason), retry in \(Int(backoff))s")
-        } else if reason != "done" && reason != "idle_closed" {
+        } else if !["done", "idle_closed", "idle_recycle"].contains(reason) {
             log("tunnel \(tunnel.id): closed (\(reason))")
         }
         fill()

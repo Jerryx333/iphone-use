@@ -36,6 +36,8 @@ final class RemoteRoutePolicy {
     }
     deinit { monitor.cancel() }
     func failure(_ route: String) { if route == "lan" { lanFailed = true } }
+    /// A new pairing may point at a different LAN host; forget earlier failures.
+    func reset() { lanFailed = false }
     func routes(_ pair: RemotePairing) -> [String] {
         guard pair.ws_url != nil else { return ["lan"] }
         return (path ?? monitor.currentPath).usesInterfaceType(.wifi) && !lanFailed ? ["lan", "wss"] : ["wss", "lan"]

@@ -27,6 +27,7 @@ final class RemoteLink {
         routes.changed = { [weak self] in self?.reconnectNow() }
     }
     func configure(enabled: Bool, pairing: RemotePairing?) {
+        routes.reset()
         self.enabled = enabled; self.pairing = pairing
         disconnect(); backoff = 1
         reconnectNow()

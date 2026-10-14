@@ -171,6 +171,11 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         catch { log("pairing: import_failed") }
     }
     func rePair() {
+        // Only replace the stored pairing with a valid new file; without one, keep what works.
+        let file = documents.appendingPathComponent("gateway-pair.json")
+        guard let data = try? Data(contentsOf: file), (try? RemotePairing.validate(data)) != nil else {
+            log("pairing: no valid gateway-pair.json, keeping the current pairing"); return
+        }
         remoteLink.configure(enabled: false, pairing: nil)
         do {
             try RemotePairing.clear(); remotePairing = nil
