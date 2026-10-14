@@ -24,13 +24,25 @@ final class RemoteLink {
     var request: ([String: Any], @escaping ([String: Any]) -> Void) -> Void = { _, _ in }
     var status: String { phase }
     init() {
-        routes.changed = { [weak self] in self?.reconnectNow() }
+        routes.changed = { [weak self] in self?.pathChanged() }
     }
     func configure(enabled: Bool, pairing: RemotePairing?) {
         routes.reset()
         self.enabled = enabled; self.pairing = pairing
         disconnect(); backoff = 1
         reconnectNow()
+    }
+    // A path change can leave an online link on a dead interface (hotspot -> home Wi‑Fi) that would
+    // otherwise take the 45 s data timeout to notice. Ask the gateway for a pong; silence for 5 s
+    // means the link is gone, so reconnect over the new path right away.
+    private func pathChanged() {
+        guard phase == "online" else { reconnectNow(); return }
+        let token = epoch, asked = Date()
+        send(["t": "ping", "seq": 0], token: token)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, token == self.epoch, self.phase == "online", self.lastData < asked else { return }
+            self.failed(token)
+        }
     }
     func reconnectNow() {
         guard enabled, pairing != nil, connection == nil else { return }
