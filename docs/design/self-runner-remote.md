@@ -292,3 +292,112 @@ health 缓存超过 5 秒时，status 最多等待后台探测 2.5 秒；动作�
 元素点击（tap_locator、tap_label、tap_element）把顶部 NavigationBar 上方的状态栏区域算作遮挡：目标中心落在状态栏或导航栏下时，沿用已有的「先滚到屏幕中部再点」逻辑，不再点到状态栏左上角的返回链接。导航栏自身的按钮不受影响；没有导航栏的页面不加这条遮挡。
 
 wait_for 为最后一次整树读取预留 `min(2.5 秒, timeout/3)`。快速探测成功但没有匹配时，最终读取失败的 observation 保留 `probe_misses` 和 `probes_answered`，避免把已读到屏幕误报为从未读到。批次中 swipe、scroll、drag 之后的第一个点击或 longpress（中间隔着 pause 也算）先等 settle，最多 1.5 秒；超时继续。
+
+## 15. 外网控制：经 Cloudflare Tunnel 的 WSS 传输与端到端加密（2026-10-14，WIB +0700）
+
+目标：手机只要能上网（蜂窝、热点、别处 Wi‑Fi，LocalDevVPN 常开），pal / daemon 就能经 Mac 上的 phone-gateway 控制它；在家仍可局域网直连。控制链路（§2–4、§11.C）与转发通道（§13）**在字节流之上的线上格式一律不变**，只是多了一种承载它们的传输：
+
+```
+手机 ──wss://phone.hiyinni.cn/selfrunner/v1/<route>──▶ Cloudflare 边缘 ──Tunnel──▶ cloudflared(Mac)
+     ──http://127.0.0.1:7383（WebSocket upgrade）──▶ phone-gateway WS 入口
+WS binary 消息 = E2E 加密记录；记录解开后是一条有序字节流，上面照旧跑长度前缀 JSON 帧、challenge/hello/welcome、open/opened 与原始字节对拷
+```
+
+### 15.1 为什么另加一层加密
+
+Cloudflare 边缘会解开 TLS，§11.C 的证书指纹钉扎在这条路上不起作用；unlock 请求里还带着 gateway 注入的手机密码。所以 WSS 只当承载，机密性、完整性和双方认证全靠 PSK 派生的端到端层。Cloudflare 能看到：route 路径、手机公网 IP、消息大小与时间；看不到内容，无法冒充任何一方（没有 PSK），重放和乱序会被计数器拒绝，事后拿到 PSK 也解不开录下的流量（每条连接用临时 X25519 密钥）。
+
+### 15.2 配对信息
+
+`gateway-pair.json` 仍是 `v:1`，新增可选字段 `ws_url`（不带路径，例如 `"wss://phone.hiyinni.cn"`）。`host`/`port`/`cert_sha256` 保留，作为局域网直连（7381，TLS + 钉扎）。
+
+- `phone-gateway pair --ws-url <URL>`：写入该字段；不传则不写（旧格式）。gateway 与 App 对它的校验相同：只接受 `wss://<主机名>[:端口]`（主机名字符集同 `host`，≤253），或仅用于本机联调的 `ws://127.0.0.1[:端口]` / `ws://localhost[:端口]`；不得含路径（单个结尾 `/` 可忽略）、查询、片段、用户信息，总长 ≤ 512。不合规则整份配对无效（`invalid_pairing`）。
+- 旧 App 读到带 `ws_url` 的文件会忽略该字段（Codable 未知键），行为不变。
+- 下发与导入流程不变；Keychain 已有配对时要在 App 里点「重新配对」才会导入新文件。PSK 不轮换时 runner token 不变。
+
+### 15.3 路由键（挡住扫描器）
+
+WS 路径固定为 `/selfrunner/v1/<route>`，`route = hex(HMAC-SHA256(PSK, "selfrunner-ws-route-v1"))` 的前 32 个字符（小写）。gateway 在 upgrade 之前比对路径（常量时间），不符直接回 404 并关闭，不占握手槽位。路由键不是秘密（Cloudflare 看得到），只用来让互联网上的随机请求够不着握手槽位；认证仍靠下面的握手。
+
+upgrade 之前的资源上限：未完成 upgrade 的 TCP 连接最多 16 条（超出立即关闭），请求头总长 ≤ 8 KiB，从 accept 到请求头读完 ≤ 3 秒。**不做按来源节流**：`CF-Connecting-IP` 可被本机进程或中继任意填写，不能当身份；PSK 为 256 位，无需防暴力猜测。
+
+已知不防：Cloudflare（或拿到路由键的人）可以持续占满握手槽位、丢弃或拖延消息，让外网手机连不上——这是可用性问题，局域网直连不受影响；机密性与完整性不受影响。
+
+### 15.4 E2E 握手
+
+WS 建立后：
+
+1. 手机发第一条 binary 消息 `M1 = "SRE1" || 0x01 || e_c`（共 37 字节，`e_c` 为本连接新生成的 X25519 公钥）。
+2. gateway 校验长度和前缀，生成自己的临时密钥，回 `M2 = "SRE1" || 0x02 || e_s`（37 字节）。
+3. 双方计算：
+   - `dh = X25519(自己的私钥, 对方公钥)`，结果全 0 即断开；
+   - `th = SHA256("selfrunner-e2e-v1" || M1 || M2)`；
+   - `prk = HKDF-Extract(salt = th, ikm = PSK || dh)`（HKDF-SHA256）；
+   - `k_c2s = HKDF-Expand(prk, "selfrunner-e2e-v1 c2s", 32)`，`k_s2c = HKDF-Expand(prk, "selfrunner-e2e-v1 s2c", 32)`。
+4. 之后每条 binary 消息是一条记录：`ChaCha20-Poly1305(k_方向, nonce = 4 个 0 字节 || seq 的 8 字节大端, aad = 空)` 的「密文 || 16 字节 tag」。**seq 不上线**：每个方向各自从 0 计数、每条记录加 1，接收方用自己期望的 seq 构造 nonce 解密，因此重放、乱序、丢弃、反射都表现为解密失败，即断开；seq 达到 2^64−1 也断开。临时私钥用后即丢（x25519-dalek `EphemeralSecret` / CryptoKit 私钥不落盘、不复用），以兑现前向保密。
+5. 明文 = 1 字节类型 + 载荷：`0x00` DATA（载荷 1..65536 字节，字节流的下一段），`0x01` EOF（载荷为空，表示发送方不再写，即半关闭；之后该方向不得再有记录）。其他类型即断开。
+6. **关闭语义**：字节流的「正常结束」只认 EOF 记录。一方发出 EOF 后仍须继续接收对方的数据，双方都发出并收到 EOF 后才关闭 WS。没收到 EOF 记录就遇到 WS Close、断线或解密失败，一律作为**错误**交给上层（读返回 io 错误，不是 EOF），防止 Cloudflare 截掉尾部被当作正常完成。
+
+之后在解出的字节流上照旧走 §4 / §11.C / §13：gateway 发 challenge（这是 gateway 的第一条记录，手机能解开它才算确认对端持有 PSK），手机回 hello（控制链路无 role，转发通道 `role:"tunnel"`，MAC 上下文不变），gateway 回 welcome。因此一条 WSS 连接认证两次：E2E 层证明持有 PSK，hello 再核对 device_id 与上下文，旧逻辑一行不改。
+
+限制与超时：
+
+- WS 单条消息 ≤ 65536 + 17 字节，单帧同上限；分片消息要正确拼装，**在累计分配之前**按上限拒绝（tokio-tungstenite 用 `WebSocketConfig` 的 `max_message_size` / `max_frame_size`，并用带配置的 accept 函数）。收到 text 消息、超长消息即断开。
+- 两层上限各管各的：E2E 记录 ≤ 64 KiB 载荷；内层帧在认证前仍 ≤ 4 KiB、认证后 ≤ 16 MiB（原逻辑）。适配器只能持有有界缓冲，不得无限预读排队。
+- 从 upgrade 完成到 welcome（E2E 握手 + challenge/hello/welcome），gateway 总时长仍是 `Timing::hello`（5 秒）。
+- 握手槽位：WS 入口独立 4 个槽位（控制链路 1 条 + 补池的通道可能同时握手），与 7381 互不挤占；槽位满时回 503 并关闭。
+
+测试向量（两端单元测试都要对上；`PSK = 00..1f`，`client_private = 20..3f`，`server_private = 40..5f`，均为连续字节，X25519 私钥按 RFC 7748 clamp）：
+
+```
+m1:              5352453101358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254
+m2:              535245310279a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a
+dh:              04c304fb1ca83cee75e206344231f33797e07d9929db670994b7c6fbeb1dc255
+transcript_hash: 418f81a9f94e6c194b81d5f083462fc6ecfd3c94df7f91bc14f055c14b48b219
+key_c2s:         840004597a499caeca91c295843319f40c52774522be214b5d6571e378be3c5f
+key_s2c:         c79a8bdb55636d741b168d40fe70b9afdc4e22f9933454f26f09e21f0c04ae62
+s2c seq 0, DATA "hello": b80ae39be1e326570554cdbcd547fbc28382c664b5d6
+c2s seq 0, DATA "world": cd03d4ee6288919dea0bf25a474d3d5432331ef75b35
+c2s seq 1, EOF:          6fc3dc760a5c5ef263404a0f4436124ca8
+route:           e285a22ef3cf3f7b6c09bb2188bc75ee
+```
+
+### 15.5 保活
+
+Cloudflare 文档称会断开 100 秒无数据的 WebSocket（未实测）。gateway 对**每条** WS 连接（控制、空闲通道、正在对拷的通道）每 30 秒（±3 秒抖动）发一次 WS Ping，手机自动回 Pong（不进 E2E 层，不影响 seq）。连续 2 次 Ping（约 60 秒）都没等到 Pong、或单次 WS 写超过 30 秒，即关闭该连接。WS 层的 Ping/Pong/Close 由收发任务独立处理，不能被上层字节流的背压卡住。Pong 可被中继伪造，只说明承载活着；控制链路判活仍靠原有加密的 15 秒 ping/pong、45 秒判离线。转发通道空闲回收仍是 `Timing::tunnel_idle`（120 秒）。
+
+### 15.6 gateway（Mac）
+
+- `serve --ws-bind <ADDR>`：可选，默认不开；只接受 loopback 地址，否则报错退出。部署值 `127.0.0.1:7383`。只做 WebSocket upgrade（HTTP/1.1 GET，路径见 15.3），别的请求一律 404。
+- E2E 层实现为一个独立模块：握手完成后返回一个实现 `AsyncRead + AsyncWrite` 的字节流（例如收发任务 + 有界通道，配 `tokio_util::io::StreamReader` 之类能把错误交给读方的适配；`tokio::io::duplex` 无法表达「异常结束」，不要用）。上层写方向 shutdown 时发 EOF 记录；收到 EOF 记录时上层读到 EOF；没有 EOF 记录的 WS 关闭、断线、解密失败让上层读到 io 错误（15.4 第 6 条），转发日志因此记为 `copy_failed` 而不是 `eof`。上层握手（challenge → hello → welcome）和之后的 `connected()`、`Tunnels::insert()` 复用 7381 的同一段代码（把那段从 `listen()` 里抽成对任意字节流通用的函数；`Tunnels` 的空闲池改存装箱的字节流）。
+- `/v1/status` 快照增加 `"link":"lan"|"wss"|null`（当前控制链路从哪个入口进来）；其余字段与 CLI compact 输出不变。日志只记入口、事件、原因码，不记 route、密钥、记录内容。
+- 依赖：WebSocket 服务端用 `tokio-tungstenite`（带 `WebSocketConfig` 的 `accept_hdr_async_with_config`，在回调里校验路径）；加密用 lock 里已有的 RustCrypto 版本：`x25519-dalek 2`、`chacha20poly1305 0.10`、`hkdf 0.12`、`sha2`。
+- 离线测试：`fake_phone` 增加 WS + E2E 客户端，`tests/` 覆盖控制链路与转发通道都能经 WS 工作（含 >1MB 往返和半关闭）、错误 PSK 在 E2E 层被拒、错误路径 404、篡改/重放/乱序记录断开、text 消息断开、无 EOF 记录的关闭在上层表现为错误、超长消息在分配前被拒、upgrade 前连接数和请求头上限、`ws-bind` 非 loopback 报错、两个入口并存且控制链路可在两者之间替换。
+
+### 15.7 cloudflared（Mac，运维）
+
+- 单独配置文件 `~/.cloudflared/phone-gateway.yml`：`tunnel` = `be9c57e2-d34d-41b3-b08c-ddb21f41b5af`，`credentials-file` 指向同名 json，ingress `phone.hiyinni.cn` → `http://127.0.0.1:7383`，其余 `http_status:404`。**不改** `~/.cloudflared/config.yml`（ycodepro 旧配置），账号里其他隧道不动。
+- launchd 用户代理 `com.at.cloudflared-phone`：`cloudflared tunnel --no-autoupdate --config ~/.cloudflared/phone-gateway.yml run`，RunAtLoad + KeepAlive，日志 `~/Library/Logs/cloudflared-phone.log`。
+- gateway 的 launchd 参数加 `--ws-bind 127.0.0.1:7383`。
+
+### 15.8 App（手机）
+
+- 引入一个字节流传输抽象（建立、收、发、半关闭/结束、取消、状态回调），两个实现：现有 TLS over TCP（钉扎不变，行为不变）与 WSS + E2E。RemoteLink 与 RemoteTunnel 的帧解析、握手、对拷逻辑改为基于该抽象。
+- WSS 实现要点：`NWConnection(to: .url(<ws_url>/selfrunner/v1/<route>))`，参数为 TLS（系统 CA 校验 Cloudflare 证书）+ `NWProtocolWebSocket.Options`（`autoReplyPing = true`，`maximumMessageSize` 设为 65536 + 17）；按**消息**收（`receiveMessage`，检查 metadata 的 opcode 只接受 binary），发送时带 `NWProtocolWebSocket.Metadata(opcode: .binary)` 的 context；「一条消息收完」不是流 EOF，流 EOF 只认 EOF 记录（15.4 第 6 条）。发送串行、seq 只在主队列分配。
+- 对拷：WSS 上 Mac 侧 EOF 记录转成对 runner 的 TCP 半关闭；runner 侧 EOF 在剩余字节发完后发 EOF 记录，**继续**把 Mac 侧数据转给 runner，直到也收到对方 EOF 才关闭。TLS 通道保持现状（Network.framework 不能只关 TLS 写方向）。
+- 超时：每次拨号尝试有自己的定时器（替换 RemoteLink 现有固定 5 秒那个），取消旧尝试并按 token 丢弃迟到回调。`lan` 预算 2 秒（含 TCP、TLS 和 welcome / 通道进入 idle），`wss` 8 秒（含 DNS、TLS、upgrade、E2E 和 welcome）。
+- 路由选择（控制链路与转发通道各自按同一规则独立决定）：当前网络路径用 Wi‑Fi 时顺序为 `lan` → `wss`，否则 `wss` → `lan`；同一条路径上 `lan` 失败过一次后，直到路径变化（NWPathMonitor）前都把 `wss` 排前。两个都失败才进入原有退避。没有 `ws_url` 时只有 `lan`，行为同现在。注意 `link=lan` 只说明控制链路，转发通道可能走的是 wss。
+- App 界面与 `status` 显示当前控制链路的路由（`lan` / `wss`）。
+- 日志不记 route、密钥、记录内容。
+- Mac 联调：Swift 源码可在 macOS 编译，对本机 gateway 的 `ws://127.0.0.1:7383` 跑通控制与转发（同 §13 的联调方式），并用 15.4 的测试向量做单元检查。
+
+### 15.9 MJPEG 流量
+
+经 WSS 时，所有字节都走 Cloudflare 免费套餐。截图走 runner HTTP，单张约 0.3–1 MB；MJPEG 按 10–30 fps、每帧 50–100 KB 估算为 0.5–3 MB/s，持续推流一小时就是 2–10 GB，且可能与 Cloudflare 对非网页大流量的条款冲突。约定：在外（`link=wss`）时只用 read / screenshot / run_steps，不长时间开 MJPEG 或录屏；真机实测数据补在 15.10。
+
+### 15.10 验收（真机）
+
+1. 手机走蜂窝或热点、只开 LocalDevVPN：`phone-gateway cmd status/read` 正常且 `link=wss`；daemon `phone_status` 为 `drivable:true`；`phone_run_steps` 能执行；
+2. `selfrunner-autoresign --force` 重签重装后，不碰手机即自动恢复（经 wss）；
+3. 回到家里 Wi‑Fi，App 重启后走 `link=lan`；
+4. 端到端加密：错误 PSK、篡改记录被拒（离线测试证明）；Cloudflare 侧只看到 binary 密文（抓 cloudflared 到 7383 的明文 HTTP 可见只有 upgrade 头和二进制帧）。
