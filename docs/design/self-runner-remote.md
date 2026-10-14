@@ -260,7 +260,7 @@ opened 成功后双向原样复制字节，正确传播半关闭（单侧 EOF �
 
 Mac 联调（2026-10-13，未接真机）：真实 gateway + 在 macOS 上编译的 `RemoteTunnel.swift` + 本地 echo / 流式服务，5 轮 4MB 往返与 8MB 服务端推流、4 路 echo 并发 + 1 路推流均逐字节一致；端口不在映射里时本地连接在 `tunnel_wait` 后关闭；gateway 重启期间手机侧按 1/2/4s 退避，恢复后补满空闲池并可正常转发。
 
-部署注意：Mac 本机 8100 可能已被其他程序占用（at-mac 上是 palpod 的 mic_bridge.py），转发端口不要默认用 8100/9100，daemon 侧用 `IPHONE_USE_WDA_URL` / `IPHONE_USE_WDA_MJPEG_URL` 指向实际转发地址。
+部署注意：Mac 本机 8100 可能已被其他程序占用，转发端口不要默认用 8100/9100，daemon 侧用 `IPHONE_USE_WDA_URL` / `IPHONE_USE_WDA_MJPEG_URL` 指向实际转发地址。
 
 
 ## 14. daemon 外部托管模式（P2）
@@ -380,6 +380,7 @@ Cloudflare 文档称会断开 100 秒无数据的 WebSocket（未实测）。gat
 - 单独配置文件（例如 `~/.cloudflared/phone-gateway.yml`）：`tunnel` = 为 phone-gateway 新建的隧道 UUID，`credentials-file` 指向同名 json，ingress `<你的域名>` → `http://127.0.0.1:7383`，其余 `http_status:404`。不要改动已有的 `~/.cloudflared/config.yml` 和账号里的其他隧道。
 - 用一个 launchd 用户代理常驻：`cloudflared tunnel --no-autoupdate --config ~/.cloudflared/phone-gateway.yml run`，RunAtLoad + KeepAlive，日志 `~/Library/Logs/cloudflared-phone.log`。
 - gateway 的 launchd 参数加 `--ws-bind 127.0.0.1:7383`。
+- 上述 plist、cloudflared 配置与 daemon 环境变量由 `scripts/selfrunner-remote-setup.py` 按本机参数文件生成；新 Mac / 新手机的完整步骤见 `docs/selfrunner-remote-setup.md`。
 
 ### 15.8 App（手机）
 

@@ -53,6 +53,9 @@ iOS 的 consent 通常由 idevice 内部使用 000000，不是要求把设备锁
 
 ## 手机端步骤
 
+远程控制（gateway、外网隧道、自动重签）的新 Mac / 新手机部署步骤合并在
+`docs/selfrunner-remote-setup.md`；下面是 S0b 研究阶段的手动步骤。
+
 1. 开启 Developer Mode。先由主会话用 Xcode 挂载 personalized DDI（本阶段不实现挂载）。
 2. 从 App Store 安装 LocalDevVPN，开启 VPN；保持开启。不能同时使用另一 VPN。
 3. 确认 App Documents 下有 `rp_pairing.plist`（安装脚本推送，或通过 Finder 文件共享放入）。

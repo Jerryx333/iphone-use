@@ -1,0 +1,340 @@
+#!/bin/bash
+# 用途：免费 Apple ID 签名到期前，自动重签、安装并启动 Self Runner。
+# 运行：LaunchAgent 每 30 分钟调用；手动：selfrunner-autoresign [--force] [--dry-run]
+# 依赖：Xcode（已登录 Apple ID）、xcodegen、python3、phone-gateway、osascript。
+# 参数：本机配置文件 ${SELFRUNNER_REMOTE_CONFIG:-~/.config/iphone-use/selfrunner-remote.env}
+#（只读 SR_ 开头的 KEY=VALUE 行，不执行），同名环境变量优先。字段见
+# docs/selfrunner-remote-setup.md；安装见 scripts/selfrunner-remote-setup.py。
+set -uo pipefail
+
+CONFIG="${SELFRUNNER_REMOTE_CONFIG:-$HOME/.config/iphone-use/selfrunner-remote.env}"
+if [ -f "$CONFIG" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*(SR_[A-Z0-9_]+)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then value="${BASH_REMATCH[1]}"; fi
+    # shellcheck disable=SC2088 # 匹配字面的 "~/"，再换成 $HOME。
+    case "$value" in "~/"*) value="$HOME/${value#\~/}" ;; esac
+    # 环境变量已设置时不覆盖。
+    [ -n "${!key+x}" ] || printf -v "$key" '%s' "$value"
+  done < "$CONFIG"
+fi
+
+SRC="${SELFRUNNER_SRC:-${SR_SRC:-$HOME/.iphone-use/selfrunner-src}}"
+APP_DIR="${APP_DIR:-$SRC/spikes/self-runner-app}"
+TEAM_ID="${TEAM_ID:-${SR_TEAM_ID:-}}"
+BUNDLE_ID="${BUNDLE_ID:-${SR_BUNDLE_ID:-dev.iphoneuse.selfrunner.spike}}"
+DEVICE="${SELFRUNNER_DEVICE:-${SR_DEVICE_UDID:-}}"
+GATEWAY_HTTP="${SR_GW_HTTP:-127.0.0.1:7382}"
+GATEWAY_HOME="${PHONE_GATEWAY_HOME:-$HOME/.config/phone-gateway}"
+DAEMON_PLIST="${SR_DAEMON_PLIST:-$HOME/Library/LaunchAgents/com.leeguoo.iphone-use.plist}"
+DAEMON_URL="${SR_DAEMON_URL:-http://127.0.0.1:8787}"
+APP="${APP:-$APP_DIR/build/TargetBuild/Debug-iphoneos/SelfRunnerSpike.app}"
+PROFILE="${PROFILE:-$APP/embedded.mobileprovision}"
+LAUNCH_ARGS=(--research-mailbox --observe-disconnect --auto-session-on --remote-on --runner-core-on)
+STATE="${STATE:-$HOME/.iphone-use/selfrunner-autoresign}"
+LOG="${LOG:-$STATE/autoresign.log}"
+RENEW_BELOW_HOURS="${RENEW_BELOW_HOURS:-48}"
+NOTIFY_BELOW_HOURS="${NOTIFY_BELOW_HOURS:-12}"
+NOTIFY_EVERY_SECS=21600
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+FORCE=0; DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) printf '未知参数：%s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+if [ -z "$TEAM_ID" ] || [ -z "$DEVICE" ]; then
+  printf '缺少 SR_TEAM_ID 或 SR_DEVICE_UDID（配置文件：%s）\n' "$CONFIG" >&2; exit 2
+fi
+for threshold in "$RENEW_BELOW_HOURS" "$NOTIFY_BELOW_HOURS"; do
+  if [[ ! "$threshold" =~ ^[0-9]+$ ]]; then
+    printf '小时阈值必须是非负整数\n' >&2; exit 2
+  fi
+done
+RENEW_BELOW_HOURS=$((10#$RENEW_BELOW_HOURS))
+NOTIFY_BELOW_HOURS=$((10#$NOTIFY_BELOW_HOURS))
+
+mkdir -p "$STATE" || exit 1
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+
+# 防并发；沿用参考脚本，超过 1 小时的空锁目录视为残留。
+if ! mkdir "$STATE/lock.d" 2>/dev/null; then
+  if [ -n "$(find "$STATE/lock.d" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+    rmdir "$STATE/lock.d" 2>/dev/null && mkdir "$STATE/lock.d" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+
+PP_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+BAK="$STATE/profiles-bak"
+moved=(); restore_needed=0
+restore_profiles() {
+  local m failed=0
+  for m in ${moved[@]+"${moved[@]}"}; do
+    if [ -f "$BAK/$m" ]; then
+      mv -f "$BAK/$m" "$PP_DIR/$m" || failed=1
+    fi
+  done
+  if (( failed == 0 )); then
+    restore_needed=0
+    log "已还原旧描述文件"
+  else
+    log "错误：部分旧描述文件还原失败，备份保留在 $BAK"
+  fi
+  return "$failed"
+}
+# EXIT trap 间接调用；ShellCheck 未识别这种引用。
+# shellcheck disable=SC2329
+cleanup() {
+  local rc=$?
+  if (( restore_needed )); then restore_profiles || rc=1; fi
+  rmdir "$STATE/lock.d" 2>/dev/null || true
+  return "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+expiry_epoch() {
+  [ -f "$PROFILE" ] || { echo 0; return; }
+  local value
+  # plistlib 直接读日期，避免依赖 plutil 输出日期格式及本机时区。
+  value=$(security cms -D -i "$PROFILE" 2>/dev/null | python3 -I -c '
+import datetime, plistlib, sys
+try:
+    d = plistlib.loads(sys.stdin.buffer.read())["ExpirationDate"]
+    if d.tzinfo is None: d = d.replace(tzinfo=datetime.timezone.utc)
+    print(int(d.timestamp()))
+except Exception: print(0)
+' 2>/dev/null) || { echo 0; return; }
+  printf '%s\n' "$value"
+}
+
+notify() {
+  local now last=0 immediate="${2:-0}"
+  if (( DRY_RUN )); then log "将会通知：$1"; return 0; fi
+  now=$(date +%s)
+  if (( immediate == 0 )); then
+    [ ! -f "$STATE/last_notify" ] || read -r last < "$STATE/last_notify"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last < NOTIFY_EVERY_SECS )) && return 0
+    printf '%s\n' "$now" > "$STATE/last_notify"
+  fi
+  # 消息作为 argv 传入，避免消息中的引号成为 AppleScript 代码。
+  osascript - "$1" >/dev/null 2>&1 <<'APPLESCRIPT'
+on run argv
+  display notification (item 1 of argv) with title "Self Runner 签名"
+end run
+APPLESCRIPT
+}
+
+# 只输出所需的枚举/布尔值；响应全文、owner 内容、token 和密码均不写日志。
+json_field() {
+  python3 -I -c '
+import json, re, sys
+mode = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+    if mode == "owner":
+        print("busy" if data.get("owner") else "idle")
+    elif mode == "code":
+        code = (data.get("error") or {}).get("code")
+        print(code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", code) else "unknown")
+    else:
+        result = data.get("result") or {}
+        ok = data.get("ok") is True
+        if mode == "transport":
+            # /v1/status 是裸对象（无 ok/result），/v1/command 才有外层包装。
+            print("online" if result.get("transport", data.get("transport")) == "online" else "offline")
+        elif mode == "unlock":
+            print("yes" if ok and (result.get("already_unlocked") is True or result.get("unlocked") is True) else "no")
+        elif mode == "vpn":
+            print("on" if ok and result.get("vpn") is True else "off" if ok and result.get("vpn") is False else "unknown")
+        elif mode == "ready":
+            print("passcode" if ok and result.get("needs_passcode") is True else
+                  "ready" if ok and result.get("xctest_ready") is True and result.get("needs_passcode") is False else "waiting")
+except Exception:
+    print("unknown")
+' "$1" 2>/dev/null
+}
+
+GATEWAY_TOKEN=""
+gateway() {
+  local endpoint="$1" body="$2" timeout="${3:-25}"
+  curl -fsS -m "$timeout" -X POST \
+    -H "Authorization: Bearer $GATEWAY_TOKEN" \
+    -H 'Content-Type: application/json' --data "$body" \
+    "http://$GATEWAY_HTTP/v1/$endpoint" 2>/dev/null
+}
+
+# 以「实际装到手机上」的签名为准：本地构建成功但安装失败时，手机上的旧签名照样会过期。
+INSTALLED="$STATE/installed_expiry"
+exp=0; [ ! -f "$INSTALLED" ] || read -r exp < "$INSTALLED"
+[[ "$exp" =~ ^[0-9]+$ ]] || exp=0
+now=$(date +%s); left_s=$(( exp - now )); left_h=$(( left_s / 3600 ))
+if (( FORCE == 0 && left_s >= RENEW_BELOW_HOURS * 3600 )); then exit 0; fi
+log "剩余 ${left_h}h，尝试重签（force=${FORCE}，dry-run=${DRY_RUN}）"
+
+GATEWAY_TOKEN=$(cat "$GATEWAY_HOME/client-token" 2>/dev/null) || GATEWAY_TOKEN=""
+status_json=""
+if [ -n "$GATEWAY_TOKEN" ]; then status_json=$(gateway status '{}' 10) || status_json=""; fi
+transport=$(printf '%s' "$status_json" | json_field transport)
+unset status_json
+if [ "$transport" != "online" ]; then
+  log "跳过：手机未经 Wi-Fi 连上 gateway，或 gateway 不可用"
+  if (( left_s < NOTIFY_BELOW_HOURS * 3600 )); then notify "手机未经 Wi‑Fi 连上 gateway"; fi
+  exit 0
+fi
+
+# devicectl 无线安装要求手机在 Mac 所在局域网（或插线）；经 Tailscale 在外时先不动描述文件。
+if ! xcrun devicectl device info lockState --device "$DEVICE" --timeout 20 >/dev/null 2>&1; then
+  log "跳过：devicectl 连不上手机（手机不在 Mac 所在局域网且未插线）"
+  if (( left_s < NOTIFY_BELOW_HOURS * 3600 )); then notify "签名剩余约 ${left_h} 小时：请让手机连回家里的 Wi‑Fi，以便自动重签"; fi
+  exit 0
+fi
+
+# Self Runner 重启后要靠 LocalDevVPN 建自动化会话；VPN 没开（比如换成了 Tailscale）时重装会起不来。
+vpn_json=$(gateway command '{"action":"status","deadline_ms":4000}' 10) || vpn_json=""
+vpn_state=$(printf '%s' "$vpn_json" | json_field vpn)
+unset vpn_json
+if [ "$vpn_state" != "on" ]; then
+  log "跳过：手机上 LocalDevVPN 未开（vpn=${vpn_state}），重装后自动化会话起不来"
+  if (( left_s < NOTIFY_BELOW_HOURS * 3600 )); then notify "签名剩余约 ${left_h} 小时：请在手机上打开 LocalDevVPN，以便自动重签"; fi
+  exit 0
+fi
+
+# 有 agent 操作手机时不打断；只保留 owner 是否非空，不记录它的内容。
+daemon_token=$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:IPHONE_USE_PASSWORD' \
+  "$DAEMON_PLIST" 2>/dev/null) || daemon_token=""
+owner_state="unknown"
+if [ -n "$daemon_token" ]; then
+  owner_state=$(curl -fsS -m 10 -H "Authorization: Bearer $daemon_token" \
+    "$DAEMON_URL/agent/status" 2>/dev/null | json_field owner) || owner_state="unknown"
+fi
+unset daemon_token
+if [ "$owner_state" = "busy" ] && (( FORCE == 0 && left_s >= 6 * 3600 )); then
+  log "跳过：手机正被 agent 使用"; exit 0
+fi
+if [ "$owner_state" = "unknown" ]; then log "daemon owner 检查不可用，继续按签名到期策略处理"; fi
+
+# 只检查固定 worktree；绝不 checkout、pull、reset 或修改 HEAD。
+src_root=$(GIT_OPTIONAL_LOCKS=0 git -C "$SRC" rev-parse --show-toplevel 2>/dev/null) || src_root=""
+src_real=$(cd "$SRC" 2>/dev/null && pwd -P) || src_real=""
+root_real=$(cd "${src_root:-/nonexistent}" 2>/dev/null && pwd -P) || root_real=""
+if [ -z "$src_real" ] || [ "$src_real" != "$root_real" ] || [ ! -d "$APP_DIR" ]; then
+  log "错误：SRC 不是 git worktree 根目录，或 APP_DIR 不存在"
+  notify "Self Runner 自动重签失败：源码 worktree 或 App 目录不可用"
+  exit 1
+fi
+
+if (( DRY_RUN )); then
+  log "将会移走 application-identifier 恰好为 $TEAM_ID.$BUNDLE_ID 的旧描述文件"
+  [ -f "$APP_DIR/build/libself_boot.a" ] || log "将会运行 $APP_DIR/build-lib.sh"
+  [ -f "$APP_DIR/Resources/DDI/Image.dmg" ] || log "将会运行 bash $SRC/scripts/research-stage-ddi.sh"
+  log "将会运行 xcodegen generate 和 xcodebuild，比较新旧到期时间；失败时还原描述文件"
+  log "将会请求 gateway unlock（deadline_ms=20000）、安装 App 并用预设参数启动"
+  log "将会轮询 gateway command status 最多 180 秒，确认 xctest_ready 且无需密码"
+  exit 0
+fi
+
+# 先移走本 App 的描述文件，逼 Xcode 申请新的免费签名。
+mkdir -p "$BAK" || { log "错误：无法创建描述文件备份目录"; exit 1; }
+restore_needed=1
+for f in "$PP_DIR"/*.mobileprovision; do
+  [ -f "$f" ] || continue
+  appid=$(security cms -D -i "$f" 2>/dev/null | \
+    plutil -extract Entitlements.application-identifier raw -o - - 2>/dev/null) || appid=""
+  if [ "$appid" = "$TEAM_ID.$BUNDLE_ID" ]; then
+    m=$(basename "$f")
+    if [ -e "$BAK/$m" ] || ! mv "$f" "$BAK/$m"; then
+      log "错误：移走旧描述文件失败或已有同名备份"
+      notify "Self Runner 自动重签失败：旧描述文件备份失败"
+      exit 1
+    fi
+    moved+=("$m")
+  fi
+done
+log "移走旧描述文件 ${#moved[@]} 个"
+
+build_app() {
+  if [ ! -f "$APP_DIR/build/libself_boot.a" ]; then
+    (cd "$APP_DIR" && ./build-lib.sh) || return "$?"
+  fi
+  if [ ! -f "$APP_DIR/Resources/DDI/Image.dmg" ]; then
+    (cd "$SRC" && DDI_HARDWARE_MODEL="${SR_HARDWARE_MODEL:-}" bash "$SRC/scripts/research-stage-ddi.sh") || return "$?"
+  fi
+  (cd "$APP_DIR" && xcodegen generate) || return "$?"
+  xcodebuild -project "$APP_DIR/SelfRunnerSpike.xcodeproj" -target SelfRunnerSpike \
+    -sdk iphoneos -configuration Debug "SYMROOT=$APP_DIR/build/TargetBuild" \
+    "OBJROOT=$APP_DIR/build/TargetObj" "DEVELOPMENT_TEAM=$TEAM_ID" -allowProvisioningUpdates build
+}
+build_app </dev/null >> "$LOG" 2>&1
+rc=$?; new=$(expiry_epoch)
+if (( rc != 0 || new <= exp )); then
+  restore_profiles || true
+  log "重签失败 rc=${rc}，新描述文件到期时间未延长或构建失败"
+  if (( left_s < NOTIFY_BELOW_HOURS * 3600 )); then
+    notify "Self Runner 自动重签失败，签名剩余约 ${left_h} 小时，日志：$LOG"
+  fi
+  exit 1
+fi
+restore_needed=0
+for m in ${moved[@]+"${moved[@]}"}; do
+  rm -f "$BAK/$m" || log "错误：无法删除已失效的描述文件备份"
+done
+
+unlock_json=$(gateway command '{"action":"unlock","deadline_ms":20000}') || unlock_json=""
+unlocked=$(printf '%s' "$unlock_json" | json_field unlock)
+if [ "$unlocked" != "yes" ]; then
+  code=$(printf '%s' "$unlock_json" | json_field code)
+  log "错误：gateway unlock 失败，error.code=$code"
+  notify "新签名已构建但未能解锁手机，请解锁后运行 selfrunner-autoresign --force"
+  exit 1
+fi
+unset unlock_json
+
+if ! xcrun devicectl device install app --device "$DEVICE" "$APP" </dev/null >> "$LOG" 2>&1; then
+  log "错误：安装 Self Runner 失败"
+  notify "Self Runner 新签名已构建，但安装失败，日志：$LOG"
+  exit 1
+fi
+if ! xcrun devicectl device process launch --device "$DEVICE" --terminate-existing \
+  "$BUNDLE_ID" "${LAUNCH_ARGS[@]}" </dev/null >> "$LOG" 2>&1; then
+  log "错误：启动 Self Runner 失败"
+  notify "Self Runner 已重签重装，但启动失败，日志：$LOG"
+  exit 1
+fi
+printf '%s\n' "$new" > "$INSTALLED"
+
+# 请求耗时也计入 180 秒；密码通知每次运行最多一次，并绕过 6 小时节流。
+poll_end=$(( SECONDS + 180 )); passcode_notified=0
+while (( SECONDS < poll_end )); do
+  remaining=$(( poll_end - SECONDS )); timeout=10
+  (( remaining >= timeout )) || timeout=$remaining
+  status_json=$(gateway command '{"action":"status","deadline_ms":4000}' "$timeout") || status_json=""
+  ready=$(printf '%s' "$status_json" | json_field ready)
+  unset status_json
+  if [ "$ready" = "ready" ]; then
+    log "重签成功，新到期 $(date -r "$new" '+%F %T %Z')"
+    rm -f "$STATE/last_notify"
+    exit 0
+  fi
+  if [ "$ready" = "passcode" ] && (( passcode_notified == 0 )); then
+    notify "Self Runner 已重签重装，请在手机上输入一次密码" 1
+    passcode_notified=1
+  fi
+  remaining=$(( poll_end - SECONDS ))
+  (( remaining > 0 )) || break
+  delay=5; (( remaining >= delay )) || delay=$remaining
+  sleep "$delay"
+done
+log "错误：等待 Self Runner 就绪超过 180 秒"
+notify "Self Runner 已重签重装，但等待就绪超时，日志：$LOG"
+exit 1
