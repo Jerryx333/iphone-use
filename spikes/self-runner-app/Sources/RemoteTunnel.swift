@@ -10,8 +10,12 @@ import CryptoKit
 // connection by sending {"t":"open","port":P}; after {"t":"opened","ok":true} both sides copy raw
 // bytes. All state lives on main, like RemoteLink.
 final class RemoteTunnel {
-    static let idleTarget = 2
-    static let totalLimit = 6
+    // The daemon opens a fresh connection per runner request, so a batch drains the pool fast. Over
+    // WSS a tunnel takes 1–2 s to come up (TLS, upgrade, E2E, challenge), hence a deeper pool and up to
+    // `parallelDials` handshakes at once while healthy; after a failure dialling is serial again.
+    static let idleTarget = 4
+    static let totalLimit = 10
+    private static let parallelDials = 3
     private static let preAuthLimit = 4096
     private static let dialSpacing = 0.3
     private static let localConnectTimeout = 1.5
@@ -40,7 +44,6 @@ final class RemoteTunnel {
     private var epoch = 0
     private var nextID = 0
     private var tunnels: [Int: Tunnel] = [:]
-    private var dialing = false
     private var lastDial = Date.distantPast
     private var backoff = 0.0
     private var scheduled: DispatchWorkItem?
@@ -70,12 +73,13 @@ final class RemoteTunnel {
         scheduled?.cancel(); scheduled = nil
         for tunnel in tunnels.values { tunnel.budget?.cancel(); tunnel.local?.cancel(); tunnel.outer.cancel() }
         tunnels.removeAll()
-        dialing = false; backoff = 0
+        backoff = 0
         fill()
     }
 
     private func fill() {
-        guard enabled, pairing != nil, !dialing, scheduled == nil else { return }
+        let handshaking = tunnels.values.filter { [.connecting, .challenge, .welcome].contains($0.phase) }.count
+        guard enabled, pairing != nil, scheduled == nil, handshaking < (backoff > 0 ? 1 : Self.parallelDials) else { return }
         let waiting = tunnels.values.filter { $0.phase != .opening && $0.phase != .piping }.count
         guard waiting < Self.idleTarget, tunnels.count < Self.totalLimit else { return }
         let earliest = lastDial.addingTimeInterval(max(Self.dialSpacing, backoff))
@@ -104,7 +108,7 @@ final class RemoteTunnel {
         let tunnel = Tunnel(id: nextID, outer: RemoteRoutePolicy.make(pair, route: route))
         tunnel.remainingRoutes = Array(candidates.dropFirst())
         tunnels[tunnel.id] = tunnel
-        dialing = true; lastDial = Date()
+        lastDial = Date()
         tunnel.outer.ready = { [weak self, weak tunnel] in
             guard let self, let tunnel, token == self.epoch, self.tunnels[tunnel.id] === tunnel else { return }
             tunnel.phase = .challenge; self.receiveFrames(tunnel, token: token)
@@ -166,7 +170,7 @@ final class RemoteTunnel {
                       tunnel.phase == .idle else { return }
                 self.close(tunnel, reason: "idle_recycle")
             }
-            dialing = false; backoff = 0
+            backoff = 0
             fill()
             return true
         case .idle:
@@ -304,7 +308,6 @@ final class RemoteTunnel {
             }
             // Authentication or reachability failure: back off. Normal recycling (the gateway's idle
             // timeout, a finished stream) refills at the plain dial spacing.
-            dialing = false
             backoff = min(30, max(1, backoff * 2))
             log("tunnel \(tunnel.id): \(reason), retry in \(Int(backoff))s")
         } else if !["done", "idle_closed", "idle_recycle"].contains(reason) {

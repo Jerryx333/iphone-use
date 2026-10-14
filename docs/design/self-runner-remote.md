@@ -256,7 +256,7 @@ opened 成功后双向原样复制字节，正确传播半关闭（单侧 EOF �
 
 离线 fake_phone 支持 tunnel 握手、端口到测试目标地址映射、拒绝端口与不回应 open；`tests/tunnel.rs` 覆盖两端口小包及超过 1MB 数据、半关闭、控制连接共存、认证隔离、等待与打开超时、FIFO 回退、空闲超时、池与并发上限、loopback 限制。
 
-手机侧（`RemoteTunnel`，状态都在 main，接口仿 `RemoteLink`：`configure(enabled:pairing:)`）：远程模式开启且 RunnerCore 在跑时保持 2 条空闲通道（握手中的也算），总数上限 6，MJPEG 这类长连接不占空闲名额。拨号间隔至少 0.3s（gateway 对同一 IP 有 100ms 握手节流，也避免挤掉控制链路重连）；认证失败或连不上时指数退避 1s→30s，gateway 120s 空闲回收、流结束属正常回收，按 0.3s 间隔补池，不退避。`ports` 映射决定 gateway 可打开的端口及实际连接的本机端口（默认 8100→8100、9100→9100），不在映射里的回 `{"t":"opened","ok":false}`；本机端口 1.5s 内连不上同样回 ok:false（早于 gateway 的 2s）。对拷时 Mac 侧的半关闭转成对 runner 的 TCP 半关闭；runner 侧 EOF 则在剩余字节发完后优雅关闭整条通道（Network.framework 的 TLS 连接不支持只关写方向）。
+手机侧（`RemoteTunnel`，状态都在 main，接口仿 `RemoteLink`：`configure(enabled:pairing:)`）：远程模式开启且 RunnerCore 在跑时保持 4 条空闲通道（握手中的也算；2026-10-14 前为 2），总数上限 10（原 6），健康时最多 3 条同时握手、失败后退回串行，MJPEG 这类长连接不占空闲名额。拨号间隔至少 0.3s（gateway 对同一 IP 有 100ms 握手节流，也避免挤掉控制链路重连）；认证失败或连不上时指数退避 1s→30s，gateway 120s 空闲回收、流结束属正常回收，按 0.3s 间隔补池，不退避。`ports` 映射决定 gateway 可打开的端口及实际连接的本机端口（默认 8100→8100、9100→9100），不在映射里的回 `{"t":"opened","ok":false}`；本机端口 1.5s 内连不上同样回 ok:false（早于 gateway 的 2s）。对拷时 Mac 侧的半关闭转成对 runner 的 TCP 半关闭；runner 侧 EOF 则在剩余字节发完后优雅关闭整条通道（Network.framework 的 TLS 连接不支持只关写方向）。
 
 Mac 联调（2026-10-13，未接真机）：真实 gateway + 在 macOS 上编译的 `RemoteTunnel.swift` + 本地 echo / 流式服务，5 轮 4MB 往返与 8MB 服务端推流、4 路 echo 并发 + 1 路推流均逐字节一致；端口不在映射里时本地连接在 `tunnel_wait` 后关闭；gateway 重启期间手机侧按 1/2/4s 退避，恢复后补满空闲池并可正常转发。
 
@@ -390,6 +390,7 @@ Cloudflare 文档称会断开 100 秒无数据的 WebSocket（未实测）。gat
 - 路由选择（控制链路与转发通道各自按同一规则独立决定）：当前网络路径用 Wi‑Fi 时顺序为 `lan` → `wss`，否则 `wss` → `lan`；同一条路径上 `lan` 失败过一次后，直到路径变化（NWPathMonitor）前都把 `wss` 排前。两个都失败才进入原有退避。没有 `ws_url` 时只有 `lan`，行为同现在。注意 `link=lan` 只说明控制链路，转发通道可能走的是 wss。
 - App 界面与 `status` 显示当前控制链路的路由（`lan` / `wss`）。
 - 日志不记 route、密钥、记录内容。
+- 真机发现并已修（2026-10-14）：切网后旧路径上的空闲通道成了僵尸（手机看来空闲、gateway 已为 0），现在路径变化即关闭空闲通道重拨，且手机侧 110 秒回收空闲通道；daemon 每个 runner 请求新开一条通道，经 WSS 一条要 1–2 秒，原来 2 条池 + 串行拨号会在 run_steps 突发时 `wait_timeout`，因此加深池并允许并行握手；「重新配对」只在有合法新文件时才替换配对。
 - Mac 联调：Swift 源码可在 macOS 编译，对本机 gateway 的 `ws://127.0.0.1:7383` 跑通控制与转发（同 §13 的联调方式），并用 15.4 的测试向量做单元检查。
 
 ### 15.9 MJPEG 流量
