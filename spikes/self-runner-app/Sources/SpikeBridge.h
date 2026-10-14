@@ -19,6 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSString *)swipeScreenFrom:(CGPoint)point to:(CGPoint)destination pid:(int)pid log:(void (^)(NSString *))log NS_SWIFT_NAME(swipeScreen(from:to:pid:log:));
 + (NSDictionary *)remoteForeground;
 + (int)remoteSystemPID;
++ (nullable NSNumber *)remoteScreenLocked NS_SWIFT_NAME(remoteScreenLocked());
 + (NSDictionary *)remoteInputReadWithMaxDepth:(NSInteger)maxDepth NS_SWIFT_NAME(remoteInputRead(maxDepth:));
 + (nullable NSString *)remoteTypeText:(NSString *)text pid:(int)pid NS_SWIFT_NAME(remoteType(text:pid:));
 + (nullable NSString *)remotePressButton:(NSString *)button NS_SWIFT_NAME(remotePress(button:));

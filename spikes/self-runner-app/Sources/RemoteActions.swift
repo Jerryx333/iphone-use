@@ -405,12 +405,14 @@ final class RemoteActions {
         var screen = CGRect.zero
         DispatchQueue.main.sync { screen = UIScreen.main.bounds }
         guard let initial = unlockSnapshot() else { return fail("read_failed") }
+        let systemLocked = SpikeBridge.remoteScreenLocked()?.boolValue
         if expired() { return fail("expired") }
         let springPID = SpikeBridge.remoteSystemPID()
-        guard springPID > 0, let pid = (initial["pid"] as? NSNumber)?.int32Value else { return fail("target_unknown") }
-        let initialLocked = lockMarked(initial) || keypad(initial, screen: screen) != nil
+        guard springPID > 0, let _ = (initial["pid"] as? NSNumber)?.int32Value else { return fail("target_unknown") }
+        // Sleep Focus uses a separate SleepLockScreen process; foreground PID cannot imply unlock.
+        let initialLocked = systemLocked == true || lockMarked(initial) || keypad(initial, screen: screen) != nil
         if !initialLocked {
-            if pid != springPID { return RemoteActionResult(["already_unlocked": true]) }
+            if systemLocked == false { return RemoteActionResult(["already_unlocked": true]) }
             guard let system = unlockSnapshot(system: true) else { return fail("read_failed") }
             if expired() { return fail("expired") }
             if !lockMarked(system), keypad(system, screen: screen) == nil { return RemoteActionResult(["already_unlocked": true]) }
@@ -456,7 +458,7 @@ final class RemoteActions {
             let keyboard = keypad(fresh, screen: screen) != nil || keypad(system, screen: screen) != nil
             let numericLabels = Set((0...9).map { String($0) })
             let uncertainKeyboard = numericLabels.isSubset(of: unlockLabels(fresh)) || numericLabels.isSubset(of: unlockLabels(system))
-            if !keyboard, !uncertainKeyboard, !lockMarked(fresh), !lockMarked(system) { return RemoteActionResult(["unlocked": true]) }
+            if !keyboard, !uncertainKeyboard, !lockMarked(fresh), !lockMarked(system), SpikeBridge.remoteScreenLocked()?.boolValue != true { return RemoteActionResult(["unlocked": true]) }
             if ProcessInfo.processInfo.systemUptime >= end { return fail(keyboard ? "unlock_failed" : "unlock_unconfirmed") }
             if !pause(0.3, until: end, expired: expired) { return fail("expired") }
         }

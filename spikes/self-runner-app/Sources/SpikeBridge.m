@@ -634,6 +634,27 @@ static void SaveSnapshot(NSData *lines, NSString *rootLabel, int pid, NSMutableD
         return ((int (*)(id, SEL))objc_msgSend)(system, NSSelectorFromString(@"processIdentifier"));
     } @catch (__unused NSException *e) { return 0; }
 }
++ (nullable NSNumber *)remoteScreenLocked {
+    // Same SpringBoardServices calls as WDA fb_isScreenLocked / IPURBridge isScreenLocked.
+    typedef mach_port_t (*ServerPort)(void);
+    typedef void (*LockStatus)(mach_port_t, BOOL *, BOOL *);
+    static ServerPort serverPort;
+    static LockStatus lockStatus;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *handle = dlopen(
+            "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+        if (handle != NULL) {
+            serverPort = (ServerPort)dlsym(handle, "SBSSpringBoardServerPort");
+            lockStatus = (LockStatus)dlsym(handle, "SBGetScreenLockStatus");
+        }
+    });
+    if (serverPort == NULL || lockStatus == NULL) return nil;
+    BOOL locked = NO;
+    BOOL passcodeEnabled = NO;
+    lockStatus(serverPort(), &locked, &passcodeEnabled);
+    return @(locked);
+}
 + (NSDictionary *)remoteForeground {
     @try {
         id device = Object(NSClassFromString(@"XCUIDevice"), @"sharedDevice");
