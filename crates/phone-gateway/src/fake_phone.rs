@@ -132,7 +132,10 @@ pub struct TunnelOptions {
     pub stall: bool,
 }
 /// Handle one open, then switch to raw bytes. Missing targets are rejected.
-pub async fn tunnel(mut stream: TlsStream<TcpStream>, options: TunnelOptions) -> Result<()> {
+pub async fn tunnel<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    options: TunnelOptions,
+) -> Result<()> {
     let frame = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
     if frame["t"] != "open" {
         return Err("open missing".into());
@@ -158,4 +161,43 @@ pub async fn tunnel(mut stream: TlsStream<TcpStream>, options: TunnelOptions) ->
         tokio::io::copy_bidirectional(&mut stream, target).await?;
     }
     Ok(())
+}
+
+/// Offline WS client; production TLS termination belongs to the relay.
+pub async fn ws(
+    pair: &Pairing,
+    timing: crate::gateway::Timing,
+    tunnel: bool,
+) -> Result<crate::e2e::Stream> {
+    let psk = STANDARD.decode(&pair.psk)?;
+    let base = crate::config::validate_ws_url(pair.ws_url.as_deref().ok_or("missing ws_url")?)?;
+    if !base.starts_with("ws://") {
+        return Err("fake WS client requires local ws URL".into());
+    }
+    let authority = base.strip_prefix("ws://").unwrap();
+    let address = if authority.contains(':') {
+        authority.to_owned()
+    } else {
+        format!("{authority}:80")
+    };
+    let tcp = TcpStream::connect(address).await?;
+    let url = format!("{base}/selfrunner/v1/{}", crate::e2e::route(&psk));
+    let (ws, _) =
+        tokio_tungstenite::client_async_with_config(&url, tcp, Some(crate::e2e::ws_config()))
+            .await?;
+    let mut stream = crate::e2e::handshake(ws, &psk, false, timing).await?;
+    let challenge = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
+    protocol::write_frame(
+        &mut stream,
+        &if tunnel {
+            tunnel_hello(pair, &challenge)?
+        } else {
+            hello(pair, &challenge)?
+        },
+    )
+    .await?;
+    if protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?["t"] != "welcome" {
+        return Err("welcome missing".into());
+    }
+    Ok(stream)
 }

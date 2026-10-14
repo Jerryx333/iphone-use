@@ -26,6 +26,8 @@ pub struct Pairing {
     pub cert_sha256: String,
     pub psk: String,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_url: Option<String>,
 }
 pub fn home() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("PHONE_GATEWAY_HOME") {
@@ -115,6 +117,7 @@ impl Config {
     }
     pub fn pairing(&self, host: String, port: u16) -> Pairing {
         Pairing {
+            ws_url: None,
             v: 1,
             host,
             port,
@@ -214,4 +217,38 @@ pub fn pair(dir: &Path, rotate: bool, host: String, port: u16, out: &Path) -> Re
     let pairing = Config::load(dir)?.pairing(host, port);
     private_write(out, &serde_json::to_vec(&pairing)?)?;
     Ok(pairing)
+}
+
+/// Validate the deliberately narrow pairing URL grammar without URL normalization.
+pub fn validate_ws_url(url: &str) -> Result<String> {
+    if url.len() > 512 {
+        return Err("invalid_pairing: ws_url".into());
+    }
+    let (secure, authority) = if let Some(a) = url.strip_prefix("wss://") {
+        (true, a)
+    } else if let Some(a) = url.strip_prefix("ws://") {
+        (false, a)
+    } else {
+        return Err("invalid_pairing: ws_url".into());
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(h, p)| (h, Some(p)));
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        || (!secure && !matches!(host, "127.0.0.1" | "localhost"))
+        || port.is_some_and(|p| {
+            p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err()
+        })
+    {
+        return Err("invalid_pairing: ws_url".into());
+    }
+    Ok(format!(
+        "{}://{authority}",
+        if secure { "wss" } else { "ws" }
+    ))
 }

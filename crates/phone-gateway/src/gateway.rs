@@ -30,6 +30,8 @@ use tokio_rustls::TlsAcceptor;
 #[derive(Clone)]
 pub struct Timing {
     pub hello: Duration,
+    pub ws_ping: Duration,
+    pub ws_write: Duration,
     pub ping: Duration,
     pub offline: Duration,
     pub tunnel_open: Duration,
@@ -40,6 +42,8 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             hello: Duration::from_secs(5),
+            ws_ping: Duration::from_secs(30),
+            ws_write: Duration::from_secs(30),
             ping: Duration::from_secs(15),
             offline: Duration::from_secs(45),
             tunnel_open: Duration::from_secs(2),
@@ -60,6 +64,7 @@ struct Pending {
 struct Inner {
     generation: u64,
     online: bool,
+    link: Option<&'static str>,
     queue: VecDeque<Pending>,
     inflight: Option<Pending>,
     last_pong: Option<u128>,
@@ -100,6 +105,7 @@ pub struct Gateway {
     passcode_reader: Arc<PasscodeReader>,
     tunnels: crate::tunnel::Tunnels,
     forwards: [Option<SocketAddr>; 2],
+    ws_bind: Option<SocketAddr>,
 }
 // Never propagate security's stdout/stderr or an OS error: either can contain secrets.
 fn keychain_passcode(device_id: &str) -> std::result::Result<String, ()> {
@@ -182,7 +188,15 @@ impl Gateway {
             passcode_reader: Arc::new(reader),
             tunnels: crate::tunnel::Tunnels::default(),
             forwards: [None, None],
+            ws_bind: None,
         }
+    }
+    pub fn with_ws_bind(mut self, bind: Option<SocketAddr>) -> Result<Self> {
+        if bind.is_some_and(|a| !a.ip().is_loopback()) {
+            return Err("WS must bind a loopback address".into());
+        }
+        self.ws_bind = bind;
+        Ok(self)
     }
     pub fn with_forwards(
         mut self,
@@ -236,7 +250,14 @@ impl Gateway {
             }
             Ok::<(), crate::Error>(())
         };
-        tokio::try_join!(forwarding, self.listen(phone), async {
+        let websocket = async {
+            if let Some(bind) = self.ws_bind {
+                self.listen_ws(TcpListener::bind(bind).await?).await
+            } else {
+                std::future::pending::<Result<()>>().await
+            }
+        };
+        tokio::try_join!(forwarding, websocket, self.listen(phone), async {
             axum::serve(http, self.router()).await.map_err(Into::into)
         })?;
         Ok(())
@@ -289,35 +310,176 @@ impl Gateway {
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let handshake = async {
-                    let mut stream = acceptor.accept(tcp).await?;
-                    let mut challenge = Challenge::new()?;
-                    protocol::write_frame(&mut stream, &challenge.frame()).await?;
-                    let hello = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
-                    let tunnel = hello.get("role").is_some_and(|role| role == "tunnel");
-                    if (tunnel && gateway.forwards.iter().all(Option::is_none))
-                        || !challenge.verify(&hello, &gateway.config.psk, &gateway.config.device_id)
-                    {
-                        return Err("authentication rejected".into());
-                    }
-                    protocol::write_frame(&mut stream, &json!({"t":"welcome"})).await?;
-                    Ok::<_, crate::Error>((stream, tunnel))
+                    let stream = acceptor.accept(tcp).await?;
+                    gateway.authenticate(Box::new(stream)).await
                 };
                 let result = timeout(gateway.timing.hello, handshake).await;
                 drop(permit);
                 if let Ok(Ok((stream, tunnel))) = result {
-                    if tunnel {
-                        gateway
-                            .tunnels
-                            .insert(stream, gateway.timing.tunnel_idle)
-                            .await;
-                    } else {
-                        gateway.connected(stream).await;
-                    }
+                    gateway.established(stream, tunnel, "lan").await;
                 }
             });
         }
     }
+    async fn authenticate(
+        &self,
+        mut stream: crate::tunnel::BoxStream,
+    ) -> Result<(crate::tunnel::BoxStream, bool)> {
+        let mut challenge = Challenge::new()?;
+        protocol::write_frame(&mut stream, &challenge.frame()).await?;
+        let hello = protocol::read_frame(&mut stream, protocol::PRE_AUTH_LIMIT).await?;
+        let tunnel = hello.get("role").is_some_and(|role| role == "tunnel");
+        if (tunnel && self.forwards.iter().all(Option::is_none))
+            || !challenge.verify(&hello, &self.config.psk, &self.config.device_id)
+        {
+            return Err("authentication rejected".into());
+        }
+        protocol::write_frame(&mut stream, &json!({"t":"welcome"})).await?;
+        Ok((stream, tunnel))
+    }
+    async fn established(
+        &self,
+        stream: crate::tunnel::BoxStream,
+        tunnel: bool,
+        link: &'static str,
+    ) {
+        if tunnel {
+            self.tunnels.insert(stream, self.timing.tunnel_idle).await;
+        } else {
+            self.connected_link(stream, link).await;
+        }
+    }
+    // tungstenite's header callback must return the full http::Response as its Err.
+    #[allow(clippy::result_large_err)]
+    pub async fn listen_ws(&self, listener: TcpListener) -> Result<()> {
+        if !listener.local_addr()?.ip().is_loopback() {
+            return Err("WS must bind a loopback address".into());
+        }
+        let pending = Arc::new(Semaphore::new(16));
+        let slots = Arc::new(Semaphore::new(4));
+        loop {
+            let (mut tcp, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(d) = accept_retry_delay(&e) {
+                        tokio::time::sleep(d).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+            let Ok(pre) = pending.clone().try_acquire_owned() else {
+                continue;
+            };
+            let gateway = self.clone();
+            let slots = slots.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read exactly the headers: never consume a coalesced first WS frame.
+                let headers = timeout(Duration::from_secs(3), async {
+                    let mut h = Vec::new();
+                    loop {
+                        if h.len() == 8192 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "headers too large",
+                            ));
+                        }
+                        h.push(tcp.read_u8().await?);
+                        if h.ends_with(b"\r\n\r\n") {
+                            return Ok(h);
+                        }
+                    }
+                })
+                .await;
+                let Ok(Ok(headers)) = headers else {
+                    return;
+                };
+                let expected = format!("/selfrunner/v1/{}", crate::e2e::route(&gateway.config.psk));
+                let line = headers.split(|b| *b == b'\r').next().unwrap_or_default();
+                let parts: Vec<_> = line.split(|b| *b == b' ').collect();
+                let correct = parts.len() == 3
+                    && parts[0] == b"GET"
+                    && parts[2] == b"HTTP/1.1"
+                    && std::str::from_utf8(parts[1])
+                        .is_ok_and(|p| protocol::token_matches(&expected, p));
+                let header_text = String::from_utf8_lossy(&headers);
+                let has_header = |name: &str, value: &str| {
+                    header_text.split("\r\n").skip(1).any(|line| {
+                        line.split_once(':').is_some_and(|(n, v)| {
+                            n.eq_ignore_ascii_case(name)
+                                && v.split(',').any(|v| v.trim().eq_ignore_ascii_case(value))
+                        })
+                    })
+                };
+                let upgrade = has_header("Upgrade", "websocket")
+                    && has_header("Connection", "upgrade")
+                    && has_header("Sec-WebSocket-Version", "13")
+                    && header_text.split("\r\n").any(|line| {
+                        line.split_once(':').is_some_and(|(n, v)| {
+                            n.eq_ignore_ascii_case("Sec-WebSocket-Key") && !v.trim().is_empty()
+                        })
+                    });
+                if !correct || !upgrade {
+                    let _=tcp.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                }
+                let Ok(permit) = slots.try_acquire_owned() else {
+                    let _=tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                };
+                let replay = crate::e2e::Prefixed::new(headers, tcp);
+                let ws = timeout(
+                    Duration::from_secs(3),
+                    tokio_tungstenite::accept_hdr_async_with_config(
+                        replay,
+                        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         response| {
+                            if req.method() == "GET"
+                                && protocol::token_matches(&expected, &req.uri().to_string())
+                            {
+                                Ok(response)
+                            } else {
+                                Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                                    .status(404)
+                                    .body(None)
+                                    .unwrap())
+                            }
+                        },
+                        Some(crate::e2e::ws_config()),
+                    ),
+                )
+                .await;
+                drop(pre);
+                let Ok(Ok(ws)) = ws else {
+                    return;
+                };
+                let handshake = async {
+                    let stream = crate::e2e::handshake(
+                        ws,
+                        &gateway.config.psk,
+                        true,
+                        gateway.timing.clone(),
+                    )
+                    .await?;
+                    gateway.authenticate(Box::new(stream)).await
+                };
+                let result = timeout(gateway.timing.hello, handshake).await;
+                drop(permit);
+                if let Ok(Ok((stream, tunnel))) = result {
+                    gateway.established(stream, tunnel, "wss").await;
+                }
+            });
+        }
+    }
+    #[cfg(test)]
     async fn connected<S>(&self, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        self.connected_link(stream, "lan").await;
+    }
+    async fn connected_link<S>(&self, stream: S, link: &'static str)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -328,6 +490,7 @@ impl Gateway {
             }
             s.generation += 1;
             s.online = true;
+            s.link = Some(link);
             s.last_pong = None;
             s.generation
         };
@@ -433,13 +596,10 @@ impl Gateway {
                     break;
                 }
             }
+            // Frames already received come first: a response that arrives together with the close of
+            // the connection (or a heartbeat tick whose write then fails) must still be delivered.
             tokio::select! {
-                _ = notified => {},
-                _ = tokio::time::sleep_until(last_ack + self.timing.offline) => break,
-                _ = heartbeat.tick() => {
-                    sequence += 1; outstanding.push_back(sequence);
-                    if timeout((last_ack + self.timing.offline).saturating_duration_since(Instant::now()), protocol::write_frame(&mut writer, &json!({"t":"ping","seq":sequence}))).await.map_or(true, |r| r.is_err()) { break; }
-                },
+                biased;
                 frame = rx.recv() => {
                     let Some(Ok(frame)) = frame else { break; };
                     match frame["t"].as_str() {
@@ -465,6 +625,45 @@ impl Gateway {
                         Some("event") => {},
                         _ => break,
                     }
+                },
+                _ = notified => {},
+                _ = tokio::time::sleep_until(last_ack + self.timing.offline) => break,
+                _ = heartbeat.tick() => {
+                    sequence += 1; outstanding.push_back(sequence);
+                    if timeout((last_ack + self.timing.offline).saturating_duration_since(Instant::now()), protocol::write_frame(&mut writer, &json!({"t":"ping","seq":sequence}))).await.map_or(true, |r| r.is_err()) { break; }
+                },
+            }
+        }
+        // A write (heartbeat, request) can fail while the response to the in-flight request is still
+        // on its way through the reader; give the reader a moment to deliver it before calling the
+        // action unknown.
+        let waiting = {
+            let s = self.inner.lock().await;
+            s.generation == generation && s.inflight.is_some()
+        };
+        if waiting {
+            let late = timeout(Duration::from_millis(500), async {
+                while let Some(Ok(frame)) = rx.recv().await {
+                    if frame["t"] == "res" {
+                        return Some(frame);
+                    }
+                }
+                None
+            })
+            .await;
+            if let Ok(Some(frame)) = late {
+                let mut s = self.inner.lock().await;
+                if s.generation == generation
+                    && s.inflight.as_ref().is_some_and(|p| frame["id"] == p.id)
+                {
+                    let p = s.inflight.take().unwrap();
+                    let mut response = if p.action == "unlock" {
+                        unlock_response(&p.id, &frame)
+                    } else {
+                        frame
+                    };
+                    response["id"] = json!(p.id);
+                    let _ = p.reply.send(response);
                 }
             }
         }
@@ -497,7 +696,7 @@ impl Gateway {
     pub async fn snapshot(&self) -> Value {
         let s = self.inner.lock().await;
         let tunnels = self.tunnels.snapshot().await;
-        json!({"tunnels":tunnels,"transport":if s.online {"online"} else {"offline"},"last_pong_at":s.last_pong,"device_id":&self.config.device_id[..8],"queue_length":s.queue.len()})
+        json!({"link":if s.online {s.link} else {None},"tunnels":tunnels,"transport":if s.online {"online"} else {"offline"},"last_pong_at":s.last_pong,"device_id":&self.config.device_id[..8],"queue_length":s.queue.len()})
     }
 }
 fn authorized(g: &Gateway, r: &Request) -> bool {

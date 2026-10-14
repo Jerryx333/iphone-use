@@ -31,6 +31,8 @@ enum Commands {
         #[arg(long)]
         rotate: bool,
         #[arg(long)]
+        ws_url: Option<String>,
+        #[arg(long)]
         out: Option<PathBuf>,
     },
     Serve {
@@ -40,6 +42,8 @@ enum Commands {
         http: SocketAddr,
         #[arg(long)]
         runner_forward: Option<SocketAddr>,
+        #[arg(long)]
+        ws_bind: Option<SocketAddr>,
         #[arg(long)]
         mjpeg_forward: Option<SocketAddr>,
     },
@@ -174,19 +178,31 @@ async fn main() -> Result<()> {
             host,
             port,
             rotate,
+            ws_url,
             out,
         } => {
             let out = out.unwrap_or_else(|| dir.join("gateway-pair.json"));
-            config::pair(&dir, rotate, host, port, &out)?;
+            let ws_url =
+                ws_url.map(|u| config::validate_ws_url(&u).unwrap_or_else(|e| usage_error(e)));
+            let mut pairing = config::pair(&dir, rotate, host, port, &out)?;
+            if ws_url.is_some() {
+                pairing.ws_url = ws_url;
+                config::private_write(&out, &serde_json::to_vec(&pairing)?)?;
+            }
             println!("{}", json!({"paired":true,"out":out}));
         }
         Commands::Serve {
             bind,
             http,
             runner_forward,
+            ws_bind,
             mjpeg_forward,
         } => {
+            if ws_bind.is_some_and(|a| !a.ip().is_loopback()) {
+                usage_error("--ws-bind must be loopback");
+            }
             Gateway::new(Config::load(&dir)?, Timing::default())
+                .with_ws_bind(ws_bind)?
                 .with_forwards(runner_forward, mjpeg_forward)?
                 .serve(bind, http)
                 .await?

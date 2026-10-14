@@ -7,7 +7,9 @@ use tokio::{
     sync::{Mutex, Notify, Semaphore},
     time::{timeout, timeout_at, Instant},
 };
-use tokio_rustls::server::TlsStream;
+pub trait ByteStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ByteStream for T {}
+pub type BoxStream = Box<dyn ByteStream>;
 
 // Count successfully written raw bytes even if copying later fails.
 struct Counted<S> {
@@ -50,7 +52,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<S> {
 }
 struct Idle {
     id: uuid::Uuid,
-    stream: TlsStream<TcpStream>,
+    stream: BoxStream,
     since: Instant,
 }
 #[derive(Clone)]
@@ -85,7 +87,7 @@ impl Tunnels {
     pub(crate) async fn snapshot(&self) -> Value {
         json!({"idle":self.idle.lock().await.len(), "active":16-self.slots.available_permits()})
     }
-    pub(crate) async fn insert(&self, stream: TlsStream<TcpStream>, lifetime: Duration) {
+    pub(crate) async fn insert(&self, stream: BoxStream, lifetime: Duration) {
         let mut pool = self.idle.lock().await;
         if pool.len() == 8 {
             tracing::info!(event = "close", code = "pool_full");

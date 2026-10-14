@@ -371,6 +371,7 @@ Cloudflare 文档称会断开 100 秒无数据的 WebSocket（未实测）。gat
 - `serve --ws-bind <ADDR>`：可选，默认不开；只接受 loopback 地址，否则报错退出。部署值 `127.0.0.1:7383`。只做 WebSocket upgrade（HTTP/1.1 GET，路径见 15.3），别的请求一律 404。
 - E2E 层实现为一个独立模块：握手完成后返回一个实现 `AsyncRead + AsyncWrite` 的字节流（例如收发任务 + 有界通道，配 `tokio_util::io::StreamReader` 之类能把错误交给读方的适配；`tokio::io::duplex` 无法表达「异常结束」，不要用）。上层写方向 shutdown 时发 EOF 记录；收到 EOF 记录时上层读到 EOF；没有 EOF 记录的 WS 关闭、断线、解密失败让上层读到 io 错误（15.4 第 6 条），转发日志因此记为 `copy_failed` 而不是 `eof`。上层握手（challenge → hello → welcome）和之后的 `connected()`、`Tunnels::insert()` 复用 7381 的同一段代码（把那段从 `listen()` 里抽成对任意字节流通用的函数；`Tunnels` 的空闲池改存装箱的字节流）。
 - `/v1/status` 快照增加 `"link":"lan"|"wss"|null`（当前控制链路从哪个入口进来）；其余字段与 CLI compact 输出不变。日志只记入口、事件、原因码，不记 route、密钥、记录内容。
+- 实现补充（2026-10-14）：E2E 读端最多排队 16 条记录（约 1 MiB），满了就阻塞读 WS 形成反压（读端停住期间 Pong 不计数，消费方卡住约 60 秒后由保活关闭连接）；异常结束前已收到的记录照常交给上层，排空后才报错。控制链路主循环的 `select!` 改为优先处理已收到的帧，并且在退出（写失败、判离线）时若有在途请求，最多再等 500ms 收它的 `res`——否则响应与连接关闭、心跳写失败同时发生时会被误报 `unknown`（WS 上一写就失败，比 TCP 更容易撞上；离线测试 `control_commands_status_and_entry_replacement` 曾 1/4 失败）。
 - 依赖：WebSocket 服务端用 `tokio-tungstenite`（带 `WebSocketConfig` 的 `accept_hdr_async_with_config`，在回调里校验路径）；加密用 lock 里已有的 RustCrypto 版本：`x25519-dalek 2`、`chacha20poly1305 0.10`、`hkdf 0.12`、`sha2`。
 - 离线测试：`fake_phone` 增加 WS + E2E 客户端，`tests/` 覆盖控制链路与转发通道都能经 WS 工作（含 >1MB 往返和半关闭）、错误 PSK 在 E2E 层被拒、错误路径 404、篡改/重放/乱序记录断开、text 消息断开、无 EOF 记录的关闭在上层表现为错误、超长消息在分配前被拒、upgrade 前连接数和请求头上限、`ws-bind` 非 loopback 报错、两个入口并存且控制链路可在两者之间替换。
 
