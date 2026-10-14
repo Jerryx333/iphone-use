@@ -8,7 +8,32 @@ struct RemotePairing: Codable {
     let port: UInt16
     let cert_sha256: String
     let psk: String
+    var ws_url: String? = nil
     let device_id: String
+    var route: String {
+        HMAC<SHA256>.authenticationCode(for: Data("selfrunner-ws-route-v1".utf8), using: SymmetricKey(data: key))
+            .prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+    var webSocketURL: URL? {
+        guard let ws_url else { return nil }
+        return URL(string: ws_url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/selfrunner/v1/" + route)
+    }
+    static func validWebSocketBase(_ value: String) -> Bool {
+        guard value.utf8.count <= 512,
+              let parts = URLComponents(string: value),
+              parts.scheme == "wss" || parts.scheme == "ws",
+              let host = parts.host, !host.isEmpty, host.utf8.count <= 253,
+              host.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:_").contains($0) }),
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.path.isEmpty || parts.path == "/",
+              parts.port == nil || (1...65535).contains(parts.port!),
+              !value.contains("%"), !value.contains("\\"),
+              value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+        // Reject an empty port, which URLComponents otherwise normalizes away.
+        let authority = value.dropFirst(parts.scheme!.count + 3).split(separator: "/", omittingEmptySubsequences: false)[0]
+        guard !authority.hasSuffix(":") else { return false }
+        return parts.scheme == "wss" || host == "127.0.0.1" || host == "localhost"
+    }
     var key: Data { Data(base64Encoded: psk)! }
     var pin: Data {
         Data(stride(from: 0, to: 64, by: 2).map { offset in
@@ -33,7 +58,8 @@ struct RemotePairing: Codable {
               pair.host.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:_").contains($0) }),
               pair.cert_sha256.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil,
               pair.device_id.range(of: "^[0-9a-fA-F]{32}$", options: .regularExpression) != nil,
-              Data(base64Encoded: pair.psk)?.count == 32 else { throw Failure.code("invalid_pairing") }
+              Data(base64Encoded: pair.psk)?.count == 32,
+              pair.ws_url.map(Self.validWebSocketBase) ?? true else { throw Failure.code("invalid_pairing") }
         return pair
     }
     static func loadOrImport(documents: URL) throws -> RemotePairing? {

@@ -79,6 +79,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
     private var activeOperation: Operation?
+    var remoteConnectionStatus: String { remoteLink.status + (remoteLink.currentRoute.map { " (" + $0 + ")" } ?? "") }
     private let remoteLink = RemoteLink()
     private let remoteActions = RemoteActions()
     private let remoteWorker = DispatchQueue(label: "dev.iphoneuse.selfrunner.remote.actions")
@@ -152,6 +153,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             mailboxTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollMailbox() }
         }
         remoteTunnel.log = { [weak self] in self?.log($0) }
+        remoteLink.changed = { [weak self] in self?.objectWillChange.send() }
         remoteLink.ready = { [weak self] in self?.ready ?? false }
         remoteLink.request = { [weak self] frame, reply in self?.executeRemote(frame, reply: reply) }
         importRemotePairing()
@@ -261,7 +263,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             "needs_passcode": needsPasscode, "needs_relaunch": needsRelaunch,
             "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
             "orientation": portrait ? "portrait" : "other", "last_action_ok_at": lastActionOKAt as Any? ?? NSNull(),
-            "runner_core": runnerCoreStatus(), "runner_tunnel": remoteTunnel.status]
+            "link": remoteLink.currentRoute as Any? ?? NSNull(), "runner_core": runnerCoreStatus(), "runner_tunnel": remoteTunnel.status]
     }
     private func loadRunnerCore() -> AnyObject? {
         if let host = runnerCoreHost { return host }
@@ -414,7 +416,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
     private func executeResearchCommand(_ command: ResearchCommand) {
         if command.action == "remote-status" {
-            mailbox?.finish(command.id, result: "remote mode=\(remoteMode) paired=\(remotePairing != nil) transport=\(remoteLink.status)")
+            mailbox?.finish(command.id, result: "remote mode=\(remoteMode) paired=\(remotePairing != nil) transport=\(remoteConnectionStatus)")
             return
         }
         // Use exactly the UI's existing operations and safety gates; no second XCTest session.
@@ -1054,6 +1056,7 @@ struct ContentView: View {
                 .textFieldStyle(.roundedBorder).disabled(model.state != "idle")
             Toggle("授权自身 PID（实验，默认关）", isOn: $model.authorizePID).disabled(model.state != "idle")
             Toggle("远程模式", isOn: $model.remoteMode)
+            Text("远程连接：\(model.remoteConnectionStatus)").font(.caption)
             Button("重新配对") { model.rePair() }.disabled(model.busy)
             Toggle("自动会话（开机即连）", isOn: $model.autoSession)
             Toggle("自动挂载 DDI（实验）", isOn: $model.autoMount)

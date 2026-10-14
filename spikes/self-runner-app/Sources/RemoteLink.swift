@@ -5,14 +5,18 @@ import CryptoKit
 
 // All transport state lives on main; action workers never own a connection.
 final class RemoteLink {
-    private var connection: NWConnection?
-    private let monitor = NWPathMonitor()
+    private var connection: RemoteTransport?
+    private let routes = RemoteRoutePolicy()
+    private var remainingRoutes: [String] = []
+    private var budget: DispatchWorkItem?
+    var currentRoute: String? { phase == "online" ? connection?.route : nil }
+    var changed: () -> Void = {}
     private var pairing: RemotePairing?
     private var enabled = false
     private var epoch = 0
     private var retry: DispatchWorkItem?
     private var backoff = 1.0
-    private var phase = "offline"
+    private var phase = "offline" { didSet { changed() } }
     private var buffer = Data()
     private var lastData = Date()
     private var heartbeat: Timer?
@@ -20,8 +24,7 @@ final class RemoteLink {
     var request: ([String: Any], @escaping ([String: Any]) -> Void) -> Void = { _, _ in }
     var status: String { phase }
     init() {
-        monitor.pathUpdateHandler = { [weak self] _ in DispatchQueue.main.async { self?.reconnectNow() } }
-        monitor.start(queue: DispatchQueue(label: "dev.iphoneuse.selfrunner.path"))
+        routes.changed = { [weak self] in self?.reconnectNow() }
     }
     func configure(enabled: Bool, pairing: RemotePairing?) {
         self.enabled = enabled; self.pairing = pairing
@@ -31,10 +34,12 @@ final class RemoteLink {
     func reconnectNow() {
         guard enabled, pairing != nil, connection == nil else { return }
         retry?.cancel(); retry = nil
+        remainingRoutes = routes.routes(pairing!)
         connect()
     }
     private func disconnect() {
         epoch += 1
+        budget?.cancel(); budget = nil
         connection?.cancel(); connection = nil
         heartbeat?.invalidate(); heartbeat = nil
         retry?.cancel(); retry = nil
@@ -42,7 +47,13 @@ final class RemoteLink {
     }
     private func failed(_ token: Int) {
         guard token == epoch else { return }
+        // Only a failed attempt counts against its route and moves on to the next candidate; a link that
+        // was online and dropped (gateway restart, network change) reconnects through the normal backoff,
+        // and reconnectNow recomputes the route order.
+        let wasOnline = phase == "online"
+        if !wasOnline, let route = connection?.route { routes.failure(route) }
         disconnect()
+        if enabled, !wasOnline, !remainingRoutes.isEmpty { connect(); return }
         guard enabled, pairing != nil else { return }
         let item = DispatchWorkItem { [weak self] in self?.reconnectNow() }
         retry = item
@@ -52,37 +63,26 @@ final class RemoteLink {
     private func connect() {
         guard let pair = pairing else { return }
         epoch += 1; let token = epoch
-        let tls = NWProtocolTLS.Options()
-        sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv13)
-        sec_protocol_options_set_max_tls_protocol_version(tls.securityProtocolOptions, .TLSv13)
-        let pin = pair.pin
-        sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, trust, complete in
-            let object = sec_trust_copy_ref(trust).takeRetainedValue()
-            guard let certificates = SecTrustCopyCertificateChain(object) as? [SecCertificate], let leaf = certificates.first else { complete(false); return }
-            let digest = Data(SHA256.hash(data: SecCertificateCopyData(leaf) as Data))
-            var difference: UInt8 = 0
-            for i in 0..<32 { difference |= digest[i] ^ pin[i] }
-            complete(difference == 0)
-        }, DispatchQueue(label: "dev.iphoneuse.selfrunner.tls"))
-        let c = NWConnection(host: NWEndpoint.Host(pair.host), port: NWEndpoint.Port(rawValue: pair.port)!,
-                             using: NWParameters(tls: tls, tcp: NWProtocolTCP.Options()))
+        guard !remainingRoutes.isEmpty else { return }
+        let route = remainingRoutes.removeFirst()
+        let c = RemoteRoutePolicy.make(pair, route: route)
         connection = c; phase = "connecting"
-        c.stateUpdateHandler = { [weak self] state in
-            guard let self, token == self.epoch else { return }
-            switch state {
-            case .ready: self.phase = "challenge"; self.receive(c, token: token)
-            case .failed, .cancelled, .waiting: self.failed(token)
-            default: break
-            }
+        c.ready = { [weak self, weak c] in
+            guard let self, let c, token == self.epoch else { return }
+            self.phase = "challenge"; self.receive(c, token: token)
         }
-        c.start(queue: .main)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+        c.failed = { [weak self] _ in self?.failed(token) }
+        let timer = DispatchWorkItem { [weak self] in
             guard let self, token == self.epoch, self.phase != "online" else { return }
             self.failed(token)
         }
+        budget = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + (route == "lan" ? 2 : 8), execute: timer)
+        c.start()
     }
-    private func receive(_ c: NWConnection, token: Int) {
-        c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, end, error in
+
+    private func receive(_ c: RemoteTransport, token: Int) {
+        c.receive { [weak self] data, end, error in
             guard let self, token == self.epoch else { return }
             if let data { self.buffer.append(data) }
             while self.buffer.count >= 4 {
@@ -114,6 +114,7 @@ final class RemoteLink {
         }
         if phase == "welcome" {
             guard t == "welcome" else { return false }
+            budget?.cancel(); budget = nil
             phase = "online"; backoff = 1; lastData = Date()
             heartbeat = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
                 guard let self, token == self.epoch else { return }
@@ -138,8 +139,8 @@ final class RemoteLink {
         guard data.count <= (phase == "online" ? 16 * 1024 * 1024 : 4096) else { failed(token); return }
         let n = UInt32(data.count)
         let header = Data([UInt8((n >> 24) & 255), UInt8((n >> 16) & 255), UInt8((n >> 8) & 255), UInt8(n & 255)])
-        c.send(content: header + data, completion: .contentProcessed { [weak self] error in
+        c.send(header + data) { [weak self] error in
             if error != nil { self?.failed(token) }
-        })
+        }
     }
 }
