@@ -57,6 +57,27 @@ env_or_existing IPHONE_USE_PORT")"
 [ "$got" = 1 ] || bad "an old environment variable did not override the plist (got $got)"
 ok_t "an old environment variable still overrides the plist"
 
+# The Self Runner gateway settings (docs/design/self-runner-remote.md §14) live
+# only in the plist; an upgrade that dropped them would silently stop routing
+# the daemon through phone-gateway.
+CARRY="$(sed -n '/^for ENV_KEY in \\$/,/^done$/{p;/^done$/q;}' "$ROOT/install.sh")"
+case "$CARRY" in *IPHONE_USE_AGENT_TOKEN*) ;; *) bad "allow-list loop not found in install.sh" ;; esac
+cat > "$TMP/gateway.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
+<key>IPHONE_USE_SELFRUNNER_GATEWAY</key><string>http://127.0.0.1:7382</string>
+<key>IPHONE_USE_SELFRUNNER_GATEWAY_TOKEN_FILE</key><string>/x/client-token</string>
+</dict></dict></plist>
+PLIST
+got="$(env -i HOME="$TMP" PATH=/usr/bin:/bin bash -c "$READERS
+append_plist_env() { [ -z \"\$2\" ] || printf '%s=%s\n' \"\$1\" \"\$2\"; }
+PLIST_DST='$TMP/gateway.plist'; OLD_PLIST='$TMP/none.plist'
+$CARRY")"
+[ "$got" = "IPHONE_USE_SELFRUNNER_GATEWAY=http://127.0.0.1:7382
+IPHONE_USE_SELFRUNNER_GATEWAY_TOKEN_FILE=/x/client-token" ] \
+    || bad "an upgrade dropped the Self Runner gateway settings (got '$got')"
+ok_t "an upgrade carries the Self Runner gateway settings forward"
+
 got="$(DAEMON_PLIST="$TMP/old.plist" bash -c "$DAEMON_ENV
 daemon_env")"
 [ "$got" = "45432 old-token 0.0.0.0" ] || bad "auto-update read '$got' from an old plist"
