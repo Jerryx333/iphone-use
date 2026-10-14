@@ -564,7 +564,11 @@ mod tests {
                 "iphone_use_request",
                 serde_json::json!({"endpoint": "/agent/input", "error_code": "a label 设置", "label": "设置", "path": "/Users/x"})
             ));
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fake.batches.lock().unwrap().iter().map(Vec::len).sum::<usize>() < 4 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("telemetry batch flushed");
         });
         let batches = fake.batches.lock().unwrap();
         let events: Vec<&serde_json::Value> = batches.iter().flatten().collect();
@@ -608,7 +612,13 @@ mod tests {
             )
             .unwrap();
             telemetry.record("/agent/input", Outcome::Ok, Duration::from_millis(1), false);
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fake.batches.lock().unwrap().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("telemetry retry completed");
         });
         // started + input in one batch: 503, then the retry fails too — dropped.
         assert_eq!(fake.batches.lock().unwrap().len(), 2);

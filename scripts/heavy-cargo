@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Resource-limited Cargo entry point. --durations profiles stable libtest cases.
+set -euo pipefail
+cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+limit=$((cores / 2)); ((limit > 0)) || limit=1
+default=$((cores / 4)); ((default > 0)) || default=1
+jobs=${CARGO_BUILD_JOBS:-$default}
+args=(); durations=0; after=0; threads=0
+while (($#)); do
+    case "$1" in
+        --) after=1; args+=("$1"); shift ;;
+        --durations) durations=1; shift ;;
+        -j|--jobs)
+            if ((after)); then args+=("$1"); shift; else
+                (($# >= 2)) || { echo 'heavy-cargo: missing jobs value' >&2; exit 2; }
+                jobs=$2; shift 2
+            fi ;;
+        -j[0-9]*|--jobs=*)
+            if ((after)); then args+=("$1"); else jobs=${1#-j}; jobs=${jobs#--jobs=}; fi; shift ;;
+        --test-threads|--test-threads=*) threads=1; args+=("$1"); shift ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+[[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo 'heavy-cargo: jobs must be a positive integer' >&2; exit 2; }
+if ((jobs > limit)); then
+    echo "heavy-cargo: requested $jobs jobs; capped at $limit (half of $cores CPUs)" >&2
+    jobs=$limit
+fi
+export CARGO_BUILD_JOBS=$jobs
+renice 10 -p $$ >/dev/null 2>&1 || true
+if command -v sccache >/dev/null 2>&1; then
+    RUSTC_WRAPPER=$(command -v sccache)
+    export RUSTC_WRAPPER
+fi
+lock="${TMPDIR:-/tmp}/iphone-use-heavy-cargo-$(id -u).lock"
+# macOS ships flock(2), but usually no flock executable. Hold the same kernel
+# lock in a parent process there; never fall back to an unlocked Cargo.
+if [[ ${HEAVY_CARGO_LOCKED:-} != "$lock" ]]; then
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>>"$lock"
+        if ! flock -n 9; then
+            echo 'heavy-cargo: waiting for another heavy Cargo invocation by this user' >&2
+            flock 9
+        fi
+    else
+        exec python3 - "$lock" "$0" "$jobs" "$durations" "${args[@]}" <<'PY'
+import fcntl, os, subprocess, sys
+lock, script, jobs, durations, *args = sys.argv[1:]
+with open(lock, 'a') as handle:
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('heavy-cargo: waiting for another heavy Cargo invocation by this user', file=sys.stderr, flush=True)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    os.environ['HEAVY_CARGO_LOCKED'] = lock
+    command = ['bash', script, '-j', jobs] + (['--durations'] if durations == '1' else []) + args
+    sys.exit(subprocess.call(command))
+PY
+    fi
+fi
+if [[ ${args[0]:-} == test ]] && (( !threads )); then
+    ((after)) || args+=(--)
+    args+=("--test-threads=$jobs")
+fi
+if ((durations)); then
+    [[ ${args[0]:-} == test ]] || { echo 'heavy-cargo: --durations requires test' >&2; exit 2; }
+    exec python3 - "${args[@]}" <<'PY'
+import concurrent.futures, json, os, subprocess, sys, time
+args = sys.argv[1:]
+split = args.index('--') if '--' in args else len(args)
+cargo, harness = args[:split], args[split + 1:]
+# Cargo accepts a positional test filter before --; libtest --list needs it too.
+value_options = {'-p', '--package', '--test', '--bin', '--example', '--bench', '--features', '--exclude', '--target', '--target-dir', '--manifest-path', '--profile', '--message-format', '--config', '--color', '--jobs', '-j'}
+expect_value = False
+for arg in cargo[1:]:
+    if expect_value:
+        expect_value = False
+    elif arg in value_options:
+        expect_value = True
+    elif not arg.startswith('-'):
+        harness = [arg, *harness]
+# Keep Cargo's package/target selection; never run an ignored case implicitly.
+result = subprocess.run(['cargo', *cargo, '--no-run', '--message-format=json'], stdout=subprocess.PIPE, text=True)
+if result.returncode:
+    sys.exit(result.returncode)
+binaries = []
+for line in result.stdout.splitlines():
+    try:
+        artifact = json.loads(line)
+    except ValueError:
+        continue
+    if artifact.get('reason') == 'compiler-artifact' and artifact.get('profile', {}).get('test') and artifact.get('executable'):
+        binaries.append(artifact['executable'])
+threads = int(os.environ['CARGO_BUILD_JOBS'])
+for i, arg in enumerate(harness):
+    if arg.startswith('--test-threads='): threads = int(arg.split('=')[1])
+    elif arg == '--test-threads': threads = int(harness[i + 1])
+rows = []; passing_rows = []; passed = failed = ignored = 0
+
+def run_case(item):
+    binary, name = item
+    start = time.monotonic()
+    process = subprocess.run([binary, name, '--exact', *harness], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return time.monotonic() - start, binary, name, process
+
+for binary in dict.fromkeys(binaries):
+    listed = subprocess.check_output([binary, '--list', *harness], text=True)
+    skipped = subprocess.check_output([binary, '--list', '--ignored'], text=True)
+    skip = {line[:-6] for line in skipped.splitlines() if line.endswith(': test')}
+    cases = [line[:-6] for line in listed.splitlines() if line.endswith(': test')]
+    active = [(binary, name) for name in cases if name not in skip or '--ignored' in harness or '--include-ignored' in harness]
+    ignored += len(cases) - len(active)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        for elapsed, binary, name, process in pool.map(run_case, active):
+            rows.append((elapsed, os.path.basename(binary), name))
+            if process.returncode:
+                failed += 1
+                print(process.stdout, flush=True)
+            else:
+                passed += 1
+                passing_rows.append((elapsed, os.path.basename(binary), name))
+print(f'Cases: {passed} passed; {failed} failed; {ignored} ignored')
+print('Slowest 10 cases (wall seconds, binary, case):')
+for elapsed, binary, name in sorted(rows, reverse=True)[:10]:
+    print(f'{elapsed:.3f}\t{binary}\t{name}')
+if failed:
+    print('Slowest 10 passing cases (wall seconds, binary, case):')
+    for elapsed, binary, name in sorted(passing_rows, reverse=True)[:10]:
+        print(f'{elapsed:.3f}\t{binary}\t{name}')
+# Cargo --no-run does not build/run doctests; preserve their normal coverage.
+docs = subprocess.call(['cargo', *cargo, '--doc', '--', *harness]) if not any(x in cargo for x in ('--lib', '--bins', '--tests', '--all-targets', '--doc', '--test', '--bin')) else 0
+sys.exit(1 if failed or docs else 0)
+PY
+fi
+exec cargo "${args[@]}"

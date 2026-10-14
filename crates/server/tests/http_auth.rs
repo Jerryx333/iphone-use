@@ -2052,7 +2052,13 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !state.wda_health.lock().unwrap().actionable {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background health probe completed");
         server.join().unwrap();
 
         let health = *state.wda_health.lock().unwrap();

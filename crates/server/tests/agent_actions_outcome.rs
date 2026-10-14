@@ -228,7 +228,10 @@ fn an_observed_batch_returns_the_screen_it_ended_on() {
                 return Some((Duration::ZERO, SESSION.to_string()));
             }
             if request.contains("/source?format=json") {
-                return Some((Duration::ZERO, BARE_TREE.to_string()));
+                return Some((Duration::ZERO, BARE_TREE.replace(
+                    "\"children\":[]",
+                    r#""children":[{"type":"XCUIElementTypeButton","label":"完成","rect":{"x":20,"y":200,"width":100,"height":44}}]"#,
+                )));
             }
             Some((Duration::ZERO, r#"{"value":null}"#.to_string()))
         });
