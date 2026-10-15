@@ -18,9 +18,12 @@ def plist(path):
     return plistlib.loads(path.read_bytes())
 
 
-def validate_main(app):
+DEFAULT_BUNDLE_ID = "com.leeguoo.iphone-use.remote"
+
+
+def validate_main(app, bundle_id=DEFAULT_BUNDLE_ID):
     info = plist(app / "Info.plist")
-    if info.get("CFBundleIdentifier") != "com.leeguoo.iphone-use.remote":
+    if info.get("CFBundleIdentifier") != bundle_id:
         raise ValueError("Unexpected main application identity")
     if not (app / info["CFBundleExecutable"]).is_file():
         raise ValueError("Main executable missing")
@@ -34,8 +37,8 @@ def validate_main(app):
     return info
 
 
-def assemble(main, runner, output):
-    info = validate_main(main)
+def assemble(main, runner, output, bundle_id=DEFAULT_BUNDLE_ID):
+    info = validate_main(main, bundle_id)
     if output.exists():
         raise ValueError("Output already exists; use a new output path")
     if not (runner / "PlugIns/PhoneUse.xctest").is_dir():
@@ -103,7 +106,8 @@ if __name__ == "__main__":
     parser.add_argument("--main", required=True, type=Path)
     parser.add_argument("--runner", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--bundle-id", default=DEFAULT_BUNDLE_ID)
     args = parser.parse_args()
-    candidate = assemble(args.main.resolve(), args.runner.resolve(), args.output.resolve())
+    candidate = assemble(args.main.resolve(), args.runner.resolve(), args.output.resolve(), args.bundle_id)
     sign(candidate, args.main.resolve())
     print("One signed application assembled; physical single-app acceptance still required: " + str(candidate))

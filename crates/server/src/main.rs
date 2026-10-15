@@ -247,6 +247,20 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Build the iOS app (Phone Use) with your own signing team and install it.
+    ///
+    /// Run after `iphone-use setup`: it reuses that phone, team and runner. A
+    /// paid team gets local control (the phone runs its own device service, no
+    /// Mac needed); a free Apple ID gets the remote app. The app is not in the
+    /// App Store. `--remote-only` skips local control; `--no-install` only
+    /// builds; `--no-pair` skips the first USB pairing for local control.
+    SetupApp {
+        /// A named instance (a second phone); default: IPHONE_USE_INSTANCE.
+        #[arg(long)]
+        instance: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Check the Mac, Xcode and the iPhone, and say how to fix what is missing.
     Doctor {
         /// A named instance (a second phone); default: IPHONE_USE_INSTANCE.
@@ -852,6 +866,12 @@ fn main() -> Result<()> {
             std::process::exit(onboarding::run_setup(&target, &args))
         }
         Command::SetupNative { args } => std::process::exit(server::setup::main(&args)),
+        Command::SetupApp { instance, args } => {
+            if let Some(name) = instance {
+                std::env::set_var("IPHONE_USE_INSTANCE", name);
+            }
+            std::process::exit(server::setup::app::run(&args))
+        }
         Command::Doctor { instance } => {
             let target = onboarding::Target::resolve(instance.as_deref())?;
             let code = onboarding::run_doctor(&target);

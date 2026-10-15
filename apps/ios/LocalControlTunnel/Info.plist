@@ -8,7 +8,7 @@
 <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
 <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
 <key>IPUKeychainGroup</key><string>$(AppIdentifierPrefix)com.leeguoo.iphone-use.selfhost-probe.shared</string>
-<key>IPURunnerBundle</key><string>com.leeguoo.iphone-use.remote</string>
+<key>IPURunnerBundle</key><string>$(IPU_APP_BUNDLE_ID)</string>
 <key>NSExtension</key><dict>
 <key>NSExtensionPointIdentifier</key><string>com.apple.networkextension.packet-tunnel</string>
 <key>NSExtensionPrincipalClass</key><string>$(PRODUCT_MODULE_NAME).PhoneTunnelProvider</string>

@@ -16,14 +16,23 @@ the user does not type a local address or password. Other phones use the same ap
 to scan the QR. Initial signing/install/pairing still uses a computer, and system
 VPN authorization and the first unlock after reboot remain human actions.
 
-Build a private signed candidate (developer-image assets must already be prepared):
+Users install it with `iphone-use setup-app` (see the guide's "Install the app"),
+which runs `Tools/build_single_app.py` with their own team. From a checkout:
 
 ```sh
+python3 experiments/phone-self-host/prepare-image.py     # this Mac's Apple developer image
 python3 apps/ios/Tools/build_single_app.py \
+  --team <TEAMID> --bundle-id com.leeguoo.iphone-use.remote.<teamid> \
   --host-lib <compiled libipu_phone_host.a> \
   --embed-lib <compiled libipu_embed.a> \
-  --output <new output directory>/PhoneUse.app
+  --output <new output directory>/PhoneUse.app      # Release; --configuration Debug for QA builds
+python3 apps/ios/Tools/build_single_app.py --remote-only --team <TEAMID> \
+  --bundle-id com.leeguoo.iphone-use.remote.<teamid> --output <dir>/PhoneUse.app   # free Apple ID
 ```
+
+`project.remote.yml` is the remote app (no network extension, so a free team can
+sign it); `project.yml` includes it and adds the local-control tunnel. Every
+bundle identifier derives from the `IPU_APP_BUNDLE_ID` build setting.
 
 The assembler rejects a missing network extension, conflicting frameworks and
 any nested `.app`. It keeps the main app identifier/data and seals the final app
