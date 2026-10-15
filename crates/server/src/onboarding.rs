@@ -762,6 +762,10 @@ mod tests {
                             Err(error) => panic!("fixture accept: {error}"),
                         }
                     };
+                    // On macOS an accepted socket inherits the listener's
+                    // non-blocking mode: read before the request arrives
+                    // returns WouldBlock. Block, bounded by the read timeout.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
