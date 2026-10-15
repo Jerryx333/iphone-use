@@ -1338,7 +1338,9 @@ impl PhoneHandler {
         `snapshot` token for phone_tap_element; indexes and snapshot tokens are valid for this read \
         only. `query` keeps only rows containing that text (label, identifier, value, placeholder) \
         and `limit` caps the rows — both keep each row's index and the snapshot, so taps still \
-        work. On the first read in a newly entered app a `registry` block lists saved flows for \
+        work. Screen text shows at most 200 rows and 32 KiB of row text; an omission notice \
+        means a partial view, not absence or list completion. Narrow with query when needed. \
+        On the first read in a newly entered app a `registry` block lists saved flows for \
         it: if one does the task, phone_flow_run it instead of tapping step by step. An `alert` \
         block means a system alert is up: answer it with an `alert` step, taps on alerts do not act. \
         ocr=auto adds text read from pixels when the tree has no interactive rows (games, \
@@ -5040,6 +5042,32 @@ mod tests {
         let text = text_of(&result);
         assert!(text.contains("Nothing was sent") || text.contains("nothing was sent"), "{text}");
         text
+    }
+
+    #[test]
+    fn filtered_elements_keep_indexes_and_coverage_in_the_model_summary() {
+        let body = serde_json::json!({"snapshot":"S", "elements":[
+            {"index":17,"kind":"Button","label":"目标"}
+        ], "filter":{"query":"目标","matched":3,"returned":1,"omitted":2,"of":30}});
+        let (result, line, _, _) = device_call("200 OK", &body.to_string(), |h| async move {
+            h.phone_elements(Parameters(ElementsParams {
+                query: Some("目标".into()), limit: Some(1), ..Default::default()
+            })).await
+        });
+        assert!(line.contains("limit=1"), "{line}");
+        assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+        for mode in [StructuredMode::Slim, StructuredMode::Full, StructuredMode::Off] {
+            let shaped = shape_structured(result.clone(), mode);
+            let text = text_of(&shaped);
+            assert!(text.contains("#17 [Button]"), "{text}");
+            assert!(!text.contains("#0 [Button]"), "{text}");
+            assert!(text.contains("\"omitted\":2"), "{text}");
+            if mode == StructuredMode::Slim {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["summary"], text);
+            } else if mode == StructuredMode::Full {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["elements"], body["elements"]);
+            }
+        }
     }
 
     #[test]

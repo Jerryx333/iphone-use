@@ -134,6 +134,10 @@ model turns. To count one task exactly, wrap it in `phone_run_start` /
 `phone_run_end` (HTTP: `POST /agent/run`). `GET /agent/elements?scope=app`
 (or `interactive`, `focused`, `changed&since=…`) returns a smaller view of the
 same read; `?image=auto` adds a screenshot only when the tree is unusable.
+MCP screen text includes at most 200 rows and 32 KiB of row text. When it
+reports omitted rows, narrow `phone_elements` with `query`/`limit`; an omitted
+target is not proven absent and a truncated list is not proven complete.
+Use the displayed `#N` with its snapshot: it is the original full-tree index.
 → reference: *Task metrics, runs and advice*
 
 ## A flow is just these steps saved

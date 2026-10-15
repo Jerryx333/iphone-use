@@ -768,6 +768,13 @@ update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
   change, one line per element, or a batch's verdict and end screen; for a
   failed batch, the failed step, its error, `retry_safe` and the end screen.
   `phone_flow_list` gives one row per flow (`detail=true` for every field).
+  Screen rows have a text budget of 200 rows and 32 KiB, after decoration
+  filtering, for full screens and deltas. Omission counts, scope/filter
+  coverage and alerts remain in the text. A partial view cannot prove absence
+  or list completion; narrow `phone_elements` with `query`/`limit` to read the
+  relevant rows. Displayed indexes always refer to the original full snapshot.
+  This is a presentation budget; it does not reduce native snapshot work or
+  truncate the daemon's JSON (`IPHONE_USE_MCP_STRUCTURED=full` keeps that JSON).
 - `structuredContent` is slim by default: the top-level verdict fields plus
   `summary`. `IPHONE_USE_MCP_STRUCTURED=full` sends the whole JSON; `off`
   sends none. Claude Code shows the model only `structuredContent` on success;
