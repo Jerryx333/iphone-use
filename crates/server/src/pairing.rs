@@ -346,7 +346,14 @@ mod tests {
     fn lan_urls_carry_the_daemon_port() {
         let p = Pairing::new(true).with_port(44321);
         let urls = p.lan_urls(Some(9999));
-        assert_eq!(urls.len(), lan_addresses().len());
+        #[cfg(target_os = "macos")]
+        let aliases = if let Some(host) = super::local_hostname() {
+            assert!(urls.contains(&format!("http://{host}:44321")));
+            1
+        } else { 0 };
+        #[cfg(not(target_os = "macos"))]
+        let aliases = 0;
+        assert_eq!(urls.len(), lan_addresses().len() + aliases);
         assert!(urls
             .iter()
             .all(|u| u.starts_with("http://") && u.ends_with(":44321")));
