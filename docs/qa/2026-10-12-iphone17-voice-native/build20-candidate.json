@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "build": "20",
+  "source_commit": "2fc62e50e2a4cbefe1f8cd37d318abfcc35ce84a",
+  "signature_deep_strict_verified": true,
+  "single_app": true,
+  "official_provider_compiled_from_unified_source": true,
+  "recovery_tests_passed": 10,
+  "native_unknown_outcome_guard_present": true,
+  "control_sha256": "7f261bb31b063a466ecb99ba529a1c17b10f1c6eaed1992ea94cda32a1e7dd3d",
+  "installed_on_iphone17": false,
+  "supersedes_build": 19,
+  "superseded_by_build": 21
+}

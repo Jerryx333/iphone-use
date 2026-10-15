@@ -584,7 +584,7 @@ const PHONE_HINTS: &[&str] = &["phone", "mobile", "tel", "手机", "电话", "�
 /// Words that make an account field also take something other than a number
 /// (`手机号/邮箱`, "Email or phone").
 const NOT_ONLY_PHONE_HINTS: &[&str] = &[
-    "mail", "user", "account", "邮箱", "用户名", "账号", "帐号", "账户", "メール", "ユーザー", "アカウント",
+    "mail", "user", "account", "邮箱", "邮件", "郵件", "用户名", "账号", "帐号", "账户", "メール", "ユーザー", "アカウント",
 ];
 
 /// An account field that takes a phone number and nothing else.
@@ -1899,6 +1899,15 @@ mod tests {
         assert!(!phone_shaped("someone@example.com"));
         assert!(!phone_shaped("player_one99"));
         assert!(!phone_shaped("123"));
+    }
+
+    #[test]
+    fn auth_email_or_phone_placeholder_accepts_email() {
+        let mut apple_account = row("TextField", "", 240.0);
+        apple_account.placeholder = Some("电子邮件或电话号码".to_string());
+        assert!(!phone_only_field(&apple_account));
+        apple_account.placeholder = Some("電子郵件或電話號碼".to_string());
+        assert!(!phone_only_field(&apple_account));
     }
 
     #[test]

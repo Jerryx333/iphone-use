@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "completed": 5,
+  "applied_actions": 3,
+  "error": null,
+  "failed_step": null,
+  "retry_safe": null,
+  "schema": 1,
+  "embedded_version": "0.17.18",
+  "scope": "Standard API batch after independent runner startup. No new smoke report was produced; input/screenshot evidence belongs to earlier separately recorded tests.",
+  "last_step_postcondition_verified": false,
+  "observation": "Batch ACK reported 3 applied actions, but the validation page remained not tested. A fresh single-step tap later produced a new successful smoke report.",
+  "follow_up_report": "ios27-wifi-reconnect-control.json"
+}

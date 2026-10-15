@@ -1,0 +1,11 @@
+{
+  "elapsed_seconds" : 3.6775230169296265,
+  "error_code" : "typing_not_observed",
+  "executor" : "on-device app via signed local runner HTTP",
+  "finished_at" : "2026-10-11T21:17:52Z",
+  "ok" : false,
+  "schema" : 1,
+  "scope" : "real input\/source\/screenshot in this test app; Mac disconnection requires a separate recorded observation",
+  "started_at" : "2026-10-11T21:17:49Z",
+  "tap_observed" : true
+}

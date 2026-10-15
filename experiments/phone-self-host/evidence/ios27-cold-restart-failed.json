@@ -1,0 +1,50 @@
+{
+  "executor": "on-device app reading its own Network Extension",
+  "native": {
+    "build_id": "9dba6789145996ed5a2aa115e5db43cb35f841109c7f77251d93877482466158",
+    "developer_services": false,
+    "error_code": "bridge_ack_failed",
+    "ios": null,
+    "linked": true,
+    "pair_record_available": false,
+    "phase": "failed",
+    "protocol_error_code": null,
+    "protocol_error_subcode": null,
+    "runner_credential_state": "pending",
+    "test_plan_started": false
+  },
+  "observed_at": "2026-10-11T18:38:31Z",
+  "probes": [
+    {
+      "detail": "POSIXErrorCode(rawValue: 54): Connection reset by peer",
+      "elapsedMilliseconds": 3,
+      "endpoint": {
+        "host": "127.0.0.1",
+        "port": 49152,
+        "purpose": "extension direct RemotePairing"
+      },
+      "outcome": "handshake_receive_failed"
+    },
+    {
+      "detail": "No completed probe within 5 seconds",
+      "elapsedMilliseconds": 5321,
+      "endpoint": {
+        "host": "10.7.0.1",
+        "port": 49152,
+        "purpose": "extension direct RemotePairing"
+      },
+      "outcome": "probe_timeout"
+    },
+    {
+      "detail": "No handshake within 8 seconds",
+      "elapsedMilliseconds": 9000,
+      "endpoint": {
+        "host": "10.7.0.1",
+        "port": 49152,
+        "purpose": "extension through-tunnel RemotePairing"
+      },
+      "outcome": "probe_timeout"
+    }
+  ],
+  "scope": "Cold restart failed after human first unlock; Mac daemon and XCTest supervisor remained stopped. No Mac runner launch before this observation."
+}

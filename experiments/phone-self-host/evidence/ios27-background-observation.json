@@ -1,0 +1,12 @@
+{
+  "started_at": "2026-10-11T17:35:14.732177+00:00",
+  "foreground_bundle": "com.apple.calculator",
+  "usb_absent": true,
+  "normal_mac_runner_stopped": true,
+  "observed_background_seconds": 160.895157,
+  "runner_still_ready": true,
+  "calculator_still_foreground_before_return": true,
+  "return_smoke_requested_at": "2026-10-11T17:37:59.319833+00:00",
+  "control_report": "ios27-independent-control-background.json",
+  "scope": "USB detached, Self Host Probe background while Calculator is foreground; direct Wi-Fi runner remains ready and control smoke rerun after returning"
+}

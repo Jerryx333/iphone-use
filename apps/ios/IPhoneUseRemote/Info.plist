@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>IPUKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)com.leeguoo.iphone-use.selfhost-probe.shared</string>
+	<key>IPUTunnelBundle</key>
+	<string>com.leeguoo.iphone-use.remote.tunnel</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>

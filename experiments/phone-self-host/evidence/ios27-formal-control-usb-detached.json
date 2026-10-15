@@ -1,0 +1,21 @@
+{
+  "elapsed_seconds": 2.164826989173889,
+  "executor": "on-device app via signed local runner HTTP",
+  "finished_at": "2026-10-11T18:59:29Z",
+  "ok": true,
+  "schema": 1,
+  "scope": "real input/source/screenshot in this test app; Mac disconnection requires a separate recorded observation",
+  "screenshot_height": 512,
+  "screenshot_sha256": "e000a464ec6d7a973473c51a7813b9831b353162d5b59576ce420bbad4c47166",
+  "screenshot_width": 236,
+  "source_verified": true,
+  "started_at": "2026-10-11T18:59:27Z",
+  "tap_observed": true,
+  "typing_observed": true,
+  "detachment_observation": {
+    "usb_present": false,
+    "usbmux_connection_types": [],
+    "normal_mac_daemon_loaded": false,
+    "scope": "Wi-Fi HTTP client only; no Mac XCTest host"
+  }
+}

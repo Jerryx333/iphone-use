@@ -1,0 +1,40 @@
+name: PhoneSelfHostProbe
+options:
+  deploymentTarget:
+    iOS: "17.4"
+settings:
+  base:
+    DEVELOPMENT_TEAM: 6ZPXG4KVVS
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    ENABLE_DEBUG_DYLIB: NO
+targets:
+  PhoneSelfHostProbe:
+    type: application
+    platform: iOS
+    sources: [Sources, Shared]
+    dependencies:
+      - target: PhoneLocalTunnel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.leeguoo.iphone-use.selfhost-probe
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: Network.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+  PhoneLocalTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel
+      - path: Shared
+      - path: Resources/DeveloperImage
+        type: folder
+        optional: true
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.leeguoo.iphone-use.selfhost-probe.tunnel
+        INFOPLIST_FILE: Tunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Network.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        OTHER_LDFLAGS: "$(inherited) $(IPU_HOST_LDFLAGS)"

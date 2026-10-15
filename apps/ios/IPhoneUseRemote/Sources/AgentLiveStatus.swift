@@ -12,6 +12,7 @@ final class AgentLiveStatus {
   private let prefix = "com.leeguoo.iphone-use.remote.agent."
   private var systemTask: BGTask?
   private var requestID: String?
+  private var sessionID: String?
   private var legacyActivity: AnyObject?
   private var legacyKey: String?
   private var legacyUpdates: Task<Void, Never>?
@@ -19,18 +20,28 @@ final class AgentLiveStatus {
   private var latest = AgentProgress(
     task: AgentTaskSnapshot(id: "pending", goal: "", state: .running))
   private var loggedStep = -1
+  private(set) var activityFailureCode: String?
   private init() {}
 
   private var useContinuedProcessing: Bool {
     #if DEBUG
-      return !UserDefaults.standard.bool(forKey: "legacyActivity")
+      return UserDefaults.standard.bool(forKey: "continuedProcessing") && !UserDefaults.standard.bool(forKey: "legacyActivity")
     #else
-      return true
+      // The phone daemon owns native execution; a system background-task expiration
+      // must not cancel it just because the companion switched apps.
+      return false
     #endif
   }
 
-  func begin(goal: String, device: String, route: String = "iphoneuse://agent", onCancel: @escaping @MainActor () async -> Void) {
+  func begin(goal: String, device: String, route: String = "iphoneuse://agent", sessionID: String? = nil, onCancel: @escaping @MainActor () async -> Void) {
+    if let sessionID, self.sessionID == sessionID,
+       legacyActivity != nil || systemTask != nil || requestID != nil {
+      cancel = onCancel
+      return
+    }
     finish(success: false, dismissImmediately: true)
+    activityFailureCode = nil
+    self.sessionID = sessionID
     cancel = onCancel
     latest = AgentProgress(task: AgentTaskSnapshot(id: "pending", goal: goal, state: .running))
     if #available(iOS 26, *), useContinuedProcessing {
@@ -71,6 +82,7 @@ final class AgentLiveStatus {
       guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
       let attributes = AgentActivityAttributes(
         goal: String(goal.prefix(80)), device: String(device.prefix(48)), route: route)
+      let previousActivities = Activity<AgentActivityAttributes>.activities
       do {
         if #available(iOS 16.2, *) {
           legacyActivity = try Activity.request(
@@ -82,11 +94,26 @@ final class AgentLiveStatus {
           legacyActivity = try Activity.request(
             attributes: attributes, contentState: content(), pushType: nil)
         }
+        // This app follows one task. A process restart can leave the previous
+        // task's activity behind even though the singleton lost its reference.
+        if let current = legacyActivity as? Activity<AgentActivityAttributes> {
+          Task {
+            for previous in previousActivities where previous.id != current.id {
+              if #available(iOS 16.2, *) {
+                await previous.end(nil, dismissalPolicy: .immediate)
+              } else {
+                await previous.end(dismissalPolicy: .immediate)
+              }
+            }
+          }
+        }
         #if DEBUG
           print("[AgentLiveStatus] activity created")
         #endif
       } catch {
         legacyActivity = nil
+        let failure = error as NSError
+        activityFailureCode = "\(failure.domain):\(failure.code)"
         #if DEBUG
           print("[AgentLiveStatus] activity failed: \(error)")
         #endif
@@ -212,6 +239,7 @@ final class AgentLiveStatus {
     systemTask = nil
     if let id = requestID { BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: id) }
     requestID = nil
+    sessionID = nil
     cancel = nil
     if #available(iOS 16.1, *), let activity = legacyActivity as? Activity<AgentActivityAttributes>
     {

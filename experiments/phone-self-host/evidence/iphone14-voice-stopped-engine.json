@@ -1,0 +1,38 @@
+{
+  "active": true,
+  "assistant_turns": 1,
+  "audio": {
+    "engine_running": false,
+    "input_buffers": 0,
+    "input_ports": [
+      "MicrophoneBuiltIn"
+    ],
+    "output_ports": [
+      "Speaker"
+    ],
+    "output_volume": 1,
+    "peak_input": 0,
+    "recognition_events": 0,
+    "recognition_failures": 0,
+    "recognition_present": true,
+    "record_permission": true,
+    "scheduled_frames": 248141,
+    "speech_permission": true,
+    "tts_packets": 446,
+    "using_local_recognition": true
+  },
+  "connecting": false,
+  "current_tool": "phone",
+  "has_error": false,
+  "muted": false,
+  "observed_at": "2026-10-11T19:20:43Z",
+  "paused": false,
+  "phone_available": true,
+  "schema": 1,
+  "speaking": true,
+  "task_active": true,
+  "task_state": "paused",
+  "thinking": false,
+  "transcript_length": 0,
+  "user_turns": 0
+}

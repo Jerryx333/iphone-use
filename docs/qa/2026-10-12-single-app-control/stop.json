@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-12T02:30:40Z",
+  "candidate": "PhoneUse-verified.app",
+  "trigger": "main App stop button",
+  "ports": {
+    "18100": "closed",
+    "18787": "closed"
+  },
+  "normal_mac_supervisor_loaded": false,
+  "normal_mac_daemon_loaded": false,
+  "network_extension_process_absent": true
+}
