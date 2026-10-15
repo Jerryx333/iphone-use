@@ -40,6 +40,15 @@ final class DeviceStoreTests: XCTestCase {
         XCTAssertEqual(DeviceStore.load(from: defaults) { _ in true }, [])
     }
 
+    func testStandaloneEndpointIsLocalAndNotARemoteTile() {
+        let local = DeviceRecord(address: DeviceStore.standalonePhoneAddress)
+        XCTAssertTrue(local.isThisPhone)
+        XCTAssertFalse(local.showInGrid)
+        XCTAssertTrue(DeviceStore.isThisPhone("http://localhost:18787"))
+        XCTAssertFalse(DeviceStore.isThisPhone("http://192.168.0.10:18787"))
+        XCTAssertFalse(DeviceStore.isThisPhone("http://127.0.0.1:18788"))
+    }
+
     func testSaveAndLoadRoundTrip() {
         let list = [DeviceRecord(address: "http://a:44321", name: "iPhone 13"),
                     DeviceRecord(address: "http://a:44322", showInGrid: false)]

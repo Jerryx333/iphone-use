@@ -234,7 +234,8 @@ final class BrowserLibrary: ObservableObject {
             guard incoming.cookies.count <= 10_000 else { throw BrowserToolError.invalidResult }
             var account = next.first { $0.externalID == incoming.id } ?? BrowserAccount(id: UUID(), externalID: incoming.id,
                 label: incoming.label ?? incoming.id, domains: domains, cookies: [], localStorage: [:], bookmarks: [], history: [], personal: [:])
-            account.label = incoming.label ?? incoming.id; account.domains = domains
+            account.label = incoming.label ?? incoming.id
+            account.updateScope(domains)
             if includeCookies { account.cookies = incoming.cookies.filter { $0.cookie(allowedDomains: domains) != nil } }
             if includeStorage {
                 account.localStorage = (incoming.local_storage ?? [:]).filter { $0.key.utf8.count <= 2000 && $0.key != "__proto__" && ((try? JSONEncoder().encode($0.value).count) ?? Int.max) <= 100_000 }

@@ -20,6 +20,7 @@ final class AgentLiveStatus {
   private var latest = AgentProgress(
     task: AgentTaskSnapshot(id: "pending", goal: "", state: .running))
   private var loggedStep = -1
+  private(set) var activityFailureCode: String?
   private init() {}
 
   private var useContinuedProcessing: Bool {
@@ -39,6 +40,7 @@ final class AgentLiveStatus {
       return
     }
     finish(success: false, dismissImmediately: true)
+    activityFailureCode = nil
     self.sessionID = sessionID
     cancel = onCancel
     latest = AgentProgress(task: AgentTaskSnapshot(id: "pending", goal: goal, state: .running))
@@ -80,6 +82,7 @@ final class AgentLiveStatus {
       guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
       let attributes = AgentActivityAttributes(
         goal: String(goal.prefix(80)), device: String(device.prefix(48)), route: route)
+      let previousActivities = Activity<AgentActivityAttributes>.activities
       do {
         if #available(iOS 16.2, *) {
           legacyActivity = try Activity.request(
@@ -91,11 +94,26 @@ final class AgentLiveStatus {
           legacyActivity = try Activity.request(
             attributes: attributes, contentState: content(), pushType: nil)
         }
+        // This app follows one task. A process restart can leave the previous
+        // task's activity behind even though the singleton lost its reference.
+        if let current = legacyActivity as? Activity<AgentActivityAttributes> {
+          Task {
+            for previous in previousActivities where previous.id != current.id {
+              if #available(iOS 16.2, *) {
+                await previous.end(nil, dismissalPolicy: .immediate)
+              } else {
+                await previous.end(dismissalPolicy: .immediate)
+              }
+            }
+          }
+        }
         #if DEBUG
           print("[AgentLiveStatus] activity created")
         #endif
       } catch {
         legacyActivity = nil
+        let failure = error as NSError
+        activityFailureCode = "\(failure.domain):\(failure.code)"
         #if DEBUG
           print("[AgentLiveStatus] activity failed: \(error)")
         #endif

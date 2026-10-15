@@ -16,6 +16,83 @@ struct IPhoneUseRemoteApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(app: app)
+                .task {
+                    do { try SingleAppTestBootstrap.startIfRequested() }
+                    catch { app.show(String(localized: "本机控制组件无法启动，请重新安装完整版本")) }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-stop") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        await tunnel.stop()
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-launch") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        await tunnel.startAndCommand("launch")
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("--local-control-restart") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        await tunnel.startAndCommand("restart")
+                    }
+                    if DeviceQAOptions.contains("--local-control-status") {
+                        let tunnel = LocalTunnel()
+                        await tunnel.load()
+                        for _ in 0..<3 {
+                            await tunnel.refresh()
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        }
+                        var report: [String: Any] = [
+                            "observed_at": ISO8601DateFormatter().string(from: Date()),
+                            "native_phase": tunnel.nativePhase,
+                            "native_error": tunnel.nativeError,
+                            "drivable": await app.connectStandaloneControlIfReady()
+                        ]
+                        do {
+                            let response = try await PhoneRunnerClient().request("GET", "/status")
+                            if let value = response["value"] as? [String: Any] {
+                                report["runner_ready"] = value["ready"] as? Bool ?? false
+                                if let daemon = value["daemon"] as? [String: Any] {
+                                    report["daemon_linked"] = daemon["linked"] as? Bool ?? false
+                                    report["daemon_state"] = daemon["state"] as? String ?? "unknown"
+                                    report["daemon_error"] = daemon["error"] as? String ?? ""
+                                }
+                            }
+                        } catch { report["runner_status_error"] = "authenticated_runner_status_unavailable" }
+                        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+                            let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                                .appendingPathComponent("local-control-diagnostics.json")
+                            try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                        }
+                    }
+                    if DeviceQAOptions.contains("--local-control-qa-access") {
+                        // Explicit DEBUG-only handoff to the paired QA Mac. Never
+                        // include this credential in diagnostics, logs or release builds.
+                        let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                            .appendingPathComponent("private-local-control-qa-access.json")
+                        if let token = ProtectedStore.read("daemon_token"),
+                           let value = String(data: token, encoding: .utf8),
+                           let data = try? JSONSerialization.data(withJSONObject: ["token": value]) {
+                            try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                            Task {
+                                try? await Task.sleep(nanoseconds: 90_000_000_000)
+                                try? FileManager.default.removeItem(at: file)
+                            }
+                        }
+                    }
+                    #endif
+                    if ProtectedStore.read("session_enabled") == Data([1]) {
+                        for _ in 0..<30 {
+                            if Task.isCancelled { return }
+                            if await app.connectStandaloneControlIfReady() {
+                                await LocalTunnel.completeForegroundLaunchIfNeeded()
+                                break
+                            }
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        }
+                    }
+                }
                 // The landing page a scanned QR opens hands off here.
                 .onOpenURL { app.handle(url: $0) }
                 .appOnChange(of: scenePhase) { _, phase in
@@ -530,7 +607,9 @@ struct RemoteView: View {
         }
         .sheet(isPresented: $showSettings) { SettingsSheet(app: app, session: session) }
         .sheet(isPresented: $showFlows) { FlowsHubView(session: session) }
-        .sheet(item: $recorder.draft) { draft in SaveFlowSheet(session: session, draft: draft) }
+        .sheet(item: $recorder.draft) { draft in
+            SaveFlowSheet(session: session, draft: draft) { _ in recorder.finishDraft(draft) }
+        }
         .task(id: session.phase == .connected) { await recorder.sync() }
         .onDisappear { recorder.leave() }
         .onAppear {
@@ -613,8 +692,12 @@ struct RemoteMenu: View {
     var body: some View {
         Button { app.openAgent() } label: { Label("让 agent 做", systemImage: "sparkles") }
         Button { Task { await recorder.toggle() } } label: {
-            recorder.recording
+            !recorder.statusKnown
+                ? Label("检查录制状态", systemImage: "arrow.clockwise")
+                : recorder.recording
                 ? Label("停止录制（\(recorder.steps) 步）", systemImage: "stop.circle")
+                : recorder.pendingDraft != nil
+                ? Label("继续保存录制", systemImage: "square.and.arrow.down")
                 : Label("录制 flow", systemImage: "record.circle")
         }
         .disabled(session.phase != .connected || recorder.busy)

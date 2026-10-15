@@ -1,0 +1,49 @@
+{
+  "executor" : "on-device iOS application",
+  "operatingSystem" : "27.0",
+  "results" : [
+    {
+      "detail" : "POSIXErrorCode(rawValue: 1): Operation not permitted",
+      "elapsedMilliseconds" : 5257,
+      "endpoint" : {
+        "host" : "127.0.0.1",
+        "port" : 62078,
+        "purpose" : "lockdown"
+      },
+      "outcome" : "tcp_timeout"
+    },
+    {
+      "detail" : "TCP connected; protocol and authorization not verified",
+      "elapsedMilliseconds" : 3,
+      "endpoint" : {
+        "host" : "127.0.0.1",
+        "port" : 49152,
+        "purpose" : "remote pairing candidate"
+      },
+      "outcome" : "tcp_open"
+    },
+    {
+      "detail" : "TCP connected; protocol and authorization not verified",
+      "elapsedMilliseconds" : 1,
+      "endpoint" : {
+        "host" : "127.0.0.1",
+        "port" : 8100,
+        "purpose" : "existing runner"
+      },
+      "outcome" : "tcp_open"
+    },
+    {
+      "detail" : "TCP connected; protocol and authorization not verified",
+      "elapsedMilliseconds" : 0,
+      "endpoint" : {
+        "host" : "127.0.0.1",
+        "port" : 8787,
+        "purpose" : "embedded daemon"
+      },
+      "outcome" : "tcp_open"
+    }
+  ],
+  "schema" : 1,
+  "scope" : "TCP reachability only; no pairing, XCTest launch, input, or Mac-detachment validation",
+  "timestamp" : "2026-10-11T04:32:34Z"
+}

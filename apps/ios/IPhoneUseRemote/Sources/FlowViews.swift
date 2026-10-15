@@ -3,100 +3,32 @@ import SwiftUI
 
 // MARK: - Recording
 
-/// A recording in the remote view: started and stopped on the device's
-/// daemon, its step count read every 2 s while it runs, its draft kept for
-/// the save sheet. The daemon owns the recording; this only mirrors it, so
-/// a remote view opened later shows one still running.
-@MainActor
-final class FlowRecorder: ObservableObject {
-    @Published private(set) var recording = false
-    @Published private(set) var steps = 0
-    @Published private(set) var busy = false
-    /// Set when a recording stops with something in it: the save sheet.
-    @Published var draft: FlowDraft?
-    @Published var message: String?
-
-    private weak var session: DeviceSession?
-    private var pollTask: Task<Void, Never>?
-
-    init(session: DeviceSession) {
-        self.session = session
-    }
-
-    /// Read whether a recording already runs there (the view appeared).
-    func sync() async {
-        guard let client = session?.client, let state = try? await client.recordingState() else { return }
-        apply(state)
-    }
-
-    func toggle() async {
-        recording ? await stop() : await start()
-    }
-
-    func start() async {
-        guard let client = session?.client, !busy else { return }
-        busy = true
-        defer { busy = false }
-        do {
+extension FlowRecorder {
+    convenience init(session: DeviceSession) {
+        self.init(read: { [weak session] in
+            guard let client = session?.client else { throw URLError(.notConnectedToInternet) }
+            return try await client.recordingState()
+        }, start: { [weak session] in
+            guard let client = session?.client else { throw URLError(.notConnectedToInternet) }
             try await client.startRecording()
-            apply(RecordingState(recording: true, steps: 0))
-            session?.show(String(localized: "开始录制：接下来的操作会记成 flow"))
-        } catch {
-            session?.show(error.localizedDescription)
-        }
-    }
-
-    func stop() async {
-        guard let client = session?.client, !busy else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let draft = try await client.stopRecording()
-            apply(RecordingState(recording: false, steps: steps))
-            if let draft, draft.flow != nil, draft.steps > 0 {
-                self.draft = draft
-            } else {
-                session?.show(String(localized: "这次没有录到步骤"))
-            }
-        } catch {
-            session?.show(error.localizedDescription)
-        }
-    }
-
-    func leave() {
-        pollTask?.cancel()
-        pollTask = nil
-    }
-
-    private func apply(_ state: RecordingState) {
-        recording = state.recording
-        steps = state.steps
-        if recording, pollTask == nil {
-            pollTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(2))
-                    guard let self, let client = self.session?.client else { return }
-                    if let state = try? await client.recordingState() {
-                        self.recording = state.recording
-                        self.steps = state.steps
-                        if !state.recording { break }
-                    }
-                }
-                self?.pollTask = nil
-            }
-        } else if !recording {
-            pollTask?.cancel()
-            pollTask = nil
-        }
+        }, stop: { [weak session] in
+            guard let client = session?.client else { throw URLError(.notConnectedToInternet) }
+            return try await client.stopRecording()
+        }, show: { [weak session] in session?.show($0) })
     }
 }
 
 /// The red pill over the remote view while recording: step count and Stop.
 struct RecordingPill: View {
     @ObservedObject var recorder: FlowRecorder
+    @State private var confirmSkip = false
 
     var body: some View {
-        if recorder.recording {
+        if !recorder.statusKnown {
+            Button("录制状态未确认 · 点击检查") { Task { await recorder.sync() } }
+                .font(.footnote).disabled(recorder.busy)
+                .accessibilityIdentifier("flow-recording-recover")
+        } else if recorder.recording {
             Button {
                 Task { await recorder.stop() }
             } label: {
@@ -114,6 +46,18 @@ struct RecordingPill: View {
             .disabled(recorder.busy)
             .accessibilityIdentifier("flow-recording")
             .padding(.bottom, Theme.Space.s)
+        } else if let pending = recorder.pendingDraft {
+            HStack {
+                Button("继续保存录制 · \(pending.steps) 步") { recorder.offerDraft() }
+                    .accessibilityIdentifier("flow-recording-save-draft")
+                Button("忽略") { confirmSkip = true }
+                    .accessibilityIdentifier("flow-recording-skip-draft")
+            }
+            .font(.footnote).disabled(recorder.busy)
+            .confirmationDialog("忽略这份草稿，允许开始新的录制？", isPresented: $confirmSkip, titleVisibility: .visible) {
+                Button("忽略草稿", role: .destructive) { recorder.skipDraft() }
+                Button("取消", role: .cancel) {}
+            }
         }
     }
 }
@@ -171,6 +115,9 @@ struct SaveFlowSheet: View {
                 }
                 if let error {
                     Section { Text(error).foregroundStyle(Theme.down).font(.footnote) }
+                    if shown == nil {
+                        Section { Button("重新读取步骤") { Task { await loadDraft() } }.disabled(loading || saving) }
+                    }
                 } else if loading {
                     Section { ProgressView("读取流程步骤…") }
                 } else if shown?.flow == nil {
@@ -184,23 +131,28 @@ struct SaveFlowSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { Task { await save() } }
-                        .disabled(loading || shown?.flow == nil || saving || !FlowID.isValid(id) || name.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(loading || shown?.flow == nil || saving || !FlowID.isValid(id) || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             .disabled(saving)
             .appOnChange(of: name) { _, _ in deriveID() }
-            .task {
-                loading = true
-                defer { loading = false }
-                do {
-                    if let draft { shown = draft }
-                    else { shown = try await session.client?.lastDraft() }
-                } catch {
-                    self.error = error.localizedDescription
-                }
-                deriveID()
-            }
+            .task { await loadDraft() }
         }
+    }
+
+    private func loadDraft() async {
+        guard !loading, !saving else { return }
+        loading = true
+        error = nil
+        defer { loading = false }
+        do {
+            if let draft { shown = draft }
+            else {
+                guard let client = session.client else { throw URLError(.notConnectedToInternet) }
+                shown = try await client.lastDraft()
+            }
+            deriveID()
+        } catch { self.error = error.localizedDescription }
     }
 
     private func deriveID() {
@@ -209,14 +161,16 @@ struct SaveFlowSheet: View {
     }
 
     private func save() async {
+        guard !saving else { return }
         guard let client = session.client else {
             error = String(localized: "设备没有连上")
             return
         }
         saving = true
+        error = nil
         defer { saving = false }
         do {
-            let saved = try await client.saveFlow(id: id, name: name.trimmingCharacters(in: .whitespaces),
+            let saved = try await client.saveFlow(id: id, name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                                                   description: detail.trimmingCharacters(in: .whitespacesAndNewlines),
                                                   flow: shown?.flow)
             session.show(String(localized: "已保存 flow \(saved)"))

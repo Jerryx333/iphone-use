@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "device_model": "iPhone 14",
+  "entry": "automatic QA submits native phone task through the unified assistant; not physical speech acceptance",
+  "observed_at": "2026-10-11T20:53:53Z",
+  "state": "done",
+  "model_chain_count": 1,
+  "native_steps": [
+    {
+      "action": "LAUNCH",
+      "ok": true
+    },
+    {
+      "action": "DONE",
+      "ok": true
+    }
+  ],
+  "screen_labels_verified": {
+    "设置": true,
+    "飞行模式": true,
+    "无线局域网": true,
+    "蓝牙": true,
+    "蜂窝网络": true,
+    "VPN": true
+  },
+  "settings_mutation_tool_used": false,
+  "scope": "Existing phone-local runtime and authenticated private model gateway. Raw screen, network values, endpoint and credentials excluded. Final returned screen is checked separately."
+}

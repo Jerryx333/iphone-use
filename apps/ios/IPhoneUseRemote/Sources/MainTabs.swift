@@ -134,6 +134,9 @@ struct AppSettingsView: View {
                     }
                 }
                 Section("设备") {
+                    NavigationLink { LocalControlSetupView(app: app) } label: {
+                        Label("本机控制", systemImage: "iphone")
+                    }
                     Button { devices = true } label: {
                         Label("管理设备", systemImage: "iphone")
                     }

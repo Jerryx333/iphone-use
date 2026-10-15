@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "device": "iPhone 17 Pro Max",
+  "scope": "normal assistant UI, private model, native on-phone tools; Mac used for installation and observation",
+  "task_id": "t-868437539f",
+  "task_status": "done",
+  "model": "gpt-5.6-sol",
+  "actions": [
+    "LAUNCH",
+    "DONE"
+  ],
+  "settings_screen_observed": true,
+  "readback_static_text_verified": [
+    "设置",
+    "蓝牙",
+    "个人热点",
+    "VPN"
+  ],
+  "dynamic_island_observed_during_execution": true,
+  "automatic_return_to_assistant_observed": true,
+  "physical_voice_entry_verified": false,
+  "mac_disconnected_this_run": false,
+  "native_unknown_outcome_guard_deployed": false,
+  "source_commit": "fa553d1",
+  "private_screenshots_published": false
+}

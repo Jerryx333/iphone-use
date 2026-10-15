@@ -1,11 +1,18 @@
 import SwiftUI
 import Combine
+import ActivityKit
 
 struct UnifiedAssistantView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var workspace: BrowserWorkspace
     @StateObject private var assistant: UnifiedAssistant
     @State private var pairing = false
+    @State private var localSetup = false
+    @State private var voiceQAStarted = false
+    @State private var toolQAStarted = false
+    @State private var toolQATaskID: UUID?
+    @State private var completionCaptureStarted = false
+    @State private var peakLiveActivities = 0
     @State private var models = false
     @State private var library = false
     @State private var flows = false
@@ -40,6 +47,7 @@ struct UnifiedAssistantView: View {
 
     var body: some View {
         AppNavigationStack {
+            ScrollViewReader { reader in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     if assistant.history.isEmpty && assistant.task == nil {
@@ -53,7 +61,7 @@ struct UnifiedAssistantView: View {
                     }
                     ForEach(assistant.history.reversed()) { task in taskCard(task) }
                     if let task = assistant.task {
-                        taskCard(task)
+                        taskCard(task).id(task.id)
                         if assistant.task?.stopRequested != true, let native = assistant.native, let prompt = native.pendingConfirm {
                             VStack(alignment: .leading, spacing: 10) {
                                 Label("需要确认手机操作", systemImage: "hand.raised")
@@ -102,6 +110,28 @@ struct UnifiedAssistantView: View {
                     if assistant.busy { ProgressView() }
                 }.padding(20)
             }
+            .onAppear {
+                guard let id = assistant.task?.id else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    reader.scrollTo(id, anchor: .bottom)
+                }
+            }
+            .appOnChange(of: assistant.task?.id) { _, id in
+                guard let id else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    reader.scrollTo(id, anchor: .bottom)
+                }
+            }
+            .appOnChange(of: assistant.task?.state) { _, state in
+                guard let state, [.done, .stopped, .failed].contains(state), let id = assistant.task?.id else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    reader.scrollTo(id, anchor: .bottom)
+                }
+            }
+            }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 8) {
                     HStack {
@@ -127,19 +157,131 @@ struct UnifiedAssistantView: View {
             }
             .onAppear { assistant.showBrowser = openBrowser; assistant.showAssistant = openAssistant; presentPhoneApproval() }
             .appOnChange(of: phoneApprovalKey) { _, _ in presentPhoneApproval() }
+            .task {
+                #if DEBUG
+                if DeviceQAOptions.contains("--voice-runtime-qa"), !voiceQAStarted {
+                    voiceQAStarted = true
+                    if #available(iOS 17.4, *) {
+                        do {
+                            // The native launcher and this view start concurrently.
+                            // Wait for the authenticated service rather than failing QA
+                            // before the runner has had a chance to finish launching.
+                            for _ in 0..<45 {
+                                if Task.isCancelled { return }
+                                if await app.connectStandaloneControlIfReady() { break }
+                                try await Task.sleep(nanoseconds: 1_000_000_000)
+                            }
+                            guard let local = app.thisPhoneSession,
+                                  local.status?.drivable == true else { throw BrowserToolError.actionFailed("本机控制尚未就绪") }
+                            app.agent.targetID = local.id
+                            for _ in 0..<120 {
+                                if Task.isCancelled { return }
+                                if UIApplication.shared.applicationState == .active { break }
+                                try await Task.sleep(nanoseconds: 500_000_000)
+                            }
+                            guard UIApplication.shared.applicationState == .active else { throw BrowserToolError.actionFailed("请先回到助手再验收语音") }
+                            // Resolve microphone/recognition permission sheets before
+                            // launching Settings, so they cannot obscure the readback.
+                            await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant))
+                            if DeviceQAOptions.contains("--phone-tools-qa"), !app.voiceCall.muted {
+                                app.voiceCall.toggleMute()
+                            }
+                            if DeviceQAOptions.contains("--phone-tools-qa") {
+                                if assistant.task?.active == true { await assistant.stop() }
+                                await assistant.archiveInterruptedDeviceQA(goal: "打开设置，读取当前屏幕标题和至少三个可见项目，把这些实际文字告诉我，然后返回助手。不要更改任何设置。")
+                                toolQAStarted = assistant.start("打开设置，读取当前屏幕标题和至少三个可见项目，把这些实际文字告诉我，然后返回助手。不要更改任何设置。", mode: .phone)
+                                if toolQAStarted { toolQATaskID = assistant.task?.id }
+                            }
+                            if DeviceQAOptions.contains("--phone-screen-qa"), let api = assistant.local?.client {
+                                Task { @MainActor in
+                                    let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                                    do {
+                                        guard try await api.status().drivable else { return }
+                                        let (image, _) = try await api.screenshot()
+                                        try image.write(to: directory.appendingPathComponent("private-phone-screen.png"), options: [.atomic, .completeFileProtection])
+                                        let (elements, response) = try await api.send(api.request("agent/elements"))
+                                        if response.statusCode == 200 {
+                                            try elements.write(to: directory.appendingPathComponent("private-phone-elements.json"), options: [.atomic, .completeFileProtection])
+                                        }
+                                        let tasks = try await api.recentTasks()
+                                        let rows = tasks.prefix(3).map { task in
+                                            ["id": task.id, "state": task.state.title, "phase": task.phase ?? "", "error": task.error ?? "", "summary": task.summary ?? "", "steps": task.steps.map { ["action": $0.action, "ok": $0.ok] as [String: Any] }] as [String: Any]
+                                        }
+                                        let data = try JSONSerialization.data(withJSONObject: rows)
+                                        try data.write(to: directory.appendingPathComponent("private-phone-tasks.json"), options: [.atomic, .completeFileProtection])
+                                    } catch { app.toast = "界面检查未取得完整结果。" }
+                                    try? await Task.sleep(nanoseconds: 120_000_000_000)
+                                    for name in ["private-phone-screen.png", "private-phone-elements.json", "private-phone-tasks.json"] {
+                                        try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+                                    }
+                                }
+                            }
+                            Task { @MainActor in
+                                for _ in 0..<1800 {
+                                    let call = app.voiceCall
+                                    if DeviceQAOptions.contains("--phone-tools-qa"), toolQATaskID == nil || assistant.task?.id == toolQATaskID {
+                                        var report: [String: Any] = ["observed_at": ISO8601DateFormatter().string(from: Date()), "qa_started": toolQAStarted, "model_count": assistant.models.count, "primary_model": assistant.models.first?.model ?? "none", "state": assistant.task?.state.rawValue ?? "none", "native_phase": assistant.native?.phase ?? "none", "native_steps": assistant.native?.steps.map { ["action": $0.action, "ok": $0.ok, "error": $0.error ?? ""] as [String: Any] } ?? [], "error": assistant.message ?? assistant.native?.error ?? "", "result": assistant.task?.reply ?? assistant.native?.summary ?? ""]
+                                        if #available(iOS 16.1, *) {
+                                            report["live_activity_enabled"] = ActivityAuthorizationInfo().areActivitiesEnabled
+                                            report["live_activity_error_code"] = AgentLiveStatus.shared.activityFailureCode ?? ""
+                                            report["app_state"] = UIApplication.shared.applicationState.rawValue
+                                            report["live_activity_count"] = Activity<AgentActivityAttributes>.activities.count
+                                            peakLiveActivities = max(peakLiveActivities, Activity<AgentActivityAttributes>.activities.count)
+                                            report["peak_live_activity_count"] = peakLiveActivities
+                                        }
+                                        if assistant.task?.active == false, toolQAStarted, !completionCaptureStarted, let api = assistant.local?.client {
+                                            completionCaptureStarted = true
+                                            Task { @MainActor in
+                                                let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                                                for _ in 0..<10 {
+                                                    if let text = try? await api.readScreenText(), text.contains("语音通话") {
+                                                        if let (image, _) = try? await api.screenshot() {
+                                                            try? image.write(to: directory.appendingPathComponent("private-task-completion-screen.png"), options: [.atomic, .completeFileProtection])
+                                                            let data = try? JSONSerialization.data(withJSONObject: ["assistant_visible": true, "read_screen_text_verified": true])
+                                                            try? data?.write(to: directory.appendingPathComponent("phone-return-qa.json"), options: [.atomic, .completeFileProtection])
+                                                        }
+                                                        break
+                                                    }
+                                                    try? await Task.sleep(nanoseconds: 500_000_000)
+                                                }
+                                            }
+                                        }
+                                        if let data = try? JSONSerialization.data(withJSONObject: report) {
+                                            let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("private-phone-execution-qa.json")
+                                            try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                                        }
+                                    }
+                                    let report: [String: Any] = ["schema": 1, "observed_at": ISO8601DateFormatter().string(from: Date()), "active": call.active, "connecting": call.connecting, "paused": call.paused, "muted": call.muted, "user_turns": call.messages.filter { $0.role == .user }.count, "assistant_turns": call.messages.filter { $0.role != .user }.count, "phone_available": assistant.phoneAvailable, "task_active": assistant.task?.active == true, "task_state": assistant.task?.state.rawValue ?? "none", "current_tool": assistant.current?.tool.rawValue ?? "none", "has_error": call.error != nil, "transcript_length": call.transcript.count, "thinking": call.thinking, "speaking": call.speaking, "audio": call.diagnosticAudioSnapshot()]
+                                    if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+                                        let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("voice-runtime-qa.json")
+                                        try? data.write(to: file, options: [.atomic, .completeFileProtection])
+                                    }
+                                    if !call.active && !call.connecting && assistant.task?.active != true { break }
+                                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                                }
+                            }
+                        } catch { app.toast = "语音验收启动失败，请检查本机服务。" }
+                    }
+                }
+                #endif
+            }
             .navigationTitle("助手")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
                         Button("模型设置") { models = true }
                         Button("账号与网站资料") { library = true }
-                        Button("配置手机执行服务") { pairing = true }
+                        Button("本机控制") { pairing = true }
                         Button("流程与定时") { flows = true }.disabled(assistant.local?.client == nil)
                         Button("语音通话") { Task { await app.voiceCall.start(phone: UnifiedVoiceControl(assistant: assistant)) } }
                     } label: { Image(systemName: "ellipsis.circle") }.accessibilityLabel("更多")
                 }
             }
-            .sheet(isPresented: $pairing) { PairThisPhoneSheet(app: app) }
+            .sheet(isPresented: $pairing) {
+                if DeviceStore.supportsStandaloneControl {
+                    AppNavigationStack { LocalControlSetupView(app: app) }
+                } else { PairThisPhoneSheet(app: app) }
+            }
             .sheet(isPresented: $models) { AppNavigationStack { ModelSettingsView(agent: app.agent) } }
             .sheet(isPresented: $library) { BrowserLibraryView(workspace: workspace, onBrowse: openBrowser) }
             .sheet(isPresented: $flows) { if let local = assistant.local { FlowsHubView(session: local) } }
@@ -179,9 +321,10 @@ struct UnifiedAssistantView: View {
 }
 
 @MainActor
-private final class UnifiedVoiceControl: AssistantPhoneControlling {
+final class UnifiedVoiceControl: AssistantPhoneControlling {
     private weak var assistant: UnifiedAssistant?
     private var observation: AnyCancellable?
+    private weak var heldSession: DeviceSession?
     var onChange: (() -> Void)?
     init(assistant: UnifiedAssistant) {
         self.assistant = assistant
@@ -191,16 +334,26 @@ private final class UnifiedVoiceControl: AssistantPhoneControlling {
         guard let assistant else { return .init(valid: false, connected: false) }
         let snapshot = (assistant.current?.tool == .phone ? assistant.native : nil) ?? assistant.task.map {
             AgentTaskSnapshot(id: $0.id.uuidString, goal: $0.goal,
-                state: $0.state == .done ? .done : ($0.active ? .running : .cancelled), phase: "observing", summary: $0.reply)
+                state: $0.state == .done ? .done : ($0.state == .failed ? .failed : ($0.active ? .running : .cancelled)),
+                phase: $0.state == .planning ? "planning" : "observing", summary: $0.reply, error: assistant.message)
         }
         let status = assistant.task.map { task in
             "任务\(task.state.title)。当前工具：\(assistant.current?.tool.title ?? "核验结果")。下一步：\(assistant.next)。" + (assistant.message ?? task.reply ?? "")
         } ?? "当前没有正在执行的任务。"
         return .init(valid: true, connected: true, busy: assistant.task?.active == true, unifiedTools: true, assistantStatus: status,
-            task: snapshot, linkNote: assistant.message, error: assistant.message)
+            task: snapshot, linkNote: nil, error: (assistant.task?.state == .failed || assistant.task?.state == .needsReview) ? assistant.message : nil)
     }
     var models: [ModelsPayload.Assist] { assistant?.models ?? [] }
+    func readScreen() async throws -> String {
+        guard let api = assistant?.local?.client else { throw BrowserToolError.actionFailed("本机执行服务未连接") }
+        return try await api.readScreenText()
+    }
     func start(goal: String) async -> Bool { assistant?.start(goal) ?? false }
     func stop() async { await assistant?.stop() }
-    func disconnect() { onChange = nil; observation = nil }
+    func maintainConnection(_ enabled: Bool) {
+        heldSession?.voiceCallKeepsConnection = false
+        heldSession = enabled ? assistant?.local : nil
+        heldSession?.voiceCallKeepsConnection = enabled
+    }
+    func disconnect() { maintainConnection(false); onChange = nil; observation = nil }
 }

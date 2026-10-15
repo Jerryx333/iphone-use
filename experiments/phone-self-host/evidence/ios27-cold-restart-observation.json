@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-11T19:03:05.439659+00:00",
+  "usb_present": false,
+  "usbmux_connection_types": [
+    "Network"
+  ],
+  "normal_mac_daemon_loaded": false,
+  "first_unlock": "human completed",
+  "phone_agent_status": {
+    "version": "0.17.18",
+    "drivable": true,
+    "device_state": "ready",
+    "owner": null,
+    "observed_at": "2026-10-11T19:01:39.325006+00:00"
+  },
+  "scope": "Full reboot over Wi-Fi; no Mac app launch, installation or XCTest bootstrap between reboot and direct phone API recovery and successful smoke. Device-container reports copied only after control passed."
+}

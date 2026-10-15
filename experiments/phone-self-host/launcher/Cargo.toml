@@ -1,0 +1,33 @@
+[package]
+name = "ipu-phone-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "PolyForm-Shield-1.0.0"
+
+[features]
+usb-provision = ["idevice/usbmuxd"]
+
+[workspace]
+
+[lib]
+name = "ipu_phone_host"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "ipu-phone-host"
+path = "src/main.rs"
+
+[dependencies]
+idevice = { path = "../.deps/idevice/idevice", default-features = false, features = ["ring", "xctest", "tcp", "remote_pairing", "tunnel_tcp_stack", "rsd", "mobile_image_mounter", "tss"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1.8"
+base64 = "0.22"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+futures = "0.3"
+
+[build-dependencies]
+sha2 = "0.10"

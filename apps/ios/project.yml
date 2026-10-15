@@ -11,7 +11,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "1.0.1"
-    CURRENT_PROJECT_VERSION: "17"
+    CURRENT_PROJECT_VERSION: "21"
 targets:
   IPhoneUseRemote:
     type: application
@@ -20,20 +20,48 @@ targets:
       - IPhoneUseRemote/Sources
       - IPhoneUseRemote/Resources
       - Shared
+      - LocalControlShared/ProtectedStore.swift
+      - LocalControlShared/PairRecordImport.swift
+      - LocalControlShared/RunnerSigning.swift
     dependencies:
       - target: AgentActivityWidget
+      - target: PhoneLocalControlTunnel
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.leeguoo.iphone-use.remote
         PRODUCT_NAME: Phone Use Remote
         PRODUCT_MODULE_NAME: IPhoneUseRemote
         INFOPLIST_FILE: IPhoneUseRemote/Info.plist
+        CODE_SIGN_ENTITLEMENTS: IPhoneUseRemote/LocalControl.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_STRICT_CONCURRENCY: complete
         SWIFT_OBJC_BRIDGING_HEADER: IPhoneUseRemote/Sources/SessionBridge.h
         LIBRARY_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)/SessionLibraries/$(PLATFORM_NAME)"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks /System/Developer/Library/Frameworks"
         OTHER_LDFLAGS: "$(inherited) -lipu_browser_session -framework Security -framework SystemConfiguration"
+  PhoneLocalControlTunnel:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.4"
+    sources:
+      - path: LocalControlTunnel
+        excludes: [Info.plist, PhoneTunnelProvider.swift]
+      - ../../experiments/phone-self-host/Tunnel/PhoneTunnelProvider.swift
+      - LocalControlShared
+      - path: ../../experiments/phone-self-host/Resources/DeveloperImage
+        type: folder
+        optional: true
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.leeguoo.iphone-use.remote.tunnel
+        INFOPLIST_FILE: LocalControlTunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: IPhoneUseRemote/LocalControl.entitlements
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        APPLICATION_EXTENSION_API_ONLY: YES
+        OTHER_LDFLAGS: "$(inherited) $(IPU_HOST_LDFLAGS)"
   AgentActivityWidget:
     type: app-extension
     platform: iOS

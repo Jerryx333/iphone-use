@@ -1,0 +1,147 @@
+--- a/idevice/src/services/dvt/xctest/mod.rs
++++ b/idevice/src/services/dvt/xctest/mod.rs
+@@ -2069,6 +2069,95 @@
+         Ok(())
+     }
+ 
++    /// Runs an XCTest session over an authenticated, caller-owned RSD tunnel.
++    /// The tunnel is retained for the entire test session; no lockdown, usbmuxd,
++    /// CoreDeviceProxy, or external host is used by this entry point.
++    #[cfg(feature = "tunnel_tcp_stack")]
++    pub async fn run_rsd<L: XCUITestListener>(
++        mut adapter: crate::tcp::handle::AdapterHandle,
++        handshake: RsdHandshake,
++        ios_major_version: u8,
++        cfg: TestConfig,
++        listener: &mut L,
++        timeout: Option<std::time::Duration>,
++    ) -> Result<(), IdeviceError> {
++        // 1. Session UUID + config path
++        let session_id = uuid::Uuid::new_v4();
++        let xctest_path = format!(
++            "/tmp/{}.xctestconfiguration",
++            session_id.to_string().to_uppercase()
++        );
++
++        if ios_major_version < 17 {
++            return Err(IdeviceError::UnexpectedResponse("RSD XCTest requires iOS 17+".into()));
++        }
++
++        // 3. Build XCTestConfiguration
++        let xctest_config = cfg.build_xctest_configuration(session_id, ios_major_version)?;
++
++        // 4. Connect to testmanagerd (ctrl + main) and DVT
++        let dvt = rsd_connect(&mut adapter, &handshake, "com.apple.instruments.dtservicehub", "dtservicehub", true).await?;
++        let ctrl = rsd_connect(&mut adapter, &handshake, TESTMANAGERD_RSD_SERVICE, "testmanagerd-ctrl", false).await?;
++        let main = rsd_connect(&mut adapter, &handshake, TESTMANAGERD_RSD_SERVICE, "testmanagerd-main", false).await?;
++        let mut conns = TestManagerConnections { ctrl, main, dvt, rsd_handles: vec![adapter] };
++        let mut ctrl_proxy = TestManagerProxy::open(&mut conns.ctrl, ios_major_version).await?;
++        let mut main_proxy = TestManagerProxy::open(&mut conns.main, ios_major_version).await?;
++        let mut process_control = XCTestProcessControlChannel::open(&mut conns.dvt).await?;
++
++        let config_name = cfg.config_name().to_owned();
++        initialize_testmanager_sessions(&mut ctrl_proxy, &mut main_proxy, &xctest_config).await?;
++        register_early_driver_channel_handler(&mut conns.main, &xctest_config).await;
++        initialize_testmanager_daemon_sessions(
++            &mut ctrl_proxy,
++            &mut main_proxy,
++            ios_major_version,
++            &session_id,
++            &xctest_config,
++        )
++        .await?;
++
++        // Build launch environment from the config
++        let (launch_args, launch_env, mut launch_options) = build_launch_env(
++            ios_major_version,
++            &session_id,
++            &cfg.runner_app_path,
++            &cfg.runner_app_container,
++            &config_name,
++            &xctest_path,
++            cfg.runner_env.as_ref(),
++            cfg.runner_args.as_deref(),
++        );
++
++        // This caller owns the runner bundle. Reusing its old process would
++        // retain the old request token instead of the new launch environment.
++        launch_options.insert("KillExisting".into(), plist::Value::Boolean(true));
++        let _pid = launch_and_authorize_test_runner(
++            &mut ctrl_proxy,
++            &mut process_control,
++            ios_major_version,
++            &cfg.runner_bundle_id,
++            launch_args,
++            launch_env,
++            launch_options,
++        )
++        .await?;
++
++        // 6-7. Wait for driver channel and start the test plan.
++        let driver_channel = start_test_plan_session(&mut conns.main, &mut main_proxy).await?;
++
++        // 8. Dispatch loop, raced against the runner connection dropping.
++        run_dispatch_loop_until_done_or_disconnect(
++            &mut conns.main,
++            driver_channel,
++            &xctest_config,
++            listener,
++            timeout,
++        )
++        .await?;
++
++        Ok(())
++    }
++
+     /// Starts an XCTest runner intended to host WebDriverAgent and waits
+     /// until WDA responds on its device-side HTTP port.
+     ///
+--- a/idevice/src/services/mobile_image_mounter.rs
++++ b/idevice/src/services/mobile_image_mounter.rs
+@@ -208,6 +208,46 @@
+             }
+         }
+ 
++        Ok(())
++    }
++
++    /// Uploads a disk image from a file, with at most one 64 KiB write pending.
++    #[cfg(not(target_arch = "wasm32"))]
++    pub async fn upload_image_file(
++        &mut self,
++        image_type: impl Into<String>,
++        path: impl AsRef<std::path::Path>,
++        signature: Vec<u8>,
++    ) -> Result<(), IdeviceError> {
++        use tokio::io::AsyncReadExt;
++        let mut image = tokio::fs::File::open(path).await?;
++        let size = image.metadata().await?.len();
++        if size == 0 || size > 1_073_741_824 {
++            return Err(IdeviceError::UnexpectedResponse("invalid image size".into()));
++        }
++        let mut request = plist::Dictionary::new();
++        request.insert("Command".into(), plist::Value::String("ReceiveBytes".into()));
++        request.insert("ImageType".into(), plist::Value::String(image_type.into()));
++        request.insert("ImageSize".into(), plist::Value::Integer(size.into()));
++        request.insert("ImageSignature".into(), plist::Value::Data(signature));
++        self.idevice.send_plist(plist::Value::Dictionary(request)).await?;
++        let reply: plist::Dictionary = self.idevice.read_plist().await?;
++        if reply.get("Status").and_then(|v| v.as_string()) != Some("ReceiveBytesAck") {
++            return Err(IdeviceError::UnexpectedResponse("image upload not acknowledged".into()));
++        }
++        let mut buffer = vec![0u8; 65_536];
++        let mut sent = 0u64;
++        loop {
++            let count = image.read(&mut buffer).await?;
++            if count == 0 { break; }
++            self.idevice.send_raw(&buffer[..count]).await?;
++            sent += count as u64;
++        }
++        if sent != size { return Err(IdeviceError::UnexpectedResponse("image size changed".into())); }
++        let reply: plist::Dictionary = self.idevice.read_plist().await?;
++        if reply.get("Status").and_then(|v| v.as_string()) != Some("Complete") {
++            return Err(IdeviceError::UnexpectedResponse("image upload incomplete".into()));
++        }
+         Ok(())
+     }
+ 

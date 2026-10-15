@@ -52,6 +52,14 @@ final class AgentStartFailureTests: XCTestCase {
 }
 
 final class AgentTaskDecodingTests: XCTestCase {
+    func testUncertainWriteRequiresReview() {
+        let uncertain = AgentTaskSnapshot(id: "fixture", goal: "fixture", state: .failed,
+            steps: [.init(n: 1, action: "TYPE_TEXT", ok: false, error: #"{"error":"outcome_unknown","retry_safe":false}"#)])
+        XCTAssertTrue(uncertain.hasUncertainAction)
+        let retryable = AgentTaskSnapshot(id: "fixture", goal: "fixture", state: .failed,
+            steps: [.init(n: 1, action: "CLICK", ok: false, error: #"{"error":"stale_element","retry_safe":true}"#)])
+        XCTAssertFalse(retryable.hasUncertainAction)
+    }
     private func decode(_ json: String) throws -> AgentTaskSnapshot {
         try JSONDecoder().decode(AgentTaskSnapshot.self, from: Data(json.utf8))
     }
@@ -303,22 +311,55 @@ private actor SleepLog {
 }
 
 final class ModelsPayloadTests: XCTestCase {
+    @MainActor func testPrivateModelProfileValidatesWithoutEmbeddingCredentialsInProvider() throws {
+        let profile = PrivateModelProfile(name: "Fixture", baseURL: "https://fixture.example/v1", model: "fixture", key: "synthetic")
+        let provider = try profile.provider()
+        XCTAssertEqual(provider.kind, .custom)
+        let stored = String(decoding: try JSONEncoder().encode(provider), as: UTF8.self)
+        XCTAssertFalse(stored.contains("synthetic"))
+        var invalid = profile
+        invalid.baseURL = "https://user:password@fixture.example/v1"
+        XCTAssertThrowsError(try invalid.provider())
+        invalid = profile; invalid.baseURL = "http://fixture.example/v1"
+        XCTAssertThrowsError(try invalid.provider())
+    }
     private func json(_ payload: ModelsPayload?) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return String(decoding: try encoder.encode(payload), as: UTF8.self)
     }
 
-    /// Out of the box: public Zen, followed by Kilo without a key.
+    /// Out of the box: only the primary Zen model; fallback is opt-in.
     func testDefaultIsTheFreeTier() throws {
         let payload = ModelSettings().payload { _ in nil }
         XCTAssertEqual(try json(payload),
-                       #"{"assist":[{"base_url":"https://opencode.ai/zen/v1","format":"openai","key":"public","model":"big-pickle"},{"base_url":"https://api.kilo.ai/api/openrouter","format":"openai","key":"","model":"free"}]}"#)
+                       #"{"assist":[{"base_url":"https://opencode.ai/zen/v1","format":"openai","key":"public","model":"big-pickle"}]}"#)
+    }
+
+    func testFallbackRequiresExplicitChoiceAndSurvivesSaving() throws {
+        var settings = ModelSettings()
+        XCTAssertEqual(settings.payload { _ in nil }?.assist.count, 1)
+        settings.allowModelFallback = true
+        XCTAssertEqual(settings.payload { _ in nil }?.assist.count, 2)
+        let restored = try JSONDecoder().decode(ModelSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertTrue(restored.allowModelFallback)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any])
+        object.removeValue(forKey: "allowModelFallback")
+        let legacy = try JSONDecoder().decode(ModelSettings.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertFalse(legacy.allowModelFallback)
+        XCTAssertEqual(legacy.assist, settings.assist)
+    }
+
+    func testMissingPrimaryCredentialDoesNotSelectAnotherService() {
+        var settings = ModelSettings()
+        settings.assist = [ModelProvider(kind: .anthropic), ModelProvider(kind: .free)]
+        XCTAssertNil(settings.payload { _ in nil })
     }
 
     /// Everything set: the shape of docs/agent-task.md › Models, assist in the person's order.
     func testFullShapeMatchesTheContract() throws {
         var settings = ModelSettings()
+        settings.allowModelFallback = true
         let anthropic = ModelProvider(kind: .anthropic)
         let free = ModelProvider(kind: .free, model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
         settings.assist = [anthropic, free]
@@ -335,6 +376,7 @@ final class ModelsPayloadTests: XCTestCase {
 
     func testProvidersWithoutAKeyOrSwitchedOffAreLeftOut() throws {
         var settings = ModelSettings()
+        settings.allowModelFallback = true
         var off = ModelProvider(kind: .free)
         off.enabled = false
         let noKey = ModelProvider(kind: .openRouter)
