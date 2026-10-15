@@ -160,12 +160,17 @@ fn install(ctx: &Ctx, options: &Options) -> Result<(), String> {
     }
 
     term::info("Installing on the phone");
-    let installed = sys::devicectl(
-        300,
-        &["device", "install", "app", "--device", &ctx.udid, &output.to_string_lossy()],
-    );
-    if !installed.contains("App installed") && !installed.contains("bundleID") {
-        return Err(format!("install failed: {}", installed.trim()));
+    // The exit status, not the text: an error report can name the bundle too.
+    let installed = Command::new("xcrun")
+        .args(["devicectl", "device", "install", "app", "--device", &ctx.udid])
+        .arg(&output)
+        .output()
+        .map_err(|e| format!("run devicectl: {e}"))?;
+    if !installed.status.success() {
+        return Err(format!(
+            "install failed: {}",
+            String::from_utf8_lossy(&installed.stderr).trim()
+        ));
     }
     term::ok("Installed: Phone Use");
     let _ = std::fs::remove_dir_all(&output);
