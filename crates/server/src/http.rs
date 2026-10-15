@@ -3171,6 +3171,7 @@ fn parse_setup_log_blocked_on(txt: &str) -> String {
         "usb".to_string()
     } else if latest_attempt.contains("has no signed-in Apple account")
         || latest_attempt.contains("No Accounts:")
+        || latest_attempt.contains("Xcode reported No Accounts while signing")
         || latest_attempt.contains("could not find or create a development provisioning")
         // the wording before v0.15, still in logs an older script wrote
         || latest_attempt.contains("could not find or create the WDA development provisioning")
@@ -3226,8 +3227,8 @@ fn human_next_step(
                 "Open Xcode with the phone connected and let device preparation finish — connecting resumes on its own",
             ),
             "account" => (
-                "打开 Xcode › 设置 › 账户，点 + 登录 Apple ID（免费账号也行）",
-                "Open Xcode › Settings › Accounts and add your Apple ID (a free one works)",
+                "打开 Xcode › 设置 › 账户登录 Apple ID；若已登录，打开 setup 提示的 runner 工程，选手机执行一次 Build For Testing，并允许钥匙串访问",
+                "Sign in under Xcode › Settings › Accounts; if already signed in, open the runner project shown by setup, select your iPhone, Build For Testing once and allow keychain access",
             ),
             "locked_after_restart" => (
                 "这台 iPhone 重启后还没解锁过：需要有人在手机上输入一次密码，之后会自动连上。",
@@ -3406,7 +3407,7 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the iPhone Developer Disk Image is unavailable — open Xcode with the phone connected, let device preparation finish, then poll status",
         ),
         "account" => Some(
-            "Xcode has no usable signed-in Apple account or provisioning profile for the device runner — open Xcode → Settings → Accounts and add an Apple ID (a free one works), then poll status; the managed service retries automatically",
+            "Xcode could not sign the device runner — sign in under Xcode → Settings → Accounts (a free Apple ID works); if already signed in, open the runner project shown by setup, select your iPhone, choose Product → Build For → Testing once and allow keychain access to create the certificate and profile; the managed service retries automatically",
         ),
         "locked_after_restart" => Some(
             "the configured iPhone is on USB but usbmuxd does not list it: it restarted and has not been unlocked since (Before First Unlock), and iOS keeps it off usbmuxd until its passcode is entered once — this is not an Xcode problem; have a person enter the passcode on the phone, and the managed service connects on its own after that, so do not send another reconnect request",
@@ -6119,11 +6120,7 @@ enum WdaControlOutcome {
 }
 
 fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String> {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-
-    let encoded = serde_json::to_vec(rows)?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(encoded)))
+    Ok(core::control::snapshot_id(rows)?)
 }
 
 /// Read-only usability statistics for one flattened element tree, reported as
@@ -6313,19 +6310,7 @@ fn lookup_element_snapshot(
 }
 
 /// Index-level diff between two element trees (see [`diff_element_rows`]).
-#[derive(Debug, PartialEq, Eq)]
-struct ElementRowsDelta {
-    /// Indexes into the CURRENT tree of rows with no identity match in the
-    /// baseline — directly usable as `element` with the new snapshot token.
-    added: Vec<usize>,
-    /// Indexes into the CURRENT tree of rows whose identity exists in the
-    /// baseline but whose state or geometry differs (value, rect, flags, depth).
-    changed: Vec<usize>,
-    /// Indexes into the BASELINE tree of rows that are gone from the current one.
-    removed: Vec<usize>,
-    /// Rows identical in both trees.
-    unchanged: usize,
-}
+type ElementRowsDelta = core::control::ElementDelta;
 
 /// Diff two flattened element trees for `?since=` responses.
 ///
@@ -6339,57 +6324,14 @@ fn diff_element_rows(
     baseline: &[crate::wda::ElementRow],
     current: &[crate::wda::ElementRow],
 ) -> ElementRowsDelta {
-    use std::collections::HashMap;
-
-    type IdentityKey<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
-    fn identity(row: &crate::wda::ElementRow) -> IdentityKey<'_> {
+    core::control::diff_rows(baseline, current, |row| {
         (
             row.kind.as_str(),
             row.label.as_str(),
             row.identifier.as_deref(),
             row.placeholder.as_deref(),
         )
-    }
-
-    let mut baseline_by_identity: HashMap<IdentityKey<'_>, std::collections::VecDeque<usize>> =
-        HashMap::new();
-    for (index, row) in baseline.iter().enumerate() {
-        baseline_by_identity
-            .entry(identity(row))
-            .or_default()
-            .push_back(index);
-    }
-
-    let mut delta = ElementRowsDelta {
-        added: Vec::new(),
-        changed: Vec::new(),
-        removed: Vec::new(),
-        unchanged: 0,
-    };
-    let mut matched_baseline = vec![false; baseline.len()];
-    for (index, row) in current.iter().enumerate() {
-        match baseline_by_identity
-            .get_mut(&identity(row))
-            .and_then(std::collections::VecDeque::pop_front)
-        {
-            Some(baseline_index) => {
-                matched_baseline[baseline_index] = true;
-                if baseline[baseline_index] == *row {
-                    delta.unchanged += 1;
-                } else {
-                    delta.changed.push(index);
-                }
-            }
-            None => delta.added.push(index),
-        }
-    }
-    delta.removed = matched_baseline
-        .iter()
-        .enumerate()
-        .filter(|(_, matched)| !**matched)
-        .map(|(index, _)| index)
-        .collect();
-    delta
+    })
 }
 
 /// `ok:true` means the action was dispatched and WDA acknowledged it, not
@@ -7407,11 +7349,7 @@ async fn perform_snapshot_element(
 /// Shared swipe-travel curve: how far a scroll gesture actually moves for a
 /// requested delta `d` along an axis of the given size.
 fn swipe_travel(d: f64, axis: f64) -> f64 {
-    if d == 0.0 {
-        0.0
-    } else {
-        (d.abs() * 1.5).clamp(0.15 * axis, 0.75 * axis) * d.signum()
-    }
+    core::control::swipe_travel(d, axis)
 }
 
 /// Is at least half of `rect` inside a `width` × `height` window?
@@ -21812,6 +21750,12 @@ mod tests {
             ✓ Xcode: Xcode 26.6\n\
             ✗ Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,\n";
         assert_eq!(parse_setup_log_blocked_on(signed_out), "account");
+        assert_eq!(
+            parse_setup_log_blocked_on(
+                "== Checking prerequisites\n✓ Team: EXAMPLE123\nXcode reported No Accounts while signing the device runner."
+            ),
+            "account"
+        );
 
         // A later attempt that got past signing must clear the stale blocker.
         let recovered = format!("{signed_out}== Checking prerequisites\n✓ Team: 43G3AR9DT8\n");

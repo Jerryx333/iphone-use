@@ -1606,12 +1606,12 @@ impl Setup {
     // ── launch ──────────────────────────────────────────────────────────────
 
     fn report_missing_account<T>(&self) -> Step<T> {
-        self.phase(
-            "signing-fail",
-            "account",
-            "sign in to an Apple account in Xcode, or configure WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID for API key signing",
+        let message = format!(
+            "Xcode reported No Accounts while signing the device runner. Open Xcode → Settings → Accounts,\n   sign in and select the development team. If Xcode already lists the account,\n   open {} in Xcode, select the IPhoneUseRunner scheme and your iPhone,\n   then choose Product → Build For → Testing once. Allow keychain access if prompted\n   so Xcode can create the signing certificate and provisioning profile, then rerun setup.\n   Alternatively, configure WDA_ASC_KEY_PATH, WDA_ASC_KEY_ID and WDA_ASC_ISSUER_ID\n   for App Store Connect API key signing.",
+            self.ctx.runner_project.display()
         );
-        die("Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,\n   sign in and select the development team, or configure WDA_ASC_KEY_PATH,\n   WDA_ASC_KEY_ID and WDA_ASC_ISSUER_ID for App Store Connect API key signing,\n   then rerun.")
+        self.phase("signing-fail", "account", &message);
+        die(message)
     }
 
     fn report_device_unavailable<T>(&mut self) -> Step<T> {

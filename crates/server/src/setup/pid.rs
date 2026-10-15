@@ -627,7 +627,9 @@ pub fn assert_port_free(ctx: &Ctx, port: u16) -> bool {
     }
     let _ = ctx;
     let selector = format!("-iTCP:{port}");
-    let Some(out) = sys::run("lsof", &["-nP", "-a", &selector, "-sTCP:LISTEN"]) else {
+    // -w: an unreachable mount (e.g. a Time Machine smbfs share) makes lsof print
+    // "WARNING: can't stat()" on stderr, which would read as a failed check below.
+    let Some(out) = sys::run("lsof", &["-w", "-nP", "-a", &selector, "-sTCP:LISTEN"]) else {
         warn(&format!("lsof could not prove TCP {port} is free:"));
         return false;
     };
