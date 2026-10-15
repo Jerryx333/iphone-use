@@ -61,9 +61,9 @@ pub fn persistent_auth_dir(state_dir: &Path) -> io::Result<PathBuf> {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(state_dir)?;
     }
     let meta = state_dir.symlink_metadata()?;
-    if !meta.is_dir() || meta.uid() != current_uid() {
+    if !meta.is_dir() || meta.uid() != current_uid() || meta.mode() & 0o022 != 0 {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-            "authentication state must be in a real directory owned by the current user"));
+            "authentication state must be in a real directory owned by the current user, without group/world write access"));
     }
     let dir = state_dir.join("auth");
     match dir.symlink_metadata() {
@@ -276,6 +276,9 @@ mod tests {
         assert_eq!(fs::metadata(&auth).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(root.path()).unwrap().mode() & 0o777, 0o755);
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(persistent_auth_dir(root.path()).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o775)).unwrap();
         assert_eq!(persistent_auth_dir(root.path()).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
