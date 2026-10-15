@@ -334,27 +334,23 @@ fn stage_pairing(ctx: &Ctx, root: &Path, bundle: &str) -> Result<(), String> {
         );
         return Ok(());
     }
-    let copied = sys::devicectl(
-        60,
-        &[
-            "device",
-            "copy",
-            "to",
-            "--device",
-            &ctx.udid,
-            "--domain-type",
-            "appDataContainer",
-            "--domain-identifier",
-            bundle,
-            "--source",
-            &record.to_string_lossy(),
-            "--destination",
-            "Documents/pair-record-import.plist",
-        ],
-    );
+    // The exit status, not the text: devicectl reports a failed copy on stderr.
+    let copied = Command::new("xcrun")
+        .args(["devicectl", "device", "copy", "to", "--device", &ctx.udid])
+        .args(["--domain-type", "appDataContainer", "--domain-identifier", bundle, "--source"])
+        .arg(&record)
+        .args(["--destination", "Documents/pair-record-import.plist"])
+        .output();
     let _ = std::fs::remove_dir_all(&dir);
-    if copied.to_ascii_lowercase().contains("error") {
-        return Err(format!("could not hand the pairing record to the app: {}", copied.trim()));
+    match copied {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return Err(format!(
+                "could not hand the pairing record to the app: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+        Err(e) => return Err(format!("run devicectl: {e}")),
     }
     term::ok("Pairing record handed to the app (it imports it on first open)");
     Ok(())
@@ -378,8 +374,9 @@ fn next_steps(full: bool) {
     println!("  1. Settings › General › VPN & Device Management: trust your developer certificate if asked.");
     if full {
         println!("  2. Open Phone Use › Settings › 本机控制, tap 启用本机控制 and allow the VPN configuration.");
-        println!("     Local control then runs on the phone with no Mac. While it runs, it holds the phone's");
-        println!("     automation session: this Mac's runner waits (iphone-use setup pause gives way).");
+        println!("     Local control then runs on the phone with no Mac. It needs the phone's automation");
+        println!("     session: if this Mac's runner holds it, run iphone-use setup pause first. To drive");
+        println!("     the phone from this Mac again, stop local control in the app, then iphone-use setup resume.");
     } else {
         println!("  2. Open Phone Use and scan the QR code on this Mac's iphone-use page to connect.");
     }

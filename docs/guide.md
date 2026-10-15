@@ -295,9 +295,10 @@ depends on the team:
   screen reads and the agent API with no Mac at run time (iOS 17.4 or later). The first
   pairing still needs the USB cable once: `setup-app` makes it and hands it to the app.
   Then, on the phone, open Phone Use › Settings › 本机控制 › 启用本机控制 and allow the VPN
-  configuration. While local control runs it holds the phone's automation session, so the
-  Mac's runner waits; `iphone-use setup pause` gives the phone back to local control and
-  `iphone-use setup resume` takes it again.
+  configuration. While local control runs it holds the phone's automation session, and the
+  Mac's runner cannot start (it waits). To drive the phone from the Mac again, stop local
+  control in the app (本机控制 › 停止本机控制), then run `iphone-use setup resume`;
+  `iphone-use setup pause` stops the Mac's runner so local control can start.
 - **Free Apple ID: the remote app.** iOS does not let a free team sign network extensions,
   so the app drives phones that a Mac serves (the QR pairing above). `--remote-only` builds
   this one on a paid team too.
