@@ -35,10 +35,15 @@ def run(command, log):
         raise SystemExit("Build failed; private log: " + str(log))
 
 
-def asc_auth():
-    """-allowProvisioningUpdates, plus App Store Connect key flags when configured."""
+def asc_auth(team):
+    """-allowProvisioningUpdates, plus App Store Connect key flags when configured.
+
+    setup-app passes the phone's key in the environment. Only our own team falls
+    back to the default runner's key: another team's build must not carry it."""
     profile = Path.home() / "Library/LaunchAgents/com.leeguoo.iphone-use.wda.plist"
-    env = plistlib.loads(profile.read_bytes()).get("EnvironmentVariables", {}) if profile.exists() else {}
+    env = {}
+    if team == DEFAULT_TEAM and profile.exists():
+        env = plistlib.loads(profile.read_bytes()).get("EnvironmentVariables", {})
     auth = ["-allowProvisioningUpdates"]
     for key, flag in [("WDA_ASC_KEY_PATH", "-authenticationKeyPath"),
                       ("WDA_ASC_KEY_ID", "-authenticationKeyID"),
@@ -87,7 +92,7 @@ if __name__ == "__main__":
 
     if args.remote_only:
         run(common + ["-project", str(project("project.remote.yml", generate)), "-scheme", "IPhoneUseRemote",
-                      "-derivedDataPath", str(build / "remote")] + signing + asc_auth() + ["build"],
+                      "-derivedDataPath", str(build / "remote")] + signing + asc_auth(args.team) + ["build"],
             build / "remote-build.log")
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(build / "remote/Build/Products" / products / "Phone Use Remote.app", output, symlinks=True)
@@ -102,7 +107,7 @@ if __name__ == "__main__":
     host_flags = '-force_load "' + str(args.host_lib.resolve()) + '" -framework Security'
     host_flags += " " + " ".join("-u _" + name for name in ["ipu_host_start", "ipu_host_stop", "ipu_host_status", "ipu_host_string_free", "ipu_host_copy_pair_record"])
     run(common + ["-project", str(project("project.yml", generate)), "-scheme", "IPhoneUseRemote",
-                  "-derivedDataPath", str(build / "main"), "IPU_HOST_LDFLAGS=" + host_flags] + signing + asc_auth() + ["build"],
+                  "-derivedDataPath", str(build / "main"), "IPU_HOST_LDFLAGS=" + host_flags] + signing + asc_auth(args.team) + ["build"],
         build / "main-build.log")
     embed_flags = '$(inherited) -force_load "' + str(args.embed_lib.resolve()) + '" -framework Security -framework SystemConfiguration'
     embed_flags += " " + " ".join("-u _" + name for name in ["ipu_daemon_start", "ipu_daemon_state", "ipu_daemon_error", "ipu_daemon_pair_code"])
@@ -111,7 +116,7 @@ if __name__ == "__main__":
         runner_signing.append("PRODUCT_BUNDLE_IDENTIFIER=" + args.runner_bundle_id)
     run(common + ["-project", str(args.runner_project), "-scheme", "IPhoneUseRunner",
                   "-derivedDataPath", str(build / "control"), "PRODUCT_NAME=PhoneUse",
-                  "OTHER_LDFLAGS=" + embed_flags] + runner_signing + asc_auth() + ["build-for-testing"],
+                  "OTHER_LDFLAGS=" + embed_flags] + runner_signing + asc_auth(args.team) + ["build-for-testing"],
         build / "control-build.log")
     main = build / "main/Build/Products" / products / "Phone Use Remote.app"
     runner = build / "control/Build/Products" / products / "PhoneUse-Runner.app"
