@@ -384,7 +384,7 @@ final class DeviceSession: ObservableObject, Identifiable {
     func retryIfWaiting() async {
         switch phase {
         case let .failed(problem) where !problem.needsLogin || pendingPair?.fresh == true
-            || (problem.resumesWhenCredentialsReturn && hasCredentials):
+            || (problem.resumesWhenCredentialsReturn && Self.hasCredentials(address)):
             retryAttempt = 0
             await connect(password: nil)
         case .connected where linkDownSince != nil:
