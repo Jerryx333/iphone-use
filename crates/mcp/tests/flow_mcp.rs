@@ -91,21 +91,27 @@ struct McpServer {
 
 impl McpServer {
     fn start(url: &str, store: &str, home: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_iphone-use-mcp"))
+        Self::start_with_prewarm(url, store, home, Some("0"))
+    }
+
+    fn start_with_prewarm(url: &str, store: &str, home: &Path, prewarm: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iphone-use-mcp"));
+        command
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", home)
             .env("IPHONE_USE_URL", url)
             .env("IPHONE_USE_TOKEN", "test-token")
-            // The scripted daemon answers only the requests each test lists.
-            .env("IPHONE_USE_MCP_PREWARM", "0")
             // These tests read every step of a result from its structure.
             .env("IPHONE_USE_MCP_STRUCTURED", "full")
             .env("IPHONE_USE_FLOWS_DIR", store)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        if let Some(value) = prewarm {
+            command.env("IPHONE_USE_MCP_PREWARM", value);
+        }
+        let child = command.spawn()
             .expect("the MCP server starts");
         Self { child, next_id: 1 }
     }
@@ -159,6 +165,43 @@ impl Drop for McpServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn discovery_and_idle_sessions_do_not_contact_the_daemon_by_default() {
+    let home = tempfile::tempdir().unwrap();
+    let store = temp_registry(home.path());
+    // Keep a second response available so an unexpected prewarm is recorded.
+    let (url, requests) = mock_daemon(vec![
+        ("200 OK", r#"{"ok":true,"released":true,"drivable":false}"#),
+        ("200 OK", r#"{"ok":true}"#),
+    ]);
+    let mut mcp = McpServer::start_with_prewarm(&url, &store, home.path(), None);
+    mcp.initialize();
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    assert!(!listed["result"]["tools"].as_array().unwrap().is_empty());
+    mcp.request("resources/list", serde_json::json!({}));
+    assert!(requests.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "initialization, discovery and idle must not prewarm or probe the daemon");
+    let status = mcp.request("tools/call", serde_json::json!({
+        "name":"phone_status", "arguments":{}
+    }));
+    assert_ne!(status["result"]["isError"], true);
+    let request = requests.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(request.starts_with("GET /agent/status "), "{request}");
+    assert!(requests.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        "a released status must not implicitly prewarm the phone");
+}
+
+#[test]
+fn startup_prewarm_remains_an_explicit_opt_in() {
+    let home = tempfile::tempdir().unwrap();
+    let store = temp_registry(home.path());
+    let (url, requests) = mock_daemon(vec![("200 OK", r#"{"ok":true}"#)]);
+    let mut mcp = McpServer::start_with_prewarm(&url, &store, home.path(), Some("1"));
+    mcp.initialize();
+    let request = requests.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(request.starts_with("POST /agent/prewarm "), "{request}");
 }
 
 /// The agent-facing path on a real failure: the tool must hand back the

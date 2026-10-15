@@ -133,8 +133,10 @@ streams end, and status shows `screen_private_secs`. A later hold without
 `private` lifts it.
 
 **Pre-warm.** A released phone may already be coming back when you look:
-`warming:true` means the daemon started the bring-up ahead of time (MCP does
-this on startup and when status is read). Poll status until `drivable:true`
+`warming:true` means the daemon started the bring-up ahead of time. MCP startup
+and status only request pre-warming with `IPHONE_USE_MCP_PREWARM=1` (off by
+default); initialize and discovery otherwise make no daemon requests.
+Poll status until `drivable:true`
 instead of calling reconnect. `POST /agent/prewarm {"reason":"status"}` asks
 for it explicitly; the answer is `started` or `skipped` with a reason
 (`no_recent_activity`, `locked`, `rate_limited`, …) and never takes the lease.

@@ -39,6 +39,15 @@ cargo build --release -p iphone-use-mcp
 | `IPHONE_USE_TOKEN` | _(none)_ | Bearer token / password (omit for open-mode daemons) |
 | `IPHONE_USE_MCP_TOOLS` | `all` | Which tools are listed and callable: `all`, `readonly`, or a comma list of tool names (see [Tool profiles](#tool-profiles-and-annotations)) |
 | `IPHONE_USE_MCP_TOKEN` | _(none)_ | With `--listen`: the bearer token HTTP clients must send; required for a non-loopback address (see [MCP over HTTP](#mcp-over-http)) |
+| `IPHONE_USE_MCP_PREWARM` | `0` | Set `1` to opt into phone pre-warming on MCP startup/status. Discovery does not contact the daemon by default. |
+
+Each stdio connection has a small bridge process with a single-thread async
+runtime. Its HTTP client/pool is created only on the first daemon request;
+initialize, tool discovery and idle sessions do not wake the phone. The
+device daemon is shared by every client targeting that instance, not started
+per conversation. Hosts decide when to launch stdio servers. To share the
+MCP process too, use the HTTP listener below; it has two async workers, a
+shared HTTP pool, and separate owners/snapshots/runs for each session.
 
 ## MCP client config
 

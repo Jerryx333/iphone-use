@@ -1257,11 +1257,10 @@ impl PhoneHandler {
     async fn phone_status(&self) -> CallToolResult {
         match self.daemon.status().await {
             Ok(s) => {
-                // A model reading status is about to act more often than
-                // not; a released phone starts coming back now (the daemon
-                // gates this on recent use and an unlocked phone).
+                // Health checks stay read-only by default. Pre-warming a
+                // released phone is an explicit opt-in.
                 if s.released == Some(true)
-                    && std::env::var("IPHONE_USE_MCP_PREWARM").map_or(true, |v| v.trim() != "0")
+                    && std::env::var("IPHONE_USE_MCP_PREWARM").is_ok_and(|v| v.trim() == "1")
                 {
                     let daemon = self.daemon.clone();
                     tokio::spawn(async move {
