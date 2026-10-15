@@ -255,20 +255,30 @@ final class DeviceSession: ObservableObject, Identifiable {
 
     /// The device moved to a new address (the person edited it): carry its
     /// password, pairing and LAN routes over, so nothing has to be re-entered.
-    static func moveCredentials(from old: String, to new: String) {
-        guard old != new else { return }
+    @discardableResult
+    static func moveCredentials(from old: String, to new: String) -> Bool {
+        guard old != new else { return true }
         let accounts: [(String) -> String] = [{ $0 }, deviceAccount, lanKeyAccount, pairAccount]
+        var saved: [(String, String, String)] = []
         for account in accounts {
-            if let secret = Keychain.password(for: account(old)) {
-                Keychain.save(password: secret, for: account(new))
-                Keychain.delete(for: account(old))
+            switch Keychain.read(for: account(old)) {
+            case let .value(secret): saved.append((account(old), account(new), secret))
+            case .missing: break
+            case .unavailable: return false
             }
         }
+        // A locked/unavailable Keychain must not turn an address edit into
+        // a permanent loss of all original credentials.
+        for (_, target, secret) in saved {
+            guard Keychain.save(password: secret, for: target) else { return false }
+        }
+        for (source, _, _) in saved { Keychain.delete(for: source) }
         let defaults = UserDefaults.standard
         if let urls = defaults.stringArray(forKey: lanURLsKey(old)) {
             defaults.set(urls, forKey: lanURLsKey(new))
             defaults.removeObject(forKey: lanURLsKey(old))
         }
+        return true
     }
 
     static func savePassword(_ password: String, for address: String) {
@@ -373,7 +383,8 @@ final class DeviceSession: ObservableObject, Identifiable {
     /// needs a password is left alone.
     func retryIfWaiting() async {
         switch phase {
-        case let .failed(problem) where !problem.needsLogin || pendingPair?.fresh == true:
+        case let .failed(problem) where !problem.needsLogin || pendingPair?.fresh == true
+            || (problem.resumesWhenCredentialsReturn && hasCredentials):
             retryAttempt = 0
             await connect(password: nil)
         case .connected where linkDownSince != nil:
@@ -387,11 +398,10 @@ final class DeviceSession: ObservableObject, Identifiable {
     /// pairing). An existing connection is dropped only once the new one has
     /// answered a status read.
     func adopt(_ client: DaemonClient, generation expected: Int? = nil) async throws {
-        // Look for the LAN while the paired address answers the status read,
-        // so connecting off the LAN costs no extra round trip.
-        async let lan = client.probeLAN()
+        // Authentication may already have selected a verified LAN route.
+        // A dead public URL must not fail status before a LAN probe finishes.
+        if !client.onLAN, let lan = await client.probeLAN() { client.use(lan) }
         let status = try await client.status()
-        client.use(await lan)
         if let expected, expected != generation { return }
         generation += 1
         if self.client != nil { teardown() }
@@ -974,7 +984,14 @@ final class DeviceSession: ObservableObject, Identifiable {
 enum Keychain {
     private static let service = "com.leeguoo.iphone-use.remote"
 
+    fileprivate enum Read { case value(String), missing, unavailable }
+
     static func password(for account: String) -> String? {
+        if case let .value(password) = read(for: account) { return password }
+        return nil
+    }
+
+    fileprivate static func read(for account: String) -> Read {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -983,21 +1000,32 @@ enum Keychain {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return .missing }
+        guard status == errSecSuccess, let data = result as? Data,
+              let password = String(data: data, encoding: .utf8) else { return .unavailable }
+        return .value(password)
     }
 
-    static func save(password: String, for account: String) {
-        delete(for: account)
-        let item: [String: Any] = [
+    @discardableResult
+    static func save(password: String, for account: String) -> Bool {
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-            kSecValueData as String: Data(password.utf8),
         ]
-        SecItemAdd(item as CFDictionary, nil)
+        let attributes = [kSecValueData as String: Data(password.utf8)]
+        let updated = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return true }
+        guard updated == errSecItemNotFound else { return false }
+        var item = query
+        item[kSecValueData as String] = Data(password.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let added = SecItemAdd(item as CFDictionary, nil)
+        if added == errSecDuplicateItem {
+            return SecItemUpdate(query as CFDictionary, attributes as CFDictionary) == errSecSuccess
+        }
+        return added == errSecSuccess
     }
 
     static func delete(for account: String) {

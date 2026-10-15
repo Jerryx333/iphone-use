@@ -45,6 +45,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Remote connection and credential recovery
+        run: bash scripts/test-remote-connection.sh
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 

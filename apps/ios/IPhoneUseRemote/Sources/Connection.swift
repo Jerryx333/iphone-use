@@ -94,6 +94,13 @@ enum ConnectProblem: Equatable, Sendable {
         }
     }
 
+    /// A locked Keychain can temporarily look empty. Once the app is in
+    /// front and saved credentials are readable again, retry those states;
+    /// a rejected password or revoked pairing still needs the person.
+    var resumesWhenCredentialsReturn: Bool {
+        self == .noCredentials || self == .sessionExpired
+    }
+
     /// Worth trying again on its own (the Mac may wake, the network may come back).
     var retryable: Bool {
         switch self {

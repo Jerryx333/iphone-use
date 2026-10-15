@@ -60,10 +60,18 @@ impl Pairing {
         if !self.lan_reachable {
             return Vec::new();
         }
-        lan_addresses()
+        let mut urls: Vec<String> = lan_addresses()
             .into_iter()
             .map(|(_, ip)| format!("http://{ip}:{port}"))
-            .collect()
+            .collect();
+        // DHCP addresses change when the Mac moves between networks. Keep
+        // its Bonjour name as another candidate; clients still require the
+        // pinned nonce proof before sending credentials to any candidate.
+        #[cfg(target_os = "macos")]
+        if let Some(host) = local_hostname() {
+            urls.push(format!("http://{host}:{port}"));
+        }
+        urls
     }
 
     /// Mint a fresh single-use code.
@@ -113,6 +121,29 @@ impl Pairing {
             .get(code)
             .is_some_and(|issued| issued.elapsed() < CODE_TTL)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn local_hostname() -> Option<String> {
+    let mut name = [0u8; 256];
+    // SAFETY: gethostname writes at most the supplied buffer length.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 { return None; }
+    let end = name.iter().position(|byte| *byte == 0)?;
+    stable_lan_hostname(std::str::from_utf8(&name[..end]).ok()?)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stable_lan_hostname(name: &str) -> Option<String> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name == "localhost" || name == "localhost.local"
+        || name.parse::<std::net::IpAddr>().is_ok() { return None; }
+    let host = if name.ends_with(".local") { name }
+        else if !name.contains('.') { format!("{name}.local") } else { return None; };
+    if host.len() > 253 || !host.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    }) { return None; }
+    Some(host)
 }
 
 /// Signing key for device tokens: bound to the daemon secret and the control
@@ -244,6 +275,15 @@ pub fn qr_svg(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stable_lan_names_survive_address_changes_without_using_public_dns_names() {
+        assert_eq!(super::stable_lan_hostname("My-Mac.local."), Some("my-mac.local".into()));
+        assert_eq!(super::stable_lan_hostname("My-Mac"), Some("my-mac.local".into()));
+        for invalid in ["", "localhost", "localhost.local", "127.0.0.1", "::1",
+            "mac.example.com", "bad/name", "bad..local", "-bad.local"] {
+            assert_eq!(super::stable_lan_hostname(invalid), None, "{invalid}");
+        }
+    }
     use super::*;
 
     #[test]

@@ -1,4 +1,5 @@
-//! Per-user runtime directory for pid/log/secret files.
+//! Per-user runtime directory for pid/log and legacy signing-key files.
+//! New signing keys live in [`persistent_auth_dir`], outside temporary storage.
 //!
 //! The directory lives at `$TMPDIR/iphone-use-$UID` (falling back to
 //! `/tmp/iphone-use-$UID` when `$TMPDIR` is unset).  It is created
@@ -51,6 +52,39 @@ pub fn legacy_runtime_dir() -> Option<PathBuf> {
 
 /// The session-cookie key's file name inside the runtime directory.
 pub const SECRET_FILE: &str = "secret";
+
+/// Durable authentication state, separate from disposable pid/log files.
+/// The parent may hold public installer files; the auth directory is 0700.
+pub fn persistent_auth_dir(state_dir: &Path) -> io::Result<PathBuf> {
+    if !state_dir.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(state_dir)?;
+    }
+    let meta = state_dir.symlink_metadata()?;
+    if !meta.is_dir() || meta.uid() != current_uid() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "authentication state must be in a real directory owned by the current user"));
+    }
+    let dir = state_dir.join("auth");
+    match dir.symlink_metadata() {
+        Ok(meta) if !meta.is_dir() => return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied, "authentication directory must not be a symlink or file")),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match ensure_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !dir.symlink_metadata()?.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "authentication directory must not be a symlink or file"));
+    }
+    validate_dir(&dir)?;
+    Ok(dir)
+}
 
 /// Copy the session secret from the pre-rename directory into `dir` when
 /// `dir` has none. The old file goes through the same checks as any read.
@@ -233,6 +267,28 @@ fn current_uid() -> u32 {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn persistent_auth_keeps_secrets_private_without_changing_the_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let auth = persistent_auth_dir(root.path()).unwrap();
+        assert_eq!(fs::metadata(&auth).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(root.path()).unwrap().mode() & 0o777, 0o755);
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(persistent_auth_dir(root.path()).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn persistent_auth_refuses_symlinked_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(other.path(), root.path().join("auth")).unwrap();
+        assert_eq!(persistent_auth_dir(root.path()).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let link = root.path().join("state-link");
+        std::os::unix::fs::symlink(other.path(), &link).unwrap();
+        assert_eq!(persistent_auth_dir(&link).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
     use tempfile::TempDir;
 
     #[test]

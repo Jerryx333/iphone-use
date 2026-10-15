@@ -218,17 +218,19 @@ final class DaemonClient: @unchecked Sendable {
     /// before it is sent any credential; nil from older daemons.
     var lanKey: Data? { routes.withLock { $0.lanKey } }
 
-    init(base: URL, lanCandidates: [URL] = [], lanKey: Data? = nil) {
+    init(base: URL, lanCandidates: [URL] = [], lanKey: Data? = nil,
+         configuration: URLSessionConfiguration? = nil,
+         probeConfiguration: URLSessionConfiguration? = nil) {
         self.publicBase = base
         routes = LockedState(initialState: Routes(active: base, lan: lanCandidates, lanKey: lanKey))
-        let probe = URLSessionConfiguration.ephemeral
+        let probe = probeConfiguration ?? URLSessionConfiguration.ephemeral
         probe.httpShouldSetCookies = false
         probe.httpCookieAcceptPolicy = .never
         probe.timeoutIntervalForRequest = 0.6
         probe.timeoutIntervalForResource = 1
         probe.waitsForConnectivity = false
         probeSession = URLSession(configuration: probe)
-        let config = URLSessionConfiguration.ephemeral
+        let config = configuration ?? URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
         config.timeoutIntervalForRequest = 8
@@ -268,6 +270,7 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     func login(password: String) async throws {
+        try await prepareAuthenticationRoute()
         var request = URLRequest(url: base.appendingPathComponent( "login"))
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -310,6 +313,7 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     private func postPair(_ body: [String: String]) async throws -> (Data, HTTPURLResponse) {
+        try await prepareAuthenticationRoute()
         var request = URLRequest(url: base.appendingPathComponent( "pair"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -328,7 +332,17 @@ final class DaemonClient: @unchecked Sendable {
             }
             return (data, response)
         case 401:
-            throw body["code"] != nil ? DaemonError.pairingCodeInvalid : DaemonError.pairingRevoked
+            // A proxy's login page or another service's 401 is not proof
+            // that this daemon revoked the pairing. Do not erase the saved
+            // device token because an intermediary demanded authentication.
+            let error = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            if body["code"] != nil, error == "pairing_code_invalid" {
+                throw DaemonError.pairingCodeInvalid
+            }
+            if body["device_token"] != nil, error == "device_token_invalid" {
+                throw DaemonError.pairingRevoked
+            }
+            throw DaemonError.notIphoneUse
         case 429:
             throw DaemonError.lockedOut
         case 404:
@@ -459,6 +473,15 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     // MARK: routes
+
+    /// Saved public tunnel URLs can disappear while the same Mac is still
+    /// reachable locally. Authenticate on a LAN route only after its nonce
+    /// proof succeeds, before sending any saved password or device token.
+    private func prepareAuthenticationRoute() async throws {
+        let direct = await probeLAN()
+        try Task.checkCancellation()
+        use(direct)
+    }
 
     /// The first LAN address that proves, within the probe timeout, that it
     /// is the daemon this app paired with, or nil. The probe carries no

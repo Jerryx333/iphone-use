@@ -32,7 +32,7 @@ mod onboarding;
 
 /// PID file name inside the runtime dir.
 const PID_FILE: &str = "iphone-use.pid";
-/// Secret file name inside the runtime dir.
+/// Signing-key file name (legacy runtime dir, now the durable auth dir).
 const SECRET_FILE: &str = server::runtime_dir::SECRET_FILE;
 const PID_RECORD_VERSION: u8 = 1;
 const STOP_WAIT_SECS: u64 = 5;
@@ -1016,7 +1016,7 @@ fn serve() -> Result<()> {
     //    listener binds, so a failed second start cannot replace the live
     //    daemon's identity.
     let dir = server::runtime_dir::runtime_dir().context("create runtime dir")?;
-    let secret = load_or_make_secret(&dir, &cfg)?;
+    let secret = load_or_make_secret(&dir, &server::instance::current().state_dir, &cfg)?;
 
     // Direct mode has stable localhost relay defaults. The setup script creates
     // these relays; keeping the client configured while WDA is down lets the web
@@ -1283,22 +1283,35 @@ async fn shutdown_signal() {
 // ---------------------------------------------------------------------------
 
 /// Load the signing secret, preferring (in order): the configured
-/// `IPHONE_USE_SECRET`, an existing secret file, or a freshly generated one.
-fn load_or_make_secret(dir: &std::path::Path, cfg: &Config) -> Result<Vec<u8>> {
+/// `IPHONE_USE_SECRET`, durable state, the legacy runtime key, or a new key.
+/// Copy the old key on upgrade so existing cookies and paired phones survive.
+fn load_or_make_secret(
+    runtime: &std::path::Path,
+    state_dir: &std::path::Path,
+    cfg: &Config,
+) -> Result<Vec<u8>> {
     if let Some(s) = &cfg.secret {
         return Ok(s.clone().into_bytes());
     }
 
-    match server::runtime_dir::read_secret(dir, SECRET_FILE) {
-        Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+    let dir = server::runtime_dir::persistent_auth_dir(state_dir)
+        .context("prepare persistent authentication state")?;
+    match server::runtime_dir::read_secret(&dir, SECRET_FILE) {
+        Ok(bytes) if bytes.len() == 32 => return Ok(bytes),
         Ok(_) => anyhow::bail!(
-            "persisted session secret is empty; remove it only after stopping every daemon"
+            "persisted session secret is incomplete; refusing to rotate paired-device credentials"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("read persisted session secret"),
     }
 
-    persist_generated_secret(dir, gen_secret()?)
+    let secret = match server::runtime_dir::read_secret(runtime, SECRET_FILE) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        Ok(_) => anyhow::bail!("legacy session secret is incomplete; refusing to rotate paired-device credentials"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => gen_secret()?,
+        Err(error) => return Err(error).context("read legacy session secret for migration"),
+    };
+    persist_generated_secret(&dir, secret)
 }
 
 /// Generate the session-cookie HMAC key directly from the operating system's
@@ -1315,7 +1328,21 @@ fn gen_secret() -> Result<Vec<u8>> {
 /// Persist a freshly generated secret. If another process wins the exclusive
 /// create race, use that process's complete secret so both daemons agree.
 fn persist_generated_secret(dir: &std::path::Path, secret: Vec<u8>) -> Result<Vec<u8>> {
-    match server::runtime_dir::write_secret(dir, SECRET_FILE, &secret) {
+    // Publish only a complete key. An O_EXCL destination alone exposes an
+    // empty/partial file to a simultaneous start between create and write.
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let nonce = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, gen_secret()?);
+    let pending = dir.join(format!(".secret-{nonce}"));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&pending)?;
+    let published = (|| -> std::io::Result<()> {
+        file.write_all(&secret)?;
+        file.sync_all()?;
+        std::fs::hard_link(&pending, dir.join(SECRET_FILE))
+    })();
+    let _ = std::fs::remove_file(&pending);
+    match published {
         Ok(()) => Ok(secret),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // `write_secret` uses O_EXCL, so the losing process can observe the
@@ -1811,18 +1838,65 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
         let cfg = test_config();
-        let first = load_or_make_secret(dir.path(), &cfg).unwrap();
-        let second = load_or_make_secret(dir.path(), &cfg).unwrap();
+        let first = load_or_make_secret(dir.path(), state.path(), &cfg).unwrap();
+        let second = load_or_make_secret(dir.path(), state.path(), &cfg).unwrap();
 
         assert_eq!(first.len(), 32);
         assert_eq!(first, second);
-        let mode = std::fs::metadata(dir.path().join(SECRET_FILE))
+        let mode = std::fs::metadata(state.path().join("auth").join(SECRET_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn session_secret_migrates_without_unpairing_and_survives_runtime_cleanup() {
+        let runtime = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let original = vec![0x51; 32];
+        server::runtime_dir::write_secret(runtime.path(), SECRET_FILE, &original).unwrap();
+        let cookie = core::auth::make_token(&original, 28_800, 1_000);
+        let device_key = server::pairing::device_key(&original, Some("synthetic-password"));
+        let device = core::auth::make_token(&device_key, 180 * 86_400, 1_000);
+        let migrated = load_or_make_secret(runtime.path(), state.path(), &test_config()).unwrap();
+        assert_eq!(migrated, original);
+        runtime.close().unwrap();
+        let another_runtime = tempfile::TempDir::new().unwrap();
+        server::runtime_dir::write_secret(another_runtime.path(), SECRET_FILE, &[0x71;32]).unwrap();
+        let restarted = load_or_make_secret(another_runtime.path(), state.path(), &test_config()).unwrap();
+        assert_eq!(restarted, original);
+        assert!(core::auth::check_token(&restarted, &cookie, 2_000));
+        let renewed_key = server::pairing::device_key(&restarted, Some("synthetic-password"));
+        assert!(core::auth::check_token(&renewed_key, &device, 2_000));
+    }
+
+    #[test]
+    fn session_secret_refuses_corrupt_state_and_honors_explicit_configuration() {
+        let runtime = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let auth = server::runtime_dir::persistent_auth_dir(state.path()).unwrap();
+        server::runtime_dir::write_secret(&auth, SECRET_FILE, b"partial").unwrap();
+        assert!(load_or_make_secret(runtime.path(), state.path(), &test_config()).is_err());
+        assert_eq!(std::fs::read(auth.join(SECRET_FILE)).unwrap(), b"partial");
+        let mut cfg = test_config();
+        cfg.secret = Some("explicit-synthetic-key".into());
+        assert_eq!(load_or_make_secret(runtime.path(), state.path(), &cfg).unwrap(),
+                   b"explicit-synthetic-key");
+    }
+
+    #[test]
+    fn session_secret_is_separate_for_each_instance() {
+        let runtime_a = tempfile::TempDir::new().unwrap();
+        let runtime_b = tempfile::TempDir::new().unwrap();
+        let state_a = tempfile::TempDir::new().unwrap();
+        let state_b = tempfile::TempDir::new().unwrap();
+        let a = load_or_make_secret(runtime_a.path(), state_a.path(), &test_config()).unwrap();
+        let b = load_or_make_secret(runtime_b.path(), state_b.path(), &test_config()).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]

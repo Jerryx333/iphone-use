@@ -398,7 +398,9 @@ final class AppModel: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !DeviceStore.same(old, address) {
             session.disconnect()
-            DeviceSession.moveCredentials(from: old, to: address)
+            guard DeviceSession.moveCredentials(from: old, to: address) else {
+                return .rejected(String(localized: "连接信息未能保存，请解锁这台手机后重试。原来的登录信息已保留。"), canSaveAnyway: false)
+            }
             devices[index].address = address
         }
         // An empty name, or the old default left as it was, follows the address.
