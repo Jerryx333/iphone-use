@@ -22,6 +22,15 @@ permissions:
   contents: read
 
 jobs:
+  remote-connection:
+    name: Remote connection and credential recovery
+    # The iOS app uses Swift 6; macos-14's default Xcode still uses Swift 5.
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash scripts/test-remote-connection.sh
+
   test:
     name: Tests and MCP tool discovery
     # Same image as the release build, so a failure here means the code, not a
@@ -44,9 +53,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Remote connection and credential recovery
-        run: bash scripts/test-remote-connection.sh
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
