@@ -139,11 +139,36 @@ struct LocalControlSetupView: View {
         }
         .task {
             await tunnel.load()
+            importStagedPairing()
             while !Task.isCancelled {
                 await tunnel.refresh()
                 if tunnel.nativePhase == "running" { _ = await app.connectStandaloneControlIfReady() }
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
+        }
+    }
+
+    /// `iphone-use setup-app` copies the first pairing record it made over USB
+    /// into this app's Documents (only a trusted, developer-mode Mac can write
+    /// there). Take it into the Keychain once, then delete the file. While local
+    /// control runs it waits, as a manual import would.
+    private func importStagedPairing() {
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("pair-record-import.plist")
+        guard FileManager.default.fileExists(atPath: url.path),
+              completePackage, DeviceStore.supportsStandaloneControl else { return }
+        guard tunnel.state == "未启用" else {
+            message = "电脑传来了新的配对记录。停止本机控制后重新打开此页即可导入。"
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: url) }
+        do {
+            var data = try PairRecordImport.read(url)
+            defer { data.resetBytes(in: 0..<data.count) }
+            try ProtectedStore.write("pair_record", data)
+            message = "已导入电脑生成的配对记录，可以启用本机控制。"
+        } catch {
+            message = "电脑传来的配对记录无效，请重新运行 iphone-use setup-app。"
         }
     }
 }

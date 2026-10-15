@@ -5,7 +5,7 @@
 	<key>IPUKeychainGroup</key>
 	<string>$(AppIdentifierPrefix)com.leeguoo.iphone-use.selfhost-probe.shared</string>
 	<key>IPUTunnelBundle</key>
-	<string>com.leeguoo.iphone-use.remote.tunnel</string>
+	<string>$(IPU_APP_BUNDLE_ID).tunnel</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>

@@ -277,7 +277,36 @@ page. The phone being controlled must stay unlocked: iOS does not let automation
 lock-screen passcode, so when it is locked the app says so within seconds and connects as
 soon as it is unlocked. On screens an app hides from capture (payment and banking apps),
 the app shows the daemon's wireframe of the accessibility tree instead of a white picture.
-Build with `cd apps/ios && xcodegen generate`, then open in Xcode.
+### Install the app
+
+The app is not in the App Store. Build and install it with your own signing team, the one
+`iphone-use setup` already uses for the device runner:
+
+```bash
+iphone-use setup-app            # add --instance <name> for a second phone
+```
+
+It downloads this release's app sources (`iphone-use-app.tar.gz`, SHA-256 verified), builds
+with your team and installs the result on the phone with `devicectl`. Which app you get
+depends on the team:
+
+- **Paid developer team: the full app, with local control.** A packet-tunnel extension in
+  the app starts the device runner on the phone itself, so the phone serves taps, typing,
+  screen reads and the agent API with no Mac at run time (iOS 17.4 or later). The first
+  pairing still needs the USB cable once: `setup-app` makes it and hands it to the app.
+  Then, on the phone, open Phone Use › Settings › 本机控制 › 启用本机控制 and allow the VPN
+  configuration. While local control runs it holds the phone's automation session, and the
+  Mac's runner cannot start (it waits). To drive the phone from the Mac again, stop local
+  control in the app (本机控制 › 停止本机控制), then run `iphone-use setup resume`;
+  `iphone-use setup pause` stops the Mac's runner so local control can start.
+- **Free Apple ID: the remote app.** iOS does not let a free team sign network extensions,
+  so the app drives phones that a Mac serves (the QR pairing above). `--remote-only` builds
+  this one on a paid team too.
+
+`--no-install` only builds; `--no-pair` skips the USB pairing. From a checkout,
+`IPHONE_USE_APP_SRC=$PWD iphone-use setup-app` builds the checkout's sources (it needs
+`xcodegen`, `scripts/build-browser-session.sh device` and the launcher library built by
+`experiments/phone-self-host/launcher/build.sh`; see `apps/ios/README.md`).
 
 ## Agent API
 

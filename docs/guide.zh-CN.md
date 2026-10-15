@@ -122,7 +122,7 @@ daemon 每天检查一次 GitHub，在 `/agent/status` 里报 `version` / `lates
 
 ## 用原生 iOS App 操作手机
 
-`apps/ios` 是原生 SwiftUI App（最低部署版本 iOS 15）。**扫码连接**：在 Mac 上打开 iphone-use 页面，点工具栏的「扫码」，用 App 扫一下就连上（用 iPhone 自带相机扫也行，还能直接在浏览器里控制）。二维码只能用一次、5 分钟内有效；App 会保存一个设备令牌自动续登录，改控制密码会让所有已配对的手机失效。也可以手动填地址和控制密码。App 用系统硬件解码播放 H.264 画面，点击、长按、滑动、按住拖动、输入文字和回主屏幕都发到 `POST /control`，跟网页走同一套接口。被控的那台 iPhone 要保持解锁：iOS 不允许自动化输入锁屏密码，所以手机锁着时 App 几秒内就会提示「请解锁」，解锁后马上连上。遇到 App 禁止截屏的界面（支付、银行类 App），画面不再是一片白，而是显示守护进程按控件树画的线框图。构建：`cd apps/ios && xcodegen generate`，再用 Xcode 打开。
+`apps/ios` 是原生 SwiftUI App（最低部署版本 iOS 15）。**扫码连接**：在 Mac 上打开 iphone-use 页面，点工具栏的「扫码」，用 App 扫一下就连上（用 iPhone 自带相机扫也行，还能直接在浏览器里控制）。二维码只能用一次、5 分钟内有效；App 会保存一个设备令牌自动续登录，改控制密码会让所有已配对的手机失效。也可以手动填地址和控制密码。App 用系统硬件解码播放 H.264 画面，点击、长按、滑动、按住拖动、输入文字和回主屏幕都发到 `POST /control`，跟网页走同一套接口。被控的那台 iPhone 要保持解锁：iOS 不允许自动化输入锁屏密码，所以手机锁着时 App 几秒内就会提示「请解锁」，解锁后马上连上。遇到 App 禁止截屏的界面（支付、银行类 App），画面不再是一片白，而是显示守护进程按控件树画的线框图。安装：App 不上 App Store，用你自己的签名团队（就是 `iphone-use setup` 给 runner 用的那个）编译安装：运行 `iphone-use setup-app`。它会下载本版本的 App 源码（`iphone-use-app.tar.gz`，校验 SHA-256），用你的团队编译，再用 `devicectl` 装到手机上。付费开发者团队装的是带**本机控制**的完整版：App 里的网络扩展在手机上自己启动 runner，运行时不需要 Mac（iOS 17.4 及以上）；首次配对要插一次 USB 线，`setup-app` 会生成配对记录交给 App，之后在手机上打开 Phone Use › 设置 › 本机控制 › 启用本机控制，并允许添加 VPN 配置。本机控制运行时占用手机的自动化会话，Mac 端 runner 启动不了（会一直等待）。要回到由 Mac 控制，先在 App 里停止本机控制（本机控制 › 停止本机控制），再运行 `iphone-use setup resume`；`iphone-use setup pause` 则是停掉 Mac 端 runner，让本机控制能启动。免费 Apple ID 签不了网络扩展，装的是远程版，只能控制 Mac 托管的手机（用上面的扫码连接）；付费团队也可以用 `--remote-only` 只装远程版。
 
 ## Agent API
 

@@ -395,6 +395,51 @@ jobs:
           cp "$lib" runner/embed/libipu_embed.a
           ls -l runner/embed/libipu_embed.a
 
+      # The iOS app for `iphone-use setup-app`: its sources, both generated
+      # Xcode projects and the libraries a user's Mac would need Rust for —
+      # the on-phone launcher (local control) and the browser session for
+      # iOS, plus the macOS tool that makes the first pairing over USB.
+      # setup-app signs it with the user's own team; it is not in the App Store.
+      - name: Build and package the iOS app sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen >/dev/null
+          bash scripts/build-browser-session.sh device
+          browser=apps/ios/SessionLibraries/iphoneos/libipu_browser_session.a
+          (cd experiments/phone-self-host/launcher && sh build.sh)
+          host=experiments/phone-self-host/launcher/target/aarch64-apple-ios/release/libipu_phone_host.a
+          nm -gU "$host" > "$RUNNER_TEMP/host-symbols.txt" 2>/dev/null || true
+          for symbol in ipu_host_start ipu_host_stop ipu_host_status ipu_host_string_free ipu_host_copy_pair_record; do
+            grep -q "_${symbol}\$" "$RUNNER_TEMP/host-symbols.txt"
+          done
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            (cd experiments/phone-self-host/launcher \
+              && cargo build --locked --release --bin ipu-phone-host --features usb-provision --target "$target")
+          done
+          tool="$RUNNER_TEMP/ipu-phone-host"
+          lipo -create -output "$tool" \
+            experiments/phone-self-host/launcher/target/aarch64-apple-darwin/release/ipu-phone-host \
+            experiments/phone-self-host/launcher/target/x86_64-apple-darwin/release/ipu-phone-host
+          codesign --force --sign - "$tool"
+          bash scripts/package-app.sh "$host" "$browser" "$tool" "$GITHUB_WORKSPACE/iphone-use-app.tar.gz"
+          if tar -tzf iphone-use-app.tar.gz | grep -v '^app/'; then
+            echo "app archive has entries outside app/" >&2; exit 1
+          fi
+          if tar -tvzf iphone-use-app.tar.gz | grep -E '^[lh]'; then
+            echo "app archive contains links" >&2; exit 1
+          fi
+          tar -tzf iphone-use-app.tar.gz > "$RUNNER_TEMP/app-entries.txt"
+          for entry in app/apps/ios/IPhoneUseRemote.xcodeproj/project.pbxproj \
+                       app/apps/ios/PhoneUseRemoteOnly.xcodeproj/project.pbxproj \
+                       app/apps/ios/Tools/build_single_app.py app/native/libipu_phone_host.a \
+                       app/apps/ios/SessionLibraries/iphoneos/libipu_browser_session.a app/bin/ipu-phone-host; do
+            grep -qx "$entry" "$RUNNER_TEMP/app-entries.txt"
+          done
+          if grep -q DeveloperImage "$RUNNER_TEMP/app-entries.txt"; then
+            echo "the Apple developer image must never ship" >&2; exit 1
+          fi
+
       # install.sh lays these sources down at ~/.iphone-use/runner; every
       # entry must sit under runner/ (the installer refuses anything else).
       - name: Package device runner sources
@@ -422,6 +467,7 @@ jobs:
           shasum -a 256 iphone-use-mcp-macos-universal.tar.gz \
             > iphone-use-mcp-macos-universal.tar.gz.sha256
           shasum -a 256 iphone-use-runner.tar.gz > iphone-use-runner.tar.gz.sha256
+          shasum -a 256 iphone-use-app.tar.gz > iphone-use-app.tar.gz.sha256
           cat iPhoneUse.app.zip.sha256
           cat iphone-use-mcp-macos-universal.tar.gz.sha256
           cat iphone-use-runner.tar.gz.sha256
@@ -440,6 +486,8 @@ jobs:
             iphone-use-mcp-macos-universal.tar.gz.sha256
             iphone-use-runner.tar.gz
             iphone-use-runner.tar.gz.sha256
+            iphone-use-app.tar.gz
+            iphone-use-app.tar.gz.sha256
             browser-use-bridge-macos-universal.tar.gz
             browser-use-bridge-macos-universal.tar.gz.sha256
           generate_release_notes: true
@@ -460,6 +508,8 @@ jobs:
             iphone-use-mcp-macos-universal.tar.gz.sha256
             iphone-use-runner.tar.gz
             iphone-use-runner.tar.gz.sha256
+            iphone-use-app.tar.gz
+            iphone-use-app.tar.gz.sha256
             browser-use-bridge-macos-universal.tar.gz
             browser-use-bridge-macos-universal.tar.gz.sha256
           retention-days: 7

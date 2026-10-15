@@ -524,6 +524,16 @@ pub fn free_profile_due(app: &Path, now: u64) -> bool {
     )
 }
 
+/// Whether the profile embedded in a built app is a paid team's (a year)
+/// rather than a free Apple ID's (7 days); None when it cannot be read.
+pub fn paid_profile(app: &Path) -> Option<bool> {
+    let profile = app.join("embedded.mobileprovision");
+    let xml = sys::stdout_of("security", &["cms", "-D", "-i", &profile.to_string_lossy()]);
+    let created = plist_date(&xml, "CreationDate")?;
+    let expiry = plist_date(&xml, "ExpirationDate")?;
+    Some(expiry.saturating_sub(created) > FREE_PROFILE_MAX_SECS)
+}
+
 fn short_lived_and_due(created: Option<u64>, expiry: Option<u64>, now: u64) -> bool {
     match (created, expiry) {
         (Some(created), Some(expiry)) => {
