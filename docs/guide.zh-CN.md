@@ -28,6 +28,8 @@ Agent  ── /agent/* ──────────> iphone-use daemon ── 
 - 不需要装任何 Homebrew 包：USB 中继内置在 App 里（`iphone-use relay`）；只有 App 版本太旧时才会退回 Homebrew 的 `iproxy`。USB 连接时，setup 直接从手机读取名称、iOS 版本、开发者磁盘映像状态和 runner 是否就绪（`iphone-use device info|ddi|runner-status`，输出 JSON），不再调用 `devicectl`；只有锁屏检查和只走 Wi‑Fi 的手机还用 `devicectl`。
 - 只有从源码构建才需要 Rust 工具链。
 
+如果 setup 报 `No Accounts`，但 Xcode 已列出你的 Apple ID，打开报错中显示的 runner 工程（通常是 `~/.iphone-use/runner/IPhoneUseRunner/IPhoneUseRunner.xcodeproj`）。选择 `IPhoneUseRunner` scheme 和你的 iPhone，执行一次 **Product → Build For → Testing**；如果弹出钥匙串访问请求，允许 Xcode 创建签名证书和描述文件，然后重跑 setup。
+
 ### 安装并接上第一台手机
 
 ```bash
