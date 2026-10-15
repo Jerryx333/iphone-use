@@ -58,6 +58,13 @@ Design, lifecycle, failure states, and security boundaries:
   `devicectl`; only the lock check and Wi-Fi-only phones still go through `devicectl`.
 - A Rust toolchain only if you build from source.
 
+If setup reports `No Accounts` even though Xcode lists your Apple ID, open the
+runner project printed in the error (normally
+`~/.iphone-use/runner/IPhoneUseRunner/IPhoneUseRunner.xcodeproj`). Select the
+`IPhoneUseRunner` scheme and your iPhone, then choose **Product → Build For →
+Testing** once. Allow keychain access if prompted so Xcode can create the signing
+certificate and provisioning profile, then rerun setup.
+
 ### Install and connect the first phone
 
 ```bash
