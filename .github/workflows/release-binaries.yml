@@ -451,7 +451,7 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           COPYFILE_DISABLE=1 tar --exclude xcuserdata --exclude .DS_Store \
-            -czf iphone-use-runner.tar.gz runner/IPhoneUseRunner/README.md runner/embed
+            -czf iphone-use-runner.tar.gz runner/IPhoneUseRunner runner/README.md runner/embed
           # (`! pipeline` would not stop the step under `set -e`; test explicitly.)
           if tar -tzf iphone-use-runner.tar.gz | grep -v '^runner/'; then
             echo "runner archive has entries outside runner/" >&2; exit 1
