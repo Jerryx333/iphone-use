@@ -501,7 +501,7 @@ name = "core"
 version = "0.19.2"
 dependencies = [
  "base64 0.22.1",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hmac",
  "serde",
  "serde_json",
@@ -2435,7 +2435,7 @@ dependencies = [
  "clap",
  "core",
  "futures-util",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "http-body-util",
  "iphone-use-mcp",
  "libc",
