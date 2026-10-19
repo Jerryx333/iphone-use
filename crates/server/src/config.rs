@@ -38,7 +38,7 @@ pub struct Config {
     /// When absent (the default), the existing behavior is preserved: the password
     /// is also accepted as a bearer, and open mode (no password) passes everything.
     pub agent_token: Option<String>,
-    /// Persistent target device identifier for WDA bring-up and recovery.
+    /// Persistent target device identifier for runner bring-up and recovery.
     ///
     /// Without this, an idle restart or browser reconnect re-ran auto-detection
     /// and could silently select a different iPhone on a multi-device Mac.
@@ -75,7 +75,11 @@ impl Config {
     /// &str>` (or similar) to avoid side-effects on the real environment.
     pub fn from_map(lookup: impl Fn(&str) -> Option<String>) -> Config {
         let get = |key: &str| {
-            lookup(key).or_else(|| core::env::legacy_name(key).and_then(|old| lookup(&old)))
+            lookup(key).or_else(|| {
+                core::env::legacy_names(key)
+                    .into_iter()
+                    .find_map(|old| lookup(&old))
+            })
         };
         let host = get("IPHONE_USE_HOST")
             .filter(|s| !s.is_empty())

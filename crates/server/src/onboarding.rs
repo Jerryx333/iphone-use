@@ -2,7 +2,7 @@
 //!
 //! They find the installed daemon of one instance (`--instance`, else
 //! `IPHONE_USE_INSTANCE`, else the default) through its LaunchAgent, so a
-//! person never has to know where `setup-wda.sh` lives, which port the daemon
+//! person never has to know where `setup-runner.sh` lives, which port the daemon
 //! took, or what the agent token is.
 
 use std::time::{Duration, Instant};
@@ -60,7 +60,7 @@ impl Target {
     }
 
     fn setup_script(&self) -> std::path::PathBuf {
-        self.instance.state_dir.join("setup-wda.sh")
+        self.instance.state_dir.join("setup-runner.sh")
     }
 
     fn named(&self) -> Option<&str> {
@@ -78,9 +78,12 @@ impl Target {
 }
 
 fn plist_env(label: &str, key: &str) -> Option<String> {
-    // A plist written before the rename spells the key PHONE_REMOTE_*.
-    plist_env_as(label, key)
-        .or_else(|| core::env::legacy_name(key).and_then(|old| plist_env_as(label, &old)))
+    // A plist written before a rename spells the key the old way.
+    plist_env_as(label, key).or_else(|| {
+        core::env::legacy_names(key)
+            .into_iter()
+            .find_map(|old| plist_env_as(label, &old))
+    })
 }
 
 fn plist_env_as(label: &str, key: &str) -> Option<String> {
@@ -134,7 +137,7 @@ pub fn run_mcp(target: &Target, args: &[String]) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// setup / doctor: the instance's own setup-wda.sh
+// setup / doctor: the instance's own setup-runner.sh
 // ---------------------------------------------------------------------------
 
 pub fn run_setup(target: &Target, args: &[String]) -> i32 {

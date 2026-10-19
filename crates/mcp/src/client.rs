@@ -53,9 +53,11 @@ fn daemon_target(
 
 /// One `EnvironmentVariables` value from `~/Library/LaunchAgents/<label>.plist`.
 fn launch_agent_env(label: &str, key: &str) -> Option<String> {
-    // A plist written before the rename spells the key PHONE_REMOTE_*.
+    // A plist written before a rename spells the key the old way.
     launch_agent_env_as(label, key).or_else(|| {
-        iu_core::env::legacy_name(key).and_then(|old| launch_agent_env_as(label, &old))
+        iu_core::env::legacy_names(key)
+            .into_iter()
+            .find_map(|old| launch_agent_env_as(label, &old))
     })
 }
 
@@ -119,7 +121,7 @@ const ELEMENTS_TIMEOUT: Duration = Duration::from_secs(45);
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
 const ACTIONS_TIMEOUT: Duration = Duration::from_secs(90);
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(120);
-/// One live-panel frame: a WDA capture takes 0.5–1.5 s, the cached paths
+/// One live-panel frame: a runner capture takes 0.5–1.5 s, the cached paths
 /// milliseconds; anything slower is skipped and the next poll tries again.
 const SCREEN_FRAME_TIMEOUT: Duration = Duration::from_secs(6);
 /// App lookup by name may read the phone's inventory cold: two devicectl
@@ -574,8 +576,8 @@ impl DaemonClient {
         let req = self.auth(self.http().get(self.url("/agent/status")));
         let resp = req.send().await?;
         let resp = check_status(resp).await?;
-        let body: StatusResponse = resp.json().await?;
-        Ok(body)
+        let body: serde_json::Value = resp.json().await?;
+        Ok(crate::types::status_from_any_release(body)?)
     }
 
     /// `GET /agent/capabilities` — what this build supports and whether the
@@ -829,11 +831,11 @@ impl DaemonClient {
     }
 
     async fn elements_at(&self, path: &str) -> anyhow::Result<String> {
-        // A cold WDA call may create a session and then request the source tree;
+        // A cold runner call may create a session and then request the source tree;
         // each upstream step is bounded by the daemon, but together can exceed
         // the generic 30-second MCP timeout. Wait long enough for the daemon to
         // return its authoritative success/error instead of abandoning the
-        // request while it still owns the WDA lock.
+        // request while it still owns the runner lock.
         let req = self
             .auth(self.http().get(self.url(path)))
             .timeout(ELEMENTS_TIMEOUT);
@@ -852,7 +854,7 @@ impl DaemonClient {
     }
 
     /// `POST /agent/mode {"mode":"agent"}` — reconnect the configured,
-    /// canonical Direct/WDA target. Target changes are deliberately not exposed
+    /// canonical Direct/runner target. Target changes are deliberately not exposed
     /// here; they require persistent configuration plus a daemon restart.
     pub async fn reconnect(&self) -> anyhow::Result<String> {
         let req = self
@@ -1676,9 +1678,9 @@ mod tests {
             "ok": true,
             "backend": "direct",
             
-            "wda": true,
-            "wda_actionable": false,
-            "wda_locked": true,
+            "runner": true,
+            "runner_actionable": false,
+            "runner_locked": true,
             "drivable": false,
             "device_state": "locked",
             "screen_state": "waiting",
@@ -1696,7 +1698,7 @@ mod tests {
         assert_eq!(status.backend.as_deref(), Some("direct"));
         assert_eq!(status.device_state.as_deref(), Some("locked"));
         assert_eq!(status.screen_state.as_deref(), Some("waiting"));
-        assert_eq!(status.wda_actionable, Some(false));
+        assert_eq!(status.runner_actionable, Some(false));
         assert_eq!(status.locked, Some(true));
         assert_eq!(status.drivable, Some(false));
         assert_eq!(status.released, Some(false));
@@ -1864,7 +1866,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_tree_fails_before_any_tap() {
         let (url, task, requests) =
-            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"wda_source_failed"}"#)]);
+            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"runner_source_failed"}"#)]);
 
         let failure = DaemonClient::new(url, None)
             .tap_label_observed("发布", false)
