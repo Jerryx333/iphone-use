@@ -6373,7 +6373,7 @@ fn rect_union_area_clipped(rects: &[[f64; 4]], screen_width: f64, screen_height:
 /// How many recent element trees the daemon retains for `?since=` diffs.
 /// An agent diffs against its own previous read, so a handful is plenty; a
 /// miss simply degrades to the full tree.
-const ELEMENT_SNAPSHOT_CACHE_CAP: usize = 8;
+const ELEMENT_SNAPSHOT_CACHE_CAP: usize = 16;
 
 /// Retain `rows` under its snapshot token so a later `?since=` can diff
 /// against it. Re-serving an already-cached snapshot refreshes its position.
@@ -11863,9 +11863,34 @@ async fn agent_actions_inner(
         if let Some((snapshot, rows)) = observed {
             let rows = Arc::new(rows);
             remember_element_snapshot(&state, &snapshot, &rows);
+            // Like an observed single action: against the last screen this
+            // owner saw, answer with what changed. Every batch used to
+            // carry the whole tree (Photos 精选集: 230 rows per batch).
+            let baseline = owner_last_snapshot(&state, &headers).and_then(|since| {
+                lookup_element_snapshot(&state, &since).map(|rows| (since, rows))
+            });
             note_owner_snapshot(&state, &headers, &snapshot);
             result["snapshot"] = serde_json::json!(snapshot);
-            result["elements"] = serde_json::json!(&*rows);
+            match baseline {
+                Some((baseline_id, baseline_rows)) => {
+                    let delta = diff_element_rows(&baseline_rows, &rows);
+                    if let Some(changed) = app_changed_json(&baseline_rows, &rows) {
+                        result["app_changed"] = changed;
+                    }
+                    // Nothing in common (another app, another screen): the
+                    // whole tree is no bigger than a delta of it.
+                    if delta.unchanged == 0 && !rows.is_empty() {
+                        result["elements"] = serde_json::json!(&*rows);
+                    } else {
+                        result["baseline"] = serde_json::json!(baseline_id);
+                        result["delta"] = elements_delta_json(&delta, &rows);
+                        if delta_shows_no_visible_change(&delta, &report) {
+                            result["no_visible_change"] = serde_json::Value::Bool(true);
+                        }
+                    }
+                }
+                None => result["elements"] = serde_json::json!(&*rows),
+            }
         }
         result["settle"] = report.to_json();
         if let Some(alert) = alert_json(probe_alert(&mut w).await) {
@@ -12196,6 +12221,130 @@ fn near_miss_candidates(rows: &[crate::runner::ElementRow], label: &str) -> Vec<
         .collect()
 }
 
+/// How [`run_scroll_find`] ended.
+struct FindRun {
+    verdict: FindVerdict,
+    /// The last page read; the verdict is about it.
+    page: crate::collect::Page,
+    swipes: u32,
+    stop_error: Option<(&'static str, String)>,
+    /// `page` is the screen as it stands: no gesture went out after it was
+    /// read (a failed read after a swipe leaves an older page).
+    current: bool,
+    /// Near misses seen on earlier pages and gone from the last one.
+    seen_earlier: Vec<serde_json::Value>,
+}
+
+/// Near misses kept from pages a swipe carried away.
+const SEEN_EARLIER_CAP: usize = 5;
+
+/// Look for `request.label` on `page`, swiping toward it at most
+/// `max_swipes` times. Every way out reads the screen after its last
+/// gesture: a swipe that reports failure may still have scrolled (hardware,
+/// Photos › 相簿: the third swipe "failed", the target was on screen), so the
+/// page is read once more and judged before giving up.
+async fn run_scroll_find<P: crate::collect::Pager>(
+    pager: &mut P,
+    mut page: crate::collect::Page,
+    request: &crate::collect::FindRequest,
+    deadline: tokio::time::Instant,
+) -> FindRun {
+    let mut swipes = 0u32;
+    let mut stop_error: Option<(&'static str, String)> = None;
+    let mut current = true;
+    let mut pages_read = 1u32;
+    let mut seen: Vec<(u32, serde_json::Value)> = Vec::new();
+    let mut note_near_misses = |page: &crate::collect::Page, number: u32| {
+        for candidate in near_miss_candidates(&page.rows, &request.label) {
+            let known = seen
+                .iter()
+                .any(|(_, old)| old["label"] == candidate["label"] && old["kind"] == candidate["kind"]);
+            if !known && seen.len() < SEEN_EARLIER_CAP * 2 {
+                seen.push((number, candidate));
+            }
+        }
+    };
+    let verdict = loop {
+        let verdict = find_verdict(&page.rows, &request.label, request.kind.as_deref());
+        if matches!(verdict, FindVerdict::NotFound) {
+            note_near_misses(&page, pages_read);
+        }
+        let direction = match &verdict {
+            FindVerdict::NotFound => request.direction,
+            // Toward the row: below the screen means reveal what is below.
+            FindVerdict::OffScreen(index) => {
+                let bottom = screen_rect(&page.rows).map(|[_, y, _, h]| y + h);
+                match (element_center(&page.rows[*index]), bottom) {
+                    (Some((_, cy)), Some(bottom)) if cy > bottom => crate::collect::Direction::Down,
+                    (Some((_, cy)), _) if cy < 0.0 => crate::collect::Direction::Up,
+                    _ => request.direction,
+                }
+            }
+            _ => break verdict,
+        };
+        if swipes >= request.max_swipes {
+            break verdict;
+        }
+        if crate::collect::too_late_to_swipe(deadline) {
+            stop_error = Some(("deadline", "the call's time budget ran out".to_string()));
+            break verdict;
+        }
+        if let Err(error) = pager.swipe(request.region, direction).await {
+            stop_error = Some(("swipe_failed", format!("{error:#}")));
+            // The gesture may have landed anyway: judge the screen it left.
+            match pager.read().await {
+                Ok(next) => {
+                    page = next;
+                    pages_read += 1;
+                    let verdict =
+                        find_verdict(&page.rows, &request.label, request.kind.as_deref());
+                    if matches!(verdict, FindVerdict::NotFound) {
+                        note_near_misses(&page, pages_read);
+                    }
+                    break verdict;
+                }
+                Err(_) => {
+                    current = false;
+                    break verdict;
+                }
+            }
+        }
+        swipes += 1;
+        match pager.read().await {
+            Ok(next) => {
+                page = next;
+                pages_read += 1;
+            }
+            Err(error) => {
+                stop_error = Some(("read_failed", format!("{error:#}")));
+                current = false;
+                break verdict;
+            }
+        }
+    };
+    let on_last: Vec<serde_json::Value> = near_miss_candidates(&page.rows, &request.label);
+    let seen_earlier = seen
+        .into_iter()
+        .filter(|(_, candidate)| {
+            !on_last
+                .iter()
+                .any(|last| last["label"] == candidate["label"] && last["kind"] == candidate["kind"])
+        })
+        .take(SEEN_EARLIER_CAP)
+        .map(|(number, candidate)| {
+            serde_json::json!({"kind": candidate["kind"], "label": candidate["label"], "page": number})
+        })
+        .collect();
+    FindRun {
+        verdict,
+        page,
+        swipes,
+        stop_error,
+        current,
+        seen_earlier,
+    }
+}
+
 /// `POST /agent/scroll_find` — `{"label":"…","kind":"Button","max_swipes":1,
 /// "direction":"down","region":[x,y,w,h]}`: is the label on screen and
 /// tappable? If not, swipe (at most `max_swipes`, default 1) and look again.
@@ -12231,7 +12380,7 @@ async fn agent_scroll_find(
         first_page: None,
     };
     use crate::collect::Pager as _;
-    let mut page = match pager.read().await {
+    let page = match pager.read().await {
         Ok(page) => page,
         Err(error) => {
             drop(w);
@@ -12241,45 +12390,17 @@ async fn agent_scroll_find(
     if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
         return refusal;
     }
-    let mut swipes = 0u32;
-    let mut stop_error: Option<(&'static str, String)> = None;
-    let verdict = loop {
-        let verdict = find_verdict(&page.rows, &request.label, request.kind.as_deref());
-        let direction = match &verdict {
-            FindVerdict::NotFound => request.direction,
-            // Toward the row: below the screen means reveal what is below.
-            FindVerdict::OffScreen(index) => {
-                let bottom = screen_rect(&page.rows).map(|[_, y, _, h]| y + h);
-                match (element_center(&page.rows[*index]), bottom) {
-                    (Some((_, cy)), Some(bottom)) if cy > bottom => crate::collect::Direction::Down,
-                    (Some((_, cy)), _) if cy < 0.0 => crate::collect::Direction::Up,
-                    _ => request.direction,
-                }
-            }
-            _ => break verdict,
-        };
-        if swipes >= request.max_swipes {
-            break verdict;
-        }
-        if crate::collect::too_late_to_swipe(deadline) {
-            stop_error = Some(("deadline", "the call's time budget ran out".to_string()));
-            break verdict;
-        }
-        if let Err(error) = pager.swipe(request.region, direction).await {
-            stop_error = Some(("swipe_failed", format!("{error:#}")));
-            break verdict;
-        }
-        swipes += 1;
-        match pager.read().await {
-            Ok(next) => page = next,
-            Err(error) => {
-                stop_error = Some(("read_failed", format!("{error:#}")));
-                break verdict;
-            }
-        }
-    };
+    let FindRun {
+        verdict,
+        page,
+        swipes,
+        stop_error,
+        current,
+        seen_earlier,
+    } = run_scroll_find(&mut pager, page, &request, deadline).await;
     drop(w);
     let mut body = serde_json::json!({"swipes": swipes, "max_swipes": request.max_swipes});
+    let found = matches!(verdict, FindVerdict::Found(_));
     if let Some(app) = active_application(&page.rows).filter(|app| !app.is_empty()) {
         body["app"] = app.into();
     }
@@ -12322,17 +12443,26 @@ async fn agent_scroll_find(
             body["stop_reason"] = "not_found".into();
             body["candidates"] = near_miss_candidates(&page.rows, &request.label).into();
             body["hint"] = "no row carries exactly this label after the allowed swipes; candidates are on-screen labels that contain it. Absence is not proof: check the screen before swiping again".into();
+            if !seen_earlier.is_empty() {
+                body["hint"] = "no row carries exactly this label after the allowed swipes; candidates are on-screen labels that contain it, seen_earlier lists ones a swipe carried off the screen (swipe back the other way to reach them). Absence is not proof: check the screen before swiping again".into();
+            }
         }
     }
-    if !matches!(verdict, FindVerdict::Found(_)) {
+    if !found {
         body["ok"] = false.into();
         body["found"] = false.into();
+        // Near misses a swipe carried off the screen: the row the caller
+        // meant may be among them, one swipe back.
+        if !seen_earlier.is_empty() {
+            body["seen_earlier"] = seen_earlier.into();
+        }
     }
-    // After a failed swipe or read the last tree read is no longer the
-    // screen: no snapshot to act on.
-    let current = !matches!(stop_error, Some(("swipe_failed" | "read_failed", _)));
+    // A found label wins over a failed gesture: the read after it showed
+    // the row, so the error is only reported alongside.
     if let Some((reason, error)) = stop_error {
-        body["stop_reason"] = reason.into();
+        if !found {
+            body["stop_reason"] = reason.into();
+        }
         body["stop_error"] = error.into();
     }
     if let Some(snapshot) = current.then(|| remember_page(&state, &headers, page.rows)).flatten() {
@@ -13268,18 +13398,21 @@ async fn agent_input_inner(
                             // carrying the token. Read before noting the new one.
                             let owner_baseline = owner_last_snapshot(&state, &headers);
                             note_owner_snapshot(&state, &headers, &snapshot);
-                            let baseline = query
-                                .since
-                                .as_deref()
-                                .filter(|since| !since.is_empty())
-                                .or_else(|| {
-                                    value.get("snapshot").and_then(serde_json::Value::as_str)
-                                })
-                                .or(owner_baseline.as_deref())
-                                .and_then(|since| {
-                                    lookup_element_snapshot(&state, since)
-                                        .map(|baseline| (since, baseline))
-                                });
+                            // The first of these still cached: a named
+                            // baseline evicted from the cache falls back to
+                            // the owner's last screen rather than to the
+                            // whole tree.
+                            let baseline = [
+                                query.since.as_deref().filter(|since| !since.is_empty()),
+                                value.get("snapshot").and_then(serde_json::Value::as_str),
+                                owner_baseline.as_deref(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .find_map(|since| {
+                                lookup_element_snapshot(&state, since)
+                                    .map(|baseline| (since, baseline))
+                            });
                             match baseline {
                                 Some((baseline_id, baseline_rows)) => {
                                     let delta = diff_element_rows(&baseline_rows, &rows);
@@ -18840,8 +18973,10 @@ async fn agent_screenshot(
     let count = marks.len();
     let snapshot = element_snapshot_id(&rows).ok();
     if let Some(snapshot) = &snapshot {
+        // Not the owner's delta baseline: the caller gets the picture, not
+        // these rows, so a later batch diffed against them could not be
+        // rebuilt into a screen.
         remember_element_snapshot(&state, snapshot, &Arc::new(rows));
-        note_owner_snapshot(&state, &headers, snapshot);
     }
     let source = png.clone();
     let drawn = tokio::task::spawn_blocking(move || {
