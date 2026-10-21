@@ -411,6 +411,10 @@ pub struct FlowTrail {
     /// An explicit recording (`POST /agent/flow/record`): every applied step
     /// lands here too, across apps and pauses, until it is stopped or saved.
     recording: Option<Trail>,
+    /// Keep the stopped draft until saved or replaced so a lost stop reply
+    /// can be recovered by a read-only status request.
+    stopped_recording: Option<Value>,
+    recording_revision: u64,
 }
 
 /// Single actions in a row before the agent is told to batch.
@@ -431,7 +435,7 @@ pub enum Converted {
 /// Translate one `/agent/input` action into a flow step. `rows` is the element
 /// tree the action's `snapshot` token referred to, so a snapshot-index tap
 /// becomes a durable locator instead of an index that means nothing tomorrow.
-pub fn convert_action(action: &Value, rows: Option<&[crate::wda::ElementRow]>) -> Converted {
+pub fn convert_action(action: &Value, rows: Option<&[crate::runner::ElementRow]>) -> Converted {
     let typ = action.get("type").and_then(Value::as_str).unwrap_or("");
     let num = |k: &str| action.get(k).and_then(Value::as_f64);
     let copy = |kind: &str, keys: &[&str]| {
@@ -485,12 +489,12 @@ pub fn convert_action(action: &Value, rows: Option<&[crate::wda::ElementRow]>) -
 
 /// A durable locator for a tree row. Never the snapshot index.
 ///
-/// An identifier stands ALONE: `tap_locator` re-resolves through WDA, which
+/// An identifier stands ALONE: `tap_locator` re-resolves through runner, which
 /// can query an identifier only by itself (accessibility id) — paired with
 /// `kind` it degrades to a kind-only query and every key on a keypad matches
 /// (hardware: Calculator `{identifier:"One",kind:"Key"}` → ambiguous).
 /// Without one, label + kind.
-pub fn locator_for_row(row: &crate::wda::ElementRow) -> Option<Value> {
+pub fn locator_for_row(row: &crate::runner::ElementRow) -> Option<Value> {
     if let Some(identifier) = row.identifier.as_deref().filter(|s| !s.trim().is_empty()) {
         return Some(json!({ "identifier": identifier }));
     }
@@ -607,6 +611,8 @@ impl FlowTrail {
 
     /// Start an explicit recording, dropping one in progress.
     pub fn start_recording(&mut self) {
+        self.recording_revision = self.recording_revision.wrapping_add(1);
+        self.stopped_recording = None;
         self.recording = Some(Trail::default());
     }
 
@@ -623,13 +629,37 @@ impl FlowTrail {
     /// recording or it holds no step).
     pub fn stop_recording(&mut self) -> Option<Value> {
         let recording = self.recording.take()?;
-        (!recording.steps.is_empty()).then(|| draft_json(&recording, "recording"))
+        let draft = (!recording.steps.is_empty()).then(|| draft_json(&recording, "recording"));
+        self.stopped_recording = draft.clone();
+        draft
     }
 
-    /// The recording's draft so far, without stopping it.
+    /// The active draft, or the unsaved stopped draft until a new recording starts.
     pub fn recording_draft(&self) -> Option<Value> {
-        let recording = self.recording.as_ref()?;
+        let Some(recording) = self.recording.as_ref() else {
+            return self.stopped_recording.clone();
+        };
         (!recording.steps.is_empty()).then(|| draft_json(recording, "recording"))
+    }
+
+    /// Saving without an explicit document uses the recording, including a
+    /// stopped one whose response was lost, before an unrelated task trail.
+    pub fn draft_for_save(&mut self) -> Option<Value> {
+        self.stop_recording().or_else(|| self.recording_draft()).or_else(|| self.draft())
+    }
+
+    pub fn recording_revision(&self) -> u64 {
+        self.recording_revision
+    }
+
+    /// A successful save acknowledges only the exact stopped document that
+    /// was saved. Another recording started during the write stays intact.
+    pub fn acknowledge_recording(&mut self, flow: &Value, revision: u64) {
+        if revision == self.recording_revision
+            && self.stopped_recording.as_ref().and_then(|draft| draft.get("flow")) == Some(flow)
+        {
+            self.stopped_recording = None;
+        }
     }
 
     fn record_into_recording(&mut self, converted: &Converted, now: Instant) {
@@ -903,47 +933,12 @@ pub fn mcp_binary() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Kinds a person's tap means to hit (the smallest one under the finger wins).
-const TAPPABLE: [&str; 15] = [
-    "Button",
-    "Cell",
-    "Link",
-    "Key",
-    "Switch",
-    "Toggle",
-    "TextField",
-    "SecureTextField",
-    "SearchField",
-    "TextView",
-    "Tab",
-    "Icon",
-    "MenuItem",
-    "SegmentedControl",
-    "StaticText",
-];
-
-/// What a person's tap at `(x, y)` (points) hit, as a durable locator: the
-/// smallest visible, tappable element under the point that has a label or an
-/// identifier. `None` falls back to recording the coordinate.
-pub fn locator_at(rows: &[crate::wda::ElementRow], x: f64, y: f64) -> Option<Value> {
-    rows.iter()
-        .filter(|row| TAPPABLE.contains(&row.kind.as_str()))
-        .filter(|row| row.visible != Some(false))
-        .filter(|row| {
-            let [rx, ry, rw, rh] = row.rect;
-            rw > 0.0 && rh > 0.0 && x >= rx && x <= rx + rw && y >= ry && y <= ry + rh
-        })
-        .filter_map(|row| locator_for_row(row).map(|locator| (row.rect[2] * row.rect[3], locator)))
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, locator)| locator)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(kind: &str, label: &str, identifier: Option<&str>) -> crate::wda::ElementRow {
-        crate::wda::ElementRow {
+    fn row(kind: &str, label: &str, identifier: Option<&str>) -> crate::runner::ElementRow {
+        crate::runner::ElementRow {
             kind: kind.into(),
             label: label.into(),
             identifier: identifier.map(str::to_string),
@@ -951,8 +946,8 @@ mod tests {
         }
     }
 
-    fn at(kind: &str, label: &str, rect: [f64; 4]) -> crate::wda::ElementRow {
-        crate::wda::ElementRow { rect, ..row(kind, label, None) }
+    fn at(kind: &str, label: &str, rect: [f64; 4]) -> crate::runner::ElementRow {
+        crate::runner::ElementRow { rect, ..row(kind, label, None) }
     }
 
     #[test]
@@ -961,7 +956,7 @@ mod tests {
             at("Cell", "电池", [0.0, 100.0, 400.0, 44.0]),
             at("StaticText", "电池", [16.0, 110.0, 40.0, 20.0]),
             at("Button", "", [300.0, 100.0, 100.0, 44.0]),
-            crate::wda::ElementRow { visible: Some(false), ..at("Button", "隐藏", [0.0, 100.0, 10.0, 10.0]) },
+            crate::runner::ElementRow { visible: Some(false), ..at("Button", "隐藏", [0.0, 100.0, 10.0, 10.0]) },
         ];
         // On the text: the text (smallest) wins.
         assert_eq!(locator_at(&rows, 20.0, 115.0).unwrap()["label"], "电池");
@@ -999,7 +994,19 @@ mod tests {
         );
         assert!(draft.to_string().contains("a pinch"), "unsupported steps become todo: {draft}");
         assert!(!trail.is_recording());
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "recover a lost stop reply");
         assert!(trail.stop_recording().is_none());
+        assert_eq!(trail.draft_for_save(), Some(draft.clone()), "save the stopped recording, not the recent task");
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "a duplicate stop must not erase it");
+        let revision = trail.recording_revision();
+        trail.acknowledge_recording(&json!({"steps": []}), revision);
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "saving another document must not discard it");
+        trail.acknowledge_recording(&draft["flow"], revision.wrapping_sub(1));
+        assert_eq!(trail.recording_draft(), Some(draft.clone()), "an old save must not acknowledge a later recording");
+        trail.acknowledge_recording(&draft["flow"], revision);
+        assert!(trail.recording_draft().is_none(), "a successfully saved draft is no longer pending");
+        trail.start_recording();
+        assert!(trail.recording_draft().is_none(), "a new recording clears the old draft");
     }
 
     fn store(dir: &Path) -> PathBuf {
@@ -1221,4 +1228,26 @@ mod tests {
             assert!(write_app_notes(&notes, bad, "x").is_err(), "{bad}");
         }
     }
+}
+
+/// Kinds a person's tap means to hit (the smallest one under the finger wins).
+const TAPPABLE: [&str; 15] = [
+    "Button", "Cell", "Link", "Key", "Switch", "Toggle", "TextField", "SecureTextField",
+    "SearchField", "TextView", "Tab", "Icon", "MenuItem", "SegmentedControl", "StaticText",
+];
+
+/// What a person's tap at `(x, y)` (points) hit, as a durable locator: the
+/// smallest visible, tappable element under the point that has a label or an
+/// identifier. `None` falls back to recording the coordinate.
+pub fn locator_at(rows: &[crate::runner::ElementRow], x: f64, y: f64) -> Option<Value> {
+    rows.iter()
+        .filter(|row| TAPPABLE.contains(&row.kind.as_str()))
+        .filter(|row| row.visible != Some(false))
+        .filter(|row| {
+            let [rx, ry, rw, rh] = row.rect;
+            rw > 0.0 && rh > 0.0 && x >= rx && x <= rx + rw && y >= ry && y <= ry + rh
+        })
+        .filter_map(|row| locator_for_row(row).map(|locator| (row.rect[2] * row.rect[3], locator)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, locator)| locator)
 }

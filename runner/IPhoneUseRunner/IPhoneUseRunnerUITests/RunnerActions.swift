@@ -84,7 +84,7 @@ enum W3CActions {
   }
 }
 
-/// WDA / W3C element reference objects.
+/// runner / W3C element reference objects.
 enum ElementReference {
   static let w3cKey = "element-6066-11e4-a52e-4f735466cecf"
 
@@ -229,5 +229,28 @@ enum ScrollDrag {
       ["type": "pointerMove", "duration": tailMs, "x": Double(end.x), "y": Double(end.y)],
       ["type": "pointerUp", "button": 0],
     ]
+  }
+}
+
+/// Preserve the Home event's dismissal semantics; activate the desktop only when it did not arrive.
+enum HomeAction {
+  static func run(
+    press: () throws -> Void, isDesktop: () -> Bool, activate: () throws -> Void,
+    now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+    sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+  ) throws {
+    func wait(_ timeout: TimeInterval) -> Bool {
+      let deadline = now() + timeout
+      repeat {
+        if isDesktop() { return true }
+        let remaining = deadline - now()
+        if remaining <= 0 { return false }
+        sleep(min(0.05, remaining))
+      } while true
+    }
+    try press()
+    if wait(0.8) { return }
+    try activate()
+    guard wait(2) else { throw RunnerError.failed("home failed: SpringBoard did not become foreground") }
   }
 }

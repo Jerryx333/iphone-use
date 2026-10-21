@@ -260,12 +260,12 @@ opened 成功后双向原样复制字节，正确传播半关闭（单侧 EOF �
 
 Mac 联调（2026-10-13，未接真机）：真实 gateway + 在 macOS 上编译的 `RemoteTunnel.swift` + 本地 echo / 流式服务，5 轮 4MB 往返与 8MB 服务端推流、4 路 echo 并发 + 1 路推流均逐字节一致；端口不在映射里时本地连接在 `tunnel_wait` 后关闭；gateway 重启期间手机侧按 1/2/4s 退避，恢复后补满空闲池并可正常转发。
 
-部署注意：Mac 本机 8100 可能已被其他程序占用，转发端口不要默认用 8100/9100，daemon 侧用 `IPHONE_USE_WDA_URL` / `IPHONE_USE_WDA_MJPEG_URL` 指向实际转发地址。
+部署注意：Mac 本机 8100 可能已被其他程序占用，转发端口不要默认用 8100/9100，daemon 侧用 `IPHONE_USE_RUNNER_URL` / `IPHONE_USE_RUNNER_MJPEG_URL` 指向实际转发地址。
 
 
 ## 14. daemon 外部托管模式（P2）
 
-设置 `IPHONE_USE_WDA_MANAGED=false`，并用 `IPHONE_USE_SELFRUNNER_GATEWAY=http://127.0.0.1:7382` 指向本机 phone-gateway。只接受 loopback HTTP 地址；无效配置会告警并忽略。未配置 gateway 时保留原有外部托管行为。
+设置 `IPHONE_USE_RUNNER_MANAGED=false`，并用 `IPHONE_USE_SELFRUNNER_GATEWAY=http://127.0.0.1:7382` 指向本机 phone-gateway。只接受 loopback HTTP 地址；无效配置会告警并忽略。未配置 gateway 时保留原有外部托管行为。
 
 `IPHONE_USE_SELFRUNNER_GATEWAY_TOKEN_FILE` 可覆盖 token 文件路径。默认读取 `$PHONE_GATEWAY_HOME/client-token`；未设置 `PHONE_GATEWAY_HOME` 时读取 `~/.config/phone-gateway/client-token`。每次请求重新读取 token，不在日志、status 或错误中输出它。daemon 不读取或处理手机密码，解锁密码由 gateway 从 Mac 钥匙串取得。
 

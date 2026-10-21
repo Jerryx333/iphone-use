@@ -1,0 +1,41 @@
+{
+  "active": true,
+  "assistant_turns": 11,
+  "audio": {
+    "category": "AVAudioSessionCategoryPlayAndRecord",
+    "engine_running": true,
+    "graph_restarts": 1,
+    "input_buffers": 2606,
+    "input_ports": [
+      "MicrophoneBuiltIn"
+    ],
+    "mode": "AVAudioSessionModeVoiceChat",
+    "output_ports": [
+      "Speaker"
+    ],
+    "output_volume": 0.20000000298023224,
+    "peak_input": 0.17405299842357635,
+    "recognition_events": 46,
+    "recognition_failures": 0,
+    "recognition_present": true,
+    "record_permission": true,
+    "scheduled_frames": 9331769,
+    "speech_permission": true,
+    "tts_packets": 16753,
+    "using_local_recognition": true
+  },
+  "connecting": false,
+  "current_tool": "phone",
+  "has_error": false,
+  "muted": false,
+  "observed_at": "2026-10-11T19:37:23Z",
+  "paused": false,
+  "phone_available": true,
+  "schema": 1,
+  "speaking": true,
+  "task_active": false,
+  "task_state": "failed",
+  "thinking": false,
+  "transcript_length": 4,
+  "user_turns": 7
+}

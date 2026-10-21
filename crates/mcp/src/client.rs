@@ -53,9 +53,11 @@ fn daemon_target(
 
 /// One `EnvironmentVariables` value from `~/Library/LaunchAgents/<label>.plist`.
 fn launch_agent_env(label: &str, key: &str) -> Option<String> {
-    // A plist written before the rename spells the key PHONE_REMOTE_*.
+    // A plist written before a rename spells the key the old way.
     launch_agent_env_as(label, key).or_else(|| {
-        iu_core::env::legacy_name(key).and_then(|old| launch_agent_env_as(label, &old))
+        iu_core::env::legacy_names(key)
+            .into_iter()
+            .find_map(|old| launch_agent_env_as(label, &old))
     })
 }
 
@@ -119,7 +121,7 @@ const ELEMENTS_TIMEOUT: Duration = Duration::from_secs(45);
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
 const ACTIONS_TIMEOUT: Duration = Duration::from_secs(90);
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(120);
-/// One live-panel frame: a WDA capture takes 0.5–1.5 s, the cached paths
+/// One live-panel frame: a runner capture takes 0.5–1.5 s, the cached paths
 /// milliseconds; anything slower is skipped and the next poll tries again.
 const SCREEN_FRAME_TIMEOUT: Duration = Duration::from_secs(6);
 /// App lookup by name may read the phone's inventory cold: two devicectl
@@ -167,7 +169,11 @@ pub(crate) fn actions_text_allowance(body: &serde_json::Value) -> Duration {
 /// `POST /agent/input` endpoints.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
-    client: Client,
+    /// HTTP pools/TLS are initialized by the first daemon request, never by
+    /// MCP initialize/tools/list. HTTP sessions share the same pool.
+    client: std::sync::Arc<std::sync::OnceLock<Client>>,
+    connect_timeout: Duration,
+    request_timeout: Duration,
     base_url: String,
     token: Option<String>,
     /// Sent as `X-Phone-Owner` on every control request so the daemon can
@@ -319,13 +325,10 @@ impl DaemonClient {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Self {
-        let client = Client::builder()
-            .connect_timeout(connect_timeout)
-            .timeout(request_timeout)
-            .build()
-            .expect("reqwest client construction is infallible");
         Self {
-            client,
+            client: std::sync::Arc::default(),
+            connect_timeout,
+            request_timeout,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token,
             owner: std::env::var("IPHONE_USE_OWNER")
@@ -337,6 +340,16 @@ impl DaemonClient {
             call_kind: None,
             run_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn http(&self) -> &Client {
+        self.client.get_or_init(|| {
+            Client::builder()
+                .connect_timeout(self.connect_timeout)
+                .timeout(self.request_timeout)
+                .build()
+                .expect("reqwest client construction is infallible")
+        })
     }
 
     fn remember_snapshot(&self, json: Option<&serde_json::Value>) {
@@ -438,7 +451,7 @@ impl DaemonClient {
             "action": "start", "run_id": run_id, "complete_trace": complete_trace
         });
         let req = self
-            .auth(self.client.post(self.url("/agent/run")))
+            .auth(self.http().post(self.url("/agent/run")))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
         let resp = check_status(req.send().await?).await?;
@@ -464,7 +477,7 @@ impl DaemonClient {
             body["turn_ids"] = serde_json::json!(turns);
         }
         let req = self
-            .auth(self.client.post(self.url("/agent/run")))
+            .auth(self.http().post(self.url("/agent/run")))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
         // A refused end (any HTTP error, or a body without ok:true) keeps
@@ -483,7 +496,7 @@ impl DaemonClient {
 
     pub async fn hold(&self, secs: u64, private: bool) -> anyhow::Result<String> {
         let req = self
-            .auth(self.client.post(self.url("/agent/hold")))
+            .auth(self.http().post(self.url("/agent/hold")))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
             .body(serde_json::json!({ "secs": secs, "private": private }).to_string());
@@ -498,7 +511,7 @@ impl DaemonClient {
     /// the owner lease for it.
     pub async fn prewarm(&self, reason: &str) -> anyhow::Result<String> {
         let req = self
-            .auth(self.client.post(self.url("/agent/prewarm")))
+            .auth(self.http().post(self.url("/agent/prewarm")))
             .timeout(Duration::from_secs(15))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
@@ -511,7 +524,7 @@ impl DaemonClient {
     /// `POST /agent/owner {"release":true}` — hand the phone lease back.
     pub async fn release_owner(&self) -> anyhow::Result<String> {
         let req = self
-            .auth(self.client.post(self.url("/agent/owner")))
+            .auth(self.http().post(self.url("/agent/owner")))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
             .body(r#"{"release":true}"#);
@@ -528,7 +541,7 @@ impl DaemonClient {
     /// Authenticated GET returning the raw body (2xx only). Used for
     /// endpoints the typed client does not model yet, e.g. `/agent/apps`.
     pub async fn get_text(&self, path: &str) -> anyhow::Result<String> {
-        let resp = self.auth(self.client.get(self.url(path))).send().await?;
+        let resp = self.auth(self.http().get(self.url(path))).send().await?;
         let resp = check_status(resp).await?;
         Ok(resp.text().await?)
     }
@@ -553,18 +566,18 @@ impl DaemonClient {
             params.push(("limit", limit.to_string()));
         }
         let req = self
-            .auth(self.client.get(self.url("/agent/apps")))
+            .auth(self.http().get(self.url("/agent/apps")))
             .query(&params)
             .timeout(APPS_LOOKUP_TIMEOUT);
         read_response(req.send().await?).await
     }
 
     pub async fn status(&self) -> anyhow::Result<StatusResponse> {
-        let req = self.auth(self.client.get(self.url("/agent/status")));
+        let req = self.auth(self.http().get(self.url("/agent/status")));
         let resp = req.send().await?;
         let resp = check_status(resp).await?;
-        let body: StatusResponse = resp.json().await?;
-        Ok(body)
+        let body: serde_json::Value = resp.json().await?;
+        Ok(crate::types::status_from_any_release(body)?)
     }
 
     /// `GET /agent/capabilities` — what this build supports and whether the
@@ -572,7 +585,7 @@ impl DaemonClient {
     /// connection and takes no owner lease.
     pub async fn capabilities(&self) -> anyhow::Result<DaemonResponse> {
         let req = self
-            .auth(self.client.get(self.url("/agent/capabilities")));
+            .auth(self.http().get(self.url("/agent/capabilities")));
         read_response(req.send().await?).await
     }
 
@@ -592,7 +605,7 @@ impl DaemonClient {
             "/agent/input".to_string()
         };
         let mut req = self
-            .auth(self.client.post(self.url(&path)))
+            .auth(self.http().post(self.url(&path)))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
             .body(msg.to_json());
@@ -615,7 +628,7 @@ impl DaemonClient {
     /// set_value, …), keeping the daemon's structured result.
     pub async fn input_value(&self, action: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
         let req = self
-            .auth(self.client.post(self.url("/agent/input")))
+            .auth(self.http().post(self.url("/agent/input")))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
             .body(action.to_string());
@@ -651,7 +664,7 @@ impl DaemonClient {
         flow_run: bool,
     ) -> anyhow::Result<DaemonResponse> {
         let mut req = self
-            .auth(self.client.post(self.url("/agent/actions")))
+            .auth(self.http().post(self.url("/agent/actions")))
             .timeout(ACTIONS_TIMEOUT + actions_text_allowance(body))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
@@ -659,7 +672,11 @@ impl DaemonClient {
         if flow_run {
             req = req.header("x-phone-flow-run", "1");
         }
-        read_response(req.send().await?).await
+        let response = read_response(req.send().await?).await?;
+        // An observed batch ends on a new screen: the next observed tap
+        // diffs against it, not against the screen before the batch.
+        self.remember_snapshot(response.json.as_ref());
+        Ok(response)
     }
 
     /// Any JSON call on the agent API, keeping the daemon's answer. A
@@ -683,7 +700,7 @@ impl DaemonClient {
     /// `PUT <path>` with a Markdown body (app notes), keeping the answer.
     pub async fn put_markdown(&self, path: &str, text: &str) -> anyhow::Result<DaemonResponse> {
         let req = self
-            .auth(self.client.put(self.url(path)))
+            .auth(self.http().put(self.url(path)))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
             .body(text.to_string());
@@ -699,7 +716,7 @@ impl DaemonClient {
     ) -> anyhow::Result<DaemonResponse> {
         let mutation = method != reqwest::Method::GET;
         let mut req = self
-            .auth(self.client.request(method, self.url(path)))
+            .auth(self.http().request(method, self.url(path)))
             .timeout(timeout);
         if mutation {
             req = req
@@ -722,7 +739,7 @@ impl DaemonClient {
         body: &serde_json::Value,
     ) -> anyhow::Result<DaemonResponse> {
         let req = self
-            .auth(self.client.post(self.url(path)))
+            .auth(self.http().post(self.url(path)))
             .timeout(ACTIONS_TIMEOUT)
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
@@ -735,7 +752,7 @@ impl DaemonClient {
     /// `GET /agent/flow/draft` — the daemon's recorded action trail as a flow
     /// v1 draft (404 `no_trail` when there is nothing to draft).
     pub async fn flow_draft(&self) -> anyhow::Result<DaemonResponse> {
-        let req = self.auth(self.client.get(self.url("/agent/flow/draft")));
+        let req = self.auth(self.http().get(self.url("/agent/flow/draft")));
         read_response(req.send().await?).await
     }
 
@@ -760,7 +777,7 @@ impl DaemonClient {
             params.push(("overlay", "elements".to_string()));
         }
         let path = query_path("/agent/screenshot", &params);
-        let req = self.auth(self.client.get(self.url(&path)));
+        let req = self.auth(self.http().get(self.url(&path)));
         let resp = req.send().await?;
         let resp = check_status(resp).await?;
         let bytes = resp.bytes().await?;
@@ -776,7 +793,7 @@ impl DaemonClient {
             path.push_str("&fresh=1");
         }
         let req = self
-            .auth(self.client.get(self.url(&path)))
+            .auth(self.http().get(self.url(&path)))
             .timeout(SCREEN_FRAME_TIMEOUT);
         let resp = check_status(req.send().await?).await?;
         Ok(resp.bytes().await?.to_vec())
@@ -818,13 +835,13 @@ impl DaemonClient {
     }
 
     async fn elements_at(&self, path: &str) -> anyhow::Result<String> {
-        // A cold WDA call may create a session and then request the source tree;
+        // A cold runner call may create a session and then request the source tree;
         // each upstream step is bounded by the daemon, but together can exceed
         // the generic 30-second MCP timeout. Wait long enough for the daemon to
         // return its authoritative success/error instead of abandoning the
-        // request while it still owns the WDA lock.
+        // request while it still owns the runner lock.
         let req = self
-            .auth(self.client.get(self.url(path)))
+            .auth(self.http().get(self.url(path)))
             .timeout(ELEMENTS_TIMEOUT);
         let resp = req.send().await?;
         let resp = check_status(resp).await?;
@@ -841,11 +858,11 @@ impl DaemonClient {
     }
 
     /// `POST /agent/mode {"mode":"agent"}` — reconnect the configured,
-    /// canonical Direct/WDA target. Target changes are deliberately not exposed
+    /// canonical Direct/runner target. Target changes are deliberately not exposed
     /// here; they require persistent configuration plus a daemon restart.
     pub async fn reconnect(&self) -> anyhow::Result<String> {
         let req = self
-            .auth(self.client.post(self.url("/agent/mode")))
+            .auth(self.http().post(self.url("/agent/mode")))
             .timeout(RECONNECT_TIMEOUT)
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
@@ -883,7 +900,7 @@ impl DaemonClient {
             "/agent/input"
         };
         let mut req = self
-            .auth(self.client.post(self.url(path)))
+            .auth(self.http().post(self.url(path)))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
             .body(json);
@@ -1220,6 +1237,22 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
+
+    #[tokio::test]
+    async fn http_pool_is_lazy_and_shared_but_session_state_is_separate() {
+        let client = DaemonClient::new("http://127.0.0.1:9", None);
+        let session = client.for_session(1);
+        let flow = client.for_flow();
+        assert!(client.client.get().is_none());
+        assert!(session.client.get().is_none());
+        assert!(!std::sync::Arc::ptr_eq(&client.last_snapshot, &session.last_snapshot));
+        assert!(!std::sync::Arc::ptr_eq(&client.run_id, &session.run_id));
+        // Building a request initializes the pool without sending to a daemon.
+        let _request = session.http().get("http://127.0.0.1:9");
+        assert!(client.client.get().is_some());
+        assert!(std::ptr::eq(client.http(), session.http()));
+        assert!(std::ptr::eq(client.http(), flow.http()));
+    }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
         stream
@@ -1649,9 +1682,9 @@ mod tests {
             "ok": true,
             "backend": "direct",
             
-            "wda": true,
-            "wda_actionable": false,
-            "wda_locked": true,
+            "runner": true,
+            "runner_actionable": false,
+            "runner_locked": true,
             "drivable": false,
             "device_state": "locked",
             "screen_state": "waiting",
@@ -1669,7 +1702,7 @@ mod tests {
         assert_eq!(status.backend.as_deref(), Some("direct"));
         assert_eq!(status.device_state.as_deref(), Some("locked"));
         assert_eq!(status.screen_state.as_deref(), Some("waiting"));
-        assert_eq!(status.wda_actionable, Some(false));
+        assert_eq!(status.runner_actionable, Some(false));
         assert_eq!(status.locked, Some(true));
         assert_eq!(status.drivable, Some(false));
         assert_eq!(status.released, Some(false));
@@ -1837,7 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_tree_fails_before_any_tap() {
         let (url, task, requests) =
-            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"wda_source_failed"}"#)]);
+            mock_daemon_sequence(&[("502 Bad Gateway", r#"{"error":"runner_source_failed"}"#)]);
 
         let failure = DaemonClient::new(url, None)
             .tap_label_observed("发布", false)

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "recorded_at": "2026-10-11T17:33:31.064179+00:00",
+  "phone_connections": [
+    "Network"
+  ],
+  "usb_absent": true,
+  "normal_mac_human_handoff": true,
+  "normal_mac_runner_stopped": true,
+  "controller": "Mac sends signed HTTP directly to iPhone Wi-Fi address; no Mac XCTest host",
+  "control_report": "ios27-independent-control-usb-detached.json",
+  "scope": "physical USB disconnection and direct Wi-Fi control; cold boot and background recovery remain pending"
+}

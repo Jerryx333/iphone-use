@@ -80,6 +80,28 @@ final class DeviceIdentityTests: XCTestCase {
         XCTAssertEqual(noted, [iPhoneX])
     }
 
+    @MainActor
+    func testLocalSelectionPrefersDrivableServiceAcrossLegacyAndNativeRecords() throws {
+        let suite = "local-selection-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let legacy = DeviceRecord(address: "http://127.0.0.1:8787")
+        let native = DeviceRecord(address: "http://127.0.0.1:18787")
+        DeviceStore.save([legacy, native], to: defaults)
+        let app = AppModel(defaults: defaults)
+        let oldSession = try XCTUnwrap(app.session(legacy.id))
+        let newSession = try XCTUnwrap(app.session(native.id))
+        oldSession.phase = .connected; newSession.phase = .connected
+        let ready = try JSONDecoder().decode(PhoneStatus.self, from: Data(#"{"device_state":"ready","drivable":true}"#.utf8))
+        oldSession.status = ready; newSession.status = ready
+        XCTAssertEqual(app.thisPhoneSession?.id, native.id)
+        newSession.status = try JSONDecoder().decode(PhoneStatus.self, from: Data(#"{"device_state":"blocked","drivable":false}"#.utf8))
+        XCTAssertEqual(app.thisPhoneSession?.id, legacy.id)
+        newSession.status = ready
+        XCTAssertEqual(app.thisPhoneSession?.id, native.id)
+        oldSession.disconnect(); newSession.disconnect()
+    }
+
     func testQualityFallsBackWhenNoFrameCame() {
         let started = Date()
         XCTAssertTrue(DeviceSession.qualityFailed(started: started, lastFrameAt: nil))

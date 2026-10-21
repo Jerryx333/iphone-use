@@ -54,7 +54,7 @@ SR_LAN_HOST=192.168.1.10                    # Mac 在家里局域网的地址，
 | `<前缀>.selfrunner-autoresign.plist` | 每 30 分钟运行一次 `selfrunner-autoresign` |
 | `phone-gateway.yml` | 隧道 UUID、凭据路径，ingress `<SR_WS_HOSTNAME>` → `http://<SR_WS_BIND>`，其余 404 |
 | `selfrunner-autoresign` | `scripts/selfrunner-autoresign` 的副本，运行时读同一份参数文件 |
-| daemon plist 的环境变量 | `IPHONE_USE_UDID`、`IPHONE_USE_WDA_MANAGED=false`、`IPHONE_USE_WDA_URL` / `IPHONE_USE_WDA_MJPEG_URL` 指向两个转发端口、`IPHONE_USE_SELFRUNNER_GATEWAY` 指向 gateway HTTP（§14）；其余键原样保留 |
+| daemon plist 的环境变量 | `IPHONE_USE_UDID`、`IPHONE_USE_RUNNER_MANAGED=false`、`IPHONE_USE_RUNNER_URL` / `IPHONE_USE_RUNNER_MJPEG_URL` 指向两个转发端口、`IPHONE_USE_SELFRUNNER_GATEWAY` 指向 gateway HTTP（§14）；其余键原样保留 |
 
 另外：缺少 `SR_SRC` 时用当前仓库的 HEAD 建一个 detached worktree；缺少隧道凭据时只提示，不创建。`~/.cloudflared/config.yml` 和账号里的其他隧道不会被碰。
 

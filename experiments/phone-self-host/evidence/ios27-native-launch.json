@@ -1,0 +1,19 @@
+{
+  "executor" : "on-device app reading its own Network Extension",
+  "native" : {
+    "build_id" : "3d9de40636bf17e68f0974bb073ef08c533c9286116cc5b2cb385b8f78bf0d61",
+    "developer_services" : true,
+    "error_code" : null,
+    "ios" : "27.0",
+    "linked" : true,
+    "pair_record_available" : true,
+    "phase" : "running",
+    "protocol_error_code" : null,
+    "protocol_error_subcode" : null,
+    "test_plan_started" : true
+  },
+  "observed_at" : "2026-10-11T15:33:26Z",
+  "probes" : [
+
+  ]
+}

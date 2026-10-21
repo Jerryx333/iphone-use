@@ -22,6 +22,15 @@ permissions:
   contents: read
 
 jobs:
+  remote-connection:
+    name: Remote connection and credential recovery
+    # The iOS app uses Swift 6; macos-14's default Xcode still uses Swift 5.
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/test-remote-connection.sh
+
   test:
     name: Tests and MCP tool discovery
     # Same image as the release build, so a failure here means the code, not a
@@ -43,13 +52,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master; explicit stable toolchain
+        with:
+          toolchain: stable
 
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # `set -o pipefail` matters in every step below: a `cargo … | grep`
       # reports the grep's status, so a compilation failure can otherwise be
@@ -95,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p iphone-use-mcp --locked
-          # setup-wda.sh hands its commands to this binary (shim + instance-context tests).
+          # setup-runner.sh hands its commands to this binary (shim + instance-context tests).
           cargo build -p server --bin iphone-use --locked
 
       # Discovery over the real protocol, against the binary this PR builds.
@@ -199,16 +210,17 @@ jobs:
           # $(...) broke the runner supervisor once).
           /bin/bash -n install.sh
           /bin/bash -n uninstall.sh
-          /bin/bash -n scripts/setup-wda.sh
+          /bin/bash -n scripts/setup-runner.sh
           bash scripts/test-install-release-transaction.sh
           bash scripts/test-install-cli-link.sh
           bash scripts/test-install-runner-sources.sh
           bash scripts/test-install-named-swap.sh
           bash scripts/test-install-legacy-plist.sh
+          bash scripts/test-install-auto-update.sh
           bash scripts/test-install-args.sh
           bash scripts/test-install-adhoc-signing.sh
           bash scripts/test-uninstall-safety.sh
-          bash scripts/test-setup-wda-shim.sh
+          bash scripts/test-setup-runner-shim.sh
           python3 scripts/test-auto-update.py
           python3 scripts/test-instance-context.py
           # The nightly re-verification canary decides whether an installed

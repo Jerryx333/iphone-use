@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "observed_at": "2026-10-11T21:17:40Z",
+  "background_seconds": 169.0,
+  "foreground_bundle": "com.apple.calculator",
+  "drivable": true,
+  "source_available": true,
+  "normal_mac_daemon_loaded": false,
+  "normal_mac_supervisor_loaded": false,
+  "usb_device_present": false,
+  "application_bundle": "com.leeguoo.iphone-use.remote",
+  "candidate": "PhoneUse-runloop.app",
+  "backend_version": "0.17.18"
+}

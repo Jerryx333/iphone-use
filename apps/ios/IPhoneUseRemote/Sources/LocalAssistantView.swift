@@ -13,7 +13,7 @@ struct LocalAssistantView: View {
     @FocusState private var composing: Bool
 
     private var local: DeviceSession? {
-        app.devices.first(where: \.isThisPhone).flatMap { app.session($0.id) }
+        app.thisPhoneSession
     }
     private var localSelected: Bool { local != nil && agent.targetID == local?.id }
     private var canSend: Bool {

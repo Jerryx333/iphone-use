@@ -38,11 +38,16 @@ pub struct Config {
     /// When absent (the default), the existing behavior is preserved: the password
     /// is also accepted as a bearer, and open mode (no password) passes everything.
     pub agent_token: Option<String>,
-    /// Persistent target device identifier for WDA bring-up and recovery.
+    /// Persistent target device identifier for runner bring-up and recovery.
     ///
     /// Without this, an idle restart or browser reconnect re-ran auto-detection
     /// and could silently select a different iPhone on a multi-device Mac.
     pub device_udid: Option<String>,
+    /// URL path prefix this daemon is also served under
+    /// (`IPHONE_USE_BASE_PATH`, e.g. `/ix`), so several daemons can share one
+    /// public host with the tunnel routing by path. Normalized to `""` (none)
+    /// or a leading-slash form without a trailing slash.
+    pub base_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +75,11 @@ impl Config {
     /// &str>` (or similar) to avoid side-effects on the real environment.
     pub fn from_map(lookup: impl Fn(&str) -> Option<String>) -> Config {
         let get = |key: &str| {
-            lookup(key).or_else(|| core::env::legacy_name(key).and_then(|old| lookup(&old)))
+            lookup(key).or_else(|| {
+                core::env::legacy_names(key)
+                    .into_iter()
+                    .find_map(|old| lookup(&old))
+            })
         };
         let host = get("IPHONE_USE_HOST")
             .filter(|s| !s.is_empty())
@@ -106,6 +115,10 @@ impl Config {
         let device_udid = get("IPHONE_USE_UDID")
             .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
 
+        let base_path = get("IPHONE_USE_BASE_PATH")
+            .map(|s| normalize_base_path(&s))
+            .unwrap_or_default();
+
         Config {
             host,
             port,
@@ -116,8 +129,38 @@ impl Config {
             owner_lease_secs,
             agent_token,
             device_udid,
+            base_path,
         }
     }
+}
+
+/// Path segments the daemon serves itself: a base path starting with one
+/// would shadow those routes, and one ending with a page name would read as
+/// a pasted page address in the app.
+const ROUTE_SEGMENTS: &[&str] = &[
+    "phone", "setup", "login", "logout", "pair", "browser", "control", "agent", "schedules",
+];
+
+/// `"ix"`, `"/ix/"` → `"/ix"`; empty, `/`, anything outside
+/// `[A-Za-z0-9._~-]` segments, or a segment named like one of the daemon's
+/// own routes (`/agent`, `/ix/phone`, …) → `""` (no prefix).
+pub fn normalize_base_path(raw: &str) -> String {
+    let segments: Vec<&str> = raw.split('/').filter(|s| !s.is_empty()).collect();
+    let valid = segments.iter().all(|seg| {
+        seg.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+            && *seg != "."
+            && *seg != ".."
+    });
+    // No segment may be a route name: clients drop a trailing page name
+    // (`…/ix/phone` → `…/ix`) from a pasted address.
+    if segments.is_empty() || !valid || segments.iter().any(|seg| ROUTE_SEGMENTS.contains(seg)) {
+        if !segments.is_empty() {
+            tracing::warn!("ignoring IPHONE_USE_BASE_PATH={raw:?}: not a usable path prefix");
+        }
+        return String::new();
+    }
+    format!("/{}", segments.join("/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +311,20 @@ mod tests {
     fn agent_token_empty_gives_none() {
         let cfg = map_cfg(&[("IPHONE_USE_AGENT_TOKEN", "")]);
         assert_eq!(cfg.agent_token, None);
+    }
+
+    #[test]
+    fn base_path_is_normalized() {
+        assert_eq!(map_cfg(&[]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "ix")]).base_path, "/ix");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/ix/")]).base_path, "/ix");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/")]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/a b")]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/../x")]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/phone")]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "agent/x")]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/ix/phone")]).base_path, "");
+        assert_eq!(map_cfg(&[("IPHONE_USE_BASE_PATH", "/lab/one")]).base_path, "/lab/one");
     }
 
     #[test]

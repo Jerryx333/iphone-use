@@ -175,9 +175,16 @@ enum DeviceStore {
     /// The address the phone's own daemon answers on, inside its device
     /// runner (docs/agent-task.md); its pairing link carries exactly this.
     static let thisPhoneAddress = "http://127.0.0.1:8787"
+    static let standalonePhoneAddress = "http://127.0.0.1:18787"
+
+    static var supportsStandaloneControl: Bool {
+        guard #available(iOS 17.4, *) else { return false }
+        return Bundle.main.object(forInfoDictionaryKey: "IPUSingleAppControl") as? Bool == true
+    }
 
     static func isThisPhone(_ address: String) -> Bool {
         same(address, thisPhoneAddress) || same(address, "http://localhost:8787")
+            || same(address, standalonePhoneAddress) || same(address, "http://localhost:18787")
     }
 
     /// `host:port`, which tells two instances on one Mac apart; 本机 for
@@ -185,8 +192,10 @@ enum DeviceStore {
     static func defaultName(for address: String) -> String {
         if isThisPhone(address) { return String(localized: "本机") }
         guard let url = URL(string: address), let host = url.host else { return address }
-        if let port = url.port { return "\(host):\(port)" }
-        return host
+        // The path tells apart daemons that share a host (`host/ix`).
+        let path = url.path == "/" ? "" : url.path
+        if let port = url.port { return "\(host):\(port)\(path)" }
+        return host + path
     }
 }
 
@@ -228,7 +237,7 @@ enum DeliveryOutcome: Equatable, Sendable {
         }
         // Lifecycle refusals (released/reconnecting/releasing) and malformed
         // requests are turned away before anything is dispatched.
-        if status == 503, let error, ["released", "reconnecting", "releasing", "wda_not_configured"].contains(error) {
+        if status == 503, let error, ["released", "reconnecting", "releasing", "runner_not_configured", "wda_not_configured"].contains(error) {
             return .notSent(reason: error)
         }
         if status == 400 { return .notSent(reason: error ?? "bad_request") }

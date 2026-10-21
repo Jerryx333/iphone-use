@@ -47,7 +47,7 @@ pub mod tunnel;
 pub mod update;
 pub mod usbmux;
 pub mod video;
-pub mod wda;
+pub mod runner;
 
 /// Re-export of the `core` crate under a non-`core` name.
 ///

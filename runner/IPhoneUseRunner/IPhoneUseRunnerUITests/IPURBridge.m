@@ -271,7 +271,7 @@ static BOOL IPURUseRequestCache(void)
     chosen = candidates.firstObject;
   } else if (candidates.count > 1) {
     // Several apps report active (split screen, a PiP, an app extension): ask the AX server
-    // who owns the probe point, like WDA's active-app detection point.
+    // who owns the probe point, like runner's active-app detection point.
     id axClient = [self axClient];
     SEL hitTest = NSSelectorFromString(@"accessibilityElementForElementAtPoint:error:");
     if (axClient != nil && [axClient respondsToSelector:hitTest]) {
@@ -581,7 +581,7 @@ static NSArray *IPURChildren(id snapshot)
   return [children isKindOfClass:NSArray.class] ? children : @[];
 }
 
-/// One snapshot node in WDA's /source?format=json shape. No isVisible / isAccessible / isHittable:
+/// One snapshot node in runner's /source?format=json shape. No isVisible / isAccessible / isHittable:
 /// computing them costs extra AX round trips per node, which is exactly what this runner avoids.
 static NSMutableDictionary *IPURSerialize(
   id snapshot, NSInteger depth, IPURWalk *walk, NSMutableArray<IPURFrontier *> *leaves)
@@ -603,7 +603,7 @@ static NSMutableDictionary *IPURSerialize(
 
   node[@"type"] = [IPURBridge elementTypeName:elementType];
   node[@"label"] = label ?: (id)NSNull.null;
-  // WDA's name: the identifier when there is one, else the label.
+  // runner's name: the identifier when there is one, else the label.
   node[@"name"] = identifier ?: label ?: (id)NSNull.null;
   node[@"value"] = value ?: (id)NSNull.null;
   node[@"rawIdentifier"] = identifier ?: (id)NSNull.null;
@@ -614,6 +614,10 @@ static NSMutableDictionary *IPURSerialize(
   // only hasKeyboardFocus (hardware: Settings' search field, iOS 27).
   BOOL focused = [IPURKVC(snapshot, @"hasFocus") boolValue] || [IPURKVC(snapshot, @"hasKeyboardFocus") boolValue];
   node[@"isFocused"] = focused ? @"1" : @"0";
+  // Selected (a picked photo in select mode, the current tab, a chosen segment). The attribute was
+  // already fetched with the snapshot; only a selected node carries the key, so the common case
+  // costs no bytes.
+  if ([IPURKVC(snapshot, @"selected") boolValue]) node[@"isSelected"] = @"1";
   if (walk->includeElements) {
     id element = IPURKVC(snapshot, @"accessibilityElement");
     if (element != nil) node[IPURNodeAXElementKey] = element;
@@ -678,13 +682,13 @@ static NSMutableDictionary<NSString *, NSNumber *> *IPURAcceptedDepths(void)
   return depths;
 }
 
-+ (NSDictionary<NSString *, id> *)wdaTreeForAXElement:(id)axElement
++ (NSDictionary<NSString *, id> *)runnerTreeForAXElement:(id)axElement
                                              maxDepth:(NSInteger)maxDepth
                                              maxNodes:(NSInteger)maxNodes
                                    extensionCallLimit:(NSInteger)extensionCallLimit
                                           rememberKey:(nullable NSString *)rememberKey
 {
-  return [self wdaTreeForAXElement:axElement
+  return [self runnerTreeForAXElement:axElement
                           maxDepth:maxDepth
                           maxNodes:maxNodes
                 extensionCallLimit:extensionCallLimit
@@ -692,7 +696,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *IPURAcceptedDepths(void)
                    includeElements:NO];
 }
 
-+ (NSDictionary<NSString *, id> *)wdaTreeForAXElement:(id)axElement
++ (NSDictionary<NSString *, id> *)runnerTreeForAXElement:(id)axElement
                                              maxDepth:(NSInteger)maxDepth
                                              maxNodes:(NSInteger)maxNodes
                                    extensionCallLimit:(NSInteger)extensionCallLimit
@@ -797,12 +801,12 @@ static NSMutableDictionary<NSString *, NSNumber *> *IPURAcceptedDepths(void)
   };
 }
 
-+ (NSDictionary<NSString *, id> *)wdaTreeForSnapshot:(id)snapshot maxNodes:(NSInteger)maxNodes
++ (NSDictionary<NSString *, id> *)runnerTreeForSnapshot:(id)snapshot maxNodes:(NSInteger)maxNodes
 {
-  return [self wdaTreeForSnapshot:snapshot maxNodes:maxNodes includeElements:NO];
+  return [self runnerTreeForSnapshot:snapshot maxNodes:maxNodes includeElements:NO];
 }
 
-+ (NSDictionary<NSString *, id> *)wdaTreeForSnapshot:(id)snapshot
++ (NSDictionary<NSString *, id> *)runnerTreeForSnapshot:(id)snapshot
                                             maxNodes:(NSInteger)maxNodes
                                      includeElements:(BOOL)includeElements
 {
@@ -1495,7 +1499,7 @@ static CGImageRef IPURDecodeScaled(NSData *input, double scale) CF_RETURNS_RETAI
 
 + (BOOL)isScreenLocked:(BOOL *)known
 {
-  // The same SpringBoardServices calls WDA's fb_isScreenLocked makes.
+  // The same SpringBoardServices calls runner's fb_isScreenLocked makes.
   typedef mach_port_t (*IPURServerPort)(void);
   typedef void (*IPURLockStatus)(mach_port_t, BOOL *, BOOL *);
   static IPURServerPort serverPort;

@@ -682,6 +682,25 @@ struct ModelSettingsView: View {
             }
             if agent.settings.sendModels {
                 Section {
+                    Picker("主模型", selection: Binding<UUID?>(
+                        get: { agent.settings.assist.first(where: \.enabled)?.id },
+                        set: { id in
+                            guard let id, let index = agent.settings.assist.firstIndex(where: { $0.id == id }) else { return }
+                            let provider = agent.settings.assist.remove(at: index)
+                            agent.settings.assist.insert(provider, at: 0)
+                        })) {
+                        ForEach(agent.settings.assist.filter(\.enabled)) { provider in
+                            Text("\(provider.name) · \(provider.model)").tag(Optional(provider.id))
+                        }
+                    }.accessibilityIdentifier("assistant-primary-model")
+                    Toggle("失败时允许使用备用模型", isOn: $agent.settings.allowModelFallback)
+                        .accessibilityIdentifier("assistant-model-fallback")
+                } footer: {
+                    Text(agent.settings.allowModelFallback
+                         ? "主模型失败后，按下方顺序尝试已启用的备用模型。"
+                         : "只使用你选定的主模型。失败时显示错误，不切换到其他服务。")
+                }
+                Section {
                     ForEach($agent.settings.assist) { $provider in
                         NavigationLink {
                             ProviderEditView(provider: $provider)
@@ -703,7 +722,7 @@ struct ModelSettingsView: View {
                 } header: {
                     Text("助手模型")
                 } footer: {
-                    Text("按顺序尝试，第一个能回答的就用它。按住右边拖动可以调整顺序。助手模型会看到屏幕截图。")
+                    Text("可以选择、添加或停用模型。开启备用模型后按列表顺序尝试，拖动可调整顺序。助手模型会看到屏幕截图。")
                 }
                 Section {
                     SecureField("TypeSafe 密钥", text: $jevKey)

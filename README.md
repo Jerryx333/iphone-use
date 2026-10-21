@@ -30,6 +30,30 @@ https://github.com/user-attachments/assets/ee298774-bf3e-4fd0-9a08-481b20904f61
 
 <sub>1-minute demo, real iPhone recordings · [中文版](https://github.com/user-attachments/assets/6192e8a6-ab2d-4dfc-b2e9-2c971f527d55)</sub>
 
+<table>
+<tr><td align="center" width="960">
+
+**Advertisement · Available**
+
+### Advertise here
+
+Showcase your product here and support ongoing maintenance.
+
+[**Ask about advertising**](mailto:leeguoooo@gmail.com?subject=iphone-use%20advertising%20inquiry&body=Product%20%2F%20company%20name%3A%0AProduct%20URL%3A%0APlacement%20%28README%20%2F%20website%20%2F%20both%29%3A%0ACampaign%20dates%3A%0ABudget%20%2F%20currency%20%28optional%29%3A%0A) · leeguoooo@gmail.com
+
+</td></tr>
+</table>
+
+## Paid setup and project sponsorship
+
+Need help setting up a real iPhone, connecting your agent or creating an iOS app test flow? Email us with your environment, the workflow and expected result, and where you are stuck. We review feasibility and agree on scope, acceptance criteria and a quote before work starts.
+
+[**Ask about paid setup**](mailto:leeguoooo@gmail.com?subject=iphone-use%20paid%20setup%20inquiry&body=Target%20website%20or%20app%20%28public%20information%20only%29%3A%0AWorkflow%20and%20expected%20result%3A%0AEnvironment%20%28Mac%20%2F%20Xcode%20%2F%20iPhone%20%2F%20iOS%20%2F%20agent%20client%29%3A%0ACurrent%20blocker%3A%0ABudget%20%2F%20currency%20%28optional%29%3A%0APreferred%20timeline%3A%0A) · [Discuss sponsorship](mailto:leeguoooo@gmail.com?subject=iphone-use%20sponsorship&body=I%20would%20like%20to%20support%20ongoing%20maintenance.%0APreferred%20contribution%20%28one-time%20or%20monthly%29%3A%0AAmount%20%2F%20currency%3A%0A) · leeguoooo@gmail.com
+
+Want to support ongoing maintenance? Email us to discuss a one-time or recurring contribution.
+
+Community bug reports and feature requests remain welcome on GitHub. Please keep credentials and private account data out of inquiries.
+
 ## Why iphone-use
 
 - **Any app, no API needed.** It works on Health, banking and payment apps (even the ones that black out screen capture), chat apps and your own app under test.
@@ -123,7 +147,7 @@ In Claude Code:
 The same daemon that serves agents lets you drive the phone yourself:
 
 - **From a browser.** The live screen arrives as H.264 encoded on the phone: native resolution at about 50 fps on the LAN, and a lighter mode for slow links. Click to tap, drag to swipe, hold to long-press, scroll with the wheel or trackpad. Type straight into the phone with your input method, and ⌘V pastes. The Controls panel lists the screen's elements so you can tap by label, and the Flow panel records what you do as a replayable flow. The page follows your browser's language (English or Chinese), with a switch in the sidebar.
-- **From another iPhone.** The native iOS app (minimum deployment target iOS 15) pairs by scanning a QR code on the Mac's page, with no address or password to type. It plays the screen with the hardware decoder and switches between your phones.
+- **From another iPhone.** The native iOS app (minimum deployment target iOS 15) pairs by scanning a QR code on the Mac's page, with no address or password to type. It plays the screen with the hardware decoder and switches between your phones. Install it with `iphone-use setup-app`, which signs it with your own team; with a paid team the app also controls its own phone with no Mac ([details](docs/guide.md#install-the-app)).
 - **Screens hidden from capture.** Banking and payment apps black out screen capture; there you see a live wireframe of the screen's elements instead of a blank picture, and you can still tap through it.
 - **From anywhere.** Reach the Mac through an authenticated HTTPS reverse proxy or a VPN such as Tailscale, and control the phone from outside your network ([security notes](docs/guide.md#security)).
 - **No collisions.** A phone has one owner at a time. While you are in control, an agent waits or is told who holds the phone, and the reverse is true too.
@@ -248,7 +272,7 @@ Through the full agent API, a tap by label that returns the settled change takes
 ## More
 
 - [Full guide](docs/guide.md): browser and iOS app, flows and the flow registry, Wi-Fi and iOS 15/16, lifecycle, configuration, security, development.
-- [Agent API reference](docs/agent-api.html) · [MCP tools](crates/mcp/README.md) · [Architecture](docs/direct-device-architecture.html) · [Device setup pitfalls](docs/wda-setup.html) · [Device runner](runner/README.md) · [Privacy](docs/privacy.md)
+- [Agent API reference](docs/agent-api.html) · [MCP tools](crates/mcp/README.md) · [Architecture](docs/direct-device-architecture.html) · [Device setup pitfalls](docs/runner-setup.html) · [Device runner](runner/README.md) · [Privacy](docs/privacy.md)
 - [Product guide](https://blog.leeguoo.com/en/posts/iphone-use/): installation, MCP setup, flows and how it compares.
 - Issues and ideas: [GitHub issues](https://github.com/leeguooooo/iphone-use/issues).
 

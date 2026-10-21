@@ -1,5 +1,57 @@
 # Phone Use Remote — iOS remote
 
+## Single-app integration (device acceptance in progress)
+
+The formal product installs one `com.leeguoo.iphone-use.remote` application. Its
+existing assistant, voice, browser, remote screen and settings remain together.
+The local network extension, activity widget and `PhoneUse.xctest` control bundle
+are embedded in that application. No separate probe or runner application is
+installed. The ordinary launch shows the normal SwiftUI UI; an authorized
+on-device XCTest launch starts the embedded control bundle in the same process.
+XCTest loads from the phone's developer image, not from a second application.
+
+Settings → 本机控制 provides enable/stop, first-pairing import and a one-time
+connection QR code. This phone connects to its authenticated service automatically;
+the user does not type a local address or password. Other phones use the same app
+to scan the QR. Initial signing/install/pairing still uses a computer, and system
+VPN authorization and the first unlock after reboot remain human actions.
+
+Users install it with `iphone-use setup-app` (see the guide's "Install the app"),
+which runs `Tools/build_single_app.py` with their own team. From a checkout:
+
+```sh
+python3 experiments/phone-self-host/prepare-image.py     # this Mac's Apple developer image
+python3 apps/ios/Tools/build_single_app.py \
+  --team <TEAMID> --bundle-id com.leeguoo.iphone-use.remote.<teamid> \
+  --host-lib <compiled libipu_phone_host.a> \
+  --embed-lib <compiled libipu_embed.a> \
+  --output <new output directory>/PhoneUse.app      # Release; --configuration Debug for QA builds
+python3 apps/ios/Tools/build_single_app.py --remote-only --team <TEAMID> \
+  --bundle-id com.leeguoo.iphone-use.remote.<teamid> --output <dir>/PhoneUse.app   # free Apple ID
+```
+
+`project.remote.yml` is the remote app (no network extension, so a free team can
+sign it); `project.yml` includes it and adds the local-control tunnel. Every
+bundle identifier derives from the `IPU_APP_BUNDLE_ID` build setting.
+
+The assembler rejects a missing network extension, conflicting frameworks and
+any nested `.app`. It keeps the main app identifier/data and seals the final app
+with the exact certificate used by the main build. Signed builds and package
+checks have passed. Unified-process real tap/type/source/screenshot, 169-second
+background source access with Calculator foreground, and the main app's QR
+pairing have passed without USB or a running Mac supervisor. Revised repeat-input
+checks passed twice, and the stop button shuts down the extension/control endpoints.
+The final stop-state UI, cold reboot and removal of obsolete owned apps remain pending.
+See [the current acceptance record](../../docs/qa/2026-10-12-single-app-control.md).
+The earlier two-app prototype's acceptance does not cover these new conditions.
+Final acceptance must install only this candidate, remove the owned obsolete
+probe/runner products after success, verify voice/browser/phone control and QR
+connection, then repeat independent background, stop/restart and cold-boot tests.
+The existing Mac-backed client remains supported by ordinary app builds.
+The main app's deployment target remains iOS 15. Standalone hosting requires
+iOS 17.4 or newer; older systems keep the existing Mac-backed entry points.
+Older-device physical acceptance remains separate.
+
 Native iOS app (SwiftUI, iOS 15+) for driving a phone that the iphone-use daemon serves.
 It logs in with the daemon's control password, shows the screen as H.264 from
 `GET /agent/h264` (decoded by VideoToolbox), and sends taps, long presses, swipes,

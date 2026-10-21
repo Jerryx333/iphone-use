@@ -1,0 +1,71 @@
+{
+  "executor": "on-device app reading its own Network Extension",
+  "native": {
+    "build_id": "9dba6789145996ed5a2aa115e5db43cb35f841109c7f77251d93877482466158",
+    "developer_services": true,
+    "error_code": null,
+    "ios": "27.0",
+    "linked": true,
+    "pair_record_available": true,
+    "phase": "running",
+    "protocol_error_code": null,
+    "protocol_error_subcode": null,
+    "runner_credential_state": "verified",
+    "test_plan_started": true
+  },
+  "observed_at": "2026-10-11T19:02:42Z",
+  "packet_count": 8415,
+  "probes": [
+    {
+      "detail": "POSIXErrorCode(rawValue: 54): Connection reset by peer",
+      "elapsedMilliseconds": 6,
+      "endpoint": {
+        "host": "127.0.0.1",
+        "port": 49152,
+        "purpose": "extension direct RemotePairing"
+      },
+      "outcome": "handshake_receive_failed"
+    },
+    {
+      "detail": "No completed probe within 5 seconds",
+      "elapsedMilliseconds": 5328,
+      "endpoint": {
+        "host": "10.7.0.1",
+        "port": 49152,
+        "purpose": "extension direct RemotePairing"
+      },
+      "outcome": "probe_timeout"
+    },
+    {
+      "detail": "RemotePairing handshake received; wire protocol 26; pairing and authorization not attempted",
+      "elapsedMilliseconds": 6207,
+      "endpoint": {
+        "host": "10.7.0.1",
+        "port": 49152,
+        "purpose": "extension through-tunnel RemotePairing"
+      },
+      "outcome": "remote_pairing_handshake"
+    },
+    {
+      "detail": "No handshake within 8 seconds",
+      "elapsedMilliseconds": 8610,
+      "endpoint": {
+        "host": "10.7.0.1",
+        "port": 8080,
+        "purpose": "extension through-tunnel RemotePairing"
+      },
+      "outcome": "probe_timeout"
+    },
+    {
+      "detail": "POSIXErrorCode(rawValue: 54): Connection reset by peer",
+      "elapsedMilliseconds": 6,
+      "endpoint": {
+        "host": "192.168.50.8",
+        "port": 49152,
+        "purpose": "extension direct own Wi-Fi RemotePairing"
+      },
+      "outcome": "handshake_receive_failed"
+    }
+  ],
+  "reflected_packet_count": 8415
+}

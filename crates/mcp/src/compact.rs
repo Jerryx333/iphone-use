@@ -11,6 +11,43 @@ const OFFSCREEN_LABELS: usize = 5;
 /// Longest label printed before it is cut.
 const LABEL_CHARS: usize = 80;
 
+/// Presentation limits only: the daemon's snapshot and full structured rows
+/// stay intact. Apply after decoration filtering so useful controls get room.
+const SCREEN_ROW_LIMIT: usize = 200;
+const SCREEN_ROW_BYTES: usize = 32 * 1024;
+
+#[derive(Default)]
+struct RowBudget {
+    rows: usize,
+    bytes: usize,
+    omitted: usize,
+}
+
+impl RowBudget {
+    fn push(&mut self, line: String, out: &mut Vec<String>) {
+        if self.rows >= SCREEN_ROW_LIMIT || self.bytes + line.len() + 1 > SCREEN_ROW_BYTES {
+            self.omitted += 1;
+        } else {
+            self.rows += 1;
+            self.bytes += line.len() + 1;
+            out.push(line);
+        }
+    }
+
+    fn finish(self, out: &mut Vec<String>) {
+        if self.omitted > 0 {
+            out.push(format!(
+                "({} rows omitted by text budget; this is a partial view, not evidence of absence or list completion. Use phone_elements query/limit to narrow the read; original element indexes still apply.)",
+                self.omitted
+            ));
+        }
+    }
+}
+
+fn row_index(row: &Value, position: usize) -> u64 {
+    row.get("index").and_then(Value::as_u64).unwrap_or(position as u64)
+}
+
 fn text(value: &Value, key: &str) -> Option<String> {
     match value.get(key)? {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
@@ -38,7 +75,7 @@ fn row_line(index: u64, row: &Value, show_id: bool) -> String {
     if let Some(id) = text(row, "identifier")
         .filter(|id| (show_id || label.is_empty()) && *id != label && !generated_id(id))
     {
-        line.push_str(&format!(" id={id}"));
+        line.push_str(&format!(" id={}", clip(&id)));
     }
     if let Some(value) = text(row, "value").filter(|value| *value != label) {
         line.push_str(&format!(" value={}", clip(&value)));
@@ -46,7 +83,7 @@ fn row_line(index: u64, row: &Value, show_id: bool) -> String {
     if text(row, "placeholder").is_some() && text(row, "value").is_none() {
         line.push_str(&format!(
             " placeholder={}",
-            text(row, "placeholder").unwrap_or_default()
+            clip(&text(row, "placeholder").unwrap_or_default())
         ));
     }
     if row.get("focused") == Some(&Value::Bool(true)) {
@@ -170,6 +207,7 @@ fn is_hidden(row: &Value) -> bool {
 /// decoration (repeated text, icons, wrapper cells) left out. Indexes stay
 /// the daemon's, so `#N` is still the element to tap.
 fn rows_block(rows: &[Value], out: &mut Vec<String>) {
+    let mut budget = RowBudget::default();
     let mut hidden = Vec::new();
     let mut omitted = 0;
     let counts = label_counts(rows.iter());
@@ -181,7 +219,12 @@ fn rows_block(rows: &[Value], out: &mut Vec<String>) {
         while ancestors.last().is_some_and(|(d, _)| *d >= depth) {
             ancestors.pop();
         }
-        let noise = is_noise(row, rows.get(index + 1), &ancestors);
+        // A filtered view can skip descendants. Only an adjacent original
+        // row can establish that an unlabeled Cell wraps the next control.
+        let next = rows.get(index + 1).filter(|next| {
+            row_index(next, index + 1) == row_index(row, index) + 1
+        });
+        let noise = is_noise(row, next, &ancestors);
         let kind = text(row, "kind").unwrap_or_default();
         let label = text(row, "label").unwrap_or_default();
         if TAPPABLE.contains(&kind.as_str()) && !label.is_empty() {
@@ -196,8 +239,9 @@ fn rows_block(rows: &[Value], out: &mut Vec<String>) {
             continue;
         }
         printed.insert(text(row, "label").unwrap_or_default());
-        out.push(row_line(index as u64, row, shared_label(row, &counts)));
+        budget.push(row_line(row_index(row, index), row, shared_label(row, &counts)), out);
     }
+    budget.finish(out);
     hidden_summary(&hidden, out);
     if omitted > 0 {
         out.push(format!("({omitted} decorative/layout rows omitted)"));
@@ -228,6 +272,16 @@ fn hidden_summary(hidden: &[String], out: &mut Vec<String>) {
 
 /// The blocks around the rows that a model should still see, compactly.
 fn extra_blocks(json: &Value, out: &mut Vec<String>) {
+    let mut partial_view = false;
+    for key in ["scope", "filter"] {
+        if let Some(block) = json.get(key).filter(|block| block.is_object()) {
+            out.push(format!("{key}: {}", bounded_json(block, 2000)));
+            partial_view = true;
+        }
+    }
+    if partial_view {
+        out.push("Partial view: missing rows do not prove absence or list completion; element indexes refer to the full snapshot.".to_string());
+    }
     if let Some(alert) = json.get("alert").filter(|alert| !alert.is_null()) {
         let body = text(alert, "text").unwrap_or_default();
         let buttons = alert
@@ -327,6 +381,7 @@ pub fn observed(json: &Value) -> Option<String> {
         };
         let mut hidden = Vec::new();
         let mut omitted = 0;
+        let mut budget = RowBudget::default();
         // Added and changed rows in tree order, so the decoration rules (text
         // repeating its control, icons, wrapper cells) see their controls.
         let mut rows: Vec<(&str, u64, Value)> = indexed("added")
@@ -363,12 +418,13 @@ pub fn observed(json: &Value) -> Option<String> {
                 omitted += 1;
             } else {
                 printed.insert(text(row, "label").unwrap_or_default());
-                out.push(format!(
+                budget.push(format!(
                     "{sign} {}",
                     row_line(*index, row, shared_label(row, &counts))
-                ));
+                ), &mut out);
             }
         }
+        budget.finish(&mut out);
         hidden_summary(&hidden, &mut out);
         if omitted > 0 {
             out.push(format!("({omitted} decorative rows omitted)"));
@@ -742,6 +798,17 @@ pub fn found_label(json: &Value) -> Option<String> {
         out.push("candidates:".to_string());
         out.extend(candidates.iter().map(|row| format!("  {}", found_row(row))));
     }
+    if let Some(seen) = json.get("seen_earlier").and_then(Value::as_array).filter(|s| !s.is_empty()) {
+        out.push("seen earlier, scrolled off:".to_string());
+        out.extend(seen.iter().map(|row| {
+            format!(
+                "  page {} {} \"{}\"",
+                text(row, "page").unwrap_or_else(|| "?".to_string()),
+                text(row, "kind").unwrap_or_default(),
+                clip(&text(row, "label").unwrap_or_default())
+            )
+        }));
+    }
     if let Some(hint) = text(json, "hint") {
         out.push(format!("hint: {hint}"));
     }
@@ -826,6 +893,17 @@ mod tests {
     }
 
     #[test]
+    fn a_find_miss_names_near_misses_a_swipe_carried_off() {
+        let body = json!({
+            "ok": false, "found": false, "stop_reason": "not_found", "swipes": 2,
+            "error": "element_not_found", "candidates": [],
+            "seen_earlier": [{"kind": "Button", "label": "截图整理相簿，9个资源。", "page": 2}]
+        });
+        let text = found_label(&body).unwrap();
+        assert!(text.contains("seen earlier, scrolled off:\n  page 2 Button \"截图整理相簿，9个资源。\""), "{text}");
+    }
+
+    #[test]
     fn a_failed_batch_keeps_the_verdict_and_the_failed_step_but_not_the_bulk() {
         let body = json!({
             "ok": false,
@@ -907,9 +985,71 @@ mod tests {
     #[test]
     fn an_error_answer_keeps_its_json() {
         assert_eq!(
-            elements(&json!({"elements": [], "error": "wda_source_failed"})),
+            elements(&json!({"elements": [], "error": "runner_source_failed"})),
             None
         );
+    }
+
+    #[test]
+    fn filtered_views_keep_full_snapshot_indexes_and_coverage() {
+        let body = json!({"snapshot":"S", "elements":[
+            {"index":7,"kind":"Cell","label":"","depth":2},
+            {"index":19,"kind":"Button","label":"目标","depth":3}
+        ], "scope":{"name":"interactive","rows":2,"of":40},
+           "filter":{"matched":5,"returned":2,"omitted":3,"of":9}});
+        let before = body.clone();
+        for render in [elements(&body).unwrap(), observed(&{
+            let mut observed = body.clone();
+            observed["ok"] = json!(true);
+            observed
+        }).unwrap()] {
+            assert!(render.contains("#7 [Cell]"), "{render}");
+            assert!(render.contains("#19 [Button]"), "{render}");
+            assert!(!render.contains("#0 ["), "{render}");
+            assert!(render.contains("\"omitted\":3"), "{render}");
+            assert!(render.contains("scope:"), "{render}");
+            assert!(render.contains("missing rows do not prove absence"));
+        }
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn screen_budget_bounds_full_and_delta_rows_but_keeps_alerts() {
+        let rows: Vec<Value> = (0..240).map(|i| json!({
+            "index": i + 1000, "kind":"Button", "label":format!("目标 {i}")
+        })).collect();
+        let body = json!({"snapshot":"S", "elements":rows,
+            "alert":{"text":"Confirm?","buttons":["Cancel"]}});
+        let before = body.clone();
+        let full = elements(&body).unwrap();
+        let mut fallback = body.clone();
+        fallback["ok"] = json!(true);
+        let delta = json!({"ok":true,"snapshot":"S", "alert":body["alert"],
+            "delta":{"added":rows.iter().map(|row| json!({
+                "index":row["index"],"element":row
+            })).collect::<Vec<_>>(),"removed":[12],"unchanged":3}});
+        for text in [full, observed(&fallback).unwrap(), observed(&delta).unwrap()] {
+            let lines: Vec<_> = text.lines().filter(|line| line.starts_with('#') || line.starts_with("+ #")).collect();
+            assert_eq!(lines.len(), SCREEN_ROW_LIMIT);
+            assert!(text.contains("#1000 [Button]"));
+            assert!(text.contains("40 rows omitted by text budget"), "{text}");
+            assert!(text.contains("not evidence of absence or list completion"));
+            assert!(text.contains("alert: \"Confirm?\" buttons: Cancel"));
+        }
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn screen_byte_budget_handles_unicode_and_long_placeholders() {
+        let rows: Vec<Value> = (0..240).map(|i| json!({
+            "kind":"TextField", "label":format!("{i}{}", "界".repeat(80)),
+            "placeholder":"字".repeat(10_000)
+        })).collect();
+        let text = elements(&json!({"snapshot":"S","elements":rows})).unwrap();
+        let row_bytes: usize = text.lines().filter(|line| line.starts_with('#')).map(|line| line.len()+1).sum();
+        assert!(row_bytes <= SCREEN_ROW_BYTES);
+        assert!(text.contains("rows omitted by text budget"));
+        assert!(text.len() < SCREEN_ROW_BYTES + 1000);
     }
 
     #[test]
@@ -937,7 +1077,7 @@ mod tests {
 
     #[test]
     fn a_bare_ok_is_not_rewritten() {
-        assert_eq!(observed(&json!({"ok": true, "transport": "wda"})), None);
+        assert_eq!(observed(&json!({"ok": true, "transport": "runner"})), None);
     }
 
     /// The shape `POST /agent/actions` answers on i13 for Settings → 蓝牙.
@@ -948,7 +1088,7 @@ mod tests {
             "applied_actions": 1,
             "snapshot": "S9",
             "settle": {"reason": "stable", "waited_ms": 812, "captures": 2},
-            "timing": {"total_ms": 1900, "wda_ms": 1500, "wda": [{"call": "GET /source", "count": 2, "ms": 400}]},
+            "timing": {"total_ms": 1900, "runner_ms": 1500, "runner": [{"call": "GET /source", "count": 2, "ms": 400}]},
             "steps": [
                 {"index": 1, "kind": "tap_label", "ok": true},
                 {"index": 2, "kind": "wait_for", "ok": true, "attempts": 1, "probe_misses": 1,

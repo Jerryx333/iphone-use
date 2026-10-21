@@ -1,0 +1,11 @@
+{
+  "version": "0.17.18",
+  "drivable": true,
+  "device_state": "ready",
+  "owner": null,
+  "observed_at": "2026-10-11T19:08:00.447373+00:00",
+  "schema": 1,
+  "stop_observation": "Exact experimental runner and Network Extension absent from process inventory after stop; then restarted without any manual process kill.",
+  "trigger": "Mac launched only the control App debug stop/start arguments; the App and its Network Extension performed shutdown and XCTest startup.",
+  "scope": "Graceful stop and subsequent on-device startup; independent cold-boot acceptance recorded separately."
+}

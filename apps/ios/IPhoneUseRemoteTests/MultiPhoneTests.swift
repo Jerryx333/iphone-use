@@ -40,6 +40,15 @@ final class DeviceStoreTests: XCTestCase {
         XCTAssertEqual(DeviceStore.load(from: defaults) { _ in true }, [])
     }
 
+    func testStandaloneEndpointIsLocalAndNotARemoteTile() {
+        let local = DeviceRecord(address: DeviceStore.standalonePhoneAddress)
+        XCTAssertTrue(local.isThisPhone)
+        XCTAssertFalse(local.showInGrid)
+        XCTAssertTrue(DeviceStore.isThisPhone("http://localhost:18787"))
+        XCTAssertFalse(DeviceStore.isThisPhone("http://192.168.0.10:18787"))
+        XCTAssertFalse(DeviceStore.isThisPhone("http://127.0.0.1:18788"))
+    }
+
     func testSaveAndLoadRoundTrip() {
         let list = [DeviceRecord(address: "http://a:44321", name: "iPhone 13"),
                     DeviceRecord(address: "http://a:44322", showInGrid: false)]
@@ -62,6 +71,8 @@ final class DeviceStoreTests: XCTestCase {
     func testDefaultNameTellsInstancesApart() {
         XCTAssertEqual(DeviceStore.defaultName(for: "http://192.168.0.13:44321"), "192.168.0.13:44321")
         XCTAssertEqual(DeviceStore.defaultName(for: "https://phone.example.com"), "phone.example.com")
+        XCTAssertEqual(DeviceStore.defaultName(for: "https://phone.example.com/ix"), "phone.example.com/ix")
+        XCTAssertEqual(DeviceStore.defaultName(for: "http://192.168.0.13:45561/ix"), "192.168.0.13:45561/ix")
     }
 
     func testRecordDecodesWithoutNewerFields() throws {
@@ -98,8 +109,8 @@ final class DeliveryOutcomeTests: XCTestCase {
     func testNotSent() {
         XCTAssertEqual(classify(408, #"{"ok":false,"error":"not_sent","outcome":"not_sent","retry_safe":true}"#),
                        .notSent(reason: "not_sent"))
-        XCTAssertEqual(classify(502, #"{"ok":false,"error":"wda_pre_dispatch_failed","outcome":"not_sent"}"#),
-                       .notSent(reason: "wda_pre_dispatch_failed"))
+        XCTAssertEqual(classify(502, #"{"ok":false,"error":"runner_pre_dispatch_failed","outcome":"not_sent"}"#),
+                       .notSent(reason: "runner_pre_dispatch_failed"))
         XCTAssertEqual(classify(503, #"{"ok":false,"error":"released","reconnecting":false}"#),
                        .notSent(reason: "released"))
         XCTAssertEqual(classify(400, #"{"ok":false,"error":"invalid_control_deadline"}"#),

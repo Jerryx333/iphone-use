@@ -84,13 +84,77 @@ final class AppModel: ObservableObject {
     let agent: AgentController
     let voiceCall = AssistantVoiceCall()
 
+    var thisPhoneSession: DeviceSession? {
+        let local = devices.compactMap { sessions[$0.id] }.filter { $0.record.isThisPhone }
+        return local.sorted { a, b in
+            @MainActor func score(_ s: DeviceSession) -> Int {
+                (s.phase == .connected ? 10 : 0) + (s.status?.drivable == true ? 20 : 0) + (s.record.address.contains(":18787") ? 1 : 0)
+            }
+            return score(a) > score(b)
+        }.first
+    }
+
+    private static var localRuntimeQAEnabled: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--local-runtime-qa") || ProcessInfo.processInfo.arguments.contains("--voice-runtime-qa")
+        #else
+        false
+        #endif
+    }
     private let defaults: UserDefaults
+    private var connectingStandalone = false
+
+    /// Attach the phone's own authenticated service without asking for an
+    /// address/password or creating a second companion-app workflow.
+    func connectStandaloneControlIfReady() async -> Bool {
+        guard DeviceStore.supportsStandaloneControl,
+              !connectingStandalone else { return false }
+        if let record = devices.first(where: { $0.address == DeviceStore.standalonePhoneAddress }),
+           sessions[record.id]?.phase == .connected { return true }
+        connectingStandalone = true
+        defer { connectingStandalone = false }
+        do {
+            let token = try ProtectedStore.token("daemon_token")
+            var request = URLRequest(url: URL(string: DeviceStore.standalonePhoneAddress + "/agent/status")!)
+            request.timeoutInterval = 3
+            request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 1_048_576,
+                  let status = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  status["drivable"] as? Bool == true else { return false }
+            let priorFocus = focusedID
+            let chooseLocal = agent.target == nil || agent.target?.record.isThisPhone == true
+            let outcome = await add(address: DeviceStore.standalonePhoneAddress,
+                                    password: try ProtectedStore.token("daemon_password"))
+            guard case let .connected(id) = outcome else { return false }
+            if chooseLocal { agent.targetID = id }
+            else { focusedID = priorFocus }
+            return true
+        } catch { return false }
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         agent = AgentController(defaults: defaults)
         agent.app = self
         #if DEBUG
+        // Device QA imports credentials privately, never as launch arguments
+        // or source constants. Consume and remove the temporary file once.
+        if ProcessInfo.processInfo.arguments.contains("--local-control-stop") { DeviceQAOptions.clear() }
+        else { DeviceQAOptions.capture() }
+        if ProcessInfo.processInfo.arguments.contains("--private-model-import") {
+            let file = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("private-model-import.json")
+            defer { try? FileManager.default.removeItem(at: file) }
+            do {
+                let profile = try JSONDecoder().decode(PrivateModelProfile.self, from: Data(contentsOf: file))
+                let provider = try profile.provider()
+                ModelSettingsStore.setSecret(profile.key, for: provider.keyAccount)
+                agent.settings.assist.insert(provider, at: 0)
+                agent.settings.allowModelFallback = false
+                agent.settings.sendModels = true
+            } catch { toast = "私有模型配置导入失败，原有模型配置已保留。" }
+        }
         // Screenshots: `-demo YES [-demoScreen <id>]` opens the demo directly.
         if defaults.bool(forKey: "demo") {
             demo = DemoSession(startingAt: defaults.string(forKey: "demoScreen"))
@@ -334,7 +398,9 @@ final class AppModel: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !DeviceStore.same(old, address) {
             session.disconnect()
-            DeviceSession.moveCredentials(from: old, to: address)
+            guard DeviceSession.moveCredentials(from: old, to: address) else {
+                return .rejected(String(localized: "连接信息未能保存，请解锁这台手机后重试。原来的登录信息已保留。"), canSaveAnyway: false)
+            }
             devices[index].address = address
         }
         // An empty name, or the old default left as it was, follows the address.

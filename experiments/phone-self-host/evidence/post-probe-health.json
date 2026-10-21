@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "scope": "Post-probe health; external Mac USB test session remained active",
+  "observed_at": "2026-10-11 04:40:05 UTC",
+  "device_model": "iPhone 17 Pro Max",
+  "ios": "27.0",
+  "drivable": true,
+  "runner_actionable": true,
+  "transport": "usb",
+  "managed_runner": true,
+  "setup_blocked_on": ""
+}

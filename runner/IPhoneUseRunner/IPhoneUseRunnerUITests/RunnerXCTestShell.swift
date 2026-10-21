@@ -1,4 +1,4 @@
-// XCTest shell of the device runner: RunnerTests.testServe (the method setup-wda.sh launches)
+// XCTest shell of the device runner: RunnerTests.testServe (the method setup-runner.sh launches)
 // starts RunnerCore and blocks in XCTWaiter. The capabilities are RunnerCore (RunnerTests.swift:
 // the file keeps its old name so upstream edits to it still merge), which Self Runner also hosts.
 

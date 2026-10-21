@@ -404,10 +404,14 @@ pub fn plist_env(path: &Path, key: &str) -> String {
         .map(|suffix| format!("IPHONE_USE_{suffix}"))
         .unwrap_or_else(|| key.to_owned());
     let value = read(&canonical);
-    match core::env::legacy_name(&canonical) {
-        Some(old) if value.is_empty() => read(&old),
-        _ => value,
+    if !value.is_empty() {
+        return value;
     }
+    core::env::legacy_names(&canonical)
+        .into_iter()
+        .map(|old| read(&old))
+        .find(|old| !old.is_empty())
+        .unwrap_or_default()
 }
 
 /// A top-level scalar (`Label`) or `ProgramArguments` item of a plist.
@@ -505,13 +509,13 @@ mod tests {
     fn setup_reads_branded_ports_and_credentials_from_plists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixture.plist");
-        std::fs::write(&path,r#"<?xml version="1.0"?><plist version="1.0"><dict><key>EnvironmentVariables</key><dict><key>IPHONE_USE_PORT</key><string>45432</string><key>PHONE_REMOTE_PORT</key><string>44321</string><key>IPHONE_USE_AGENT_TOKEN</key><string>synthetic-token</string><key>WDA_PORT</key><string>8100</string></dict></dict></plist>"#).unwrap();
+        std::fs::write(&path,r#"<?xml version="1.0"?><plist version="1.0"><dict><key>EnvironmentVariables</key><dict><key>IPHONE_USE_PORT</key><string>45432</string><key>PHONE_REMOTE_PORT</key><string>44321</string><key>IPHONE_USE_AGENT_TOKEN</key><string>synthetic-token</string><key>IPU_RUNNER_PORT</key><string>8100</string></dict></dict></plist>"#).unwrap();
         assert_eq!(plist_env(&path, "PHONE_REMOTE_PORT"), "45432");
         assert_eq!(
             plist_env(&path, "PHONE_REMOTE_AGENT_TOKEN"),
             "synthetic-token"
         );
-        assert_eq!(plist_env(&path, "WDA_PORT"), "8100");
+        assert_eq!(plist_env(&path, "IPU_RUNNER_PORT"), "8100");
     }
     /// devicectl can hang forever on a wedged tunnel; every call is bounded.
     #[test]

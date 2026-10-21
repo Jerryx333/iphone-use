@@ -1,0 +1,22 @@
+{
+  "elapsed_seconds": 1.9152859449386597,
+  "executor": "on-device app via signed local runner HTTP",
+  "finished_at": "2026-10-11T21:14:26Z",
+  "ok": true,
+  "schema": 1,
+  "scope": "real input/source/screenshot in this test app; Mac disconnection requires a separate recorded observation",
+  "screenshot_height": 512,
+  "screenshot_sha256": "356268c9dcb65c93e568868cb9fe2e1f2d32dcbbda0b8104ae17687b900c51c7",
+  "screenshot_width": 236,
+  "source_verified": true,
+  "started_at": "2026-10-11T21:14:25Z",
+  "tap_observed": true,
+  "typing_observed": true,
+  "application_bundle": "com.leeguoo.iphone-use.remote",
+  "control_bundle": "PhoneUse.xctest",
+  "candidate": "PhoneUse-runloop.app",
+  "backend_version": "0.17.18",
+  "normal_mac_daemon_loaded": false,
+  "normal_mac_supervisor_loaded": false,
+  "usb_device_present": false
+}

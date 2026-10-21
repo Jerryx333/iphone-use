@@ -8,7 +8,7 @@
   <LaunchAgents>/<前缀>.selfrunner-autoresign.plist 每 30 分钟检查签名并自动重签
   <cloudflared>/phone-gateway.yml                  隧道 ingress：<域名> → WSS 入口
   <autoresign 路径>                                 scripts/selfrunner-autoresign 的副本
-  daemon plist 的环境变量                           外部托管模式（§14）：WDA/MJPEG 指向转发端口
+  daemon plist 的环境变量                           外部托管模式（§14）：runner/MJPEG 指向转发端口
 
 用法：
   selfrunner-remote-setup.py check                 与现网逐项比较，一致返回 0
@@ -193,12 +193,12 @@ def cloudflared_yml(v):
 
 
 def daemon_env(v):
-    # §14 外部托管：daemon 不管 WDA 生命周期，经 gateway 的转发端口访问手机上的 runner。
+    # §14 外部托管：daemon 不管 runner 生命周期，经 gateway 的转发端口访问手机上的 runner。
     return {
         "IPHONE_USE_UDID": v["SR_DEVICE_UDID"],
-        "IPHONE_USE_WDA_MANAGED": "false",
-        "IPHONE_USE_WDA_URL": f"http://{v['SR_RUNNER_FORWARD']}",
-        "IPHONE_USE_WDA_MJPEG_URL": f"http://{v['SR_MJPEG_FORWARD']}",
+        "IPHONE_USE_RUNNER_MANAGED": "false",
+        "IPHONE_USE_RUNNER_URL": f"http://{v['SR_RUNNER_FORWARD']}",
+        "IPHONE_USE_RUNNER_MJPEG_URL": f"http://{v['SR_MJPEG_FORWARD']}",
         "IPHONE_USE_SELFRUNNER_GATEWAY": f"http://{v['SR_GW_HTTP']}",
     }
 
@@ -278,8 +278,8 @@ def daemon_env_keys(merged):
 
 
 def daemon_env_template():
-    return ("IPHONE_USE_UDID", "IPHONE_USE_WDA_MANAGED", "IPHONE_USE_WDA_URL",
-            "IPHONE_USE_WDA_MJPEG_URL", "IPHONE_USE_SELFRUNNER_GATEWAY")
+    return ("IPHONE_USE_UDID", "IPHONE_USE_RUNNER_MANAGED", "IPHONE_USE_RUNNER_URL",
+            "IPHONE_USE_RUNNER_MJPEG_URL", "IPHONE_USE_SELFRUNNER_GATEWAY")
 
 
 def cmd_check(v):

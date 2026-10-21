@@ -1,0 +1,24 @@
+{
+  "version": "0.17.19",
+  "drivable": true,
+  "device_state": "ready",
+  "owner": null,
+  "human_handoff": false,
+  "managed_runner": true,
+  "phone_daemon": {
+    "linked": true,
+    "port": 8787,
+    "state": "serving"
+  },
+  "observed_at": "2026-10-11T19:16:10.360456+00:00",
+  "vpn": {
+    "observed_at": "2026-10-11T19:14:20.068710+00:00",
+    "selected_vpn": "Shadowrocket",
+    "vpn_switch_values": [
+      "0",
+      "0"
+    ],
+    "action_ok": true
+  },
+  "probe_private_export_removed": true
+}

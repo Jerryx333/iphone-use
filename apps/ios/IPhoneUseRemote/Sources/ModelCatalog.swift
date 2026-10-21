@@ -126,8 +126,31 @@ enum ZenCompatibility {
             }
             let delta = choice["delta"] as? [String: Any] ?? [:]
             content += delta["content"] as? String ?? ""
-            for call in delta["tool_calls"] as? [[String: Any]] ?? [] {
-                guard let index = call["index"] as? Int else { throw BrowserToolError.invalidResult }
+            for (position, call) in (delta["tool_calls"] as? [[String: Any]] ?? []).enumerated() {
+                guard let index = call["index"] as? Int else {
+                    // Zen also sends a complete terminal tool list without
+                    // fragment indexes. Accept only a fully identified call
+                    // with complete object arguments, never guess fragments.
+                    guard choice["finish_reason"] as? String == "tool_calls",
+                          let id = call["id"] as? String, !id.isEmpty,
+                          call["type"] as? String == "function",
+                          let function = call["function"] as? [String: String],
+                          let name = function["name"], !name.isEmpty,
+                          let arguments = function["arguments"],
+                          (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
+                        throw BrowserToolError.invalidResult
+                    }
+                    if let previous = calls[position] {
+                        let partial = previous["function"] as? [String: String] ?? [:]
+                        guard previous["id"] as? String == id,
+                              name.hasPrefix(partial["name"] ?? ""),
+                              arguments.hasPrefix(partial["arguments"] ?? "") else {
+                            throw BrowserToolError.invalidResult
+                        }
+                    }
+                    calls[position] = call
+                    continue
+                }
                 var saved = calls[index] ?? ["type": "function"]
                 if let id = call["id"] { saved["id"] = id }
                 var function = saved["function"] as? [String: String] ?? [:]

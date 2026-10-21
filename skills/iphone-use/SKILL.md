@@ -8,7 +8,7 @@ description: Use when a task needs a real iPhone — operating iOS apps that hav
 The [iphone-use](https://github.com/leeguooooo/iphone-use) daemon drives a
 physical iPhone through its own XCTest device runner. This runner replaced
 WebDriverAgent in v0.14.0; it does not use iPhone Mirroring. The HTTP interface
-is WebDriverAgent-compatible, and legacy "WDA" field names refer to this runner. It never touches the Mac's screen or
+is WebDriverAgent-compatible (its `/wda/...` routes). It never touches the Mac's screen or
 cursor. Use the HTTP API below or the bundled MCP server (`phone_*` tools); the
 loop is the same. Details live in the reference: `curl -s -H "$AUTH"
 "$HOST/agent/reference"` serves the copy that matches the running daemon
@@ -94,13 +94,22 @@ it off again.
 | Type | `text` (into the focused field; up to 20000 chars — on `text_partially_typed` send only `remaining_text` with `clear:false`) | `phone_type` | `type` (`input` names a runtime value) |
 | Key | `key` `return`… | `phone_key` | `key` |
 | Home / Spotlight | `shortcut` | `phone_shortcut` | `shortcut` |
-| Scroll | `scroll` `dy` (80 ≈ 15% of a screen, 400 ≈ 75%) | `phone_scroll` | `scroll` |
+| Scroll | `scroll` `dy` (80 ≈ 15% of a screen, 400 ≈ 75%) | `phone_scroll` (`x`, `y`, `dx`, `dy` required) | `scroll` (`x`, `y`, `dx`, `dy` required in MCP batches) |
 | System alert | `alert` `button` / `action` | `phone_run_steps` step | `alert` |
 | App asks you to log in | `POST /agent/login` (`iphone-use auth login --bwu`) | `phone_login` | — |
 | Switch / slider | `perform` `toggle` / `adjust` | `phone_run_steps` `perform` step (element + snapshot) | — |
 
 All actions, including swipe, drag, picker, set_value and the scroll variants,
 are listed in the reference: *Actions catalogue*.
+
+HTTP `/agent/input` supplies defaults for omitted scroll anchors and `dx`.
+MCP `phone_scroll` and `phone_run_steps` scroll steps require all four fields.
+Choose normalized `x`/`y` inside the intended scroll area on the current screen.
+For a center anchor verified from that screen, the MCP batch shape is:
+
+```json
+{"steps":[{"kind":"scroll","x":0.5,"y":0.5,"dx":0.0,"dy":80.0}]}
+```
 
 ```bash
 curl -s -H "$AUTH" -H "$MUTATION" -H "$OWNER" -X POST "$HOST/agent/input" \
@@ -134,6 +143,10 @@ model turns. To count one task exactly, wrap it in `phone_run_start` /
 `phone_run_end` (HTTP: `POST /agent/run`). `GET /agent/elements?scope=app`
 (or `interactive`, `focused`, `changed&since=…`) returns a smaller view of the
 same read; `?image=auto` adds a screenshot only when the tree is unusable.
+MCP screen text includes at most 200 rows and 32 KiB of row text. When it
+reports omitted rows, narrow `phone_elements` with `query`/`limit`; an omitted
+target is not proven absent and a truncated list is not proven complete.
+Use the displayed `#N` with its snapshot: it is the original full-tree index.
 → reference: *Task metrics, runs and advice*
 
 ## A flow is just these steps saved

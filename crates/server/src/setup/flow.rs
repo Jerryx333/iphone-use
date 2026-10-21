@@ -1,10 +1,10 @@
 //! `setup`: bring the device runner up on the phone, relay it to loopback,
-//! point the daemon at it, and — under launchd (`WDA_KEEPALIVE=1`) — hold
+//! point the daemon at it, and — under launchd (`IPU_RUNNER_KEEPALIVE=1`) — hold
 //! while it stays healthy, exiting so launchd rebuilds it when it does not.
 //!
-//! Stage for stage, message for message, what `setup-wda.sh` did: the daemon
+//! Stage for stage, message for message, what `setup-runner.sh` did: the daemon
 //! and the web client read the same status phases and blockers, and
-//! `wda-agent.log` reads the same.
+//! `runner-agent.log` reads the same.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -80,13 +80,22 @@ pub struct Setup {
     /// Readiness came straight over USB (no LAN address known yet).
     from_probe: bool,
     /// The target is off USB and this run reaches it through CoreDevice's
-    /// encrypted Wi-Fi tunnel (`WDA_TRANSPORT=auto`).
+    /// encrypted Wi-Fi tunnel (`IPU_RUNNER_TRANSPORT=auto`).
     over_tunnel: bool,
     interactive_lock: Option<InteractiveLock>,
     /// Set when the phone takes the legacy (iOS 15/16) path.
     legacy_ios: Option<LegacyRun>,
     /// The on-phone daemon library linked into the runner (see `embed`).
     embed: Option<super::embed::EmbedLib>,
+    /// `setup-native prebuild`: build and record the product, never touch
+    /// the phone, the daemon, the supervisor or the status file.
+    prebuild_only: bool,
+    /// This run builds only because an upgrade changed the product
+    /// ([`runner::upgrade_rebuild`]).
+    upgrade_rebuild: bool,
+    /// The control relay reaches the phone through CoreDevice's Wi-Fi
+    /// tunnel, not usbmuxd (only for what the log calls it).
+    relay_over_tunnel: bool,
 }
 
 /// A phone on the legacy (iOS 15/16) path: see `legacy_ios`.
@@ -160,6 +169,9 @@ impl Setup {
             interactive_lock: None,
             legacy_ios: None,
             embed: None,
+            prebuild_only: false,
+            upgrade_rebuild: false,
+            relay_over_tunnel: false,
         }
     }
 
@@ -474,6 +486,7 @@ impl Setup {
             legacy_ios::clear_record(self.ctx.state_dir());
             self.wait_for_developer_services()?;
             self.wait_for_unlock()?;
+            self.remove_pre_rename_runner();
         }
         self.phase(
             "building",
@@ -537,21 +550,11 @@ impl Setup {
         let xcode_version =
             checks::xcode_version_cached(self.ctx.state_dir(), &xcodebuild.to_string_lossy());
         self.icon_source = icon::source(&self.ctx);
-        // The icon is part of the product: a different icon rebuilds.
-        let key = format!(
-            "{}|{}",
-            runner::cache_key(
-                &self.ctx,
-                &source_hash,
-                &self.ctx.bundle_id,
-                &self.ctx.team_id,
-                &self.ctx.udid,
-                &xcode_version,
-                sdk.as_deref().unwrap_or(""),
-                &deployment_override,
-                &super::embed::cache_component(self.embed.as_ref()),
-            ),
-            icon::cache_component(self.icon_source.as_deref())
+        let key = self.product_key(
+            &source_hash,
+            &xcode_version,
+            sdk.as_deref(),
+            &deployment_override,
         );
         let (products, xctestrun, from_cache) = self.product(&xcodebuild, &key)?;
         let url = if self.legacy_ios.is_some() {
@@ -622,7 +625,7 @@ impl Setup {
             Err(error) => {
                 self.phase("prereq", "warp", "WARP is connected and breaks CoreDevice");
                 return die(format!(
-                    "{error}\n   WARP would otherwise invalidate the just-verified runner session and create a restart loop.\n   See docs/wda-setup.html pitfall (WARP)."
+                    "{error}\n   WARP would otherwise invalidate the just-verified runner session and create a restart loop.\n   See docs/runner-setup.html pitfall (WARP)."
                 ));
             }
         }
@@ -642,10 +645,10 @@ impl Setup {
                 "Xcode is not installed. Get it from the App Store ({XCODE_APP_STORE_URL}), open it once, then rerun"
             ));
         };
-        if valid_port(&self.ctx.wda_port).is_none() {
+        if valid_port(&self.ctx.runner_port).is_none() {
             return die(format!(
-                "WDA_PORT must be a decimal TCP port from 1 to 65535 (got '{}')",
-                self.ctx.wda_port
+                "IPU_RUNNER_PORT must be a decimal TCP port from 1 to 65535 (got '{}')",
+                self.ctx.runner_port
             ));
         }
         if valid_port(&self.ctx.mjpeg_port).is_none() {
@@ -654,10 +657,10 @@ impl Setup {
                 self.ctx.mjpeg_port
             ));
         }
-        if self.ctx.wda_port == self.ctx.mjpeg_port {
+        if self.ctx.runner_port == self.ctx.mjpeg_port {
             return die(format!(
-                "WDA_PORT and MJPEG_PORT must be different (both are '{}')",
-                self.ctx.wda_port
+                "IPU_RUNNER_PORT and MJPEG_PORT must be different (both are '{}')",
+                self.ctx.runner_port
             ));
         }
         let version =
@@ -671,7 +674,9 @@ impl Setup {
         let signing = match checks::resolve_signing(&self.ctx) {
             Ok(signing) => signing,
             Err(error) => {
-                checks::open_xcode_for_account(&self.ctx);
+                if !self.prebuild_only {
+                    checks::open_xcode_for_account(&self.ctx);
+                }
                 return die(error);
             }
         };
@@ -693,6 +698,33 @@ impl Setup {
         Ok(())
     }
 
+    /// A phone set up before v0.20 still has the runner under its old,
+    /// WebDriverAgent-era identifier: the renamed one is a second app, and a
+    /// free team has three app slots. Remove the old one once per phone,
+    /// before the renamed runner is installed; best effort, never fatal.
+    fn remove_pre_rename_runner(&self) {
+        let Some(old) = checks::pre_rename_bundle(&self.ctx.bundle_id) else {
+            return;
+        };
+        let marker = self
+            .ctx
+            .state_dir()
+            .join(format!("pre-rename-runner-removed.{}", self.ctx.udid));
+        if self.ctx.udid.is_empty() || marker.exists() {
+            return;
+        }
+        let app = format!("{old}.xctrunner");
+        let out = sys::devicectl(
+            30,
+            &["device", "uninstall", "app", "--device", &self.ctx.udid, &app],
+        );
+        // devicectl answers this for an app that was never installed too.
+        if out.contains("App uninstalled") {
+            info(&format!("Pre-rename runner app is gone from the phone: {app}"));
+            let _ = std::fs::write(&marker, b"");
+        }
+    }
+
     fn resolve_device(&mut self) -> Step {
         info("Resolving target device");
         let udid_ok = |udid: &str| udid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
@@ -702,7 +734,7 @@ impl Setup {
         if !self.ctx.instance.is_default() && self.ctx.udid.is_empty() {
             let name = &self.ctx.instance.name;
             return die(format!(
-                "instance {name} has no target iPhone; set WDA_UDID or rerun install.sh --instance {name} --udid <UDID>"
+                "instance {name} has no target iPhone; set IPU_RUNNER_UDID or rerun install.sh --instance {name} --udid <UDID>"
             ));
         }
         if self.ctx.udid.is_empty() {
@@ -712,12 +744,12 @@ impl Setup {
                 ok(&format!("using USB-connected iPhone: {}", self.ctx.udid));
             } else if !usb.is_empty() {
                 return die(format!(
-                    "multiple iPhones are connected over USB ({}). Set WDA_UDID=<one>; refusing to guess.",
+                    "multiple iPhones are connected over USB ({}). Set IPU_RUNNER_UDID=<one>; refusing to guess.",
                     usb.join(" ")
                 ));
             } else if self.ctx.wifi_tunnel_allowed() {
                 // No cable: the one phone with a live encrypted Wi-Fi tunnel
-                // (WDA_ALLOW_LAN only adds the plain LAN relay, it does not
+                // (IPU_RUNNER_ALLOW_LAN only adds the plain LAN relay, it does not
                 // change which phone is picked).
                 // Guessing among several could drive the wrong phone.
                 let tunneled = checks::wifi_tunnel_udids();
@@ -729,7 +761,7 @@ impl Setup {
                     ));
                 } else if tunneled.len() > 1 {
                     return die(format!(
-                        "no iPhone is on USB and several have a Wi-Fi tunnel ({}). Set WDA_UDID=<one>; refusing to guess.",
+                        "no iPhone is on USB and several have a Wi-Fi tunnel ({}). Set IPU_RUNNER_UDID=<one>; refusing to guess.",
                         tunneled.join(" ")
                     ));
                 }
@@ -738,7 +770,7 @@ impl Setup {
         if !self.ctx.udid.is_empty() {
             self.wait_until_connected()?;
         }
-        // WDA_TRANSPORT=usb requires the cable even with WDA_ALLOW_LAN=1: that
+        // IPU_RUNNER_TRANSPORT=usb requires the cable even with IPU_RUNNER_ALLOW_LAN=1: that
         // flag only adds the plain LAN relay, it is not a transport choice.
         if !self.ctx.lan() || !self.ctx.wifi_tunnel_allowed() {
             if self.ctx.udid.is_empty() {
@@ -751,9 +783,9 @@ impl Setup {
                 }
                 self.phase("prereq", "usb", "no USB iPhone is connected");
                 if self.ctx.wifi_tunnel_allowed() {
-                    return die("no iPhone was found over USB or on a CoreDevice Wi-Fi tunnel.\n   Plug in and unlock one iPhone (a Wi-Fi phone needs a tunnel: pair it with this Mac over USB once,\n   keep it on the same network), or set WDA_UDID=<UDID>; no build was started.");
+                    return die("no iPhone was found over USB or on a CoreDevice Wi-Fi tunnel.\n   Plug in and unlock one iPhone (a Wi-Fi phone needs a tunnel: pair it with this Mac over USB once,\n   keep it on the same network), or set IPU_RUNNER_UDID=<UDID>; no build was started.");
                 }
-                return die("WDA_TRANSPORT=usb requires USB, but no USB iPhone was found.\n   Plug in and unlock one iPhone, or set WDA_UDID=<USB UDID>; no build was started.");
+                return die("IPU_RUNNER_TRANSPORT=usb requires USB, but no USB iPhone was found.\n   Plug in and unlock one iPhone, or set IPU_RUNNER_UDID=<USB UDID>; no build was started.");
             }
             let usb = checks::usb_udids();
             if !checks::on_usb(&self.ctx.udid, &usb)
@@ -767,7 +799,7 @@ impl Setup {
             } else if !checks::on_usb(&self.ctx.udid, &usb) {
                 // Off the cable, CoreDevice's encrypted Wi-Fi tunnel reaches
                 // the phone from this Mac only, so it needs no opt-in; the
-                // plain LAN relay stays behind WDA_ALLOW_LAN=1.
+                // plain LAN relay stays behind IPU_RUNNER_ALLOW_LAN=1.
                 if self.ctx.wifi_tunnel_allowed() && checks::wifi_tunnel_or_wake(&self.ctx.udid) {
                     ok(&format!(
                         "{} is off USB; setting up through its encrypted CoreDevice Wi-Fi tunnel (USB is used whenever it is plugged in)",
@@ -781,7 +813,7 @@ impl Setup {
                         if self.ctx.wifi_tunnel_allowed() {
                             "the configured iPhone is neither on USB nor on a CoreDevice Wi-Fi tunnel"
                         } else {
-                            "the configured iPhone is not connected over USB (WDA_TRANSPORT=usb)"
+                            "the configured iPhone is not connected over USB (IPU_RUNNER_TRANSPORT=usb)"
                         },
                     );
                     return die(not_reachable_message(
@@ -805,9 +837,9 @@ impl Setup {
                 }
             }
         } else if self.ctx.udid.is_empty() {
-            warn("WDA_ALLOW_LAN=1: no USB target; paired destinations will be enumerated from the runner project");
+            warn("IPU_RUNNER_ALLOW_LAN=1: no USB target; paired destinations will be enumerated from the runner project");
         }
-        let ports = [self.ctx.wda_port.clone(), self.ctx.mjpeg_port.clone()];
+        let ports = [self.ctx.runner_port.clone(), self.ctx.mjpeg_port.clone()];
         let refs: Vec<&str> = ports.iter().map(String::as_str).collect();
         if let Err(error) = super::ctx::check_bindings_cached(&self.ctx, &refs) {
             println!("{error}");
@@ -825,13 +857,13 @@ impl Setup {
         if let Err(error) = checks::runner_source_valid(&self.ctx) {
             self.phase(
                 "prereq",
-                "wda",
+                "runner",
                 "device runner sources are missing or unsafe",
             );
             return die(error);
         }
         let Some(hash) = checks::runner_source_hash(&self.ctx.runner_src) else {
-            self.phase("prereq", "wda", "device runner sources could not be read");
+            self.phase("prereq", "runner", "device runner sources could not be read");
             return die(format!(
                 "could not read the device runner sources in {}",
                 self.ctx.runner_src.display()
@@ -858,7 +890,9 @@ impl Setup {
             embed: &self.ctx.embed,
             embed_lib: &self.ctx.embed_lib,
             runner_src: &self.ctx.runner_src,
-            keepalive: self.ctx.keepalive,
+            // The prebuild runs unattended: it links what is there and never
+            // runs cargo in a checkout, like the supervisor.
+            keepalive: self.ctx.keepalive || self.prebuild_only,
         };
         let log = self.rel("embed-build.log");
         let home = self.ctx.home.clone();
@@ -958,7 +992,7 @@ impl Setup {
                 for udid in &udids {
                     eprintln!("    {udid}");
                 }
-                die("multiple paired iOS destinations are available; set WDA_UDID=<one exact UDID>")
+                die("multiple paired iOS destinations are available; set IPU_RUNNER_UDID=<one exact UDID>")
             }
         }
     }
@@ -1013,7 +1047,7 @@ impl Setup {
                 .count();
             if count > 1 {
                 warn(&format!(
-                    "{count} iOS devices are paired — if the wrong one was picked, re-run with WDA_UDID=<classic-udid> (the 00008…/8-… id)."
+                    "{count} iOS devices are paired — if the wrong one was picked, re-run with IPU_RUNNER_UDID=<classic-udid> (the 00008…/8-… id)."
                 ));
             }
         }
@@ -1253,7 +1287,7 @@ impl Setup {
                 for line in sys::devicectl(8, &["list", "devices"]).lines() {
                     eprintln!("    {line}");
                 }
-                warn("If the wrong phone was picked, re-run with WDA_UDID=<classic-udid>.");
+                warn("If the wrong phone was picked, re-run with IPU_RUNNER_UDID=<classic-udid>.");
                 warn("If WARP is connected, verify its effective Excluded routes contain fe80::/10 and fd00::/8.");
                 warn("Temporarily disconnect WARP only when those Zero Trust Split Tunnel exclusions cannot be added.");
                 self.phase(
@@ -1261,7 +1295,7 @@ impl Setup {
                     "ddi",
                     "developer services never became available",
                 );
-                return die("developer services not available (docs/wda-setup.html pitfall ①; check WARP/USB)");
+                return die("developer services not available (docs/runner-setup.html pitfall ①; check WARP/USB)");
             }
             if self.ctx.keepalive {
                 if tries == 1 && !self.lock_retry {
@@ -1300,7 +1334,7 @@ impl Setup {
     /// an unreadable one proves nothing).
     fn wait_for_unlock(&mut self) -> Step {
         let (limit, complaint) =
-            lock_wait_limit(std::env::var("WDA_LOCK_WAIT_SECS").ok().as_deref());
+            lock_wait_limit(std::env::var("IPU_RUNNER_LOCK_WAIT_SECS").ok().as_deref());
         if let Some(complaint) = complaint {
             warn(&complaint);
         }
@@ -1349,12 +1383,63 @@ impl Setup {
 
     // ── the product ─────────────────────────────────────────────────────────
 
+    /// The product-cache key of this run. The icon is part of the product:
+    /// a different icon rebuilds. Setup and the post-upgrade prebuild must
+    /// compute it the same way, or the prebuilt product is never reused.
+    fn product_key(
+        &self,
+        source_hash: &str,
+        xcode_version: &str,
+        sdk: Option<&str>,
+        deployment_override: &str,
+    ) -> String {
+        format!(
+            "{}|{}",
+            runner::cache_key(
+                &self.ctx,
+                source_hash,
+                &self.ctx.bundle_id,
+                &self.ctx.team_id,
+                &self.ctx.udid,
+                xcode_version,
+                sdk.unwrap_or(""),
+                deployment_override,
+                &super::embed::cache_component(self.embed.as_ref()),
+            ),
+            icon::cache_component(self.icon_source.as_deref())
+        )
+    }
+
+    /// Wait for the build lock: a post-upgrade prebuild may be building this
+    /// very product, and the product it records is then reused below.
+    fn build_lock(&mut self) -> Step<runner::BuildLock> {
+        let mut announced = false;
+        loop {
+            match runner::try_build_lock(&self.ctx) {
+                Ok(Some(lock)) => return Ok(lock),
+                Ok(None) => {}
+                Err(why) => return die(why),
+            }
+            if !announced {
+                announced = true;
+                info("Waiting for the background runner build (after an upgrade) to finish");
+                self.phase(
+                    "building",
+                    &self.build_blocker.clone(),
+                    runner::UPGRADE_BUILD_MESSAGE,
+                );
+            }
+            proc::sleep(Duration::from_secs(1))?;
+        }
+    }
+
     /// (products dir, .xctestrun, reused from the cache).
     fn product(&mut self, xcodebuild: &Path, key: &str) -> Step<(PathBuf, PathBuf, bool)> {
-        let rebuild = std::env::var("WDA_RUNNER_REBUILD").is_ok_and(|v| v == "1");
+        let _lock = self.build_lock()?;
+        let rebuild = std::env::var("IPU_RUNNER_REBUILD").is_ok_and(|v| v == "1");
         if !rebuild {
             if let Some((products, _app, xctestrun)) = runner::cache_read(&self.ctx, key) {
-                ok("Reusing the runner product from the last bring-up (no rebuild; WDA_RUNNER_REBUILD=1 forces one)");
+                ok("Reusing the runner product from the last bring-up (no rebuild; IPU_RUNNER_REBUILD=1 forces one)");
                 self.phase(
                     "building",
                     &self.build_blocker.clone(),
@@ -1363,7 +1448,13 @@ impl Setup {
                 return Ok((products, xctestrun, true));
             }
         }
-        let build_log = self.rel("wda-runner-product-build.log");
+        self.upgrade_rebuild = !rebuild
+            && runner::recorded_key(&self.ctx)
+                .is_some_and(|old| runner::upgrade_rebuild(&old, key));
+        if self.upgrade_rebuild {
+            info("The runner product changed with the iphone-use upgrade; building it once (about 1-2 min)");
+        }
+        let build_log = self.rel("runner-product-build.log");
         match self.ensure_launchable(xcodebuild, &build_log)? {
             Some((products, xctestrun)) => {
                 // Record as soon as it is verified, not after it serves: a
@@ -1395,12 +1486,12 @@ impl Setup {
                     // "could not find or create a development provisioning" is
                     // the phrase the daemon maps to its `account` blocker.
                     return die(format!(
-                        "Xcode could not find or create a development provisioning profile for the device runner.\n   In Xcode → Settings → Accounts, refresh the selected team, keep the iPhone\n   registered, then rerun. With WDA_ASC_* API-key signing, check that the key\n   can manage profiles. Build log: {}",
+                        "Xcode could not find or create a development provisioning profile for the device runner.\n   In Xcode → Settings → Accounts, refresh the selected team, keep the iPhone\n   registered, then rerun. With IPU_RUNNER_ASC_* API-key signing, check that the key\n   can manage profiles. Build log: {}",
                         build_log.display()
                     ));
                 }
                 let error = self.validation_error.clone();
-                self.phase("building-fail", "wda", &error);
+                self.phase("building-fail", "runner", &error);
                 die(format!("device runner product is not launchable: {error}"))
             }
         }
@@ -1410,7 +1501,11 @@ impl Setup {
         self.phase(
             "building",
             &self.build_blocker.clone(),
-            "building the device runner",
+            if self.upgrade_rebuild {
+                runner::UPGRADE_BUILD_MESSAGE
+            } else {
+                "building the device runner"
+            },
         );
         let _ = std::fs::write(build_log, b"");
         let signing = self.signing.clone().unwrap_or(Signing {
@@ -1542,7 +1637,7 @@ impl Setup {
         if self.repair_attempted {
             self.phase(
                 "building-fail",
-                "wda",
+                "runner",
                 &format!("runner still invalid after one repair: {reason}"),
             );
             return Ok(false);
@@ -1590,7 +1685,7 @@ impl Setup {
         if !rebuilt {
             self.phase(
                 "building-fail",
-                "wda",
+                "runner",
                 &format!("runner repair failed: {}", self.validation_error),
             );
             return Ok(false);
@@ -1606,12 +1701,12 @@ impl Setup {
     // ── launch ──────────────────────────────────────────────────────────────
 
     fn report_missing_account<T>(&self) -> Step<T> {
-        self.phase(
-            "signing-fail",
-            "account",
-            "sign in to an Apple account in Xcode, or configure WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID for API key signing",
+        let message = format!(
+            "Xcode reported No Accounts while signing the device runner. Open Xcode → Settings → Accounts,\n   sign in and select the development team. If Xcode already lists the account,\n   open {} in Xcode, select the IPhoneUseRunner scheme and your iPhone,\n   then choose Product → Build For → Testing once. Allow keychain access if prompted\n   so Xcode can create the signing certificate and provisioning profile, then rerun setup.\n   Alternatively, configure IPU_RUNNER_ASC_KEY_PATH, IPU_RUNNER_ASC_KEY_ID and IPU_RUNNER_ASC_ISSUER_ID\n   for App Store Connect API key signing.",
+            self.ctx.runner_project.display()
         );
-        die("Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,\n   sign in and select the development team, or configure WDA_ASC_KEY_PATH,\n   WDA_ASC_KEY_ID and WDA_ASC_ISSUER_ID for App Store Connect API key signing,\n   then rerun.")
+        self.phase("signing-fail", "account", &message);
+        die(message)
     }
 
     fn report_device_unavailable<T>(&mut self) -> Step<T> {
@@ -1821,7 +1916,7 @@ impl Setup {
                 if self.ctx.keepalive {
                     self.phase("building", &self.build_blocker.clone(), &message);
                 } else {
-                    self.phase("building-fail", "wda", &message);
+                    self.phase("building-fail", "runner", &message);
                 }
                 // Keep the kind: KeepAlive retries within seconds, not the
                 // build failure's minutes.
@@ -1938,7 +2033,7 @@ impl Setup {
                 }
                 self.phase(
                     "building-fail",
-                    "wda",
+                    "runner",
                     "the device runner did not report its server URL before the startup timeout",
                 );
                 return die(format!(
@@ -1990,7 +2085,7 @@ impl Setup {
                 if locked {
                     self.phase(
                         "building-fail",
-                        "wda",
+                        "runner",
                         "phone is locked and the device runner exited",
                     );
                     return die(
@@ -2031,7 +2126,7 @@ impl Setup {
                 }
                 self.phase(
                     "building-fail",
-                    "wda",
+                    "runner",
                     "the device runner exited before reporting its server URL",
                 );
                 return die(format!(
@@ -2106,7 +2201,7 @@ impl Setup {
         if elapsed >= 300 {
             self.phase(
                 "building-fail",
-                "wda",
+                "runner",
                 "phone remained locked for 5 minutes",
             );
             return die("the phone remained locked for 5 minutes. Unlock it, then rerun setup.");
@@ -2120,7 +2215,7 @@ impl Setup {
         }
         self.phase(
             "building",
-            "wda",
+            "runner",
             "phone is locked; interactive setup is waiting up to 5 minutes",
         );
         Ok(())
@@ -2163,12 +2258,12 @@ impl Setup {
                     "--device-port".into(),
                     device_port.to_string(),
                 ];
-                let mut desc = format!("USB relay (usbmuxd) on 127.0.0.1:{local}");
+                let mut desc = native_relay_desc(local, self.relay_over_tunnel);
                 if let Some(ip) = self.legacy_lan_host() {
                     let why = if self.legacy_ios.as_ref().is_some_and(|l| l.auth_enforced) {
                         "signed requests only"
                     } else {
-                        "WDA_ALLOW_LAN=1, unauthenticated runner"
+                        "IPU_RUNNER_ALLOW_LAN=1, unauthenticated runner"
                     };
                     desc.push_str(&format!(", LAN fallback {ip}:{device_port} ({why})"));
                     args.extend(["--lan-host".into(), ip]);
@@ -2234,11 +2329,11 @@ impl Setup {
     /// LAN: a USB relay is the default, then the encrypted CoreDevice tunnel;
     /// an iOS 15/16 phone falls back to its LAN address once its runner
     /// proved it refuses unsigned requests; a LAN socat relay only behind
-    /// WDA_ALLOW_LAN=1. Returns the control URL.
+    /// IPU_RUNNER_ALLOW_LAN=1. Returns the control URL.
     fn relays(&mut self, url: &str) -> Step<String> {
-        let wda_port = valid_port(&self.ctx.wda_port).unwrap_or(8100);
+        let runner_port = valid_port(&self.ctx.runner_port).unwrap_or(8100);
         let mjpeg_port = valid_port(&self.ctx.mjpeg_port).unwrap_or(9100);
-        info(&format!("Starting localhost relay on 127.0.0.1:{wda_port}"));
+        info(&format!("Starting localhost relay on 127.0.0.1:{runner_port}"));
         let (mut phone_ip, mut device_port) = split_host_port(url);
         if valid_port(&device_port).is_none() {
             return die(format!(
@@ -2252,15 +2347,15 @@ impl Setup {
             Role::Relay,
         ) {
             return die(format!(
-                "the prior control-relay PID record is not safe to stop; refusing to reuse TCP {wda_port}"
+                "the prior control-relay PID record is not safe to stop; refusing to reuse TCP {runner_port}"
             ));
         }
-        if !pid::assert_port_free(&self.ctx, wda_port) {
+        if !pid::assert_port_free(&self.ctx, runner_port) {
             return die(format!(
-                "TCP {wda_port} must be free before starting the managed control relay"
+                "TCP {runner_port} must be free before starting the managed control relay"
             ));
         }
-        let relay_log = self.rel("wda-relay.log");
+        let relay_log = self.rel("runner-relay.log");
         let _ = std::fs::write(&relay_log, b"");
         let target_is_usb = checks::on_usb(&self.ctx.udid, &checks::usb_udids());
         // Off the cable, CoreDevice's encrypted Wi-Fi tunnel reaches the
@@ -2268,9 +2363,10 @@ impl Setup {
         // the phone's LAN address and leaves the runner open to the network.
         // An iOS 15/16 phone has no CoreDevice tunnel; its relay follows it
         // from usbmuxd's USB attachment to its Wi-Fi one (or to its LAN
-        // address behind WDA_ALLOW_LAN=1).
+        // address behind IPU_RUNNER_ALLOW_LAN=1).
         let legacy = self.legacy_ios.is_some();
         let wifi_tunnel = !legacy && !target_is_usb && checks::wifi_tunnel(&self.ctx.udid);
+        self.relay_over_tunnel = wifi_tunnel;
         if wifi_tunnel {
             ok("the iPhone is off USB; relaying through its CoreDevice Wi-Fi tunnel");
         }
@@ -2314,7 +2410,7 @@ impl Setup {
         }
         if tool.is_none() && self.ctx.lan() {
             if let Some(socat) = sys::which("socat") {
-                warn("WDA_ALLOW_LAN=1: a plain LAN relay is unencrypted (screen contents cross the network in the clear), and a runner older than request signing accepts anyone; use only on a trusted, isolated LAN");
+                warn("IPU_RUNNER_ALLOW_LAN=1: a plain LAN relay is unencrypted (screen contents cross the network in the clear), and a runner older than request signing accepts anyone; use only on a trusted, isolated LAN");
                 if phone_ip.is_empty()
                     || !phone_ip
                         .bytes()
@@ -2336,11 +2432,11 @@ impl Setup {
             } else {
                 self.phase(
                     "serving",
-                    "wda",
+                    "runner",
                     "no permitted control relay tool is available",
                 );
             }
-            return die("the device layer relays over USB, or off the cable through the phone's encrypted CoreDevice Wi-Fi tunnel.\n   Neither is available: plug the iPhone in over USB (or keep it on the same network as this Mac so its tunnel\n   comes up); if it is connected, the iPhoneUse app is missing or too old to relay — reinstall it or run:\n   iphone-use upgrade. A plain LAN relay to the phone's address is unencrypted, so it stays disabled\n   unless WDA_ALLOW_LAN=1 is explicitly set for a trusted, isolated network.");
+            return die("the device layer relays over USB, or off the cable through the phone's encrypted CoreDevice Wi-Fi tunnel.\n   Neither is available: plug the iPhone in over USB (or keep it on the same network as this Mac so its tunnel\n   comes up); if it is connected, the iPhoneUse app is missing or too old to relay — reinstall it or run:\n   iphone-use upgrade. A plain LAN relay to the phone's address is unencrypted, so it stays disabled\n   unless IPU_RUNNER_ALLOW_LAN=1 is explicitly set for a trusted, isolated network.");
         };
         // Both relays start before either is checked: the control check and
         // the video's first frame used to run one after the other.
@@ -2362,7 +2458,7 @@ impl Setup {
         let relay_pid_file = self.ctx.relay_pid_file.clone();
         let (relay_pid, desc) = self.start_relay(
             Role::Relay,
-            wda_port,
+            runner_port,
             device_port,
             &phone_ip,
             &tool,
@@ -2372,7 +2468,7 @@ impl Setup {
         ok(&format!("PID-verified control relay {relay_pid}: {desc}"));
         // Live video: the runner's MJPEG stream on the device's :9100, in the
         // same XCUITest session as control.
-        let mjpeg_log = self.rel("wda-mjpeg-relay.log");
+        let mjpeg_log = self.rel("runner-mjpeg-relay.log");
         let _ = std::fs::write(&mjpeg_log, b"");
         let mjpeg_pid_file = self.ctx.mjpeg_relay_pid_file.clone();
         let (mjpeg_pid, mjpeg_desc) = self.start_relay(
@@ -2392,12 +2488,51 @@ impl Setup {
         // stream anyway, so a slow first MJPEG frame is a warning, not a
         // failed round that relaunches the runner.
         spawn_video_first_frame_check(mjpeg_port, mjpeg_log.clone(), self.ctx.runner_auth());
-        let target_url = format!("http://127.0.0.1:{wda_port}");
-        if !sys::runner_ok(
-            &format!("{target_url}/status"),
-            Duration::from_secs(5),
-            &self.ctx.runner_auth(),
-        ) {
+        let target_url = format!("http://127.0.0.1:{runner_port}");
+        // The runner already answered on the phone; a relay that cannot reach
+        // it yet is usually the tunnel switching paths (usbmuxd <-> network).
+        // Probe again and restart the relay once before giving up: failing
+        // here relaunches the runner, and on a passcode phone every launch
+        // needs a person to type the passcode.
+        let status_url = format!("{target_url}/status");
+        let auth = self.ctx.runner_auth();
+        let mut failures = 0u32;
+        let answered = recover_relay(
+            || {
+                let answered = sys::runner_ok(&status_url, Duration::from_secs(5), &auth);
+                if !answered {
+                    failures += 1;
+                    if failures == 1 {
+                        warn("the device runner is serving but did not answer through the relay yet; retrying (the tunnel may be switching between USB and network)");
+                    }
+                }
+                Ok(answered)
+            },
+            || {
+                if !pid::stop(
+                    &self.ctx,
+                    &self.ctx.relay_pid_file,
+                    &self.legacy.relay,
+                    Role::Relay,
+                ) || !pid::assert_port_free(&self.ctx, runner_port)
+                {
+                    return Ok(false);
+                }
+                let (relay_pid, desc) = self.start_relay(
+                    Role::Relay,
+                    runner_port,
+                    device_port,
+                    &phone_ip,
+                    &tool,
+                    &relay_pid_file,
+                    &relay_log,
+                )?;
+                ok(&format!("Restarted the control relay {relay_pid}: {desc}"));
+                Ok(true)
+            },
+            proc::sleep,
+        )?;
+        if !answered {
             return die(format!(
                 "relay up but the device runner is not answering through it — check {}",
                 relay_log.display()
@@ -2419,7 +2554,7 @@ impl Setup {
         if !ctx.daemon_plist.is_file() {
             warn("daemon LaunchAgent not found; the runner can be verified, but the product daemon cannot be started");
             println!(
-                "    IPHONE_USE_BACKEND=direct IPHONE_USE_WDA_URL={target_url} IPHONE_USE_WDA_MJPEG_URL={mjpeg_url} iphone-use serve"
+                "    IPHONE_USE_BACKEND=direct IPHONE_USE_RUNNER_URL={target_url} IPHONE_USE_RUNNER_MJPEG_URL={mjpeg_url} iphone-use serve"
             );
             return Ok(DaemonEndpoint {
                 port: "44321".into(),
@@ -2462,14 +2597,14 @@ impl Setup {
         if current("IPHONE_USE_UDID") != ctx.udid {
             changed.push("IPHONE_USE_UDID");
         }
-        if current("IPHONE_USE_WDA_URL") != target_url {
-            changed.push("IPHONE_USE_WDA_URL");
+        if current("IPHONE_USE_RUNNER_URL") != target_url {
+            changed.push("IPHONE_USE_RUNNER_URL");
         }
-        if current("IPHONE_USE_WDA_MJPEG_URL") != mjpeg_url {
-            changed.push("IPHONE_USE_WDA_MJPEG_URL");
+        if current("IPHONE_USE_RUNNER_MJPEG_URL") != mjpeg_url {
+            changed.push("IPHONE_USE_RUNNER_MJPEG_URL");
         }
-        if current("IPHONE_USE_WDA_MANAGED") != "true" {
-            changed.push("IPHONE_USE_WDA_MANAGED");
+        if current("IPHONE_USE_RUNNER_MANAGED") != "true" {
+            changed.push("IPHONE_USE_RUNNER_MANAGED");
         }
         // A per-phone Xcode reaches the daemon's own devicectl/xcrun calls
         // through its environment, which it reads at startup.
@@ -2482,22 +2617,22 @@ impl Setup {
             changed.push("DEVELOPER_DIR");
         }
         let needs_restart = !changed.is_empty();
-        if current("WDA_ALLOW_LAN") != ctx.allow_lan {
-            changed.push("WDA_ALLOW_LAN");
+        if current("IPU_RUNNER_ALLOW_LAN") != ctx.allow_lan {
+            changed.push("IPU_RUNNER_ALLOW_LAN");
         }
-        if current("WDA_TRANSPORT") != ctx.transport {
-            changed.push("WDA_TRANSPORT");
+        if current("IPU_RUNNER_TRANSPORT") != ctx.transport {
+            changed.push("IPU_RUNNER_TRANSPORT");
         }
         let config_changed = !changed.is_empty();
         if config_changed {
             for (key, value) in [
                 ("IPHONE_USE_BACKEND", "direct"),
                 ("IPHONE_USE_UDID", ctx.udid.as_str()),
-                ("IPHONE_USE_WDA_URL", target_url),
-                ("IPHONE_USE_WDA_MJPEG_URL", mjpeg_url.as_str()),
-                ("IPHONE_USE_WDA_MANAGED", "true"),
-                ("WDA_ALLOW_LAN", ctx.allow_lan.as_str()),
-                ("WDA_TRANSPORT", ctx.transport.as_str()),
+                ("IPHONE_USE_RUNNER_URL", target_url),
+                ("IPHONE_USE_RUNNER_MJPEG_URL", mjpeg_url.as_str()),
+                ("IPHONE_USE_RUNNER_MANAGED", "true"),
+                ("IPU_RUNNER_ALLOW_LAN", ctx.allow_lan.as_str()),
+                ("IPU_RUNNER_TRANSPORT", ctx.transport.as_str()),
             ] {
                 plist_set_env(&staged, key, value);
             }
@@ -2572,9 +2707,9 @@ impl Setup {
     /// the runner and both relays.
     fn verify_supervision(&mut self, target_url: &str) -> Step {
         let ctx = &self.ctx;
-        let wda_port = valid_port(&ctx.wda_port).unwrap_or(8100);
+        let runner_port = valid_port(&ctx.runner_port).unwrap_or(8100);
         let mjpeg_port = valid_port(&ctx.mjpeg_port).unwrap_or(9100);
-        let verified = launchd::loaded(ctx, &ctx.instance.wda_label)
+        let verified = launchd::loaded(ctx, &ctx.instance.runner_label)
             && pid::validate(
                 ctx,
                 &ctx.runner_pid_file,
@@ -2588,7 +2723,7 @@ impl Setup {
                 &ctx.relay_pid_file,
                 &self.legacy.relay,
                 Role::Relay,
-                wda_port,
+                runner_port,
             )
             && pid::verify_loopback_listener(
                 ctx,
@@ -2605,7 +2740,7 @@ impl Setup {
         if !verified {
             self.phase(
                 "supervisor-fail",
-                "wda",
+                "runner",
                 "the device runner is reachable but launchd supervision is unverified",
             );
             return die("the device runner endpoint is up, but dedicated launchd supervision could not be verified");
@@ -2614,7 +2749,7 @@ impl Setup {
     }
 
     /// Poll the daemon's own `/agent/status` until it reaches the runner.
-    /// `wda:true` is the setup verdict; `drivable:true` (unlocked, automation
+    /// `runner:true` is the setup verdict; `drivable:true` (unlocked, automation
     /// granted) is only waited for briefly — a locked phone is a runtime hint,
     /// never a reason to tear a healthy runner down.
     fn verify_product(&mut self, daemon: &DaemonEndpoint) -> Step {
@@ -2677,7 +2812,7 @@ impl Setup {
             proc::sleep(Duration::from_millis(500))?;
         }
         token.clear();
-        let locked = status.get("wda_locked") == Some(&serde_json::Value::Bool(true));
+        let locked = status.get("runner_locked") == Some(&serde_json::Value::Bool(true));
         if !ready {
             let cause = handoff_error
                 .as_deref()
@@ -2685,11 +2820,11 @@ impl Setup {
                 .unwrap_or_default();
             self.phase(
                 "daemon-fail",
-                "wda",
+                "runner",
                 &format!("daemon never reached the device runner after a verified handoff{cause}"),
             );
             return die(format!(
-                "the device runner, relays, and launchd supervision are verified, but the daemon did not report wda=true within {}s{cause}.\n   Inspect: ~/Library/Logs/iPhoneUse/iphone-use.log",
+                "the device runner, relays, and launchd supervision are verified, but the daemon did not report runner=true within {}s{cause}.\n   Inspect: ~/Library/Logs/iPhoneUse/iphone-use.log",
                 max_tries / 2
             ));
         }
@@ -2742,7 +2877,7 @@ impl Setup {
         println!("  Runner    : {url} (on-phone), {target_url} (verified relay)");
         println!(
             "  Supervisor: {} (job, runner, and /status verified)",
-            launchd::service(ctx, &ctx.instance.wda_label)
+            launchd::service(ctx, &ctx.instance.runner_label)
         );
         println!(
             "  Video     : http://127.0.0.1:{} (startup stream + relay ownership verified)",
@@ -2778,7 +2913,7 @@ impl Setup {
 
     fn endpoint_locked(&self) -> bool {
         sys::runner_get(
-            &format!("http://127.0.0.1:{}/wda/locked", self.ctx.wda_port),
+            &format!("http://127.0.0.1:{}/wda/locked", self.ctx.runner_port),
             Duration::from_secs(3),
             &self.ctx.runner_auth(),
         )
@@ -2812,11 +2947,14 @@ impl Setup {
         }
         info("KeepAlive mode: holding while the PID-verified runner and relays stay healthy");
         const MAX_FAILURES: u32 = ProbeCount::MAX;
-        let wda_port = valid_port(&self.ctx.wda_port).unwrap_or(8100);
+        let runner_port = valid_port(&self.ctx.runner_port).unwrap_or(8100);
         let mjpeg_port = valid_port(&self.ctx.mjpeg_port).unwrap_or(9100);
-        let status_url = format!("http://127.0.0.1:{wda_port}/status");
+        let status_url = format!("http://127.0.0.1:{runner_port}/status");
+        // Only the root element: proof the runner can read at all, at the
+        // same small cost on a heavy screen as on a light one.
         let read_url = format!(
-            "http://127.0.0.1:{wda_port}/source?format=json&excluded_attributes=visible,accessible"
+            "http://127.0.0.1:{runner_port}/source?{}",
+            crate::runner::MINIMAL_READ_QUERY
         );
         let mut cycle: u64 = 0;
         let mut failures = 0;
@@ -2862,7 +3000,7 @@ impl Setup {
                 &self.ctx.relay_pid_file,
                 &self.legacy.relay,
                 Role::Relay,
-                wda_port,
+                runner_port,
             ) || !pid::verify_loopback_listener(
                 &self.ctx,
                 &self.ctx.mjpeg_relay_pid_file,
@@ -2886,8 +3024,12 @@ impl Setup {
                 probes = ProbeCount::default();
                 continue;
             }
-            let answered =
-                sys::runner_ok(&status_url, Duration::from_secs(4), &self.ctx.runner_auth());
+            // `/status` is answered off the runner's main thread and says
+            // whether main is still on a request (a heavy screen's tree read
+            // can take ~30 s). A read now would only queue behind it.
+            let status = runner_status(&status_url, &self.ctx.runner_auth());
+            let answered = status.is_some();
+            let busy_ms = status.flatten();
             // A pulled cable looks like a dead runner from here. Ask whether
             // the phone is still attached before counting a miss: an absent
             // phone is `not_connected`, never a runner failure to rebuild.
@@ -2930,10 +3072,19 @@ impl Setup {
             cycle += 1;
             let probe = if !answered {
                 Probe::StatusMiss
+            } else if crate::runner::busy_working(busy_ms) {
+                Probe::Busy
             } else if (cycle.is_multiple_of(3) || probes.suspicious())
                 && !runner_reads(&read_url, &self.ctx.runner_auth())
             {
-                Probe::ReadFail
+                // A minimal read that failed while the runner is working on
+                // something else is still that something being slow.
+                let after = runner_status(&status_url, &self.ctx.runner_auth()).flatten();
+                if crate::runner::busy_working(after) {
+                    Probe::Busy
+                } else {
+                    Probe::ReadFail
+                }
             } else {
                 Probe::Ok
             };
@@ -2952,6 +3103,12 @@ impl Setup {
                     ));
                 }
                 break "half_dead";
+            }
+            if probe == Probe::Busy {
+                info(&format!(
+                    "the device runner is busy on a slow request ({} ms; a heavy screen read); not counted as a failure",
+                    busy_ms.unwrap_or(0)
+                ));
             }
             if probe == Probe::ReadFail {
                 info(&format!(
@@ -3077,8 +3234,21 @@ impl Setup {
     }
 }
 
-/// A light screen read through the runner's relay: 2xx with a tree, not an
-/// error envelope. Heavy screens can take several seconds, hence the budget.
+/// `/status` within 4 s: `None` when it did not answer below 400, else how
+/// long the runner's main thread has been busy (see
+/// [`crate::runner::status_busy_ms`]).
+fn runner_status(url: &str, auth: &crate::runner_token::TokenSource) -> Option<Option<u64>> {
+    let (code, body) = sys::runner_get(url, Duration::from_secs(4), auth)?;
+    (code < 400).then(|| {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| crate::runner::status_busy_ms(&v))
+    })
+}
+
+/// A minimal screen read through the runner's relay: 2xx with a tree, not an
+/// error envelope. The read is the root element only, but it still queues
+/// behind whatever the runner's main thread is doing, hence the budget.
 fn runner_reads(url: &str, auth: &crate::runner_token::TokenSource) -> bool {
     let Some((status, body)) = sys::runner_get(url, Duration::from_secs(15), auth) else {
         return false;
@@ -3102,7 +3272,7 @@ fn runner_enforces_auth(status_url: &str, auth: &crate::runner_token::TokenSourc
         .is_some_and(|v| v.pointer("/value/auth/required") == Some(&serde_json::Value::Bool(true)))
 }
 
-/// The body of a successful `/source` read: a JSON value that is not WDA's
+/// The body of a successful `/source` read: a JSON value that is not runner's
 /// `{"value":{"error":…}}` envelope.
 fn read_body_ok(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|root| {
@@ -3130,7 +3300,7 @@ impl Verdict {
     fn of(status: &serde_json::Value) -> Verdict {
         if status.get("drivable") == Some(&serde_json::Value::Bool(true)) {
             Verdict::Drivable
-        } else if status.get("wda") == Some(&serde_json::Value::Bool(true)) {
+        } else if status.get("runner") == Some(&serde_json::Value::Bool(true)) {
             Verdict::Reachable
         } else {
             Verdict::Down
@@ -3208,7 +3378,7 @@ pub fn restore_backup(backup: &Path, target: &Path, mode: u32) -> bool {
 
 // ── pure decisions (unit-tested below) ──────────────────────────────────────
 
-/// `WDA_LOCK_WAIT_SECS`: whole seconds; anything else falls back to 300 with
+/// `IPU_RUNNER_LOCK_WAIT_SECS`: whole seconds; anything else falls back to 300 with
 /// a complaint instead of breaking the comparison.
 pub fn lock_wait_limit(raw: Option<&str>) -> (u64, Option<String>) {
     match raw {
@@ -3219,7 +3389,7 @@ pub fn lock_wait_limit(raw: Option<&str>) -> (u64, Option<String>) {
         Some(value) => (
             300,
             Some(format!(
-                "WDA_LOCK_WAIT_SECS='{value}' is not a whole number of seconds; using 300"
+                "IPU_RUNNER_LOCK_WAIT_SECS='{value}' is not a whole number of seconds; using 300"
             )),
         ),
     }
@@ -3277,11 +3447,11 @@ fn waited(wait: Option<u64>) -> String {
 pub fn not_reachable_message(udid: &str, tunnel_allowed: bool) -> String {
     if tunnel_allowed {
         format!(
-            "target {udid} is not on USB and has no CoreDevice Wi-Fi tunnel to this Mac.\n   Plug that iPhone in, or keep it unlocked on the same network as this Mac (it must have been paired over USB once);\n   a plain LAN relay to the phone's address is never used unless WDA_ALLOW_LAN=1."
+            "target {udid} is not on USB and has no CoreDevice Wi-Fi tunnel to this Mac.\n   Plug that iPhone in, or keep it unlocked on the same network as this Mac (it must have been paired over USB once);\n   a plain LAN relay to the phone's address is never used unless IPU_RUNNER_ALLOW_LAN=1."
         )
     } else {
         format!(
-            "target {udid} is not currently connected over USB, and WDA_TRANSPORT=usb rules out its Wi-Fi tunnel.\n   Plug in that iPhone, or unset WDA_TRANSPORT to allow the encrypted CoreDevice Wi-Fi tunnel."
+            "target {udid} is not currently connected over USB, and IPU_RUNNER_TRANSPORT=usb rules out its Wi-Fi tunnel.\n   Plug in that iPhone, or unset IPU_RUNNER_TRANSPORT to allow the encrypted CoreDevice Wi-Fi tunnel."
         )
     }
 }
@@ -3349,9 +3519,15 @@ pub enum Probe {
     Ok,
     /// `/status` did not answer in time.
     StatusMiss,
-    /// `/status` answered but a light screen read failed: the "half dead"
-    /// runner that answers status forever while every agent read errors.
+    /// `/status` answered but a minimal screen read failed while the
+    /// runner was not busy: the "half dead" runner that answers status
+    /// forever while every agent read errors.
     ReadFail,
+    /// `/status` answered and reports the runner's main thread busy on a
+    /// request (a heavy screen's tree read) for less than
+    /// [`crate::runner::RUNNER_WEDGED_MS`]: slow, not broken. Neither a
+    /// failure nor proof of health.
+    Busy,
 }
 
 /// Whether the held phone is still attached, consulted only when `/status`
@@ -3402,7 +3578,11 @@ impl ProbeCount {
             self.recent.pop_front();
         }
         self.recent.push_back(probe);
-        self.failures = self.recent.iter().filter(|p| **p != Probe::Ok).count() as u32;
+        self.failures = self
+            .recent
+            .iter()
+            .filter(|p| matches!(p, Probe::StatusMiss | Probe::ReadFail))
+            .count() as u32;
         self.failures >= Self::MAX
     }
 
@@ -3420,9 +3600,12 @@ impl ProbeCount {
         self.failures > 0
     }
 
-    /// The window holds a failed read while `/status` answered.
+    /// At least [`Self::MAX`] of the window are minimal reads that failed
+    /// while `/status` answered and the runner was idle. One failed read
+    /// among missed `/status` probes is a flaky link, not a runner that
+    /// cannot read; a slow screen is [`Probe::Busy`] and never counts.
     pub fn half_dead(&self) -> bool {
-        self.recent.contains(&Probe::ReadFail)
+        self.recent.iter().filter(|p| **p == Probe::ReadFail).count() as u32 >= Self::MAX
     }
 }
 
@@ -3441,6 +3624,88 @@ fn handoff_daemon_ready(body: &[u8], expected: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_relay_that_answers_late_is_kept_and_the_runner_is_not_relaunched() {
+        use std::cell::Cell;
+        // Answers on the third probe: after one relay restart, no failure.
+        let (probes, restarts, slept) = (Cell::new(0), Cell::new(0), Cell::new(0u64));
+        let answered = super::recover_relay(
+            || {
+                probes.set(probes.get() + 1);
+                Ok(probes.get() >= 3)
+            },
+            || {
+                restarts.set(restarts.get() + 1);
+                Ok(true)
+            },
+            |wait| {
+                slept.set(slept.get() + wait.as_secs());
+                Ok(())
+            },
+        );
+        assert_eq!(answered.ok(), Some(true));
+        assert_eq!((probes.get(), restarts.get(), slept.get()), (3, 1, 5));
+
+        // A first answer needs no wait and no restart.
+        let restarts = Cell::new(0);
+        let answered = super::recover_relay(
+            || Ok(true),
+            || {
+                restarts.set(restarts.get() + 1);
+                Ok(true)
+            },
+            |_| panic!("no wait"),
+        );
+        assert_eq!(answered.ok(), Some(true));
+        assert_eq!(restarts.get(), 0);
+    }
+
+    #[test]
+    fn a_relay_that_never_answers_gives_up_within_the_window() {
+        use std::cell::Cell;
+        let (probes, restarts, slept) = (Cell::new(0), Cell::new(0), Cell::new(0u64));
+        let answered = super::recover_relay(
+            || {
+                probes.set(probes.get() + 1);
+                Ok(false)
+            },
+            || {
+                restarts.set(restarts.get() + 1);
+                Ok(true)
+            },
+            |wait| {
+                slept.set(slept.get() + wait.as_secs());
+                Ok(())
+            },
+        );
+        assert_eq!(answered.ok(), Some(false));
+        assert_eq!((probes.get(), restarts.get()), (5, 1), "one restart, bounded probes");
+        assert!(slept.get() <= 20, "bounded backoff: {}s", slept.get());
+
+        // A relay that cannot be replaced safely ends the attempt.
+        let probes = Cell::new(0);
+        let answered = super::recover_relay(
+            || {
+                probes.set(probes.get() + 1);
+                Ok(false)
+            },
+            || Ok(false),
+            |_| Ok(()),
+        );
+        assert_eq!(answered.ok(), Some(false));
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn the_relay_says_which_path_it_takes() {
+        assert_eq!(
+            super::native_relay_desc(8100, false),
+            "USB relay (usbmuxd) on 127.0.0.1:8100"
+        );
+        let tunnel = super::native_relay_desc(8100, true);
+        assert!(tunnel.contains("Wi-Fi tunnel") && !tunnel.contains("usbmuxd"), "{tunnel}");
+    }
+
     #[test]
     fn handoff_requires_the_linked_daemon_to_be_serving() {
         use super::handoff_daemon_ready as ready;
@@ -3474,7 +3739,7 @@ mod tests {
         // Below the runner's own floor no path helps but an update.
         let ancient = super::ios_too_old_message("Xcode 27.0", Some("14.8"), false).unwrap();
         assert!(ancient.contains("iOS 15 or later"), "{ancient}");
-        assert!(super::legacy_needs_asc_message("15.4.1").contains("WDA_ASC_KEY_PATH"));
+        assert!(super::legacy_needs_asc_message("15.4.1").contains("IPU_RUNNER_ASC_KEY_PATH"));
         // At or above the floor, an Xcode without one, a legacy DeviceSupport
         // image, or an unreadable version never blocks.
         assert!(super::ios_too_old_message("Xcode 27.0", Some("17.0"), false).is_none());
@@ -3492,11 +3757,11 @@ mod tests {
     fn an_unreachable_target_names_the_tunnel_and_never_offers_the_lan_relay_as_the_fix() {
         let auto = not_reachable_message("00008110-001C18203AD2401E", true);
         assert!(auto.contains("no CoreDevice Wi-Fi tunnel"), "{auto}");
-        assert!(auto.contains("unless WDA_ALLOW_LAN=1"), "{auto}");
+        assert!(auto.contains("unless IPU_RUNNER_ALLOW_LAN=1"), "{auto}");
         assert!(!auto.contains("slow Wi-Fi"), "{auto}");
         let usb = not_reachable_message("00008110-001C18203AD2401E", false);
         assert!(usb.contains("not currently connected over USB"), "{usb}");
-        assert!(usb.contains("WDA_TRANSPORT=usb"), "{usb}");
+        assert!(usb.contains("IPU_RUNNER_TRANSPORT=usb"), "{usb}");
     }
 
     #[test]
@@ -3646,6 +3911,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_runner_busy_on_a_heavy_screen_is_never_half_dead() {
+        // The field failure (iOS 27 Photos search grid): /status answers,
+        // main is busy ~30 s on a tree read, every read behind it times out.
+        // Busy probes are neither failures nor health, however many.
+        let mut probes = ProbeCount::default();
+        for _ in 0..20 {
+            assert!(!probes.record(Probe::Busy), "a slow screen never rebuilds");
+        }
+        assert!(!probes.half_dead());
+        assert!(!probes.suspicious(), "busy alone does not even count");
+        // Busy probes between real read failures do not hide them.
+        let mut probes = ProbeCount::default();
+        let pattern = [Probe::ReadFail, Probe::Busy, Probe::ReadFail, Probe::ReadFail];
+        let verdicts: Vec<bool> = pattern.iter().map(|p| probes.record(*p)).collect();
+        assert_eq!(verdicts, [false, false, false, true]);
+        assert!(probes.half_dead());
+    }
+
+    #[test]
+    fn one_failed_read_among_status_misses_is_not_half_dead() {
+        // It used to be: `half_dead` was "any ReadFail in the window", so a
+        // flaky link (two /status misses) plus one slow read was restarted as
+        // "cannot read the screen" even under another session's lease.
+        let mut probes = ProbeCount::default();
+        probes.record(Probe::StatusMiss);
+        probes.record(Probe::ReadFail);
+        assert!(probes.record(Probe::StatusMiss), "three failures still count");
+        assert!(!probes.half_dead(), "but they are not three failed reads");
+    }
+
+    #[test]
+    fn busy_status_bodies_are_read_from_the_runner() {
+        use crate::runner::{busy_working, status_busy_ms, RUNNER_WEDGED_MS};
+        let busy = serde_json::json!({"value": {"ready": true, "busy": true, "busyMs": 12_000}});
+        assert_eq!(status_busy_ms(&busy), Some(12_000));
+        assert!(busy_working(status_busy_ms(&busy)));
+        let idle = serde_json::json!({"value": {"ready": true, "busy": false}});
+        assert_eq!(status_busy_ms(&idle), None);
+        let old_runner = serde_json::json!({"value": {"ready": true}});
+        assert_eq!(status_busy_ms(&old_runner), None);
+        let stuck = serde_json::json!({"value": {"busy": true, "busyMs": RUNNER_WEDGED_MS}});
+        assert!(!busy_working(status_busy_ms(&stuck)), "stuck past the cap is not working");
+    }
+
+    #[test]
+    fn the_hold_reads_only_the_root_element() {
+        let query = crate::runner::MINIMAL_READ_QUERY;
+        assert!(query.contains("max_depth=1"), "{query}");
+        assert!(query.contains("max_nodes=1"), "{query}");
+        assert!(query.contains("extension_calls=0"), "{query}");
+    }
+
     /// Drive the hold's per-probe decision the way `hold` does: an away probe
     /// skips the window, a counted one is recorded. Returns (step, rebuild).
     fn hold_step(
@@ -3770,15 +4088,15 @@ mod tests {
     #[test]
     fn verdicts() {
         assert_eq!(
-            Verdict::of(&serde_json::json!({"drivable": true, "wda": true})),
+            Verdict::of(&serde_json::json!({"drivable": true, "runner": true})),
             Verdict::Drivable
         );
         assert_eq!(
-            Verdict::of(&serde_json::json!({"drivable": false, "wda": true, "managed_wda": true})),
+            Verdict::of(&serde_json::json!({"drivable": false, "runner": true, "managed_runner": true})),
             Verdict::Reachable
         );
         assert_eq!(
-            Verdict::of(&serde_json::json!({"managed_wda": true, "wda_actionable": true})),
+            Verdict::of(&serde_json::json!({"managed_runner": true, "runner_actionable": true})),
             Verdict::Down
         );
         assert_eq!(Verdict::of(&serde_json::Value::Null), Verdict::Down);
@@ -3809,6 +4127,108 @@ pub struct SelfInstallTx {
 }
 
 impl Setup {
+    /// `setup-native prebuild`, which the auto-update job runs after it
+    /// upgraded this instance: build, validate, inject the icon into and
+    /// record the runner product the next connect needs, so that connect
+    /// reuses it instead of building while a person waits (every release
+    /// replaces the on-phone daemon library, which is part of the product).
+    ///
+    /// It never touches the phone (no device lookup, developer services,
+    /// install or launch), the daemon, the supervisor or the setup status
+    /// file. It does nothing while the Mac is busy, while a setup attempt is
+    /// working, or while another build holds the build lock; a setup that
+    /// starts meanwhile waits for it and reuses what it recorded. Exit 0 when
+    /// there is nothing to do or the product is recorded.
+    pub fn run_prebuild(mut self) -> i32 {
+        proc::install_signal_handlers();
+        self.prebuild_only = true;
+        match self.prebuild_product() {
+            Ok(()) => 0,
+            Err(Exit(code)) => code,
+        }
+    }
+
+    fn prebuild_product(&mut self) -> Step {
+        let skip = |why: &str| {
+            info(&format!("Runner prebuild skipped: {why}"));
+            Ok(())
+        };
+        if self.ctx.udid.is_empty() {
+            return skip("this instance has no target iPhone yet");
+        }
+        if legacy_record_for(&self.ctx).is_some() {
+            return skip("an iOS 15/16 phone's runner is built on its own path at connect");
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let limit = runner::prebuild_load_limit(
+            cores,
+            std::env::var("IPU_PREBUILD_MAX_LOAD").ok().as_deref(),
+        );
+        if let Some(load) = runner::load_average().filter(|load| *load > limit) {
+            return skip(&format!(
+                "this Mac is busy (load {load:.1} > {limit:.1}); the next connect builds"
+            ));
+        }
+        if let Some(phase) = status::active_phase(&self.ctx.status_file) {
+            return skip(&format!("a setup attempt is working ({phase}); it builds the product itself"));
+        }
+        // Below whatever a person is doing; xcodebuild and its compilers
+        // inherit it. Not background QoS: a connect that starts meanwhile
+        // waits for this build, and E-core-only would make that wait longer.
+        // SAFETY: setpriority on this process only.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+        }
+        self.prerequisites()?;
+        let source_hash = self.runner_source()?;
+        self.embed = self.embed_library()?;
+        let (deployment_override, sdk) = self.xcconfig()?;
+        let xcodebuild = PathBuf::from(sys::stdout_of("xcrun", &["--find", "xcodebuild"]));
+        if xcodebuild.as_os_str().is_empty() || !sys::is_executable(&xcodebuild) {
+            return die("could not resolve the selected Xcode's xcodebuild executable");
+        }
+        let xcode_version =
+            checks::xcode_version_cached(self.ctx.state_dir(), &xcodebuild.to_string_lossy());
+        self.icon_source = icon::source(&self.ctx);
+        let key = self.product_key(
+            &source_hash,
+            &xcode_version,
+            sdk.as_deref(),
+            &deployment_override,
+        );
+        let _lock = match runner::try_build_lock(&self.ctx) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return skip("another runner build is running"),
+            Err(why) => return skip(&why),
+        };
+        if runner::cache_read(&self.ctx, &key).is_some() {
+            ok("Runner product is already current; nothing to prebuild");
+            return Ok(());
+        }
+        // Only a phone that was set up before: its first build belongs to
+        // the setup a person runs.
+        let Some(old) = runner::recorded_key(&self.ctx) else {
+            return skip("this phone has no recorded runner product yet");
+        };
+        self.upgrade_rebuild = runner::upgrade_rebuild(&old, &key);
+        info("Prebuilding the device runner product for the next connect (no phone access)");
+        let build_log = self.rel("runner-product-build.log");
+        match self.ensure_launchable(&xcodebuild, &build_log)? {
+            Some((products, xctestrun)) => {
+                if runner::cache_write(&self.ctx, &key, &products, &xctestrun) {
+                    ok("Recorded the prebuilt runner product; the next connect installs it without building");
+                    Ok(())
+                } else {
+                    die("could not record the prebuilt runner product; the next connect builds")
+                }
+            }
+            None => die(format!(
+                "runner prebuild failed ({}); the next connect builds as before",
+                self.validation_error
+            )),
+        }
+    }
+
     /// An interactive setup: build and prove the runner, then hand it to the
     /// dedicated launchd supervisor and verify the hand-off.
     pub fn run_interactive(mut self) -> i32 {
@@ -3842,7 +4262,7 @@ impl Setup {
         self.body()
     }
 
-    /// `setup-wda.sh` keeps a copy at a fixed path so the daemon can start and
+    /// `setup-runner.sh` keeps a copy at a fixed path so the daemon can start and
     /// stop the runner without knowing where the repo lives. Only a setup run
     /// from somewhere else replaces it; the prior copy is kept for rollback.
     fn install_self(&mut self) -> Result<(), i32> {
@@ -3850,7 +4270,7 @@ impl Setup {
         self.self_install.rollback = self
             .ctx
             .state_dir()
-            .join(format!("setup-wda.rollback.{}.sh", std::process::id()));
+            .join(format!("setup-runner.rollback.{}.sh", std::process::id()));
         let Some(script) = self.ctx.script.clone() else {
             return Ok(());
         };
@@ -3868,7 +4288,7 @@ impl Setup {
         }
         if target.is_file() {
             if !copy_preserving(&target, &self.self_install.rollback) {
-                eprintln!("could not back up existing setup-wda.sh");
+                eprintln!("could not back up existing setup-runner.sh");
                 return Err(1);
             }
             self.self_install.had_previous = true;
@@ -3880,7 +4300,7 @@ impl Setup {
             }
             _ => {
                 eprintln!(
-                    "could not atomically install setup-wda.sh at {}",
+                    "could not atomically install setup-runner.sh at {}",
                     target.display()
                 );
                 Err(1)
@@ -3910,7 +4330,7 @@ impl Setup {
         // Xcode, or a signed-in account.
         let account = !ctx.team_id.is_empty()
             || ctx.asc_signing_enabled()
-            || !sys::plist_env(&ctx.wda_agent_plist, "WDA_TEAM_ID").is_empty()
+            || !sys::plist_env(&ctx.runner_agent_plist, "IPU_RUNNER_TEAM_ID").is_empty()
             || !sys::defaults_read(
                 "com.apple.dt.Xcode",
                 "IDEProvisioningTeamManagerLastSelectedTeamID",
@@ -3977,19 +4397,19 @@ impl Setup {
     /// enable policy are saved first.
     fn pause_supervisor(&mut self) -> Step {
         let ctx = self.ctx.clone();
-        let label = ctx.instance.wda_label.clone();
+        let label = ctx.instance.runner_label.clone();
         self.sup.active = true;
         self.sup.rollback = ctx.state_dir().join(format!(
-            "wda-supervisor.rollback.{}.plist",
+            "runner-supervisor.rollback.{}.plist",
             std::process::id()
         ));
         let Some(disabled) = launchd::disabled_state(&ctx, &label) else {
             return die("could not snapshot the runner supervisor's launchd disabled policy");
         };
         self.sup.prev_disabled = disabled;
-        if ctx.wda_agent_plist.is_file() {
+        if ctx.runner_agent_plist.is_file() {
             self.sup.prev_present = true;
-            if !copy_preserving(&ctx.wda_agent_plist, &self.sup.rollback) {
+            if !copy_preserving(&ctx.runner_agent_plist, &self.sup.rollback) {
                 return die("could not save the existing runner supervisor plist for rollback");
             }
         }
@@ -4008,7 +4428,7 @@ impl Setup {
     }
 
     /// Write and bootstrap the supervisor plist: launchd runs the fixed copy
-    /// of the setup script with `WDA_KEEPALIVE=1` and this run's settings.
+    /// of the setup script with `IPU_RUNNER_KEEPALIVE=1` and this run's settings.
     fn install_supervisor(&mut self) -> bool {
         let ctx = self.ctx.clone();
         if !sys::is_executable(&ctx.self_install) {
@@ -4024,11 +4444,11 @@ impl Setup {
         }
         // The key order is the script's, so a plist reads the same either way.
         let mut pairs: Vec<(&str, String)> = vec![
-            ("WDA_KEEPALIVE", "1".into()),
+            ("IPU_RUNNER_KEEPALIVE", "1".into()),
             ("PATH", super::ctx::SUPERVISOR_PATH.into()),
-            ("WDA_UDID", ctx.udid.clone()),
-            ("WDA_TEAM_ID", ctx.team_id.clone()),
-            ("WDA_BUNDLE_ID", ctx.bundle_id.clone()),
+            ("IPU_RUNNER_UDID", ctx.udid.clone()),
+            ("IPU_RUNNER_TEAM_ID", ctx.team_id.clone()),
+            ("IPU_RUNNER_BUNDLE_ID", ctx.bundle_id.clone()),
         ];
         // A checkout/custom setup must keep using the explicitly selected
         // engine after launchd takes over, rather than an older installed app.
@@ -4044,24 +4464,24 @@ impl Setup {
                 ctx.runner_src.to_string_lossy().into_owned(),
             ));
         }
-        pairs.push(("WDA_PORT", ctx.wda_port.clone()));
+        pairs.push(("IPU_RUNNER_PORT", ctx.runner_port.clone()));
         pairs.push(("MJPEG_PORT", ctx.mjpeg_port.clone()));
-        pairs.push(("WDA_ALLOW_LAN", ctx.allow_lan.clone()));
-        pairs.push(("WDA_TRANSPORT", ctx.transport.clone()));
+        pairs.push(("IPU_RUNNER_ALLOW_LAN", ctx.allow_lan.clone()));
+        pairs.push(("IPU_RUNNER_TRANSPORT", ctx.transport.clone()));
         // The on-phone daemon: the supervisor's relaunches must build and
         // start the same runner as this run.
         pairs.push(("IPU_EMBED", ctx.embed.clone()));
         pairs.push(("IPU_EMBED_LIB", ctx.embed_lib.clone()));
         pairs.push((crate::phone_daemon::HOST_ENV, ctx.daemon_host.clone()));
-        if let Ok(icon) = std::env::var("WDA_RUNNER_ICON") {
+        if let Ok(icon) = std::env::var("IPU_RUNNER_ICON") {
             if !icon.is_empty() && icon != "auto" {
-                pairs.push(("WDA_RUNNER_ICON", icon));
+                pairs.push(("IPU_RUNNER_ICON", icon));
             }
         }
         if ctx.asc_signing_enabled() {
-            pairs.push(("WDA_ASC_KEY_PATH", ctx.asc_key_path.clone()));
-            pairs.push(("WDA_ASC_KEY_ID", ctx.asc_key_id.clone()));
-            pairs.push(("WDA_ASC_ISSUER_ID", ctx.asc_issuer_id.clone()));
+            pairs.push(("IPU_RUNNER_ASC_KEY_PATH", ctx.asc_key_path.clone()));
+            pairs.push(("IPU_RUNNER_ASC_KEY_ID", ctx.asc_key_id.clone()));
+            pairs.push(("IPU_RUNNER_ASC_ISSUER_ID", ctx.asc_issuer_id.clone()));
         }
         pairs.extend(env);
         if let Some(dir) = &ctx.developer_dir {
@@ -4099,14 +4519,14 @@ impl Setup {
     <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
 "#,
-            label = ctx.instance.wda_label,
+            label = ctx.instance.runner_label,
             setup = xml_escape(&ctx.self_install.to_string_lossy()),
-            log = xml_escape(&ctx.wda_agent_log.to_string_lossy()),
+            log = xml_escape(&ctx.runner_agent_log.to_string_lossy()),
         );
         let _ = std::fs::create_dir_all(ctx.home.join("Library/LaunchAgents"));
         let staged = PathBuf::from(format!(
             "{}.install.{}",
-            ctx.wda_agent_plist.display(),
+            ctx.runner_agent_plist.display(),
             std::process::id()
         ));
         self.sup.staged = Some(staged.clone());
@@ -4118,12 +4538,12 @@ impl Setup {
             warn("generated runner supervisor plist is invalid");
             return false;
         }
-        if std::fs::rename(&staged, &ctx.wda_agent_plist).is_err() {
+        if std::fs::rename(&staged, &ctx.runner_agent_plist).is_err() {
             warn("could not atomically install the runner supervisor plist");
             return false;
         }
         self.sup.staged = None;
-        let label = ctx.instance.wda_label.clone();
+        let label = ctx.instance.runner_label.clone();
         launchd::bootout(&ctx, &label);
         if !launchd::wait_gone(&ctx, &label) {
             warn("old runner supervisor did not finish stopping");
@@ -4131,10 +4551,10 @@ impl Setup {
         }
         // A prior installer may have disabled the label persistently.
         launchd::enable(&ctx, &label);
-        if !launchd::bootstrap(&ctx, &ctx.wda_agent_plist) {
+        if !launchd::bootstrap(&ctx, &ctx.runner_agent_plist) {
             warn(&format!(
                 "could not bootstrap the runner supervisor: {}",
-                ctx.wda_agent_plist.display()
+                ctx.runner_agent_plist.display()
             ));
             return false;
         }
@@ -4175,7 +4595,7 @@ impl Setup {
         if !self.install_supervisor() {
             return die("the device runner is reachable now, but its launchd supervisor could not be installed");
         }
-        let wda_port = valid_port(&ctx.wda_port).unwrap_or(8100);
+        let runner_port = valid_port(&ctx.runner_port).unwrap_or(8100);
         let mjpeg_port = valid_port(&ctx.mjpeg_port).unwrap_or(9100);
         for _ in 0..60 {
             let new_id = pid::validate(
@@ -4191,13 +4611,13 @@ impl Setup {
                 .as_ref()
                 .is_some_and(|id| *id != old_id && !id.1.is_empty());
             if replaced
-                && launchd::loaded(&ctx, &ctx.instance.wda_label)
+                && launchd::loaded(&ctx, &ctx.instance.runner_label)
                 && pid::verify_loopback_listener(
                     &ctx,
                     &ctx.relay_pid_file,
                     &self.legacy.relay,
                     Role::Relay,
-                    wda_port,
+                    runner_port,
                 )
                 && pid::verify_loopback_listener(
                     &ctx,
@@ -4221,10 +4641,10 @@ impl Setup {
             }
             proc::sleep(Duration::from_secs(2))?;
         }
-        self.phase("supervisor-fail", "wda", "launchd handoff not verified");
+        self.phase("supervisor-fail", "runner", "launchd handoff not verified");
         die(format!(
             "runner launchd job loaded, but its replacement runner was not verified within 120s.\n   Check: {}\n   Then:  {} status",
-            ctx.wda_agent_log.display(),
+            ctx.runner_agent_log.display(),
             ctx.self_install.display()
         ))
     }
@@ -4260,7 +4680,7 @@ impl Setup {
         }
         if status != 0 && self.sup.active && !self.handoff_complete {
             let ctx = self.ctx.clone();
-            let label = ctx.instance.wda_label.clone();
+            let label = ctx.instance.runner_label.clone();
             let mut sup_ok = true;
             warn("setup failed — restoring the prior runner supervisor file and loaded state");
             launchd::bootout(&ctx, &label);
@@ -4269,7 +4689,7 @@ impl Setup {
                 warn("new runner supervisor did not fully stop during rollback");
             }
             if self.sup.prev_present {
-                if !restore_backup(&self.sup.rollback, &ctx.wda_agent_plist, 0o600) {
+                if !restore_backup(&self.sup.rollback, &ctx.runner_agent_plist, 0o600) {
                     sup_ok = false;
                     warn(&format!(
                         "could not restore the prior supervisor plist; rescue backup retained at:\n   {}",
@@ -4277,19 +4697,19 @@ impl Setup {
                     ));
                 }
             } else {
-                let _ = std::fs::remove_file(&ctx.wda_agent_plist);
-                if ctx.wda_agent_plist.exists() {
+                let _ = std::fs::remove_file(&ctx.runner_agent_plist);
+                if ctx.runner_agent_plist.exists() {
                     sup_ok = false;
                     warn(&format!(
                         "could not remove the newly created supervisor plist: {}",
-                        ctx.wda_agent_plist.display()
+                        ctx.runner_agent_plist.display()
                     ));
                 }
             }
             if self.sup.prev_loaded {
-                if sup_ok && self_ok && plist_lints(&ctx.wda_agent_plist) {
+                if sup_ok && self_ok && plist_lints(&ctx.runner_agent_plist) {
                     launchd::enable(&ctx, &label);
-                    if !launchd::bootstrap(&ctx, &ctx.wda_agent_plist)
+                    if !launchd::bootstrap(&ctx, &ctx.runner_agent_plist)
                         || !launchd::loaded(&ctx, &label)
                     {
                         sup_ok = false;
@@ -4330,6 +4750,50 @@ fn xml_escape(text: &str) -> String {
 
 /// Warn, on a background thread, when the video relay has not delivered its
 /// first byte within 8 s. Never fails setup: control is what agents need.
+/// What the control relay is, for the log: the native relay follows the
+/// phone over usbmuxd on the cable, or over CoreDevice's Wi-Fi tunnel off it.
+fn native_relay_desc(local: u16, over_tunnel: bool) -> String {
+    if over_tunnel {
+        format!("Wi-Fi tunnel relay (CoreDevice) on 127.0.0.1:{local}")
+    } else {
+        format!("USB relay (usbmuxd) on 127.0.0.1:{local}")
+    }
+}
+
+/// Pauses between control-relay probes after a failure (about 15 s in all,
+/// on top of the probes' own 5 s limits) …
+const RELAY_RETRY_PAUSES: [Duration; 4] = [
+    Duration::from_secs(2),
+    Duration::from_secs(3),
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+];
+/// … and after how many failed probes the relay is restarted, once.
+const RELAY_RESTART_AFTER: usize = 2;
+
+/// Whether the runner answers through the control relay, probing again on
+/// the schedule above and restarting the relay once. `restart` returning
+/// false (the relay could not be replaced safely) ends the attempt.
+fn recover_relay(
+    mut probe: impl FnMut() -> Step<bool>,
+    mut restart: impl FnMut() -> Step<bool>,
+    mut pause: impl FnMut(Duration) -> Step,
+) -> Step<bool> {
+    if probe()? {
+        return Ok(true);
+    }
+    for (index, wait) in RELAY_RETRY_PAUSES.iter().enumerate() {
+        pause(*wait)?;
+        if index + 1 == RELAY_RESTART_AFTER && !restart()? {
+            return Ok(false);
+        }
+        if probe()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn spawn_video_first_frame_check(
     mjpeg_port: u16,
     mjpeg_log: PathBuf,
@@ -4356,11 +4820,11 @@ fn spawn_video_first_frame_check(
 
 // ── the legacy (iOS 15/16) path ─────────────────────────────────────────────
 
-/// iOS 15/16 needs App Store Connect API-key signing (`WDA_ASC_*`): Xcode
+/// iOS 15/16 needs App Store Connect API-key signing (`IPU_RUNNER_ASC_*`): Xcode
 /// cannot register such a phone or provision for it, and only the API can.
 pub fn legacy_needs_asc_message(device: &str) -> String {
     format!(
-        "This iPhone runs iOS {device}. iphone-use drives iOS 15 and 16 without updating the phone, but only with a paid Apple Developer account's App Store Connect API key (WDA_ASC_KEY_PATH, WDA_ASC_KEY_ID, WDA_ASC_ISSUER_ID): this Xcode cannot see the phone, so the key registers it and signs the runner. Configure the key and rerun setup, or update the iPhone to iOS 17 or later"
+        "This iPhone runs iOS {device}. iphone-use drives iOS 15 and 16 without updating the phone, but only with a paid Apple Developer account's App Store Connect API key (IPU_RUNNER_ASC_KEY_PATH, IPU_RUNNER_ASC_KEY_ID, IPU_RUNNER_ASC_ISSUER_ID): this Xcode cannot see the phone, so the key registers it and signs the runner. Configure the key and rerun setup, or update the iPhone to iOS 17 or later"
     )
 }
 
@@ -4384,7 +4848,7 @@ fn legacy_record_for(ctx: &Ctx) -> Option<legacy_ios::Record> {
 /// This phone has run on the legacy path and its lockdownd answers on its
 /// recorded LAN address: setup can start it over Wi-Fi with no cable.
 pub fn legacy_reachable_over_wifi(ctx: &Ctx) -> bool {
-    // WDA_TRANSPORT=usb: the cable only, for this path too.
+    // IPU_RUNNER_TRANSPORT=usb: the cable only, for this path too.
     ctx.wifi_tunnel_allowed()
         && legacy_record_for(ctx)
         .and_then(|r| r.lan_ip)
@@ -4396,7 +4860,7 @@ impl Setup {
     /// only when the runner proved it refuses unsigned requests (an iOS 15/16
     /// phone has no CoreDevice tunnel, so this is its only path off the
     /// cable); an older runner with no request signing only behind
-    /// WDA_ALLOW_LAN=1.
+    /// IPU_RUNNER_ALLOW_LAN=1.
     fn legacy_lan_host(&self) -> Option<String> {
         let legacy = self.legacy_ios.as_ref()?;
         if !legacy.auth_enforced && !self.ctx.lan() {
@@ -4417,7 +4881,7 @@ impl Setup {
                 legacy.host.as_deref().unwrap_or("?"),
             ),
             Some(legacy) if legacy.host.is_some() => format!(
-                "device runner ready (iOS {}, started over Wi-Fi): it would survive the cable being pulled, but this Mac reaches it off the cable only over the LAN, and this runner predates request signing (or does not answer on the LAN) — rerun setup to update it, or opt in with WDA_ALLOW_LAN=1 on a trusted network; keep the cable in meanwhile",
+                "device runner ready (iOS {}, started over Wi-Fi): it would survive the cable being pulled, but this Mac reaches it off the cable only over the LAN, and this runner predates request signing (or does not answer on the LAN) — rerun setup to update it, or opt in with IPU_RUNNER_ALLOW_LAN=1 on a trusted network; keep the cable in meanwhile",
                 legacy.ios
             ),
             Some(legacy) => format!(
@@ -4491,7 +4955,7 @@ impl Setup {
                 "the iOS 15/16 launcher ({}) is missing next to iphone-use; reinstall or upgrade iphone-use",
                 legacy_ios::LAUNCHER_NAME
             );
-            self.phase("prereq", "wda", &message);
+            self.phase("prereq", "runner", &message);
             return die(message);
         };
         let on_usb = self.legacy_on_usb();
@@ -4526,7 +4990,7 @@ impl Setup {
         if host.is_none() && !on_usb {
             let mut message = legacy_needs_usb_message(&ios);
             if !self.ctx.wifi_tunnel_allowed() {
-                message.push_str(" (WDA_TRANSPORT=usb: Wi-Fi starts are turned off for this phone)");
+                message.push_str(" (IPU_RUNNER_TRANSPORT=usb: Wi-Fi starts are turned off for this phone)");
             }
             self.phase("prereq", "legacy_needs_usb", &message);
             // Retried at once when the cable comes or the phone answers on
@@ -4540,7 +5004,7 @@ impl Setup {
         match &host {
             Some(ip) => ok(&format!("iOS {ios}: starting over Wi-Fi ({ip}); the runner keeps running with the cable pulled")),
             None if !self.ctx.wifi_tunnel_allowed() => {
-                ok(&format!("iOS {ios}: starting over USB (WDA_TRANSPORT=usb)"))
+                ok(&format!("iOS {ios}: starting over USB (IPU_RUNNER_TRANSPORT=usb)"))
             }
             None => ok(&format!(
                 "iOS {ios}: starting over USB (lockdownd does not answer over Wi-Fi yet)"
@@ -4725,7 +5189,7 @@ impl Setup {
                 Ok((app, assembled_key))
             }
             Err(error) => {
-                self.phase("building-fail", "wda", &error);
+                self.phase("building-fail", "runner", &error);
                 die(format!("could not assemble the iOS 15/16 runner: {error}"))
             }
         }
@@ -4754,7 +5218,7 @@ impl Setup {
             if let Err(error) = legacy_ios::install(&launcher, &udid, host.as_deref(), &app) {
                 self.phase(
                     "building-fail",
-                    "wda",
+                    "runner",
                     &format!("installing the runner failed: {error}"),
                 );
                 return die(format!("installing the runner on the iPhone failed: {error}"));
@@ -4865,7 +5329,7 @@ impl Setup {
                         }
                         self.phase(
                             "building-fail",
-                            "wda",
+                            "runner",
                             &format!("the iOS 15/16 runner did not start: {reason}"),
                         );
                         return die(format!(
@@ -4904,7 +5368,7 @@ impl Setup {
     /// connections to an app it has not allowed (China's "wireless data"
     /// setting, or local network access) and asks only while the app is in
     /// front. Off the cable every path to the runner (usbmuxd's Wi-Fi
-    /// attachment, or the LAN address behind WDA_ALLOW_LAN=1) needs this.
+    /// attachment, or the LAN address behind IPU_RUNNER_ALLOW_LAN=1) needs this.
     /// Setup brings the runner's app to the front, answers the prompt and
     /// goes back to the Home Screen. Never fails setup.
     fn legacy_wifi(&mut self, url: &str, target_url: &str) -> Step<String> {

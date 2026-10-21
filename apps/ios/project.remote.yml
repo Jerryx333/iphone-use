@@ -1,0 +1,107 @@
+# The remote app: drives phones a Mac serves. A free Apple ID can sign it.
+# project.yml adds local control (a packet-tunnel extension) on top of this.
+name: PhoneUseRemoteOnly
+options:
+  bundleIdPrefix: com.leeguoo
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    DEVELOPMENT_TEAM: 6ZPXG4KVVS
+    # Every bundle identifier derives from this one. `iphone-use setup-app`
+    # passes the user's own (com.leeguoo.iphone-use.remote.<team>) together
+    # with DEVELOPMENT_TEAM, because only our team can sign this default.
+    IPU_APP_BUNDLE_ID: com.leeguoo.iphone-use.remote
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "1.0.1"
+    CURRENT_PROJECT_VERSION: "21"
+targets:
+  IPhoneUseRemote:
+    type: application
+    platform: iOS
+    sources:
+      - IPhoneUseRemote/Sources
+      - IPhoneUseRemote/Resources
+      - Shared
+      - LocalControlShared/ProtectedStore.swift
+      - LocalControlShared/PairRecordImport.swift
+      - LocalControlShared/RunnerSigning.swift
+    dependencies:
+      - target: AgentActivityWidget
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(IPU_APP_BUNDLE_ID)
+        PRODUCT_NAME: Phone Use Remote
+        PRODUCT_MODULE_NAME: IPhoneUseRemote
+        INFOPLIST_FILE: IPhoneUseRemote/Info.plist
+        CODE_SIGN_ENTITLEMENTS: IPhoneUseRemote/Remote.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_OBJC_BRIDGING_HEADER: IPhoneUseRemote/Sources/SessionBridge.h
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)/SessionLibraries/$(PLATFORM_NAME)"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks /System/Developer/Library/Frameworks"
+        OTHER_LDFLAGS: "$(inherited) -lipu_browser_session -framework Security -framework SystemConfiguration"
+  AgentActivityWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.1"
+    sources:
+      - AgentActivityWidget
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(IPU_APP_BUNDLE_ID).activity
+        INFOPLIST_FILE: AgentActivityWidget/Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        SWIFT_STRICT_CONCURRENCY: complete
+  IPhoneUseRemoteTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - IPhoneUseRemoteTests
+    dependencies:
+      - target: IPhoneUseRemote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(IPU_APP_BUNDLE_ID).tests
+        GENERATE_INFOPLIST_FILE: YES
+        # The app's product name has spaces; xcodegen's default host path uses the target name.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Phone Use Remote.app/Phone Use Remote"
+        SWIFT_STRICT_CONCURRENCY: complete
+  IPhoneUseRemoteUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - IPhoneUseRemoteUITests
+    dependencies:
+      - target: IPhoneUseRemote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(IPU_APP_BUNDLE_ID).uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: IPhoneUseRemote
+        SWIFT_STRICT_CONCURRENCY: complete
+schemes:
+  IPhoneUseRemote:
+    build:
+      targets:
+        IPhoneUseRemote: all
+        IPhoneUseRemoteTests: [test]
+    test:
+      targets:
+        - IPhoneUseRemoteTests
+  # Needs Tools/mock_daemon.py running (see README); kept out of the main
+  # scheme so `xcodebuild test` stays self-contained.
+  IPhoneUseRemoteUITests:
+    build:
+      targets:
+        IPhoneUseRemote: all
+        IPhoneUseRemoteUITests: [test]
+    test:
+      targets:
+        - IPhoneUseRemoteUITests

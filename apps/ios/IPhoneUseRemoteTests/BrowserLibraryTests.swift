@@ -70,6 +70,30 @@ final class BrowserLibraryTests: XCTestCase {
         XCTAssertThrowsError(try library.importPayload(payload("work", secret: "synthetic"), selected: ["work"], includeCookies: true, includeStorage: true, includeBookmarks: false, includeHistory: false, includePersonal: false, trustSites: false))
         XCTAssertEqual(try Data(contentsOf: file), original)
     }
+    func testMetadataOnlyReimportWithChangedSiteDropsFormerSessionScope() throws {
+        let (library, file, key) = fixture()
+        defer { try? FileManager.default.removeItem(at: file) }
+        try library.importPayload(payload("work", secret: "synthetic-old-cookie"), selected: ["work"],
+                                  includeCookies: true, includeStorage: true, includeBookmarks: false,
+                                  includeHistory: false, includePersonal: false, trustSites: false)
+        let id = try XCTUnwrap(library.accounts.first { $0.externalID == "work" }?.id)
+        try library.markApplied(id)
+        var incoming = try payload("work", secret: "synthetic-not-selected")
+        incoming.accounts[0].site = "new.test"
+        try library.importPayload(incoming, selected: ["work"], includeCookies: false, includeStorage: false,
+                                  includeBookmarks: true, includeHistory: false, includePersonal: false, trustSites: false)
+        let changed = try XCTUnwrap(library.accounts.first { $0.id == id })
+        XCTAssertEqual(changed.domains, ["new.test"])
+        XCTAssertTrue(changed.cookies.isEmpty)
+        XCTAssertTrue(changed.localStorage.isEmpty)
+        XCTAssertTrue(changed.needsApply)
+        let reopened = BrowserLibrary(file: file, key: key)
+        let persisted = try XCTUnwrap(reopened.accounts.first { $0.id == id })
+        XCTAssertEqual(persisted.domains, ["new.test"])
+        XCTAssertTrue(persisted.cookies.isEmpty)
+        XCTAssertTrue(persisted.localStorage.isEmpty)
+        XCTAssertTrue(persisted.needsApply)
+    }
     func testDesktopPairingAndEncryptedVaultBinding() throws {
         let (library, file, key) = fixture(); defer { try? FileManager.default.removeItem(at: file) }
         let scope = String(repeating: "a", count: 24), grantKey = Data(repeating: 2, count: 32)

@@ -1,4 +1,4 @@
-//! axum HTTP app: the web client, the agent API, and the WDA proxy.
+//! axum HTTP app: the web client, the agent API, and the runner proxy.
 //!
 //! Routes (contract from `web/index.html`):
 //!   * `GET  /phone`       — auth-gated; serves the embedded web client.
@@ -126,7 +126,7 @@ impl Default for AuthLimiter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-enum WdaLifecycleTransition {
+enum RunnerLifecycleTransition {
     Active = 0,
     Releasing = 1,
     Reconnecting = 2,
@@ -140,12 +140,12 @@ enum WdaLifecycleTransition {
 /// ABA). The generation makes each round distinguishable, and only its own
 /// token can end it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WdaTransitionToken {
+pub struct RunnerTransitionToken {
     generation: u64,
-    phase: WdaLifecycleTransition,
+    phase: RunnerLifecycleTransition,
 }
 
-/// Single-owner arbitration for managed WDA start/stop transitions.
+/// Single-owner arbitration for managed runner start/stop transitions.
 ///
 /// Release and reconnect are mutually exclusive device lifecycle operations.
 /// Keeping them in one atomic state means they cannot both win after stale
@@ -155,7 +155,7 @@ pub struct WdaTransitionToken {
 /// Every successful begin bumps the generation, so a token identifies exactly
 /// one round of one transition.
 #[derive(Debug)]
-pub struct WdaLifecycle {
+pub struct RunnerLifecycle {
     state: std::sync::atomic::AtomicU64,
     /// Serialises phase changes with evidence published under a token.
     ///
@@ -167,47 +167,47 @@ pub struct WdaLifecycle {
     gate: Mutex<()>,
 }
 
-const WDA_LIFECYCLE_PHASE_MASK: u64 = 0xff;
+const RUNNER_LIFECYCLE_PHASE_MASK: u64 = 0xff;
 
-impl WdaLifecycle {
+impl RunnerLifecycle {
     pub fn new() -> Self {
         Self {
-            state: std::sync::atomic::AtomicU64::new(WdaLifecycleTransition::Active as u64),
+            state: std::sync::atomic::AtomicU64::new(RunnerLifecycleTransition::Active as u64),
             gate: Mutex::new(()),
         }
     }
 
-    fn decode(state: u64) -> (u64, WdaLifecycleTransition) {
+    fn decode(state: u64) -> (u64, RunnerLifecycleTransition) {
         let generation = state >> 8;
-        let phase = match state & WDA_LIFECYCLE_PHASE_MASK {
-            value if value == WdaLifecycleTransition::Active as u64 => {
-                WdaLifecycleTransition::Active
+        let phase = match state & RUNNER_LIFECYCLE_PHASE_MASK {
+            value if value == RunnerLifecycleTransition::Active as u64 => {
+                RunnerLifecycleTransition::Active
             }
-            value if value == WdaLifecycleTransition::Releasing as u64 => {
-                WdaLifecycleTransition::Releasing
+            value if value == RunnerLifecycleTransition::Releasing as u64 => {
+                RunnerLifecycleTransition::Releasing
             }
-            value if value == WdaLifecycleTransition::Reconnecting as u64 => {
-                WdaLifecycleTransition::Reconnecting
+            value if value == RunnerLifecycleTransition::Reconnecting as u64 => {
+                RunnerLifecycleTransition::Reconnecting
             }
-            _ => unreachable!("WDA lifecycle state is private and always valid"),
+            _ => unreachable!("runner lifecycle state is private and always valid"),
         };
         (generation, phase)
     }
 
-    fn encode(generation: u64, phase: WdaLifecycleTransition) -> u64 {
+    fn encode(generation: u64, phase: RunnerLifecycleTransition) -> u64 {
         (generation << 8) | phase as u64
     }
 
-    fn current(&self) -> WdaLifecycleTransition {
+    fn current(&self) -> RunnerLifecycleTransition {
         Self::decode(self.state.load(std::sync::atomic::Ordering::Acquire)).1
     }
 
-    fn try_begin(&self, transition: WdaLifecycleTransition) -> Option<WdaTransitionToken> {
-        debug_assert_ne!(transition, WdaLifecycleTransition::Active);
+    fn try_begin(&self, transition: RunnerLifecycleTransition) -> Option<RunnerTransitionToken> {
+        debug_assert_ne!(transition, RunnerLifecycleTransition::Active);
         let mut observed = self.state.load(std::sync::atomic::Ordering::Acquire);
         loop {
             let (generation, phase) = Self::decode(observed);
-            if phase != WdaLifecycleTransition::Active {
+            if phase != RunnerLifecycleTransition::Active {
                 return None;
             }
             let next_generation = generation.wrapping_add(1);
@@ -218,7 +218,7 @@ impl WdaLifecycle {
                 std::sync::atomic::Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Some(WdaTransitionToken {
+                    return Some(RunnerTransitionToken {
                         generation: next_generation,
                         phase: transition,
                     })
@@ -232,13 +232,13 @@ impl WdaLifecycle {
     /// when the token is no longer current, which is a normal outcome for a
     /// task that was superseded or that raced another observer. The generation
     /// is preserved so the next begin still produces a fresh token.
-    fn finish(&self, token: WdaTransitionToken) -> bool {
-        debug_assert_ne!(token.phase, WdaLifecycleTransition::Active);
+    fn finish(&self, token: RunnerTransitionToken) -> bool {
+        debug_assert_ne!(token.phase, RunnerLifecycleTransition::Active);
         let finished = self
             .state
             .compare_exchange(
                 Self::encode(token.generation, token.phase),
-                Self::encode(token.generation, WdaLifecycleTransition::Active),
+                Self::encode(token.generation, RunnerLifecycleTransition::Active),
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
@@ -253,7 +253,7 @@ impl WdaLifecycle {
     }
 
     /// Whether this token still owns the current transition.
-    fn owns(&self, token: WdaTransitionToken) -> bool {
+    fn owns(&self, token: RunnerTransitionToken) -> bool {
         self.state.load(std::sync::atomic::Ordering::Acquire)
             == Self::encode(token.generation, token.phase)
     }
@@ -263,7 +263,7 @@ impl WdaLifecycle {
     /// when the token has been superseded and nothing was published.
     fn publish_if_current<R>(
         &self,
-        token: WdaTransitionToken,
+        token: RunnerTransitionToken,
         publish: impl FnOnce() -> R,
     ) -> Option<R> {
         let _gate = recover(self.gate.lock());
@@ -273,42 +273,42 @@ impl WdaLifecycle {
         Some(publish())
     }
 
-    fn try_begin_releasing(&self) -> Option<WdaTransitionToken> {
+    fn try_begin_releasing(&self) -> Option<RunnerTransitionToken> {
         let _gate = recover(self.gate.lock());
-        self.try_begin(WdaLifecycleTransition::Releasing)
+        self.try_begin(RunnerLifecycleTransition::Releasing)
     }
 
-    fn finish_releasing(&self, token: WdaTransitionToken) -> bool {
-        debug_assert_eq!(token.phase, WdaLifecycleTransition::Releasing);
+    fn finish_releasing(&self, token: RunnerTransitionToken) -> bool {
+        debug_assert_eq!(token.phase, RunnerLifecycleTransition::Releasing);
         let _gate = recover(self.gate.lock());
         self.finish(token)
     }
 
-    fn try_begin_reconnecting(&self) -> Option<WdaTransitionToken> {
+    fn try_begin_reconnecting(&self) -> Option<RunnerTransitionToken> {
         let _gate = recover(self.gate.lock());
-        self.try_begin(WdaLifecycleTransition::Reconnecting)
+        self.try_begin(RunnerLifecycleTransition::Reconnecting)
     }
 
-    fn finish_reconnecting(&self, token: WdaTransitionToken) -> bool {
-        debug_assert_eq!(token.phase, WdaLifecycleTransition::Reconnecting);
+    fn finish_reconnecting(&self, token: RunnerTransitionToken) -> bool {
+        debug_assert_eq!(token.phase, RunnerLifecycleTransition::Reconnecting);
         let _gate = recover(self.gate.lock());
         self.finish(token)
     }
 
     pub fn is_releasing(&self) -> bool {
-        self.current() == WdaLifecycleTransition::Releasing
+        self.current() == RunnerLifecycleTransition::Releasing
     }
 
     pub fn is_reconnecting(&self) -> bool {
-        self.current() == WdaLifecycleTransition::Reconnecting
+        self.current() == RunnerLifecycleTransition::Reconnecting
     }
 
     pub fn is_transitioning(&self) -> bool {
-        self.current() != WdaLifecycleTransition::Active
+        self.current() != RunnerLifecycleTransition::Active
     }
 }
 
-impl Default for WdaLifecycle {
+impl Default for RunnerLifecycle {
     fn default() -> Self {
         Self::new()
     }
@@ -324,6 +324,9 @@ pub struct AppState {
     pub session_ttl_secs: u64,
     /// Whether to mark the cookie `Secure` (true behind TLS).
     pub cookie_secure: bool,
+    /// Path prefix the daemon is also served under (`IPHONE_USE_BASE_PATH`):
+    /// `""` or e.g. `"/ix"`. Pages, redirects and the session cookie use it.
+    pub base_path: String,
     /// Rate limiter for login and agent bearer auth failures.
     /// After 5 consecutive failures requests are rejected with 429 for 30 s.
     pub auth_limiter: Arc<Mutex<AuthLimiter>>,
@@ -336,7 +339,7 @@ pub struct AppState {
     /// When `None`, the existing behavior applies: the password (if set) is used as
     /// the bearer check, and open mode (no password) passes everything through.
     pub agent_token: Option<String>,
-    /// Persisted target iPhone UDID used by every WDA start/restart.
+    /// Persisted target iPhone UDID used by every runner start/restart.
     pub device_udid: Option<String>,
     /// The iOS simulator this daemon drives instead of a phone
     /// (`IPHONE_USE_SIMULATOR`, preview): device services go through simctl
@@ -349,87 +352,87 @@ pub struct AppState {
     /// action and POSTs the result here. Bounded ring buffer; oldest dropped.
     pub inbox: Arc<Mutex<std::collections::VecDeque<InboxItem>>>,
     /// Optional L2 element-tree control via WebDriverAgent on the phone
-    /// (`IPHONE_USE_WDA_URL`, e.g. `http://<phone-ip>:8100`). When present,
+    /// (`IPHONE_USE_RUNNER_URL`, e.g. `http://<phone-ip>:8100`). When present,
     /// agent input auto-routes through it (see [`agent_input`]): text goes in
     /// as Unicode (CJK lands cleanly), taps are synthesized on-device (no host
-    /// cursor). Control fails closed on WDA errors.
+    /// cursor). Control fails closed on runner errors.
     /// `tokio::sync::Mutex` because the client mutates its cached session and
     /// handlers hold the lock across awaits.
-    pub wda: Option<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>>,
-    /// Whether this daemon owns the local WDA supervisor and relay lifecycle.
+    pub runner: Option<Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>>,
+    /// Whether this daemon owns the local runner supervisor and relay lifecycle.
     ///
-    /// Only a direct backend pointed at a loopback WDA URL is managed. A remote
-    /// `IPHONE_USE_WDA_URL` is externally owned: this process may use it, but
+    /// Only a direct backend pointed at a loopback runner URL is managed. A remote
+    /// `IPHONE_USE_RUNNER_URL` is externally owned: this process may use it, but
     /// must never stop or bootstrap local launchd jobs on its behalf.
-    pub managed_wda: bool,
+    pub managed_runner: bool,
     /// A local Direct backend whose managed ownership is waiting for a
     /// canonical target UDID. Pending setup is neither daemon-managed nor
     /// external: lifecycle actions stay disabled until setup persists a target
     /// and the daemon restarts.
-    pub managed_wda_pending: bool,
+    pub managed_runner_pending: bool,
     /// Latest released tag on GitHub (e.g. `"v0.3.0"`), refreshed by a
     /// background task every 24h (`main::spawn_update_check`). `None` until
     /// the first successful fetch (or when offline). Read by `agent_status`
     /// to surface `update_available` to agents and the web client.
     pub latest_release: Arc<Mutex<Option<String>>>,
-    /// WDA's on-device MJPEG stream URL (e.g. `http://127.0.0.1:9100`), if WDA
+    /// runner's on-device MJPEG stream URL (e.g. `http://127.0.0.1:9100`), if runner
     /// is configured. The `/agent/mjpeg` endpoint proxies it for live video —
     /// the MJPEG server runs inside the same XCUITest session as control.
     /// Defaults to `127.0.0.1:9100` (the relay target), override via
-    /// `IPHONE_USE_WDA_MJPEG_URL`.
+    /// `IPHONE_USE_RUNNER_MJPEG_URL`.
     pub mjpeg_url: Option<String>,
     /// The H.264 re-encoder fed from `mjpeg_url` (see [`crate::video`]);
-    /// `None` where it cannot run (no WDA video, or not macOS).
+    /// `None` where it cannot run (no runner video, or not macOS).
     pub video: Option<Arc<crate::video::VideoHub>>,
-    /// Last-known "WDA can act on-device" flag, updated by Direct health probes
+    /// Last-known "runner can act on-device" flag, updated by Direct health probes
     /// and control events. Direct handlers use it as readiness evidence but
-    /// always fail closed when WDA cannot act.
-    pub wda_actionable: Arc<std::sync::atomic::AtomicBool>,
+    /// always fail closed when runner cannot act.
+    pub runner_actionable: Arc<std::sync::atomic::AtomicBool>,
     /// Screen reads failed while the runner still answered `/status` (a
     /// "half dead" runner). The health poller's actionability probe never
     /// reads the tree, so without this it would flip such a runner straight
     /// back to drivable. Set when a read path gives up; cleared only once a
     /// light tree read succeeds again.
-    pub wda_read_degraded: Arc<std::sync::atomic::AtomicBool>,
+    pub runner_read_degraded: Arc<std::sync::atomic::AtomicBool>,
     /// Scan-to-connect codes (see [`crate::pairing`]).
     pub pairing: Arc<crate::pairing::Pairing>,
-    /// Last completed WDA health probe. Status polling uses this cache whenever
+    /// Last completed runner health probe. Status polling uses this cache whenever
     /// the control client is busy, so a slow health check never queues behind or
     /// blocks a time-sensitive browser gesture indefinitely.
-    pub wda_health: Arc<Mutex<crate::wda::WdaHealth>>,
+    pub runner_health: Arc<Mutex<crate::runner::RunnerHealth>>,
     pub selfrunner_gateway: Option<Arc<crate::selfrunner::Gateway>>,
-    /// Why WDA last stopped being drivable, captured at the transition (#26 §2).
-    /// Without this, a mid-session `wda:true -> false` is indistinguishable from
+    /// Why runner last stopped being drivable, captured at the transition (#26 §2).
+    /// Without this, a mid-session `runner:true -> false` is indistinguishable from
     /// a human picking the phone up, and agents blame the wrong thing.
-    pub wda_death: Arc<Mutex<WdaDeath>>,
+    pub runner_death: Arc<Mutex<RunnerDeath>>,
     /// Single in-flight background health probe. Fresh status requests return
     /// immediately; stale requests wait up to 2.5 seconds; a control request aborts this task before taking the
-    /// WDA mutex so a cold/slow probe cannot delay an input action.
-    pub wda_health_probe: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// runner mutex so a cold/slow probe cannot delay an input action.
+    pub runner_health_probe: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// The background capture of the settled screen after an observed action
-    /// (see `capture_settled_frame_later`). It holds the WDA client for a
+    /// (see `capture_settled_frame_later`). It holds the runner client for a
     /// whole screenshot, so the next control request cancels it rather than
     /// queue behind it.
     pub settled_frame_prefetch: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
-    /// Number of Direct control requests currently waiting for or using WDA.
-    /// Health polling re-checks this while holding `wda_health_probe`'s mutex,
+    /// Number of Direct control requests currently waiting for or using runner.
+    /// Health polling re-checks this while holding `runner_health_probe`'s mutex,
     /// closing the race where a poll could start a new probe after input asked
     /// the previous probe to stop.
-    pub wda_control_pending: Arc<std::sync::atomic::AtomicUsize>,
+    pub runner_control_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Monotonic timestamp of the last remote-driving activity — any `/agent`
     /// control or live-view request, refreshed by [`AppState::touch_activity`].
     /// The idle-release watchdog ([`spawn_idle_release_watchdog`]) frees the
-    /// phone (stops WDA, boots out its KeepAlive LaunchAgent) once this goes
+    /// phone (stops runner, boots out its KeepAlive LaunchAgent) once this goes
     /// stale and nobody is watching, so the owner gets their device back when
     /// no one is driving it remotely.
     pub last_activity: Arc<Mutex<Instant>>,
-    /// True while WDA has been auto-released for idle (runner stopped + its
+    /// True while runner has been auto-released for idle (runner stopped + its
     /// LaunchAgent booted out). The next `/agent/input` re-bootstraps it.
     pub released: Arc<std::sync::atomic::AtomicBool>,
-    /// Mutually-exclusive managed WDA stop/bootstrap transition. New
+    /// Mutually-exclusive managed runner stop/bootstrap transition. New
     /// control/view requests fail fast while it is owned. `released` stays true
     /// until bootstrap succeeds, so a failed recovery is never reported active.
-    pub wda_lifecycle: Arc<WdaLifecycle>,
+    pub runner_lifecycle: Arc<RunnerLifecycle>,
     /// Open `/agent/mjpeg` live-view streams. A connected viewer counts as
     /// activity for as long as it watches, so passive viewing doesn't get
     /// released out from under the user.
@@ -457,7 +460,7 @@ pub struct AppState {
     /// Operator/agent "hold" lease: while set and in the future, the idle
     /// watchdog never releases the phone even with no recent actions — a human
     /// in the loop (typing a password, approving a prompt) otherwise trips the
-    /// idle window and pays a 60–120s WDA rebuild every time.
+    /// idle window and pays a 60–120s runner rebuild every time.
     pub hold_until: Arc<Mutex<Option<Instant>>>,
     /// A hold taken with `"private":true` (the person is signing in on the
     /// phone): until then nothing reads the screen — screenshots, live video
@@ -475,9 +478,9 @@ pub struct AppState {
     pub owner_lease_secs: u64,
     /// How a reconnect brings the managed supervisor up: `(setup_sh, log,
     /// udid) -> started`. Blocking. The daemon uses
-    /// [`write_and_bootstrap_wda_agent`]; tests substitute a fake so a
+    /// [`write_and_bootstrap_runner_agent`]; tests substitute a fake so a
     /// reconnect can run without touching launchd.
-    pub wda_bootstrap: fn(&str, &str, &str) -> bool,
+    pub runner_bootstrap: fn(&str, &str, &str) -> bool,
 }
 
 /// The current phone owner: a client-chosen name and when it last acted.
@@ -760,7 +763,7 @@ async fn agent_owner_inner(
 /// The bounded ring behind [`AppState::element_snapshots`]: recently served
 /// element trees keyed by their snapshot token, oldest first.
 pub type ElementSnapshotCache =
-    std::collections::VecDeque<(String, Arc<Vec<crate::wda::ElementRow>>)>;
+    std::collections::VecDeque<(String, Arc<Vec<crate::runner::ElementRow>>)>;
 
 impl AppState {
     /// Stamp "remote driving happened just now" for the idle-release watchdog.
@@ -834,21 +837,21 @@ impl AppState {
     }
 
     /// Give a Direct control operation priority over background health work.
-    fn begin_wda_control(&self) -> WdaControlPriorityGuard {
-        self.wda_control_pending
+    fn begin_runner_control(&self) -> RunnerControlPriorityGuard {
+        self.runner_control_pending
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if let Some(probe) = recover(self.wda_health_probe.lock()).take() {
+        if let Some(probe) = recover(self.runner_health_probe.lock()).take() {
             probe.abort();
         }
-        WdaControlPriorityGuard(self.wda_control_pending.clone())
+        RunnerControlPriorityGuard(self.runner_control_pending.clone())
     }
 }
 
-/// RAII marker that prevents status polling from starting a competing WDA
+/// RAII marker that prevents status polling from starting a competing runner
 /// health probe while a time-sensitive Direct action is pending.
-struct WdaControlPriorityGuard(Arc<std::sync::atomic::AtomicUsize>);
+struct RunnerControlPriorityGuard(Arc<std::sync::atomic::AtomicUsize>);
 
-impl Drop for WdaControlPriorityGuard {
+impl Drop for RunnerControlPriorityGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -949,17 +952,56 @@ pub struct InboxItem {
 const INBOX_CAP: usize = 64;
 
 /// Build the axum router for the daemon.
+///
+/// With a base path (`IPHONE_USE_BASE_PATH=/ix`) every route is also served
+/// under `/ix`, so a tunnel can send `host/ix/*` here without rewriting the
+/// path. The API stays reachable without the prefix (MCP, iOS app and LAN
+/// clients that know only the port); the browser pages redirect to their
+/// prefixed address so the session cookie, scoped to the prefix, is sent.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let pages = Router::new()
         .route("/", get(root))
         .route("/phone", get(phone))
         .route("/setup", get(setup))
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", get(logout))
-        // Scan-to-connect: a signed-in page mints a one-time code shown as a
-        // QR; the phone that scans it gets a session without the password.
-        .route("/pair/new", post(pair_new))
         .route("/pair", get(pair_page).post(pair_submit))
+        .route("/schedules", get(crate::schedules::page));
+    let api = api_routes().layer(axum::middleware::from_fn(crate::timing::layer));
+    let base = state.base_path.clone();
+    let app = if base.is_empty() {
+        pages.merge(api)
+    } else {
+        let to_base = || axum::routing::any(redirect_to_base);
+        Router::new()
+            .route("/", to_base())
+            .route("/phone", to_base())
+            .route("/setup", to_base())
+            .route("/login", to_base())
+            .route("/logout", to_base())
+            .route("/pair", to_base())
+            .route("/schedules", to_base())
+            .merge(api.clone())
+            .nest(&base, pages.merge(api))
+    };
+    app.with_state(state)
+}
+
+/// An unprefixed page request on a daemon with a base path: send it to the
+/// same page under the prefix (307 keeps a POST a POST).
+async fn redirect_to_base(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Response {
+    let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    let target = format!("{}{path_and_query}", state.base_path);
+    with_security_headers(Redirect::temporary(&target).into_response())
+}
+
+/// The routes every caller reaches by path: the agent API, video, control.
+fn api_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        // Scan-to-connect: a signed-in page mints a one-time code shown as a
+        // QR; the phone that scans it gets a session without the password
+        // (the `/pair` page itself is in `router`'s pages).
+        .route("/pair/new", post(pair_new))
         .route("/pair/probe", get(pair_probe))
         .route("/browser/chrome", post(browser_chrome))
         // Browser control: one HTTP request per gesture, each with an explicit
@@ -996,7 +1038,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/inbox", get(agent_inbox_get).post(agent_inbox_post))
         .route("/agent/inbox/drain", post(agent_inbox_drain))
         // Semantic intents channel: curated Shortcuts verbs dispatched
-        // on-device via WDA's sessionless `POST /url`
+        // on-device via runner's sessionless `POST /url`
         // (`shortcuts://run-shortcut` deep link). Results return through the
         // existing `/agent/inbox`; the registry file — not the phone — is the
         // capability list.
@@ -1024,8 +1066,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/agent/app-notes",
             get(agent_app_notes_get).put(agent_app_notes_put),
         )
-        // Scheduled flows and test suites (see `schedules`).
-        .route("/schedules", get(crate::schedules::page))
+        // Scheduled flows and test suites (see `schedules`; the page is in
+        // `router`'s pages).
         .route(
             "/agent/schedules",
             get(crate::schedules::list).post(crate::schedules::create),
@@ -1037,9 +1079,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/agent/schedules/:id/runs", get(crate::schedules::runs))
         .route("/agent/schedules/:id/run", post(crate::schedules::run_now))
-        // Per-request WDA timing on every /agent/* answer (see `timing`).
-        .layer(axum::middleware::from_fn(crate::timing::layer))
-        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,32 +1101,34 @@ fn with_security_headers(mut resp: Response) -> Response {
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the `phone_session` cookie value from request headers.
+/// Extract every `phone_session` cookie value from request headers.
 /// Every `Cookie` header is read: a client may send cookies (the session and
-/// `iphone_use_lang`) in separate headers.
-fn session_cookie(headers: &HeaderMap) -> Option<String> {
+/// `iphone_use_lang`) in separate headers. Daemons sharing one host under
+/// different base paths each set their own `phone_session`, and the browser
+/// sends all whose path matches, so there can be several.
+fn session_cookies(headers: &HeaderMap) -> Vec<String> {
     let prefix = format!("{SESSION_COOKIE}=");
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
-        .find_map(|pair| pair.trim().strip_prefix(prefix.as_str()).map(str::to_string))
+        .filter_map(|pair| pair.trim().strip_prefix(prefix.as_str()).map(str::to_string))
+        .collect()
 }
 
 /// Return `true` if the request is authenticated.
 ///
 /// When no password is configured the daemon runs open (LAN dev) and every
-/// request is treated as authed. Otherwise the `phone_session` cookie must carry
+/// request is treated as authed. Otherwise a `phone_session` cookie must carry
 /// a valid, unexpired token signed by the daemon secret.
 pub fn is_authed(state: &AppState, headers: &HeaderMap) -> bool {
     if state.password.is_none() {
         return true;
     }
-    match session_cookie(headers) {
-        Some(token) => core::auth::check_token(&state.secret, &token, now_secs()),
-        None => false,
-    }
+    session_cookies(headers)
+        .iter()
+        .any(|token| core::auth::check_token(&state.secret, token, now_secs()))
 }
 
 /// True when the request reached us over HTTPS. The daemon itself always serves
@@ -1112,37 +1153,67 @@ fn make_session_cookie(state: &AppState, secure: bool) -> String {
     let token = core::auth::make_token(&state.secret, state.session_ttl_secs, now_secs());
     let secure = if secure { "; Secure" } else { "" };
     format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        "{SESSION_COOKIE}={token}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        cookie_path(state),
         state.session_ttl_secs
     )
 }
 
 /// Build the cookie that clears the session.
-fn clear_session_cookie(secure: bool) -> String {
+fn clear_session_cookie(state: &AppState, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
+    format!(
+        "{SESSION_COOKIE}=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+        cookie_path(state)
+    )
+}
+
+/// The session cookie's `Path`: the base path, so daemons sharing a host do
+/// not overwrite each other's session.
+fn cookie_path(state: &AppState) -> &str {
+    if state.base_path.is_empty() {
+        "/"
+    } else {
+        &state.base_path
+    }
+}
+
+/// `path` (a daemon route such as `/phone`) as the browser must request it.
+pub(crate) fn based(state: &AppState, path: &str) -> String {
+    format!("{}{path}", state.base_path)
 }
 
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
-async fn root() -> Response {
-    with_security_headers(Redirect::to("/phone").into_response())
+async fn root(State(state): State<Arc<AppState>>) -> Response {
+    with_security_headers(Redirect::to(&based(&state, "/phone")).into_response())
 }
 
 async fn phone(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_authed(&state, &headers) {
-        return with_security_headers(Redirect::to("/login").into_response());
+        return with_security_headers(Redirect::to(&based(&state, "/login")).into_response());
     }
-    with_security_headers(Html(INDEX_HTML).into_response())
+    with_security_headers(Html(with_base(&state, INDEX_HTML)).into_response())
 }
 
 async fn setup(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_authed(&state, &headers) {
-        return with_security_headers(Redirect::to("/login?next=%2Fsetup").into_response());
+        return with_security_headers(
+            Redirect::to(&based(&state, "/login?next=%2Fsetup")).into_response(),
+        );
     }
-    with_security_headers(Html(SETUP_HTML).into_response())
+    with_security_headers(Html(with_base(&state, SETUP_HTML)).into_response())
+}
+
+/// A page with the base path filled in: the web pages read it from
+/// `<meta name="iphone-use-base">` and prefix every request with it.
+pub(crate) fn with_base(state: &AppState, html: &str) -> String {
+    html.replace(
+        r#"<meta name="iphone-use-base" content="">"#,
+        &format!(r#"<meta name="iphone-use-base" content="{}">"#, state.base_path),
+    )
 }
 
 /// The login form HTML (self-contained, no external assets).
@@ -1183,7 +1254,7 @@ button:hover{filter:brightness(1.06)}
 .lang:hover{color:var(--text)}
 .lang:focus-visible{outline:3px solid var(--ring);outline-offset:1px}
 </style></head><body>
-<form method="POST" action="/login" novalidate>
+<form method="POST" action="__BASE__/login" novalidate>
   <div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg></div>
   <h1>iphone-use</h1>
   <p class="hint" id="passwordHint">请输入这台 Mac 安装 iphone-use 时生成的控制密码。忘记后，请回到 Mac 重新运行安装程序查看或重设。</p>
@@ -1259,7 +1330,12 @@ fn login_destination(next: Option<&str>) -> &'static str {
     }
 }
 
-fn render_login(error: Option<[&str; 2]>, next: Option<&str>, chinese: bool) -> String {
+fn render_login(
+    base: &str,
+    error: Option<[&str; 2]>,
+    next: Option<&str>,
+    chinese: bool,
+) -> String {
     let error = error.map_or("", |[zh, en]| if chinese { zh } else { en });
     let next_input = match login_destination(next) {
         "/setup" => r#"<input type="hidden" name="next" value="/setup">"#,
@@ -1270,6 +1346,7 @@ fn render_login(error: Option<[&str; 2]>, next: Option<&str>, chinese: bool) -> 
         .replace("__LANG_SWITCH__", &lang_switch(chinese))
         .replace("__NEXT_INPUT__", next_input)
         .replace("__ERR__", error)
+        .replace("__BASE__", base)
         .replace(
             "__INVALID__",
             if error.is_empty() { "false" } else { "true" },
@@ -1290,10 +1367,12 @@ async fn login_form(
     // Already authed → return to the allow-listed route the user originally
     // requested instead of silently dropping them on the control page.
     if is_authed(&state, &headers) {
-        return with_security_headers(Redirect::to(destination).into_response());
+        return with_security_headers(Redirect::to(&based(&state, destination)).into_response());
     }
     let chinese = crate::locale::request_prefers_chinese(&headers);
-    with_security_headers(Html(render_login(None, Some(destination), chinese)).into_response())
+    with_security_headers(
+        Html(render_login(&state.base_path, None, Some(destination), chinese)).into_response(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1320,7 +1399,7 @@ async fn login_submit(
     // missing value as an authentication failure: the user has not attempted a
     // credential yet.
     if form.password.is_empty() {
-        let mut resp = Html(render_login(Some(LOGIN_EMPTY), Some(destination), chinese)).into_response();
+        let mut resp = Html(render_login(&state.base_path, Some(LOGIN_EMPTY), Some(destination), chinese)).into_response();
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return with_security_headers(resp);
     }
@@ -1328,7 +1407,7 @@ async fn login_submit(
     {
         let limiter = state.auth_limiter.lock().unwrap();
         if limiter.is_locked() {
-            let mut resp = Html(render_login(Some(LOGIN_LOCKED), Some(destination), chinese))
+            let mut resp = Html(render_login(&state.base_path, Some(LOGIN_LOCKED), Some(destination), chinese))
             .into_response();
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
             resp.headers_mut()
@@ -1341,7 +1420,7 @@ async fn login_submit(
         redirect_with_cookie(&state, destination, &headers)
     } else {
         state.auth_limiter.lock().unwrap().record_failure();
-        let body = render_login(Some(LOGIN_WRONG), Some(destination), chinese);
+        let body = render_login(&state.base_path, Some(LOGIN_WRONG), Some(destination), chinese);
         let mut resp = Html(body).into_response();
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         with_security_headers(resp)
@@ -1352,7 +1431,7 @@ async fn login_submit(
 /// arrived over HTTPS — see `request_is_https`).
 fn redirect_with_cookie(state: &AppState, to: &str, headers: &HeaderMap) -> Response {
     let secure = request_is_https(state, headers);
-    let mut resp = Redirect::to(to).into_response();
+    let mut resp = Redirect::to(&based(state, to)).into_response();
     if let Ok(v) = HeaderValue::from_str(&make_session_cookie(state, secure)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
@@ -1361,8 +1440,8 @@ fn redirect_with_cookie(state: &AppState, to: &str, headers: &HeaderMap) -> Resp
 
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let secure = request_is_https(&state, &headers);
-    let mut resp = Redirect::to("/login").into_response();
-    if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(secure)) {
+    let mut resp = Redirect::to(&based(&state, "/login")).into_response();
+    if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(&state, secure)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     with_security_headers(resp)
@@ -1476,7 +1555,7 @@ async fn pair_new(
         None => String::new(),
     };
     let code = state.pairing.issue();
-    let url = format!("{scheme}://{host}{port}/pair?c={code}");
+    let url = format!("{scheme}://{host}{port}{}/pair?c={code}", state.base_path);
     pair_json(
         StatusCode::OK,
         serde_json::json!({
@@ -1627,8 +1706,9 @@ async fn pair_page(
         // preview or prefetch cannot use it up; scripts off → one click.
         let body = format!(
             r#"<h1>正在登录 iphone-use…</h1>
-<form method="POST" action="/pair"><input type="hidden" name="c" value="{code}"><button type="submit">打开控制页</button></form>
-<script>document.forms[0].submit()</script>"#
+<form method="POST" action="{base}/pair"><input type="hidden" name="c" value="{code}"><button type="submit">打开控制页</button></form>
+<script>document.forms[0].submit()</script>"#,
+            base = state.base_path,
         );
         return with_security_headers(Html(render_pair_page(&body, chinese)).into_response());
     }
@@ -1641,13 +1721,14 @@ async fn pair_page(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let base = format!("{scheme}://{host}");
+    let base = format!("{scheme}://{host}{}", state.base_path);
     let app_link = format!("iphoneuse://pair?u={}&amp;c={code}", percent_encode(&base));
     let body = format!(
         r#"<h1>连接这台 Mac 上的 iPhone</h1>
 <p>装了 Phone Use Remote App 就用 App 打开，画面更流畅；没装也可以直接在浏览器里控制。</p>
 <a href="{app_link}">在 Phone Use Remote App 中打开</a>
-<form method="POST" action="/pair"><input type="hidden" name="c" value="{code}"><button type="submit">在浏览器里控制</button></form>"#
+<form method="POST" action="{}/pair"><input type="hidden" name="c" value="{code}"><button type="submit">在浏览器里控制</button></form>"#,
+        state.base_path,
     );
     with_security_headers(Html(render_pair_page(&body, chinese)).into_response())
 }
@@ -1747,7 +1828,15 @@ async fn pair_submit(
             .and_then(|v| v.to_str().ok())
             .unwrap_or(""),
     );
-    body["lan_urls"] = state.pairing.lan_urls(request_port).into();
+    // Under a base path the app must keep it on the LAN too: its login and
+    // pairing pages answer there, not at the bare port.
+    body["lan_urls"] = state
+        .pairing
+        .lan_urls(request_port)
+        .into_iter()
+        .map(|url| format!("{url}{}", state.base_path))
+        .collect::<Vec<_>>()
+        .into();
     // The app checks a LAN address with this before trusting it (see `pair_probe`).
     body["lan_key"] = base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
@@ -1810,7 +1899,7 @@ fn pair_form_code(body: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 //
 // An agent (an MCP client or a script) drives the phone by POSTing to
-// this already-running daemon, which dispatches to on-device WDA.
+// this already-running daemon, which dispatches to on-device runner.
 
 /// Extract the bytes after `Authorization: Bearer `.
 ///
@@ -2018,29 +2107,29 @@ fn target_not_configured_response() -> Response {
             .status(StatusCode::CONFLICT)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"ok":false,"error":"target_not_configured","hint":"run setup-wda.sh to select and persist the canonical iPhone before using Direct control"}"#,
+                r#"{"ok":false,"error":"target_not_configured","hint":"run setup-runner.sh to select and persist the canonical iPhone before using Direct control"}"#,
             ))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
 }
 
-/// Return cached WDA health and, when idle, start one background refresh.
+/// Return cached runner health and, when idle, start one background refresh.
 ///
-/// A cold WDA session can legitimately take longer than the old 1.5-second
+/// A cold runner session can legitimately take longer than the old 1.5-second
 /// status budget. Cancelling it on every poll meant the session was never
 /// cached and `drivable` stayed false forever. The refresh now gets a realistic
 /// deadline and survives the HTTP status request that started it. Direct input
-/// has priority: [`AppState::begin_wda_control`] aborts the probe before waiting
-/// for the shared WDA client, and the pending counter prevents a replacement
+/// has priority: [`AppState::begin_runner_control`] aborts the probe before waiting
+/// for the shared runner client, and the pending counter prevents a replacement
 /// probe from racing in behind it.
-async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
+async fn cached_runner_health(state: &AppState) -> crate::runner::RunnerHealth {
     let stale =
-        recover(state.wda_health.lock()).updated_at.elapsed() > std::time::Duration::from_secs(5);
+        recover(state.runner_health.lock()).updated_at.elapsed() > std::time::Duration::from_secs(5);
     start_health_probe(state);
     if stale {
         let _ = tokio::time::timeout(std::time::Duration::from_millis(2500), async {
             loop {
-                let running = recover(state.wda_health_probe.lock())
+                let running = recover(state.runner_health_probe.lock())
                     .as_ref()
                     .is_some_and(|p| !p.is_finished());
                 if !running {
@@ -2051,15 +2140,15 @@ async fn cached_wda_health(state: &AppState) -> crate::wda::WdaHealth {
         })
         .await;
     }
-    *recover(state.wda_health.lock())
+    *recover(state.runner_health.lock())
 }
 
-fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
-    let cached = *recover(state.wda_health.lock());
-    let Some(wda) = &state.wda else {
-        return crate::wda::WdaHealth::down();
+fn start_health_probe(state: &AppState) -> crate::runner::RunnerHealth {
+    let cached = *recover(state.runner_health.lock());
+    let Some(runner) = &state.runner else {
+        return crate::runner::RunnerHealth::down();
     };
-    let mut probe_slot = recover(state.wda_health_probe.lock());
+    let mut probe_slot = recover(state.runner_health_probe.lock());
     if probe_slot
         .as_ref()
         .is_some_and(|probe| !probe.is_finished())
@@ -2068,22 +2157,22 @@ fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
     }
     *probe_slot = None;
     if state
-        .wda_control_pending
+        .runner_control_pending
         .load(std::sync::atomic::Ordering::Acquire)
         != 0
     {
         return cached;
     }
 
-    let wda = wda.clone();
-    let health_cache = state.wda_health.clone();
-    let actionable = state.wda_actionable.clone();
+    let runner = runner.clone();
+    let health_cache = state.runner_health.clone();
+    let actionable = state.runner_actionable.clone();
     let released = state.released.clone();
-    let death = state.wda_death.clone();
-    let read_degraded = state.wda_read_degraded.clone();
-    let releasing = state.wda_lifecycle.is_releasing();
+    let death = state.runner_death.clone();
+    let read_degraded = state.runner_read_degraded.clone();
+    let releasing = state.runner_lifecycle.is_releasing();
     *probe_slot = Some(tokio::spawn(async move {
-        let Ok(mut client) = wda.try_lock() else {
+        let Ok(mut client) = runner.try_lock() else {
             return;
         };
         match tokio::time::timeout(std::time::Duration::from_secs(15), client.probe_health()).await
@@ -2093,7 +2182,12 @@ fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
                 let degraded = read_degraded.load(Ordering::Acquire);
                 // Only a runner that otherwise looks fine needs the read: if it
                 // is down or not actionable, that already keeps it undrivable.
-                let read_ok = if degraded && health.actionable {
+                // Not while the runner is still on a slow read: the probe
+                // would only queue behind it; stay degraded until it is free.
+                let read_ok = if degraded
+                    && health.actionable
+                    && !crate::runner::busy_working(client.main_busy_ms().await)
+                {
                     tokio::time::timeout(std::time::Duration::from_secs(10), client.read_probe())
                         .await
                         .ok()
@@ -2105,7 +2199,7 @@ fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
                     tracing::info!("screen reads work again; the device runner is drivable");
                 }
                 read_degraded.store(still, Ordering::Release);
-                apply_wda_health_probe_tracked(
+                apply_runner_health_probe_tracked(
                     &health_cache,
                     &actionable,
                     &released,
@@ -2117,7 +2211,7 @@ fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
             Err(_) => {
                 // Preserve the last completed observation. A timeout is not an
                 // authoritative "down", and the next status poll may retry.
-                tracing::warn!("WDA health probe timed out; retaining cached health");
+                tracing::warn!("runner health probe timed out; retaining cached health");
             }
         }
     }));
@@ -2125,20 +2219,20 @@ fn start_health_probe(state: &AppState) -> crate::wda::WdaHealth {
 }
 
 // ---------------------------------------------------------------------------
-// wda_died_reason — who actually killed it (issue #26 §2)
+// runner_died_reason — who actually killed it (issue #26 §2)
 // ---------------------------------------------------------------------------
 
-/// Why WDA last stopped being drivable, and when.
+/// Why runner last stopped being drivable, and when.
 ///
-/// `reason` is empty when WDA has never gone down in this daemon's lifetime.
+/// `reason` is empty when runner has never gone down in this daemon's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct WdaDeath {
+pub struct RunnerDeath {
     pub reason: &'static str,
     /// Unix seconds of the transition; 0 when there hasn't been one.
     pub at: u64,
 }
 
-/// Classify a WDA up→down transition from the two observations around it.
+/// Classify a runner up→down transition from the two observations around it.
 ///
 /// Deliberately reasons from *signatures we can observe* rather than probing
 /// the network stack. `warp-cli` is frequently absent even on machines running
@@ -2156,9 +2250,9 @@ pub struct WdaDeath {
 /// Neither is a human picking up the phone, which is what the old status
 /// implied by staying silent. Returns `None` when this is not a death (no
 /// previous drivable state, or still drivable).
-fn classify_wda_death(
-    prev: crate::wda::WdaHealth,
-    new: crate::wda::WdaHealth,
+fn classify_runner_death(
+    prev: crate::runner::RunnerHealth,
+    new: crate::runner::RunnerHealth,
     released: bool,
     releasing: bool,
 ) -> Option<&'static str> {
@@ -2182,7 +2276,7 @@ fn classify_wda_death(
 }
 
 /// Recovery guidance per death reason. Empty when there is nothing to say.
-fn wda_death_hint(reason: &str) -> &'static str {
+fn runner_death_hint(reason: &str) -> &'static str {
     match reason {
         "idle_release" => {
             "the device runner was released on purpose after idle — the next control request starts it again; nothing is broken"
@@ -2202,57 +2296,57 @@ fn wda_death_hint(reason: &str) -> &'static str {
     }
 }
 
-/// Commit one completed WDA health observation to every readiness cache.
+/// Commit one completed runner health observation to every readiness cache.
 ///
 /// `released` tracks whether the managed runner has relinquished the device.
 /// An authoritative `up` probe clears it immediately, including when launchd
 /// self-healed the runner outside an explicit `/agent/mode` readiness wait.
-fn apply_wda_health_probe(
-    health_slot: &Mutex<crate::wda::WdaHealth>,
+fn apply_runner_health_probe(
+    health_slot: &Mutex<crate::runner::RunnerHealth>,
     actionable: &std::sync::atomic::AtomicBool,
     released: &std::sync::atomic::AtomicBool,
-    health: crate::wda::WdaHealth,
+    health: crate::runner::RunnerHealth,
 ) -> bool {
-    apply_wda_health_probe_tracked(health_slot, actionable, released, false, None, health)
+    apply_runner_health_probe_tracked(health_slot, actionable, released, false, None, health)
 }
 
-/// [`apply_wda_health_probe`] plus death attribution.
+/// [`apply_runner_health_probe`] plus death attribution.
 ///
 /// Split so the plain call sites stay unchanged while the probe path can
-/// record *why* WDA stopped being drivable. This is the single choke point
+/// record *why* runner stopped being drivable. This is the single choke point
 /// every completed observation passes through, so it is the only place that
 /// sees both sides of a transition.
-fn apply_wda_health_probe_tracked(
-    health_slot: &Mutex<crate::wda::WdaHealth>,
+fn apply_runner_health_probe_tracked(
+    health_slot: &Mutex<crate::runner::RunnerHealth>,
     actionable: &std::sync::atomic::AtomicBool,
     released: &std::sync::atomic::AtomicBool,
     releasing: bool,
-    death_slot: Option<&Mutex<WdaDeath>>,
-    health: crate::wda::WdaHealth,
+    death_slot: Option<&Mutex<RunnerDeath>>,
+    health: crate::runner::RunnerHealth,
 ) -> bool {
     use std::sync::atomic::Ordering;
 
     let prev = *recover(health_slot.lock());
     let was_released = released.load(Ordering::Acquire);
     if let Some(slot) = death_slot {
-        if let Some(reason) = classify_wda_death(prev, health, was_released, releasing) {
+        if let Some(reason) = classify_runner_death(prev, health, was_released, releasing) {
             tracing::warn!(
                 reason,
-                "WDA stopped being drivable: {}",
-                wda_death_hint(reason)
+                "runner stopped being drivable: {}",
+                runner_death_hint(reason)
             );
-            *recover(slot.lock()) = WdaDeath {
+            *recover(slot.lock()) = RunnerDeath {
                 reason,
                 at: now_secs(),
             };
         } else if health.actionable {
             // Recovered — clear the epitaph so a stale cause can't be read as
             // the current state.
-            *recover(slot.lock()) = WdaDeath::default();
+            *recover(slot.lock()) = RunnerDeath::default();
         }
     }
 
-    *recover(health_slot.lock()) = crate::wda::WdaHealth {
+    *recover(health_slot.lock()) = crate::runner::RunnerHealth {
         updated_at: Instant::now(),
         ..health
     };
@@ -2267,12 +2361,12 @@ fn apply_wda_health_probe_tracked(
 /// these, and each is logged, so a reconnect that goes quiet is a bug with a
 /// name rather than an unexplained flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WdaReadinessOutcome {
+enum RunnerReadinessOutcome {
     /// A real action succeeded — the phone is drivable.
     Ready,
-    /// WDA answers but the phone is locked; only a person can clear that.
+    /// runner answers but the phone is locked; only a person can clear that.
     Locked,
-    /// setup-wda.sh published a prerequisite it cannot pass on its own.
+    /// setup-runner.sh published a prerequisite it cannot pass on its own.
     SetupBlocked,
     /// The bring-up budget ran out.
     Deadline,
@@ -2280,7 +2374,7 @@ enum WdaReadinessOutcome {
     Superseded,
 }
 
-impl WdaReadinessOutcome {
+impl RunnerReadinessOutcome {
     fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",
@@ -2295,12 +2389,12 @@ impl WdaReadinessOutcome {
 /// End the reconnect this token owns. A superseded task finishes nothing —
 /// the round it belonged to is already over, and the current one belongs to
 /// somebody else.
-fn finish_wda_readiness_wait(
-    lifecycle: &WdaLifecycle,
-    token: WdaTransitionToken,
-    outcome: WdaReadinessOutcome,
+fn finish_runner_readiness_wait(
+    lifecycle: &RunnerLifecycle,
+    token: RunnerTransitionToken,
+    outcome: RunnerReadinessOutcome,
 ) {
-    if outcome == WdaReadinessOutcome::Superseded {
+    if outcome == RunnerReadinessOutcome::Superseded {
         tracing::debug!(
             outcome = outcome.as_str(),
             "readiness wait exited without owning the lifecycle"
@@ -2315,13 +2409,13 @@ fn finish_wda_readiness_wait(
     }
 }
 
-const WDA_READINESS_TIMEOUT_SECS: u64 = 420;
+const RUNNER_READINESS_TIMEOUT_SECS: u64 = 420;
 
 /// Time limits for one readiness wait. Production uses [`Self::default`];
 /// tests shrink it so the real loop can be driven to each outcome in
 /// milliseconds instead of minutes.
 #[derive(Debug, Clone, Copy)]
-struct WdaReadinessBudget {
+struct RunnerReadinessBudget {
     /// Whole-wait budget.
     total: std::time::Duration,
     /// Ceiling for one probe. Also clamped to what is left of `total`, so a
@@ -2331,10 +2425,10 @@ struct WdaReadinessBudget {
     poll: std::time::Duration,
 }
 
-impl Default for WdaReadinessBudget {
+impl Default for RunnerReadinessBudget {
     fn default() -> Self {
         Self {
-            total: std::time::Duration::from_secs(WDA_READINESS_TIMEOUT_SECS),
+            total: std::time::Duration::from_secs(RUNNER_READINESS_TIMEOUT_SECS),
             probe: std::time::Duration::from_secs(20),
             // Until the runner serves, a probe fails at once (nothing on the
             // loopback port, or the relay closes immediately), so a short gap
@@ -2351,14 +2445,14 @@ impl Default for WdaReadinessBudget {
 /// otherwise leave `reconnecting` set with nobody left to clear it. Dropping
 /// this guard attempts the same finish the normal path performs; the token
 /// makes it a no-op when the round has already been superseded or finished.
-struct WdaReadinessOwnership {
-    lifecycle: Arc<WdaLifecycle>,
-    token: WdaTransitionToken,
+struct RunnerReadinessOwnership {
+    lifecycle: Arc<RunnerLifecycle>,
+    token: RunnerTransitionToken,
     resolved: bool,
 }
 
-impl WdaReadinessOwnership {
-    fn new(lifecycle: Arc<WdaLifecycle>, token: WdaTransitionToken) -> Self {
+impl RunnerReadinessOwnership {
+    fn new(lifecycle: Arc<RunnerLifecycle>, token: RunnerTransitionToken) -> Self {
         Self {
             lifecycle,
             token,
@@ -2368,9 +2462,9 @@ impl WdaReadinessOwnership {
 
     /// Normal completion: end the round unless it was superseded (in which
     /// case this task owns nothing and must leave the current round alone).
-    fn resolve(&mut self, outcome: WdaReadinessOutcome) {
+    fn resolve(&mut self, outcome: RunnerReadinessOutcome) {
         self.resolved = true;
-        finish_wda_readiness_wait(&self.lifecycle, self.token, outcome);
+        finish_runner_readiness_wait(&self.lifecycle, self.token, outcome);
     }
 
     /// The supervisor never came up: end the round without a readiness wait.
@@ -2380,7 +2474,7 @@ impl WdaReadinessOwnership {
     }
 }
 
-impl Drop for WdaReadinessOwnership {
+impl Drop for RunnerReadinessOwnership {
     fn drop(&mut self) {
         if self.resolved {
             return;
@@ -2396,14 +2490,14 @@ impl Drop for WdaReadinessOwnership {
 
 /// Drive one readiness wait to an outcome. Contains no lifecycle bookkeeping
 /// so it can be awaited directly by tests with a short budget.
-async fn run_wda_readiness_wait(
+async fn run_runner_readiness_wait(
     state: &Arc<AppState>,
-    token: WdaTransitionToken,
-    budget: WdaReadinessBudget,
+    token: RunnerTransitionToken,
+    budget: RunnerReadinessBudget,
     setup_status_path: &str,
     kicked_at: u64,
-) -> WdaReadinessOutcome {
-    // setup-wda.sh allows up to six minutes for xcodebuild to report the
+) -> RunnerReadinessOutcome {
+    // setup-runner.sh allows up to six minutes for xcodebuild to report the
     // on-device server URL, and first startup after an Xcode update can use
     // most of that budget. Ending the lifecycle after two minutes exposed
     // `released` while launchd was still building, which invited a second
@@ -2413,7 +2507,7 @@ async fn run_wda_readiness_wait(
     tracing::info!(
         budget_secs = budget.total.as_secs(),
         generation = token.generation,
-        "managed WDA readiness wait started"
+        "managed runner readiness wait started"
     );
     let mut seen_up = false;
     let mut setup_blocker = String::new();
@@ -2423,14 +2517,14 @@ async fn run_wda_readiness_wait(
     let outcome = loop {
         // Another round taking over means this task owns nothing: it must not
         // publish evidence and must not finish anyone's transition.
-        if !state.wda_lifecycle.owns(token) {
-            break WdaReadinessOutcome::Superseded;
+        if !state.runner_lifecycle.owns(token) {
+            break RunnerReadinessOutcome::Superseded;
         }
         if tokio::time::Instant::now() >= deadline {
-            break WdaReadinessOutcome::Deadline;
+            break RunnerReadinessOutcome::Deadline;
         }
         // A concrete prerequisite failure is authoritative. Keeping the
-        // transition at `reconnecting` for the full WDA budget made an
+        // transition at `reconnecting` for the full runner budget made an
         // unplugged phone look like a slow-but-healthy startup and hid the
         // actionable USB/trust/DDI message from clients. Lifecycle
         // transitions must only trust the current helper's structured status.
@@ -2439,20 +2533,20 @@ async fn run_wda_readiness_wait(
         // about this round and must not end it.
         setup_blocker = read_structured_setup_blocked_on_at(setup_status_path, kicked_at);
         if !setup_blocker.is_empty() {
-            break WdaReadinessOutcome::SetupBlocked;
+            break RunnerReadinessOutcome::SetupBlocked;
         }
         // `read_structured_setup_blocked_on` is a synchronous file read, so
         // the budget must be re-read after it rather than before.
         let probe_deadline = deadline.min(tokio::time::Instant::now() + budget.probe);
         if tokio::time::Instant::now() >= deadline {
-            break WdaReadinessOutcome::Deadline;
+            break RunnerReadinessOutcome::Deadline;
         }
-        if let Some(wda) = &state.wda {
-            let _priority = state.begin_wda_control();
+        if let Some(runner) = &state.runner {
+            let _priority = state.begin_runner_control();
             // Absolute, so a probe cannot outlive the budget no matter how
             // long the work before it took.
             let result = tokio::time::timeout_at(probe_deadline, async {
-                wda.lock().await.probe_health_detailed().await
+                runner.lock().await.probe_health_detailed().await
             })
             .await;
             if result.is_err() {
@@ -2470,83 +2564,83 @@ async fn run_wda_readiness_wait(
                 // A completion that lands after the budget is late evidence:
                 // it must not be published, and it must not report ready.
                 if tokio::time::Instant::now() >= deadline {
-                    break WdaReadinessOutcome::Deadline;
+                    break RunnerReadinessOutcome::Deadline;
                 }
                 seen_up |= health.up;
                 // Publishing is gated on still owning this round, and the
                 // check and the write happen under the lifecycle gate, so a
                 // handover cannot slip between them and let this round's
                 // observation land in the next one.
-                let published = state.wda_lifecycle.publish_if_current(token, || {
-                    apply_wda_health_probe(
-                        &state.wda_health,
-                        &state.wda_actionable,
+                let published = state.runner_lifecycle.publish_if_current(token, || {
+                    apply_runner_health_probe(
+                        &state.runner_health,
+                        &state.runner_actionable,
                         &state.released,
                         health,
                     )
                 });
                 match published {
-                    None => break WdaReadinessOutcome::Superseded,
-                    Some(true) => break WdaReadinessOutcome::Ready,
+                    None => break RunnerReadinessOutcome::Superseded,
+                    Some(true) => break RunnerReadinessOutcome::Ready,
                     Some(false) => {}
                 }
                 if health.up && health.locked == Some(true) {
-                    // WDA is up and only the lock screen stands between it and
+                    // runner is up and only the lock screen stands between it and
                     // actions. That is the user's to clear, not the daemon's,
                     // so the reconnect is complete: end the lifecycle now
                     // instead of hiding the "unlock" hint behind
                     // `reconnecting` for the rest of the budget.
-                    break WdaReadinessOutcome::Locked;
+                    break RunnerReadinessOutcome::Locked;
                 }
             }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            break WdaReadinessOutcome::Deadline;
+            break RunnerReadinessOutcome::Deadline;
         }
         tokio::time::sleep(budget.poll.min(remaining)).await;
     };
     match outcome {
-        WdaReadinessOutcome::Ready => {
+        RunnerReadinessOutcome::Ready => {
             state.touch_activity();
             tracing::info!(
                 elapsed_secs = started.elapsed().as_secs(),
-                "managed WDA reconnect complete: the phone is drivable"
+                "managed runner reconnect complete: the phone is drivable"
             );
         }
-        WdaReadinessOutcome::Locked => tracing::info!(
-            "managed WDA is up but the iPhone is locked — reconnect complete, unlock to drive"
+        RunnerReadinessOutcome::Locked => tracing::info!(
+            "managed runner is up but the iPhone is locked — reconnect complete, unlock to drive"
         ),
-        WdaReadinessOutcome::SetupBlocked => tracing::warn!(
+        RunnerReadinessOutcome::SetupBlocked => tracing::warn!(
             blocked_on = %setup_blocker,
-            "managed WDA reconnect stopped on a setup prerequisite"
+            "managed runner reconnect stopped on a setup prerequisite"
         ),
-        WdaReadinessOutcome::Deadline => {
+        RunnerReadinessOutcome::Deadline => {
             if seen_up {
-                let health = *recover(state.wda_health.lock());
+                let health = *recover(state.runner_health.lock());
                 tracing::warn!(
                     locked = ?health.locked,
                     elapsed_secs = started.elapsed().as_secs(),
                     last_error = %last_error,
-                    "managed WDA is running but did not become actionable before reconnect deadline"
+                    "managed runner is running but did not become actionable before reconnect deadline"
                 );
             } else {
                 tracing::warn!(
                     elapsed_secs = started.elapsed().as_secs(),
                     last_error = %last_error,
-                    "managed WDA did not become actionable before reconnect deadline"
+                    "managed runner did not become actionable before reconnect deadline"
                 );
             }
         }
-        WdaReadinessOutcome::Superseded => tracing::debug!(
+        RunnerReadinessOutcome::Superseded => tracing::debug!(
             generation = token.generation,
-            "managed WDA readiness wait superseded by a newer round"
+            "managed runner readiness wait superseded by a newer round"
         ),
     }
     outcome
 }
 
-fn spawn_wda_readiness_wait(state: Arc<AppState>, ownership: WdaReadinessOwnership) {
+fn spawn_runner_readiness_wait(state: Arc<AppState>, ownership: RunnerReadinessOwnership) {
     // The ownership guard is moved in, so a future the runtime drops without
     // ever polling it still releases its own generation.
     let token = ownership.token;
@@ -2554,10 +2648,10 @@ fn spawn_wda_readiness_wait(state: Arc<AppState>, ownership: WdaReadinessOwnersh
         let mut ownership = ownership;
         let setup_status_path =
             crate::instance::Instance::path_str(&crate::instance::current().status_file());
-        let outcome = run_wda_readiness_wait(
+        let outcome = run_runner_readiness_wait(
             &state,
             token,
-            WdaReadinessBudget::default(),
+            RunnerReadinessBudget::default(),
             &setup_status_path,
             setup_kicked_at(),
         )
@@ -2602,34 +2696,34 @@ async fn agent_status(
             (StatusCode::BAD_REQUEST, "invalid MJPEG stream id").into_response(),
         );
     }
-    let lifecycle = state.wda_lifecycle.current();
-    let releasing = lifecycle == WdaLifecycleTransition::Releasing;
-    let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
+    let lifecycle = state.runner_lifecycle.current();
+    let releasing = lifecycle == RunnerLifecycleTransition::Releasing;
+    let reconnecting = lifecycle == RunnerLifecycleTransition::Reconnecting;
     let hold_remaining = state.hold_remaining_secs();
     let screen_private_secs = state.screen_private_secs();
     let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
     let human_handoff = released && human_handoff_active();
     // L2 health — action-level, not just /status (which lies: it reports
     // `ready` even when every UI action fails Code=41 because the phone is
-    // locked or the test session was severed). `wda` stays "runner reachable"
-    // for back-compat; `wda_actionable` is the honest "can it act right now".
-    let health = if state.managed_wda_pending {
-        crate::wda::WdaHealth::down()
+    // locked or the test session was severed). `runner` stays "runner reachable"
+    // for back-compat; `runner_actionable` is the honest "can it act right now".
+    let health = if state.managed_runner_pending {
+        crate::runner::RunnerHealth::down()
     } else if reconnecting {
-        *recover(state.wda_health.lock())
+        *recover(state.runner_health.lock())
     } else {
-        cached_wda_health(&state).await
+        cached_runner_health(&state).await
     };
-    let wda = health.up;
-    let wda_actionable = health.actionable;
-    let wda_locked = match health.locked {
+    let runner = health.up;
+    let runner_actionable = health.actionable;
+    let runner_locked = match health.locked {
         Some(true) => "true",
         Some(false) => "false",
         None => "null",
     };
-    // `mode` remains for old clients: agent while WDA answers, else offline.
-    let mode = if wda { "agent" } else { "offline" };
-    let drivable = wda_actionable && !releasing && !reconnecting && !released;
+    // `mode` remains for old clients: agent while runner answers, else offline.
+    let mode = if runner { "agent" } else { "offline" };
+    let drivable = runner_actionable && !releasing && !reconnecting && !released;
     // Version + update hint. `latest_release` is fetched by a background
     // task (24h cadence); `update::is_newer` is the same comparison
     // `iphone-use upgrade` uses (numeric, so a build ahead of the last release
@@ -2643,6 +2737,10 @@ async fn agent_status(
         ),
         None => ("null".to_string(), false),
     };
+    // The daily auto-update job: whether it is on, and how its last upgrade went.
+    let auto_update = crate::update::AutoUpdateState::read()
+        .and_then(|auto_update| serde_json::to_string(&auto_update).ok())
+        .unwrap_or_else(|| "null".to_string());
     let mjpeg_viewer_count = state
         .live_streams
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2670,23 +2768,23 @@ async fn agent_status(
     let mjpeg_stream_age_json = mjpeg_stream_age_ms
         .map(|age_ms| age_ms.to_string())
         .unwrap_or_else(|| "null".to_string());
-    let recovery_owner = if state.managed_wda {
+    let recovery_owner = if state.managed_runner {
         "daemon"
-    } else if state.managed_wda_pending {
+    } else if state.managed_runner_pending {
         "unconfigured"
     } else {
         "external"
     };
-    // Setup progress: `setup-wda.sh` writes ~/.iphone-use/wda-setup-status.json
+    // Setup progress: `setup-runner.sh` writes ~/.iphone-use/runner-setup-status.json
     // ({phase, blocked_on, message, ts}) as it runs. Read it before selecting
     // the recovery hint: a concrete prerequisite failure must take precedence
     // over the generic "keep waiting" text while reconnecting.
-    let setup_status = if state.managed_wda {
+    let setup_status = if state.managed_runner {
         read_structured_setup_status()
     } else {
         None
     };
-    let setup_blocked_on = if state.managed_wda {
+    let setup_blocked_on = if state.managed_runner {
         // An automation refusal on a phone known to have a passcode is the
         // passcode prompt nobody answered: name it (setup does too when it
         // knows; this covers a passcode the daemon learned first).
@@ -2712,10 +2810,26 @@ async fn agent_status(
             .unwrap_or(""),
     )
     .unwrap_or_else(|_| "\"\"".to_string());
-    // Death attribution (#26 §2). Only meaningful while WDA is actually down;
+    // A setup attempt bringing the runner up right now (the supervisor's
+    // rebuild after an idle release, an upgrade rebuild): it is a reconnect
+    // in progress whatever the daemon's own lifecycle says, or a person sees
+    // "paused after inactivity" through minutes of building. A runner that
+    // answers but reports the phone locked is waiting on a person, not on
+    // setup: the unlock advice below must win.
+    let setup_working = setup_working(
+        state.managed_runner
+            && !runner_actionable
+            && !releasing
+            && !reconnecting
+            && (!runner || runner_locked != "true"),
+        setup_status.as_ref(),
+        || setup_in_flight(&crate::instance::current().state_dir),
+    );
+    let reconnecting = reconnecting || setup_working.is_some();
+    // Death attribution (#26 §2). Only meaningful while runner is actually down;
     // a stale cause next to a healthy runner would read as a live problem.
-    let death = *recover(state.wda_death.lock());
-    let (wda_died_reason, wda_died_at) = if wda_actionable || death.reason.is_empty() {
+    let death = *recover(state.runner_death.lock());
+    let (runner_died_reason, runner_died_at) = if runner_actionable || death.reason.is_empty() {
         ("", 0)
     } else {
         (death.reason, death.at)
@@ -2723,14 +2837,14 @@ async fn agent_status(
     // Build progress (#26 §1). Read raw — unlike `setup_status`, a *stale*
     // status is meaningful here: it means the helper died mid-build rather
     // than that the blocker went away.
-    let wda_build = if state.managed_wda {
-        derive_wda_build(
+    let runner_build = if state.managed_runner {
+        derive_runner_build(
             read_raw_setup_status().as_ref(),
             now_secs(),
             read_runner_log_tail,
         )
     } else {
-        WdaBuild::unknown()
+        RunnerBuild::unknown()
     }
     .to_json();
     // When not drivable, tell the caller HOW to recover (the recovery differs by
@@ -2742,45 +2856,49 @@ async fn agent_status(
     let setup_hint = instance_setup_blocker_hint(&setup_blocked_on, crate::instance::current());
     let (advice, hint) = if releasing {
         ("releasing", "direct device service is being released after inactivity — wait for confirmation before reconnecting")
-    } else if !wda {
-        if state.managed_wda_pending {
+    } else if !runner {
+        if state.managed_runner_pending {
             ("unconfigured", "no canonical iPhone target is configured — run iphone-use setup to persist IPHONE_USE_UDID; until then the daemon will not stop or start the local device runner")
         } else if let Some(blocker_hint) = setup_hint.as_deref() {
             ("blocker", blocker_hint)
+        } else if let Some(advice) = setup_working {
+            advice
         } else if reconnecting {
             ("reconnecting", "the daemon is restarting its managed direct device service — wait for reconnecting=false before retrying")
-        } else if released && !state.managed_wda {
+        } else if released && !state.managed_runner {
             ("external", "the remote device runner endpoint is externally managed — restart it on the owning host; this daemon will not stop or bootstrap local services")
         } else if released && human_handoff {
             ("handoff", "the phone was handed to a person (mode=human) and the device runner is stopped so they can use it in hand — POST /agent/mode {mode:agent} takes it back")
         } else if released {
             ("released", "direct device service was released after inactivity — reconnect to restart the device runner, then keep the phone unlocked and awake")
-        } else if !state.managed_wda {
+        } else if !state.managed_runner {
             ("external", "the configured remote device runner endpoint is unreachable and externally managed — recover it on the owning host; this daemon will not run local setup or launchctl commands")
         } else {
             ("offline", "direct device service is unreachable — start or repair the device runner and the 8100/9100 relays (iphone-use doctor)")
         }
+    } else if let Some(advice) = setup_working {
+        advice
     } else if reconnecting {
         ("reconnecting", "the daemon is restarting its managed direct device service — wait for reconnecting=false before retrying")
-    } else if wda && !wda_actionable {
+    } else if runner && !runner_actionable {
         if state
-            .wda_read_degraded
+            .runner_read_degraded
             .load(std::sync::atomic::Ordering::Acquire)
-            && wda_locked != "true"
+            && runner_locked != "true"
         {
             (
                 "read_failing",
-                "the device runner answers /status but cannot read the screen — it is being restarted; wait for drivable=true before retrying",
+                "the device runner answers /status but its last screen reads failed; reads are probed again on every status poll, and the runner is replaced only if even a minimal read keeps failing — wait for drivable=true before retrying",
             )
-        } else if wda_locked == "true" {
+        } else if runner_locked == "true" {
             (
                 "locked",
                 "the device runner is reachable but the iPhone is locked — unlock it and keep it awake",
             )
-        } else if !wda_died_reason.is_empty() {
+        } else if !runner_died_reason.is_empty() {
             // We watched it die; say what took it down instead of the generic
             // "cannot act" that made a severed session look like interference.
-            ("died", wda_death_hint(wda_died_reason))
+            ("died", runner_death_hint(runner_died_reason))
         } else {
             // Reachable but the last read/action failed, with no death reason
             // and no lock: a `/source` read that timed out on a heavy page, or
@@ -2796,7 +2914,7 @@ async fn agent_status(
     // Hints name commands and ports for the default instance; a second
     // phone has its own relay ports and needs `--instance NAME`.
     let hint = hint_for_this_daemon(hint, crate::instance::current(), &relay_ports_label());
-    let self_runner = if !state.managed_wda && !state.managed_wda_pending && !drivable {
+    let self_runner = if !state.managed_runner && !state.managed_runner_pending && !drivable {
         match &state.selfrunner_gateway {
             Some(gateway) => Some(gateway.status().await),
             None => None,
@@ -2814,7 +2932,7 @@ async fn agent_status(
         .unwrap_or_default();
     let hint_json = serde_json::to_string(&hint).unwrap_or_else(|_| "\"\"".into());
     let next_step_json = guidance
-        .or_else(|| human_next_step(advice, &setup_blocked_on, wda_died_reason))
+        .or_else(|| human_next_step(advice, &setup_blocked_on, runner_died_reason))
         .map(|(zh, en)| {
             let instance = crate::instance::current();
             serde_json::json!({
@@ -2826,21 +2944,21 @@ async fn agent_status(
         .unwrap_or_else(|| "null".to_string());
     let device_state = if releasing {
         "releasing"
-    } else if !wda && !setup_blocked_on.is_empty() {
+    } else if !runner && !setup_blocked_on.is_empty() {
         "blocked"
     } else if reconnecting {
         "reconnecting"
     } else if released {
         "released"
-    } else if wda_actionable {
+    } else if runner_actionable {
         "ready"
-    } else if wda_locked == "true" {
+    } else if runner_locked == "true" {
         "locked"
-    } else if wda {
+    } else if runner {
         // NOT "blocked". A blocker is something a human has to clear, and
         // `blocked` above always comes with a named `setup_blocked_on`
         // (warp|proxy|usb|trust|ddi|account|automation_mode_disabled|…). This
-        // branch has no blocker at all — WDA answers, the last read just
+        // branch has no blocker at all — runner answers, the last read just
         // failed. An agent that saw `blocked` here went looking for
         // `setup_blocked_on`, found it empty, and had nothing left to do but
         // guess (#74).
@@ -2851,33 +2969,33 @@ async fn agent_status(
     // A simulator that is still booting, or switched off, says so instead
     // of `offline` (its simctl state, refreshed in the background).
     let device_state = match state.simulator.as_ref().and_then(|s| s.info()) {
-        Some(device) if !wda_actionable => {
+        Some(device) if !runner_actionable => {
             crate::simulator::device_state_for(&device.state).unwrap_or(device_state)
         }
         _ => device_state,
     };
-    let screen_state = if wda && mjpeg_stream_fresh {
+    let screen_state = if runner && mjpeg_stream_fresh {
         "live"
-    } else if wda {
+    } else if runner {
         "waiting"
     } else {
         "offline"
     };
     // Seconds since the last agent control, read, or live-view request
     // (status polls do not count). Unattended upgrades use it to tell a phone
-    // that is merely up from one somebody is driving: since v0.6.3 WDA stays
+    // that is merely up from one somebody is driving: since v0.6.3 runner stays
     // up indefinitely, so `device_state:"ready"` alone says nothing about use.
     let idle_secs = state.idle_for().as_secs();
     let transport = managed_transport(&state).await;
     let wifi_start_refused =
-        state.managed_wda && wifi_start_refused(&crate::instance::current().state_dir);
+        state.managed_runner && wifi_start_refused(&crate::instance::current().state_dir);
     // Why idle release keeps this runner (a start needs a person), or null.
     // A passcode phone's runner is kept only while it is up (a down one is
     // released), so report it only then; the Wi-Fi case also keeps a runner
     // a probe saw down.
     let keep_runner_alive = crate::keep_runner::status_json(
         state
-            .managed_wda
+            .managed_runner
             .then(|| {
                 crate::keep_runner::current(
                     &crate::instance::current().state_dir,
@@ -2886,10 +3004,10 @@ async fn agent_status(
                 )
             })
             .flatten()
-            .filter(|because| wda || because.keeps_down_runner()),
+            .filter(|because| runner || because.keeps_down_runner()),
     );
-    let legacy_ios = legacy_ios_json(state.managed_wda, &crate::instance::current().state_dir);
-    let rtt = crate::wda::wda_rtt_ms();
+    let legacy_ios = legacy_ios_json(state.managed_runner, &crate::instance::current().state_dir);
+    let rtt = crate::runner::runner_rtt_ms();
     let rtt_json = rtt.map_or("null".to_string(), |ms| ms.to_string());
     let transport_hint = serde_json::to_string(&transport_hint(transport, rtt))
         .unwrap_or_else(|_| "null".into());
@@ -2914,9 +3032,9 @@ async fn agent_status(
     // its time, so a Shortcuts flash on a recording can be matched to it.
     let agent_focus = recover(state.agent_focus.lock()).status_json();
     // The daemon inside the runner on the phone, as its last /status said.
-    let phone_daemon = crate::phone_daemon::status_json(wda);
+    let phone_daemon = crate::phone_daemon::status_json(runner);
     let body = format!(
-        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_wda":{},"managed_wda_pending":{},"recovery_owner":"{recovery_owner}","wda":{wda},"wda_actionable":{wda_actionable},"wda_locked":{wda_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"wda_build":{wda_build},"wda_died_reason":"{wda_died_reason}","wda_died_at":{wda_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"transport":"{transport}","wda_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}{self_runner_field}}}"#,
+        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}{self_runner_field}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&status_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -2925,9 +3043,10 @@ async fn agent_status(
         },
         owner_status(&state).1,
         status_udid.is_some(),
-        state.managed_wda,
-        state.managed_wda_pending,
+        state.managed_runner,
+        state.managed_runner_pending,
     );
+    let body = with_pre_rename_status_fields(body);
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
@@ -2935,14 +3054,42 @@ async fn agent_status(
     with_security_headers(resp)
 }
 
+/// Status fields under the names clients released before v0.20 read, when
+/// the runner was named after WebDriverAgent: an iPhone app or an MCP client
+/// installed then keeps working against this daemon. Remove once those
+/// clients are gone.
+const PRE_RENAME_STATUS_FIELDS: &[(&str, &str)] = &[
+    ("runner", "wda"),
+    ("runner_actionable", "wda_actionable"),
+    ("runner_locked", "wda_locked"),
+    ("runner_build", "wda_build"),
+    ("runner_died_reason", "wda_died_reason"),
+    ("runner_died_at", "wda_died_at"),
+    ("runner_rtt_ms", "wda_rtt_ms"),
+    ("managed_runner", "managed_wda"),
+    ("managed_runner_pending", "managed_wda_pending"),
+];
+
+fn with_pre_rename_status_fields(body: String) -> String {
+    let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str(&body) else {
+        return body;
+    };
+    for (name, old) in PRE_RENAME_STATUS_FIELDS {
+        if let Some(value) = fields.get(*name).cloned() {
+            fields.insert((*old).to_string(), value);
+        }
+    }
+    serde_json::Value::Object(fields).to_string()
+}
+
 /// How control reaches the managed runner right now (`usb`, `wifi-tunnel`,
-/// `wifi`, `unknown`), or `external` for a WDA this daemon does not manage.
+/// `wifi`, `unknown`), or `external` for a runner this daemon does not manage.
 async fn managed_transport(state: &AppState) -> &'static str {
-    if !state.managed_wda {
+    if !state.managed_runner {
         return "external";
     }
     let state_dir = &crate::instance::current().state_dir;
-    let relayed = wda_transport(state_dir);
+    let relayed = runner_transport(state_dir);
     match (relayed, state.device_udid.as_deref()) {
         ("usb", Some(udid)) if native_relay(state_dir) => native_relay_transport(udid).await,
         _ => relayed,
@@ -3005,11 +3152,11 @@ fn idle_release_keeps_wifi_runner(start_refused: bool, transport: &str) -> bool 
     }) == Some(crate::keep_runner::Because::WifiStartRefused)
 }
 
-/// How control traffic reaches WDA, from the relay setup-wda.sh recorded:
+/// How control traffic reaches runner, from the relay setup-runner.sh recorded:
 /// `iphone-use relay` (usbmuxd, started only for a USB phone) or a legacy
 /// `iproxy` = USB, `socat` to the phone's address = Wi-Fi.
-fn wda_transport(state_dir: &std::path::Path) -> &'static str {
-    match std::fs::read_to_string(state_dir.join("wda-relay.pid")) {
+fn runner_transport(state_dir: &std::path::Path) -> &'static str {
+    match std::fs::read_to_string(state_dir.join("runner-relay.pid")) {
         Ok(record) if record.contains("/iphone-use relay ") || record.contains("iproxy") => "usb",
         Ok(record) if record.contains("socat") => "wifi",
         _ => "unknown",
@@ -3019,14 +3166,14 @@ fn wda_transport(state_dir: &std::path::Path) -> &'static str {
 /// The control relay is `iphone-use relay`, which follows the phone from USB
 /// to its CoreDevice Wi-Fi tunnel (a legacy iproxy cannot).
 fn native_relay(state_dir: &std::path::Path) -> bool {
-    std::fs::read_to_string(state_dir.join("wda-relay.pid"))
+    std::fs::read_to_string(state_dir.join("runner-relay.pid"))
         .is_ok_and(|record| record.contains("/iphone-use relay "))
 }
 
 /// The control relay falls back to the phone's LAN address (`--lan-host`, an
 /// iOS 15/16 phone).
 fn lan_relay(state_dir: &std::path::Path) -> bool {
-    std::fs::read_to_string(state_dir.join("wda-relay.pid"))
+    std::fs::read_to_string(state_dir.join("runner-relay.pid"))
         .is_ok_and(|record| record.contains(" --lan-host "))
 }
 
@@ -3065,18 +3212,18 @@ async fn native_relay_transport(udid: &str) -> &'static str {
     transport
 }
 
-/// Why control is slow, when it is the transport. Every WDA call pays one
+/// Why control is slow, when it is the transport. Every runner call pays one
 /// round trip, and an action is one to three calls.
 fn transport_hint(transport: &str, rtt_ms: Option<u64>) -> Option<String> {
     (transport == "wifi" || transport == "wifi-tunnel").then(|| match rtt_ms {
         Some(ms) => format!(
-            "WDA traffic goes over Wi-Fi (~{ms} ms per call, paid one to three times per action); connect the iPhone to this Mac with a cable and reconnect for faster control"
+            "runner traffic goes over Wi-Fi (~{ms} ms per call, paid one to three times per action); connect the iPhone to this Mac with a cable and reconnect for faster control"
         ),
-        None => "WDA traffic goes over Wi-Fi; connect the iPhone to this Mac with a cable and reconnect for faster control".to_string(),
+        None => "runner traffic goes over Wi-Fi; connect the iPhone to this Mac with a cable and reconnect for faster control".to_string(),
     })
 }
 
-/// Read `blocked_on` from `setup-wda.sh`'s status file, but only if it was
+/// Read `blocked_on` from `setup-runner.sh`'s status file, but only if it was
 /// written in the last 5 minutes (a stale file from a finished run shouldn't be
 /// reported as a live blocker).
 ///
@@ -3105,7 +3252,7 @@ fn read_structured_setup_blocked_on() -> String {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-struct WdaSetupStatus {
+struct RunnerSetupStatus {
     #[serde(default)]
     phase: String,
     #[serde(default)]
@@ -3113,7 +3260,7 @@ struct WdaSetupStatus {
     #[serde(default)]
     message: String,
     ts: u64,
-    // Setup status protocol v1 (`_status_publish` in setup-wda.sh). Absent on
+    // Setup status protocol v1 (`_status_publish` in setup-runner.sh). Absent on
     // files written by an older helper, which is what the zero defaults mean.
     #[serde(default)]
     schema_version: u32,
@@ -3129,7 +3276,7 @@ struct WdaSetupStatus {
     heartbeat_ts: u64,
 }
 
-fn read_structured_setup_status() -> Option<WdaSetupStatus> {
+fn read_structured_setup_status() -> Option<RunnerSetupStatus> {
     read_structured_setup_status_at(
         &crate::instance::Instance::path_str(&crate::instance::current().status_file()),
         setup_kicked_at(),
@@ -3150,7 +3297,7 @@ fn setup_kicked_at() -> u64 {
 /// directory. A status older than `kicked_at` is the previous helper's and
 /// reads as absent: hardware, a `usb` blocker left by an unplugged cable
 /// ended the reconnect started after plugging it back in.
-fn read_structured_setup_status_at(status_path: &str, kicked_at: u64) -> Option<WdaSetupStatus> {
+fn read_structured_setup_status_at(status_path: &str, kicked_at: u64) -> Option<RunnerSetupStatus> {
     std::fs::read_to_string(status_path)
         .ok()
         .and_then(|txt| parse_setup_status(&txt, now_secs()))
@@ -3199,26 +3346,27 @@ fn parse_setup_log_blocked_on(txt: &str) -> String {
     let latest_attempt = txt
         .rsplit_once("== Checking prerequisites")
         .map_or(txt, |(_, latest)| latest);
-    if latest_attempt.contains("WARP is ON and will block WDA")
+    if latest_attempt.contains("WARP is ON and will block runner")
         || latest_attempt.contains("Split Tunnel exclusions do not cover the CoreDevice")
     {
         "warp".to_string()
     } else if latest_attempt.contains("not currently connected over USB")
         || latest_attempt.contains("no USB iPhone was found")
         || latest_attempt.contains("no USB iPhone is connected")
-        // `WDA_TRANSPORT=auto`: neither on USB nor on its Wi-Fi tunnel
+        // `IPU_RUNNER_TRANSPORT=auto`: neither on USB nor on its Wi-Fi tunnel
         || latest_attempt.contains("is not on USB and has no CoreDevice Wi-Fi tunnel")
         || latest_attempt.contains("no iPhone was found over USB")
     {
         "usb".to_string()
     } else if latest_attempt.contains("has no signed-in Apple account")
         || latest_attempt.contains("No Accounts:")
+        || latest_attempt.contains("Xcode reported No Accounts while signing")
         || latest_attempt.contains("could not find or create a development provisioning")
         // the wording before v0.15, still in logs an older script wrote
-        || latest_attempt.contains("could not find or create the WDA development provisioning")
+        || latest_attempt.contains("could not find or create the runner development provisioning")
     {
-        // A signed-out Xcode (common after an Xcode update) fails every WDA
-        // build with "No Accounts"; surfacing it beats a generic wda blocker
+        // A signed-out Xcode (common after an Xcode update) fails every runner
+        // build with "No Accounts"; surfacing it beats a generic runner blocker
         // that sends the operator to a log they may not know exists.
         "account".to_string()
     } else {
@@ -3231,12 +3379,94 @@ fn parse_setup_log_blocked_on(txt: &str) -> String {
 /// page and the iOS app show this verbatim, so all three surfaces say the same
 /// thing; `hint` stays the diagnostic text for agents. `None` when there is
 /// nothing to do.
+/// The advice for a setup attempt bringing the runner up, when the daemon
+/// would otherwise not call it a reconnect (`eligible`: managed, runner not
+/// actionable, no release or reconnect of its own) and the attempt is alive
+/// (`in_flight`, checked last: it runs `ps`).
+fn setup_working(
+    eligible: bool,
+    status: Option<&RunnerSetupStatus>,
+    in_flight: impl FnOnce() -> bool,
+) -> Option<(&'static str, &'static str)> {
+    if !eligible {
+        return None;
+    }
+    status
+        .and_then(|status| setup_working_advice(&status.phase, &status.message))
+        .filter(|_| in_flight())
+}
+
+/// A setup attempt at work, by its published phase and message: the advice
+/// [`human_next_step`] words for a person, and the hint for agents. `None`
+/// for a phase that is not work in progress (ready, failed, backing off,
+/// waiting for a cable or an unlock — those have blockers of their own).
+fn setup_working_advice(phase: &str, message: &str) -> Option<(&'static str, &'static str)> {
+    if phase.is_empty()
+        || phase == "ready"
+        || phase.ends_with("-fail")
+        || matches!(
+            phase,
+            "waiting" | "lock-backoff" | "lock-wait" | "interrupted" | "stopped" | "completed"
+        )
+    {
+        return None;
+    }
+    Some(if message == crate::setup::runner::UPGRADE_BUILD_MESSAGE {
+        (
+            "setting_up_upgrade",
+            "setup is building the device runner once after an iphone-use upgrade (about 1-2 min, longer on a busy Mac) — wait for drivable=true; do not call reconnect again",
+        )
+    } else if message.starts_with("launching the device runner")
+        || message.starts_with("reusing the verified runner product")
+    {
+        (
+            "setting_up_launch",
+            "setup is starting the device runner on the phone — keep the phone unlocked and awake, wait for drivable=true; do not call reconnect again",
+        )
+    } else if phase == "building" {
+        (
+            "setting_up_build",
+            "setup is building the device runner (a minute or two) — wait for drivable=true; do not call reconnect again",
+        )
+    } else if phase == "ddi-wait" {
+        (
+            "setting_up_ddi",
+            "setup is waiting for the phone's developer services — keep the phone unlocked and awake, wait for drivable=true",
+        )
+    } else {
+        (
+            "setting_up",
+            "setup is bringing the device runner up — wait for drivable=true; do not call reconnect again",
+        )
+    })
+}
+
 fn human_next_step(
     advice: &str,
     blocked_on: &str,
     died_reason: &str,
 ) -> Option<(&'static str, &'static str)> {
     Some(match advice {
+        "setting_up_upgrade" => (
+            "升级后需要重新编译一次设备 runner（约 1–2 分钟，Mac 忙时更久），完成后自动连上，请稍候",
+            "Building the device runner once after the upgrade (about 1–2 min, longer on a busy Mac); it connects on its own when done",
+        ),
+        "setting_up_build" => (
+            "正在编译设备 runner（约 1–2 分钟），完成后自动连上，请稍候",
+            "Building the device runner (about 1–2 min); it connects on its own when done",
+        ),
+        "setting_up_launch" => (
+            "正在手机上启动设备 runner，请保持手机解锁亮屏",
+            "Starting the device runner on the phone — keep it unlocked and awake",
+        ),
+        "setting_up_ddi" => (
+            "正在等待手机的开发者服务，请保持手机解锁亮屏",
+            "Waiting for the phone's developer services — keep it unlocked and awake",
+        ),
+        "setting_up" => (
+            "正在连接手机，请稍候",
+            "Connecting to the phone — one moment",
+        ),
         "releasing" => ("正在释放设备，请稍候", "Releasing the phone — one moment"),
         "unconfigured" => (
             "连接、解锁并信任 iPhone，然后在这台 Mac 上运行 iphone-use setup",
@@ -3256,8 +3486,8 @@ fn human_next_step(
                 "The iPhone isn't connected to this Mac: plug it in over USB (or join the same Wi-Fi) and unlock it — it reconnects on its own once the phone is back",
             ),
             "usb" => (
-                "用 USB 连接这台 iPhone（或让它和这台 Mac 在同一个 Wi-Fi 下；设了 WDA_TRANSPORT=usb 时只能插线），解锁并保持亮屏，连接会自动恢复",
-                "Plug this iPhone in over USB (or keep it on this Mac's Wi-Fi; with WDA_TRANSPORT=usb only the cable works), unlock it and keep it awake — connecting resumes on its own",
+                "用 USB 连接这台 iPhone（或让它和这台 Mac 在同一个 Wi-Fi 下；设了 IPU_RUNNER_TRANSPORT=usb 时只能插线），解锁并保持亮屏，连接会自动恢复",
+                "Plug this iPhone in over USB (or keep it on this Mac's Wi-Fi; with IPU_RUNNER_TRANSPORT=usb only the cable works), unlock it and keep it awake — connecting resumes on its own",
             ),
             "trust" => (
                 "在 iPhone 上解锁并点「信任」，保持亮屏，连接会自动恢复",
@@ -3268,8 +3498,8 @@ fn human_next_step(
                 "Open Xcode with the phone connected and let device preparation finish — connecting resumes on its own",
             ),
             "account" => (
-                "打开 Xcode › 设置 › 账户，点 + 登录 Apple ID（免费账号也行）",
-                "Open Xcode › Settings › Accounts and add your Apple ID (a free one works)",
+                "打开 Xcode › 设置 › 账户登录 Apple ID；若已登录，打开 setup 提示的 runner 工程，选手机执行一次 Build For Testing，并允许钥匙串访问",
+                "Sign in under Xcode › Settings › Accounts; if already signed in, open the runner project shown by setup, select your iPhone, Build For Testing once and allow keychain access",
             ),
             "locked_after_restart" => (
                 "这台 iPhone 重启后还没解锁过：需要有人在手机上输入一次密码，之后会自动连上。",
@@ -3292,8 +3522,8 @@ fn human_next_step(
                 "The iPhone runs a newer iOS than this Mac's Xcode supports: install an Xcode that supports it (a beta Xcode for a beta iOS), then run iphone-use setup --xcode <that Xcode.app> for this phone — retrying or reconnecting will not help",
             ),
             "ios_too_old" => (
-                "这台 iPhone 的 iOS 这台 Mac 现在驱动不了：iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统 runner 本身不支持，只能升级手机；重试、重连和换线都解决不了",
-                "This Mac cannot drive this iPhone's iOS yet: iOS 15 and 16 work without updating the phone, but need a paid Apple Developer account's App Store Connect API key (WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID) — configure it and run iphone-use setup again; iOS 14 and older are below what the runner supports and need an iOS update — retrying, reconnecting or another cable will not help",
+                "这台 iPhone 的 iOS 这台 Mac 现在驱动不了：iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统 runner 本身不支持，只能升级手机；重试、重连和换线都解决不了",
+                "This Mac cannot drive this iPhone's iOS yet: iOS 15 and 16 work without updating the phone, but need a paid Apple Developer account's App Store Connect API key (IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID) — configure it and run iphone-use setup again; iOS 14 and older are below what the runner supports and need an iOS update — retrying, reconnecting or another cable will not help",
             ),
             "ddi_needs_reboot" => (
                 "iPhone 上残留了旧的开发者磁盘映像，开发者服务起不来：请把 iPhone 重启一次，解锁后保持插线，会自动接着连接",
@@ -3311,7 +3541,7 @@ fn human_next_step(
                 "这台 iPhone 的 iOS 不允许通过 Wi-Fi 启动设备服务（和锁屏密码、设置开关都无关，手机上没有可点的选项，重试也没用）：插一次线启动（保持解锁，约 20 秒连上），之后拔掉可以一直用 Wi-Fi，直到设备服务重启（比如手机重启）时再插一次",
                 "This iPhone's iOS will not start the device service over Wi-Fi (not a passcode or a setting, nothing to tap on the phone, and retrying will not help): plug it in by USB once to start it (unlocked, about 20 s), then unplug it and keep using Wi-Fi until the device service restarts (for example after the phone restarts), when it needs the cable once more",
             ),
-            "wda" => (
+            "runner" => (
                 "设备 runner 启动失败：在这台 Mac 上运行 iphone-use doctor 查看原因",
                 "The device runner failed to start: run iphone-use doctor on this Mac",
             ),
@@ -3354,8 +3584,8 @@ fn human_next_step(
             ),
         },
         "read_failing" => (
-            "设备 runner 还在应答但读不到屏幕，正在自动重启它，稍等片刻",
-            "The device runner answers but cannot read the screen; it is being restarted — wait a moment",
+            "设备 runner 还在应答但最近几次读屏失败，正在自动复查，持续失败才会重启它，稍等片刻",
+            "The device runner answers but its last screen reads failed; it is being rechecked and is restarted only if reads keep failing — wait a moment",
         ),
         "degraded" => (
             "上一次读取没完成（页面太重或 App 卡住），稍等会自动恢复",
@@ -3395,8 +3625,8 @@ fn relay_ports_label() -> String {
     };
     format!(
         "{}/{}",
-        port("IPHONE_USE_WDA_URL", "8100"),
-        port("IPHONE_USE_WDA_MJPEG_URL", "9100")
+        port("IPHONE_USE_RUNNER_URL", "8100"),
+        port("IPHONE_USE_RUNNER_MJPEG_URL", "9100")
     )
 }
 
@@ -3407,14 +3637,14 @@ fn hint_for_this_daemon(text: &str, instance: &crate::instance::Instance, ports:
     for_instance(&text.replace("8100/9100", ports), instance)
 }
 
-/// [`setup_blocker_hint`] for a specific instance: the `wda` blocker names
+/// [`setup_blocker_hint`] for a specific instance: the `runner` blocker names
 /// that instance's own setup log and helper, not the default instance's
 /// `~/.iphone-use` (#126). A second phone keeps its state elsewhere.
 fn instance_setup_blocker_hint(
     blocked_on: &str,
     instance: &crate::instance::Instance,
 ) -> Option<std::borrow::Cow<'static, str>> {
-    if blocked_on == "wda" {
+    if blocked_on == "runner" {
         return Some(
             format!(
                 "the device runner failed to start — inspect {} and run {} doctor (iphone-use doctor) before retrying",
@@ -3439,7 +3669,7 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the iPhone isn't connected to this Mac — plug it in over USB (or join the same Wi-Fi) and unlock it; usbmuxd and CoreDevice both report it absent, so nothing is rebuilt or relaunched until it is back, and the managed service reconnects on its own — the relays are not the problem, so do not send another reconnect request",
         ),
         "usb" => Some(
-            "the configured iPhone is not available over USB or its encrypted CoreDevice Wi-Fi tunnel — connect that phone, or (unless WDA_TRANSPORT=usb, which allows only the cable; setup_message says when) keep it unlocked on this Mac's network; keep it awake while the managed service retries",
+            "the configured iPhone is not available over USB or its encrypted CoreDevice Wi-Fi tunnel — connect that phone, or (unless IPU_RUNNER_TRANSPORT=usb, which allows only the cable; setup_message says when) keep it unlocked on this Mac's network; keep it awake while the managed service retries",
         ),
         "trust" => Some(
             "the configured iPhone needs trust or developer-signing approval — unlock the phone, accept the prompt, then keep it awake while the managed service retries",
@@ -3448,7 +3678,7 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the iPhone Developer Disk Image is unavailable — open Xcode with the phone connected, let device preparation finish, then poll status",
         ),
         "account" => Some(
-            "Xcode has no usable signed-in Apple account or provisioning profile for the device runner — open Xcode → Settings → Accounts and add an Apple ID (a free one works), then poll status; the managed service retries automatically",
+            "Xcode could not sign the device runner — sign in under Xcode → Settings → Accounts (a free Apple ID works); if already signed in, open the runner project shown by setup, select your iPhone, choose Product → Build For → Testing once and allow keychain access to create the certificate and profile; the managed service retries automatically",
         ),
         "locked_after_restart" => Some(
             "the configured iPhone is on USB but usbmuxd does not list it: it restarted and has not been unlocked since (Before First Unlock), and iOS keeps it off usbmuxd until its passcode is entered once — this is not an Xcode problem; have a person enter the passcode on the phone, and the managed service connects on its own after that, so do not send another reconnect request",
@@ -3466,7 +3696,7 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the iPhone runs a newer iOS than the selected Xcode supports (setup_message names both versions) — install an Xcode that supports that iOS (a beta Xcode for a beta iOS) and point this phone at it with iphone-use setup --xcode /Applications/Xcode-beta.app (other phones keep theirs), or select it for the whole Mac with xcode-select; retrying or reconnecting cannot fix this, so do not send another reconnect request",
         ),
         "ios_too_old" => Some(
-            "the iPhone runs an iOS this Mac cannot drive yet (setup_message says which case) — iOS 15/16 is driven without an iOS update through the legacy path, which needs App Store Connect API-key signing (WDA_ASC_KEY_PATH, WDA_ASC_KEY_ID, WDA_ASC_ISSUER_ID of a paid developer account) because the selected Xcode cannot see the phone; iOS 14 and older are below the runner's floor and need an iOS update; retrying, reconnecting or replugging cannot fix this, so do not send another reconnect request",
+            "the iPhone runs an iOS this Mac cannot drive yet (setup_message says which case) — iOS 15/16 is driven without an iOS update through the legacy path, which needs App Store Connect API-key signing (IPU_RUNNER_ASC_KEY_PATH, IPU_RUNNER_ASC_KEY_ID, IPU_RUNNER_ASC_ISSUER_ID of a paid developer account) because the selected Xcode cannot see the phone; iOS 14 and older are below the runner's floor and need an iOS update; retrying, reconnecting or replugging cannot fix this, so do not send another reconnect request",
         ),
         "ddi_needs_reboot" => Some(
             "the iOS 15/16 phone has a stale developer disk image mounted: lockdownd answers every developer service (testmanagerd) with InvalidService even after setup remounted the right image — have a person restart the iPhone once and keep it plugged in and unlocked; the managed service re-checks every few minutes, so do not send another reconnect request",
@@ -3480,8 +3710,8 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
         "wifi_automation_refused" => Some(
             "over Wi-Fi the iPhone would not start the device runner's UI-automation session (code 74: testmanagerd took the test session but never gave the runner its IDE channel; setup_message has the wait) — this iPhone's iOS refuses to start UI automation over the network, and no passcode, setting or Wi-Fi retry changes that; have a person plug the iPhone in by USB once, unlocked: the runner starts in about 20 s and keeps working over Wi-Fi after the unplug, until the phone restarts or the runner has to start again; the managed service waits 15 minutes between Wi-Fi attempts and retries at once when the phone is plugged in, so do not send another reconnect request",
         ),
-        "wda" => Some(
-            "the device runner failed to start — inspect ~/.iphone-use/wda-agent.log and run iphone-use doctor before retrying",
+        "runner" => Some(
+            "the device runner failed to start — inspect ~/.iphone-use/runner-agent.log and run iphone-use doctor before retrying",
         ),
         _ => None,
     }
@@ -3494,8 +3724,8 @@ fn parse_setup_blocked_on(txt: &str, now: u64) -> String {
         .unwrap_or_default()
 }
 
-fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
-    let mut status: WdaSetupStatus = serde_json::from_str(txt).ok()?;
+fn parse_setup_status(txt: &str, now: u64) -> Option<RunnerSetupStatus> {
+    let mut status: RunnerSetupStatus = serde_json::from_str(txt).ok()?;
     // An Xcode too old for the phone is published once, then KeepAlive waits
     // out a 900 s backoff with no heartbeat (#126); keep it visible across
     // that wait and the next attempt instead of letting it age out at 300 s.
@@ -3533,7 +3763,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
             | "legacy_needs_usb"
             | "not_connected"
             | "locked"
-            | "wda"
+            | "runner"
     ) {
         return None;
     }
@@ -3551,7 +3781,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
 }
 
 // ---------------------------------------------------------------------------
-// wda_build — "is it compiling, or did it fail?" (issue #26 §1)
+// runner_build — "is it compiling, or did it fail?" (issue #26 §1)
 // ---------------------------------------------------------------------------
 
 /// Bring-up progress, split into the one distinction `setup_blocked_on` can't
@@ -3560,12 +3790,12 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<WdaSetupStatus> {
 /// `setup_blocked_on` answers "what prerequisite is missing" and is empty for
 /// a run that is simply slow. But an `xcodebuild` that is three minutes into a
 /// clean build and an `xcodebuild` that died two minutes ago both present as
-/// `wda:false, setup_blocked_on:""` — so an agent polling status cannot tell
+/// `runner:false, setup_blocked_on:""` — so an agent polling status cannot tell
 /// "wait longer" from "stop waiting and read the log". This object makes that
 /// call explicit, and carries the log tail for the case where the answer is
 /// "go look".
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WdaBuild {
+struct RunnerBuild {
     /// `ready` | `building` | `failed` | `stalled` | `unknown`.
     state: &'static str,
     /// The helper's own phase string, verbatim (`building`, `ddi-wait`, …).
@@ -3579,7 +3809,7 @@ struct WdaBuild {
     log_tail: String,
 }
 
-impl WdaBuild {
+impl RunnerBuild {
     /// No status file at all — bring-up was never attempted by this helper.
     fn unknown() -> Self {
         Self {
@@ -3605,7 +3835,7 @@ impl WdaBuild {
 
 /// A helper phase this stale is not "working slowly", it is gone.
 ///
-/// `setup-wda.sh` rewrites its status on every step, including a per-poll
+/// `setup-runner.sh` rewrites its status on every step, including a per-poll
 /// "building (Ns elapsed)" heartbeat, so silence this long means the process
 /// died without writing a `-fail` phase (killed, panicked, machine slept).
 const BUILD_STALE_SECS: u64 = 300;
@@ -3654,15 +3884,15 @@ fn tail_lines(txt: &str, max_lines: usize, max_bytes: usize) -> String {
     out
 }
 
-/// Build [`WdaBuild`] from the helper's status file plus, when the state calls
+/// Build [`RunnerBuild`] from the helper's status file plus, when the state calls
 /// for it, the tail of the runner log.
-fn derive_wda_build(
-    status: Option<&WdaSetupStatus>,
+fn derive_runner_build(
+    status: Option<&RunnerSetupStatus>,
     now: u64,
     read_log: impl Fn() -> String,
-) -> WdaBuild {
+) -> RunnerBuild {
     let Some(status) = status else {
-        return WdaBuild::unknown();
+        return RunnerBuild::unknown();
     };
     let age_secs = now.saturating_sub(status.ts);
     let state = classify_build_state(&status.phase, age_secs);
@@ -3672,7 +3902,7 @@ fn derive_wda_build(
     } else {
         String::new()
     };
-    WdaBuild {
+    RunnerBuild {
         state,
         phase: status.phase.clone(),
         since: status.ts,
@@ -3686,24 +3916,24 @@ fn derive_wda_build(
 /// [`read_structured_setup_status`] drops a stale file so a finished run isn't
 /// reported as a live blocker. Build state needs the opposite: a stale
 /// `building` is exactly the signal that the helper died mid-build.
-fn read_raw_setup_status() -> Option<WdaSetupStatus> {
+fn read_raw_setup_status() -> Option<RunnerSetupStatus> {
     let txt = std::fs::read_to_string(crate::instance::current().status_file()).ok()?;
-    let mut status: WdaSetupStatus = serde_json::from_str(&txt).ok()?;
+    let mut status: RunnerSetupStatus = serde_json::from_str(&txt).ok()?;
     status.phase = status.phase.chars().take(64).collect();
     status.message = status.message.chars().take(512).collect();
     Some(status)
 }
 
-/// Tail of `~/.iphone-use/wda-runner.log` — the xcodebuild output.
+/// Tail of `~/.iphone-use/runner.log` — the xcodebuild output.
 fn read_runner_log_tail() -> String {
     std::fs::read_to_string(crate::instance::current().runner_log()).unwrap_or_default()
 }
 
-/// launchd label for the dedicated, self-healing WDA job.
-/// launchd label of this instance's WDA supervisor (`com.leeguoo.iphone-use.wda`
-/// for the default instance, `.wda.<name>` for a named one — #67).
-fn wda_agent_label() -> &'static str {
-    &crate::instance::current().wda_label
+/// launchd label for the dedicated, self-healing runner job.
+/// launchd label of this instance's runner supervisor (`com.leeguoo.iphone-use.runner`
+/// for the default instance, `.runner.<name>` for a named one — #67).
+fn runner_agent_label() -> &'static str {
+    &crate::instance::current().runner_label
 }
 
 /// Current GUI launchd domain (`gui/<uid>`), via `id -u`.
@@ -3773,7 +4003,7 @@ fn wait_launchd_job_gone(domain: &str, label: &str) -> bool {
     !launchd_job_loaded(domain, label)
 }
 
-fn valid_wda_udid(udid: &str) -> bool {
+fn valid_runner_udid(udid: &str) -> bool {
     !udid.is_empty()
         && udid.len() <= 128
         && udid
@@ -3802,7 +4032,7 @@ fn stage_file(
             destination
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("wda-agent"),
+                .unwrap_or("runner-agent"),
             std::process::id(),
             suffix
         ));
@@ -3848,11 +4078,11 @@ fn restore_plist(plist_path: &std::path::Path, original: Option<&[u8]>) {
     }
 }
 
-/// Whether `setup-wda.sh` is actively working right now.
+/// Whether `setup-runner.sh` is actively working right now.
 ///
 /// The idle watchdog needs this to tell two states apart that look identical
-/// from the outside — "WDA is down because the supervisor is in a rebuild loop
-/// pestering the human for a passcode" (release it) versus "WDA is down because
+/// from the outside — "runner is down because the supervisor is in a rebuild loop
+/// pestering the human for a passcode" (release it) versus "runner is down because
 /// it is being started right now, for an agent that asked for it" (leave it
 /// alone). Without the distinction the watchdog kills a legitimate build
 /// partway, the next request restarts it, and the phone never becomes
@@ -3869,11 +4099,11 @@ fn setup_in_flight(state_dir: &std::path::Path) -> bool {
     if state_dir.as_os_str().is_empty() {
         return false;
     }
-    let path = state_dir.join("wda-setup-status.json");
+    let path = state_dir.join("runner-setup-status.json");
     let Ok(txt) = std::fs::read_to_string(&path) else {
         return false;
     };
-    let Ok(status) = serde_json::from_str::<WdaSetupStatus>(&txt) else {
+    let Ok(status) = serde_json::from_str::<RunnerSetupStatus>(&txt) else {
         return false;
     };
     let mtime_age = path
@@ -3895,7 +4125,7 @@ const LEGACY_SETUP_ACTIVE_WITHIN: std::time::Duration = std::time::Duration::fro
 /// same process (pid *and* start time — pids get reused); then the heartbeat
 /// must be fresh.
 fn setup_in_flight_from(
-    status: &WdaSetupStatus,
+    status: &RunnerSetupStatus,
     now: u64,
     mtime_age: Option<std::time::Duration>,
     owner_alive: impl Fn(u32, &str) -> bool,
@@ -3927,51 +4157,51 @@ fn setup_owner_alive(pid: u32, owner_start: &str) -> bool {
         .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == owner_start.trim())
 }
 
-/// Name of the retry state `setup-wda.sh` persists across supervisor restarts.
+/// Name of the retry state `setup-runner.sh` persists across supervisor restarts.
 /// Kept in one place because the daemon must clear exactly this file — and
 /// nothing else — when a caller explicitly asks for the phone.
-const WDA_RETRY_STATE_FILE: &str = "wda-retry-state.v1";
+const RUNNER_RETRY_STATE_FILE: &str = "runner-retry-state.v1";
 
 /// Drop the supervisor's persisted retry backoff.
 ///
-/// `setup-wda.sh` backs off between rebuild attempts (up to 15 minutes while
+/// `setup-runner.sh` backs off between rebuild attempts (up to 15 minutes while
 /// the phone is locked) and persists that timer so a launchd restart resumes
 /// it rather than hammering the device. The supervisor cannot tell a launchd
 /// auto-restart from a `kickstart` the daemon issued because an agent asked
 /// for the phone — so an explicit bring-up would otherwise inherit a long
 /// sleep and blow past the daemon's readiness window. An explicit request is
 /// the one signal that outranks the backoff, so clear it here.
-fn clear_wda_retry_backoff(state_dir: &std::path::Path) {
+fn clear_runner_retry_backoff(state_dir: &std::path::Path) {
     if state_dir.as_os_str().is_empty() {
         return;
     }
-    let path = state_dir.join(WDA_RETRY_STATE_FILE);
+    let path = state_dir.join(RUNNER_RETRY_STATE_FILE);
     match std::fs::remove_file(&path) {
-        Ok(()) => tracing::warn!("cleared the WDA retry backoff for an explicit bring-up"),
+        Ok(()) => tracing::warn!("cleared the runner retry backoff for an explicit bring-up"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!("could not clear the WDA retry backoff: {error}"),
+        Err(error) => tracing::warn!("could not clear the runner retry backoff: {error}"),
     }
 }
 
-/// Start or restart the dedicated WDA supervisor without destroying its
+/// Start or restart the dedicated runner supervisor without destroying its
 /// persisted signing/path/port policy.
 ///
-/// `setup-wda.sh` owns the complete plist contract. Reconnect edits only a
+/// `setup-runner.sh` owns the complete plist contract. Reconnect edits only a
 /// mode-0600 staging copy, validates it, and atomically installs it so a crash
 /// cannot truncate the live policy. A changed target is fully unloaded and
 /// bootstrapped because launchd caches environment variables; an unchanged
 /// policy may be kickstarted. A minimal plist is created only when no
 /// setup-generated file exists yet.
-pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> bool {
-    if !std::path::Path::new(setup_sh).is_file() || !valid_wda_udid(udid) {
+pub fn write_and_bootstrap_runner_agent(setup_sh: &str, log: &str, udid: &str) -> bool {
+    if !std::path::Path::new(setup_sh).is_file() || !valid_runner_udid(udid) {
         return false;
     }
     // Both callers mean "bring the phone up now" (the setup endpoint and an
     // explicit reconnect), so neither should inherit a pending backoff.
-    clear_wda_retry_backoff(&crate::instance::current().state_dir);
+    clear_runner_retry_backoff(&crate::instance::current().state_dir);
     // From here on the status file the old helper left is history.
     SETUP_KICKED_AT.store(now_secs(), std::sync::atomic::Ordering::Release);
-    let plist_path = crate::instance::current().wda_plist();
+    let plist_path = crate::instance::current().runner_plist();
     let Some(parent) = plist_path.parent() else {
         return false;
     };
@@ -3988,31 +4218,31 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
         contents.clone()
     } else {
         let mut environment = vec![
-            ("WDA_KEEPALIVE", "1".to_string()),
-            ("WDA_UDID", udid.to_string()),
+            ("IPU_RUNNER_KEEPALIVE", "1".to_string()),
+            ("IPU_RUNNER_UDID", udid.to_string()),
             (
                 "PATH",
                 "/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin".to_string(),
             ),
         ];
-        // Everything setup-wda.sh reads that the daemon's own environment may
+        // Everything setup-runner.sh reads that the daemon's own environment may
         // carry. The three ASC keys travel together: the script only signs
         // with an API key when all of them are present, and refuses to mix a
         // partial override with a persisted set.
         for key in [
-            "WDA_TEAM_ID",
-            "WDA_BUNDLE_ID",
-            "WDA_DIR",
-            "WDA_REF",
-            "WDA_PORT",
+            "IPU_RUNNER_TEAM_ID",
+            "IPU_RUNNER_BUNDLE_ID",
+            "IPU_RUNNER_DIR",
+            "IPU_RUNNER_REF",
+            "IPU_RUNNER_PORT",
             "MJPEG_PORT",
-            "WDA_ALLOW_LAN",
-            "WDA_TRANSPORT",
-            "WDA_RUNNER_NAME",
-            "WDA_RUNNER_ICON",
-            "WDA_ASC_KEY_PATH",
-            "WDA_ASC_KEY_ID",
-            "WDA_ASC_ISSUER_ID",
+            "IPU_RUNNER_ALLOW_LAN",
+            "IPU_RUNNER_TRANSPORT",
+            "IPU_RUNNER_NAME",
+            "IPU_RUNNER_ICON",
+            "IPU_RUNNER_ASC_KEY_PATH",
+            "IPU_RUNNER_ASC_KEY_ID",
+            "IPU_RUNNER_ASC_ISSUER_ID",
             // A named instance's supervisor must run its own setup copy as
             // that instance (#67); unset for the default instance.
             "IPHONE_USE_INSTANCE",
@@ -4052,7 +4282,7 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
     <key>StandardErrorPath</key><string>{log_xml}</string>
 </dict></plist>
 "#,
-            label = wda_agent_label()
+            label = runner_agent_label()
         )
         .into_bytes()
     };
@@ -4064,7 +4294,7 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
     if original.is_some() {
         // Edit only the staging copy. A crash or PlistBuddy failure cannot
         // truncate or partially rewrite the live launchd configuration.
-        let set_command = format!("Set :EnvironmentVariables:WDA_UDID {udid}");
+        let set_command = format!("Set :EnvironmentVariables:IPU_RUNNER_UDID {udid}");
         let set = std::process::Command::new("/usr/libexec/PlistBuddy")
             .args(["-c", &set_command])
             .arg(&staged)
@@ -4072,7 +4302,7 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
             .map(|status| status.success())
             .unwrap_or(false);
         if !set {
-            let add_command = format!("Add :EnvironmentVariables:WDA_UDID string {udid}");
+            let add_command = format!("Add :EnvironmentVariables:IPU_RUNNER_UDID string {udid}");
             let added = std::process::Command::new("/usr/libexec/PlistBuddy")
                 .args(["-c", &add_command])
                 .arg(&staged)
@@ -4126,8 +4356,8 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
     }
 
     let domain = gui_domain();
-    let service = format!("{domain}/{}", wda_agent_label());
-    let was_loaded = launchd_job_loaded(&domain, wda_agent_label());
+    let service = format!("{domain}/{}", runner_agent_label());
+    let was_loaded = launchd_job_loaded(&domain, runner_agent_label());
     // Cold start: the job isn't in the gui domain yet — it was booted out on a
     // prior stop, or never loaded after login. `launchctl enable`/`kickstart`
     // both fail on an unknown service with "Could not find service … in domain
@@ -4145,7 +4375,7 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
                 .unwrap_or(false)
         };
         let mut bootstrapped = bootstrap_job();
-        if !bootstrapped && !launchd_job_loaded(&domain, wda_agent_label()) {
+        if !bootstrapped && !launchd_job_loaded(&domain, runner_agent_label()) {
             // A persistently-disabled service refuses bootstrap. Now that the
             // label is known to the domain, clearing the disabled flag and
             // retrying recovers it.
@@ -4154,7 +4384,7 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
                 .status();
             bootstrapped = bootstrap_job();
         }
-        if !launchd_job_loaded(&domain, wda_agent_label()) {
+        if !launchd_job_loaded(&domain, runner_agent_label()) {
             if !bootstrapped && plist_changed {
                 restore_plist(&plist_path, original.as_deref());
             }
@@ -4164,14 +4394,14 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
         // start it when it is not: `kickstart -k` on the run RunAtLoad just
         // began killed it, and launchd's 30 s ThrottleInterval then held the
         // restart — every cold connect waited 30 s before setup even began.
-        if !launchd_job_running(&domain, wda_agent_label()) {
+        if !launchd_job_running(&domain, runner_agent_label()) {
             let _ = std::process::Command::new("launchctl")
                 .args(["kickstart", &service])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        return launchd_job_loaded(&domain, wda_agent_label());
+        return launchd_job_loaded(&domain, runner_agent_label());
     }
     // A persistently disabled service rejects bootstrap. Enable first and treat
     // failure as authoritative instead of continuing into a misleading start.
@@ -4186,7 +4416,7 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
                 let _ = std::process::Command::new("launchctl")
                     .args(["bootout", &service])
                     .status();
-                let _ = wait_launchd_job_gone(&domain, wda_agent_label());
+                let _ = wait_launchd_job_gone(&domain, runner_agent_label());
             }
             restore_plist(&plist_path, original.as_deref());
         }
@@ -4200,14 +4430,14 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
             .map(|status| status.success())
             .unwrap_or(false)
     } else {
-        // Any plist change (especially WDA_UDID) requires a full unload/reload;
+        // Any plist change (especially IPU_RUNNER_UDID) requires a full unload/reload;
         // kickstart alone would reuse launchd's cached old environment.
         if was_loaded {
             let _ = std::process::Command::new("launchctl")
                 .args(["bootout", &service])
                 .status();
         }
-        wait_launchd_job_gone(&domain, wda_agent_label())
+        wait_launchd_job_gone(&domain, runner_agent_label())
             && std::process::Command::new("launchctl")
                 .args(["bootstrap", &domain])
                 .arg(&plist_path)
@@ -4215,30 +4445,30 @@ pub fn write_and_bootstrap_wda_agent(setup_sh: &str, log: &str, udid: &str) -> b
                 .map(|status| status.success())
                 .unwrap_or(false)
     };
-    let verified = activated && launchd_job_loaded(&domain, wda_agent_label());
+    let verified = activated && launchd_job_loaded(&domain, runner_agent_label());
     if !verified && plist_changed {
         // Preserve the last known-good on-disk policy while leaving the
         // mismatched service down; never restart a cached old target.
         let _ = std::process::Command::new("launchctl")
             .args(["bootout", &service])
             .status();
-        let _ = wait_launchd_job_gone(&domain, wda_agent_label());
+        let _ = wait_launchd_job_gone(&domain, runner_agent_label());
         restore_plist(&plist_path, original.as_deref());
     }
     verified
 }
 
-/// Disable, then boot out, the WDA LaunchAgent (so its KeepAlive stops
+/// Disable, then boot out, the runner LaunchAgent (so its KeepAlive stops
 /// rebuilding the runner). Best-effort; ignored if it isn't loaded.
 ///
 /// The disable is what makes a release outlive a logout or reboot. A plain
 /// bootout left the plist enabled, so the next login loaded it, RunAtLoad
 /// started the runner, and iOS asked for the passcode to enable UI automation
 /// on a phone nobody had asked for. Every path that brings the phone back
-/// ([`write_and_bootstrap_wda_agent`], `setup-wda.sh resume`, setup itself)
+/// ([`write_and_bootstrap_runner_agent`], `setup-runner.sh resume`, setup itself)
 /// enables the label first.
-fn bootout_wda_agent() {
-    let service = format!("{}/{}", gui_domain(), wda_agent_label());
+fn bootout_runner_agent() {
+    let service = format!("{}/{}", gui_domain(), runner_agent_label());
     let _ = std::process::Command::new("launchctl")
         .args(["disable", &service])
         .status();
@@ -4247,17 +4477,17 @@ fn bootout_wda_agent() {
         .status();
 }
 
-/// Whether launchd holds the WDA label persistently disabled — the resting
+/// Whether launchd holds the runner label persistently disabled — the resting
 /// state a release leaves behind. Newer macOS prints `=> disabled`, older
 /// releases `=> true`.
-fn wda_agent_disabled() -> bool {
+fn runner_agent_disabled() -> bool {
     let Ok(output) = std::process::Command::new("launchctl")
         .args(["print-disabled", &gui_domain()])
         .output()
     else {
         return false;
     };
-    launchd_label_disabled(&String::from_utf8_lossy(&output.stdout), wda_agent_label())
+    launchd_label_disabled(&String::from_utf8_lossy(&output.stdout), runner_agent_label())
 }
 
 fn launchd_label_disabled(print_disabled: &str, label: &str) -> bool {
@@ -4269,15 +4499,15 @@ fn launchd_label_disabled(print_disabled: &str, label: &str) -> bool {
     })
 }
 
-/// Stop the on-phone WDA runner + relay and boot out its KeepAlive LaunchAgent
+/// Stop the on-phone runner + relay and boot out its KeepAlive LaunchAgent
 /// (FIRST — else KeepAlive would just rebuild the runner we're about to kill).
 /// Used by the idle-release watchdog. Only the dedicated launchd job and setup
 /// script are in scope: global process-name matching can kill an unrelated
 /// developer's xcodebuild/iproxy process (or a different phone). If the script
 /// is unavailable, orphan ownership cannot be proven and the stop deliberately
 /// fails closed. Blocking — call under `spawn_blocking`.
-fn stop_wda_runner_blocking(setup_sh: &str) -> bool {
-    bootout_wda_agent();
+fn stop_runner_blocking(setup_sh: &str) -> bool {
+    bootout_runner_agent();
     let stopped_by_owner = std::path::Path::new(setup_sh).is_file()
         && std::process::Command::new("bash")
             .arg(setup_sh)
@@ -4286,13 +4516,13 @@ fn stop_wda_runner_blocking(setup_sh: &str) -> bool {
             .map(|status| status.success())
             .unwrap_or(false);
     let domain = gui_domain();
-    let supervisor_gone = wait_launchd_job_gone(&domain, wda_agent_label());
+    let supervisor_gone = wait_launchd_job_gone(&domain, runner_agent_label());
     supervisor_gone && stopped_by_owner
 }
 
 /// Give idle-release observation priority over a background status probe while
 /// preserving foreground control priority. The second pending check while
-/// holding the probe slot closes the race with [`AppState::begin_wda_control`],
+/// holding the probe slot closes the race with [`AppState::begin_runner_control`],
 /// which increments the counter before taking the same slot.
 fn abort_health_probe_for_idle(
     control_pending: &std::sync::atomic::AtomicUsize,
@@ -4313,19 +4543,19 @@ fn abort_health_probe_for_idle(
     true
 }
 
-fn prepare_idle_wda_probe(state: &AppState) -> bool {
-    abort_health_probe_for_idle(&state.wda_control_pending, &state.wda_health_probe)
+fn prepare_idle_runner_probe(state: &AppState) -> bool {
+    abort_health_probe_for_idle(&state.runner_control_pending, &state.runner_health_probe)
 }
 
-/// Idle auto-release — the phone belongs to its owner first. When WDA is
+/// Idle auto-release — the phone belongs to its owner first. When runner is
 /// configured and nobody has driven it for `IPHONE_USE_IDLE_RELEASE_SECS`
 /// (default 300; `0` disables) and no viewer is streaming, stop the on-phone
-/// WDA runner and boot out its KeepAlive LaunchAgent so the device is free for
-/// hands-on use. The next `/agent/input` re-bootstraps WDA (see [`agent_input`]).
+/// runner and boot out its KeepAlive LaunchAgent so the device is free for
+/// hands-on use. The next `/agent/input` re-bootstraps runner (see [`agent_input`]).
 ///
-/// No-op (and silent) when WDA isn't configured or is externally managed.
+/// No-op (and silent) when runner isn't configured or is externally managed.
 ///
-/// How long WDA must have been down for the next up edge to count as a human
+/// How long runner must have been down for the next up edge to count as a human
 /// cold start (which earns a fresh activity window) rather than a crash-loop
 /// bounce (which must not reset the idle clock). See issue #66.
 const COLD_START_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
@@ -4400,8 +4630,8 @@ fn note_reconnect_after_release() {
 }
 
 pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
-    if !state.managed_wda || state.wda.is_none() {
-        return; // an external/remote WDA is never lifecycle-managed here
+    if !state.managed_runner || state.runner.is_none() {
+        return; // an external/remote runner is never lifecycle-managed here
     }
     // On by default again (v0.6.3 to v0.7.3 kept the runner up). A runner
     // that is always up is a runner that KeepAlive relaunches whenever iOS
@@ -4424,10 +4654,10 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     // must not report the parked phone as an offline device to be repaired:
     // the label is still disabled, so this is the released resting state and
     // the next request brings the phone up on demand.
-    if !launchd_job_loaded(&gui_domain(), wda_agent_label()) && wda_agent_disabled() {
+    if !launchd_job_loaded(&gui_domain(), runner_agent_label()) && runner_agent_disabled() {
         state.released.store(true, std::sync::atomic::Ordering::Release);
         recover(state.flow_trail.lock()).reset();
-        tracing::info!("WDA supervisor is parked (disabled); starting released");
+        tracing::info!("runner supervisor is parked (disabled); starting released");
     }
     let base_window = std::time::Duration::from_secs(idle_secs);
     tracing::info!("idle auto-release enabled: free the phone after {idle_secs}s idle (stretches up to {}s when it is wanted back soon after a release)", stretched_idle_window(base_window, IDLE_STRETCH_CAP).as_secs());
@@ -4451,23 +4681,23 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             if state.released.load(Ordering::Relaxed) {
                 continue; // already let go — reconnect is on-demand (agent_input)
             }
-            if state.wda_lifecycle.is_transitioning() {
+            if state.runner_lifecycle.is_transitioning() {
                 continue;
             }
             // Status polling must not starve lifecycle work forever. Cancel its
             // bounded health probe only when no real control is pending; control
             // always wins this arbitration.
-            if !prepare_idle_wda_probe(&state) {
+            if !prepare_idle_runner_probe(&state) {
                 continue;
             }
             // Observe the service transition before consulting the idle clock.
-            // The daemon may have spent hours online while WDA was down; when a
-            // human starts WDA later, that first up edge begins a fresh full
+            // The daemon may have spent hours online while runner was down; when a
+            // human starts runner later, that first up edge begins a fresh full
             // activity window instead of immediately releasing the new runner.
-            let up = match &state.wda {
-                Some(wda) => match wda.try_lock() {
+            let up = match &state.runner {
+                Some(runner) => match runner.try_lock() {
                     Ok(client) => {
-                        if state.wda_control_pending.load(Ordering::Acquire) != 0 {
+                        if state.runner_control_pending.load(Ordering::Acquire) != 0 {
                             drop(client);
                             continue;
                         }
@@ -4480,7 +4710,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 None => false,
             };
             if !up {
-                // Do NOT skip the release check just because WDA is down. A
+                // Do NOT skip the release check just because runner is down. A
                 // down endpoint is usually the supervisor's rebuild loop, and
                 // that loop is what demands "Unlock iPhone to Continue" over
                 // and over. Bailing out here left the one situation the user
@@ -4497,7 +4727,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 if state.viewer_busy()
                     || state.held()
                     || state.idle_release_waits(window)
-                    || state.wda_control_pending.load(Ordering::Acquire) != 0
+                    || state.runner_control_pending.load(Ordering::Acquire) != 0
                 {
                     continue;
                 }
@@ -4528,37 +4758,37 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 // we were awaiting above, and this stop would bootout the
                 // supervisor it had just bootstrapped; with it, handlers fail
                 // fast on `releasing` and a reconnect cannot start underneath.
-                let Some(release_token) = state.wda_lifecycle.try_begin_releasing() else {
+                let Some(release_token) = state.runner_lifecycle.try_begin_releasing() else {
                     continue;
                 };
                 if state.viewer_busy()
                     || state.held()
                     || state.idle_release_waits(window)
-                    || state.wda_control_pending.load(Ordering::Acquire) != 0
+                    || state.runner_control_pending.load(Ordering::Acquire) != 0
                     || setup_in_flight(&crate::instance::current().state_dir)
                 {
-                    state.wda_lifecycle.finish_releasing(release_token);
+                    state.runner_lifecycle.finish_releasing(release_token);
                     continue;
                 }
                 tracing::info!(
-                    "idle {}s and WDA is down — stopping the supervisor so it stops rebuilding",
+                    "idle {}s and runner is down — stopping the supervisor so it stops rebuilding",
                     state.idle_for().as_secs()
                 );
                 let script = setup_sh.clone();
                 let stopped =
-                    tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+                    tokio::task::spawn_blocking(move || stop_runner_blocking(&script))
                         .await
                         .unwrap_or(false);
                 if stopped {
-                    state.wda_actionable.store(false, Ordering::Relaxed);
-                    *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                    state.runner_actionable.store(false, Ordering::Relaxed);
+                    *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                     state.released.store(true, Ordering::Release);
                     recover(state.flow_trail.lock()).reset();
                     *recover(state.owner.lock()) = None;
                     note_idle_release();
                     release_backoff_until = None;
                     release_failures = 0;
-                    tracing::info!("phone released: supervisor stopped while WDA was already down");
+                    tracing::info!("phone released: supervisor stopped while runner was already down");
                 } else {
                     // A failed stop used to be terminal: `released` stayed
                     // false and the `!up` early-continue meant we never tried
@@ -4570,7 +4800,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                         backoff.as_secs()
                     );
                 }
-                state.wda_lifecycle.finish_releasing(release_token);
+                state.runner_lifecycle.finish_releasing(release_token);
                 continue;
             }
             if !was_up {
@@ -4598,19 +4828,19 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             if state.held() {
                 continue; // an explicit hold lease keeps the phone
             }
-            if state.wda_control_pending.load(Ordering::Acquire) != 0 {
+            if state.runner_control_pending.load(Ordering::Acquire) != 0 {
                 continue; // a real control request outranks idle release
             }
             if state.idle_release_waits(window) {
                 continue; // driven recently
             }
-            // The WDA probe waits behind the shared client lock. Activity may
+            // The runner probe waits behind the shared client lock. Activity may
             // have resumed while we were awaiting it, so re-check before owning
             // the release transition.
             if state.viewer_busy()
                 || state.held()
                 || state.idle_release_waits(window)
-                || state.wda_control_pending.load(Ordering::Acquire) != 0
+                || state.runner_control_pending.load(Ordering::Acquire) != 0
             {
                 continue;
             }
@@ -4632,7 +4862,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 continue;
             }
             kept_runner = None;
-            let Some(release_token) = state.wda_lifecycle.try_begin_releasing() else {
+            let Some(release_token) = state.runner_lifecycle.try_begin_releasing() else {
                 continue;
             };
             // Close the check→CAS race. Once `releasing=true`, request handlers
@@ -4640,32 +4870,32 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             if state.viewer_busy()
                 || state.held()
                 || state.idle_release_waits(window)
-                || state.wda_control_pending.load(Ordering::Acquire) != 0
+                || state.runner_control_pending.load(Ordering::Acquire) != 0
             {
-                state.wda_lifecycle.finish_releasing(release_token);
+                state.runner_lifecycle.finish_releasing(release_token);
                 continue;
             }
             tracing::info!(
-                "idle {}s with no viewer — releasing the phone (stopping WDA)",
+                "idle {}s with no viewer — releasing the phone (stopping runner)",
                 state.idle_for().as_secs()
             );
-            // While WDA is still up: give Do Not Disturb back first.
+            // While runner is still up: give Do Not Disturb back first.
             release_agent_focus(&state).await;
             let script = setup_sh.clone();
-            let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+            let stopped = tokio::task::spawn_blocking(move || stop_runner_blocking(&script))
                 .await
                 .unwrap_or(false);
-            let endpoint_down = match &state.wda {
-                Some(wda) => {
-                    let mut wda = wda.lock().await;
-                    wda.invalidate_session();
-                    !wda.is_up().await
+            let endpoint_down = match &state.runner {
+                Some(runner) => {
+                    let mut runner = runner.lock().await;
+                    runner.invalidate_session();
+                    !runner.is_up().await
                 }
                 None => true,
             };
             if stopped && endpoint_down {
-                state.wda_actionable.store(false, Ordering::Relaxed);
-                *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                state.runner_actionable.store(false, Ordering::Relaxed);
+                *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
                 *recover(state.owner.lock()) = None;
@@ -4673,7 +4903,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 was_up = false;
                 release_backoff_until = None;
                 release_failures = 0;
-                tracing::info!("idle release confirmed: supervisor/runner stopped and WDA is down");
+                tracing::info!("idle release confirmed: supervisor/runner stopped and runner is down");
             } else {
                 tracing::warn!(
                     "idle release was not confirmed (processes_stopped={stopped}, endpoint_down={endpoint_down}); retrying in {}s",
@@ -4684,7 +4914,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     }
                 );
             }
-            state.wda_lifecycle.finish_releasing(release_token);
+            state.runner_lifecycle.finish_releasing(release_token);
         }
     });
 }
@@ -4693,7 +4923,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
 /// kickstart, which waits for the previous setup run to exit) may take
 /// before the reconnect stops waiting for it. The blocking call carries on;
 /// only the lifecycle is freed, so status probes the runner again.
-const WDA_BOOTSTRAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+const RUNNER_BOOTSTRAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Start one managed reconnect round and run it to its end in the
 /// background: own the lifecycle, start the supervisor, then hand the round
@@ -4705,22 +4935,22 @@ const WDA_BOOTSTRAP_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// cancelled with its request (a client that timed out or went away), and
 /// the round it had begun stayed `reconnecting` forever: no readiness wait
 /// was ever spawned, status kept answering from the cache it never refreshes
-/// mid-reconnect, setup's handoff check saw `wda:false` on every runner it
+/// mid-reconnect, setup's handoff check saw `runner:false` on every runner it
 /// brought up, and only a daemon restart ended it. Awaiting the returned
 /// handle is safe: dropping it does not cancel the round.
 fn begin_managed_reconnect(
     state: &Arc<AppState>,
     udid: String,
 ) -> Option<tokio::task::JoinHandle<bool>> {
-    let token = state.wda_lifecycle.try_begin_reconnecting()?;
-    let ownership = WdaReadinessOwnership::new(state.wda_lifecycle.clone(), token);
+    let token = state.runner_lifecycle.try_begin_reconnecting()?;
+    let ownership = RunnerReadinessOwnership::new(state.runner_lifecycle.clone(), token);
     let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
     let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
-    let bootstrap = state.wda_bootstrap;
+    let bootstrap = state.runner_bootstrap;
     let state = state.clone();
     Some(tokio::spawn(async move {
         let started = tokio::task::spawn_blocking(move || bootstrap(&setup_sh, &log, &udid));
-        let bootstrapped = match tokio::time::timeout(WDA_BOOTSTRAP_BUDGET, started).await {
+        let bootstrapped = match tokio::time::timeout(RUNNER_BOOTSTRAP_BUDGET, started).await {
             Ok(Ok(started)) => started,
             Ok(Err(error)) => {
                 tracing::warn!("starting the device-runner supervisor failed: {error}");
@@ -4729,7 +4959,7 @@ fn begin_managed_reconnect(
             Err(_) => {
                 tracing::warn!(
                     "starting the device-runner supervisor took longer than {}s; ending this reconnect so status probes the runner directly",
-                    WDA_BOOTSTRAP_BUDGET.as_secs()
+                    RUNNER_BOOTSTRAP_BUDGET.as_secs()
                 );
                 false
             }
@@ -4738,11 +4968,11 @@ fn begin_managed_reconnect(
             // launchd acceptance is not device readiness: keep the
             // transition visible until a real action-level probe succeeds
             // (or the readiness budget ends).
-            *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+            *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
             state
-                .wda_actionable
+                .runner_actionable
                 .store(false, std::sync::atomic::Ordering::Release);
-            spawn_wda_readiness_wait(state, ownership);
+            spawn_runner_readiness_wait(state, ownership);
         } else {
             ownership.abandon();
         }
@@ -4784,10 +5014,10 @@ async fn maybe_prewarm(
         .unwrap_or_default();
     let inputs = prewarm::Inputs {
         trigger,
-        managed: state.managed_wda && state.wda.is_some() && !state.managed_wda_pending,
+        managed: state.managed_runner && state.runner.is_some() && !state.managed_runner_pending,
         released: state.released.load(std::sync::atomic::Ordering::Acquire),
         human_handoff: human_handoff_active(),
-        lifecycle_busy: state.wda_lifecycle.is_transitioning(),
+        lifecycle_busy: state.runner_lifecycle.is_transitioning(),
         other_owner,
         blocker: &blocker,
         since_last_start: prewarm::since_last_start(trigger),
@@ -4819,7 +5049,7 @@ async fn maybe_prewarm(
     tokio::spawn(async move {
         // The readiness wait owns the reconnect; `warming` mirrors it.
         let started = Instant::now();
-        while watched.wda_lifecycle.is_reconnecting()
+        while watched.runner_lifecycle.is_reconnecting()
             && started.elapsed() < std::time::Duration::from_secs(300)
         {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -4938,7 +5168,7 @@ pub fn set_human_handoff(active: bool) {
 // ---------------------------------------------------------------------------
 
 /// Single-step `type` values. `direct_agent_action` handles three itself and
-/// delegates the rest to `wda_control_with_client`, so the single-step surface
+/// delegates the rest to `runner_control_with_client`, so the single-step surface
 /// is the union of both. Hand-kept and checked against those two dispatchers
 /// by `capability_catalogue_matches_the_dispatchers`.
 const CAPABILITY_SINGLE_STEP_ACTIONS: &[&str] = &[
@@ -5103,19 +5333,19 @@ fn capability_ownership(state: &AppState, headers: &HeaderMap) -> CapabilityOwne
     }
 }
 
-/// Read-only, cache-only availability. Contacting WDA here would make a
+/// Read-only, cache-only availability. Contacting runner here would make a
 /// discovery call wake the phone, and taking the owner lease would make it
 /// steal the device — a capability probe must do neither.
 fn capability_availability(state: &AppState, headers: &HeaderMap) -> serde_json::Value {
     use std::sync::atomic::Ordering;
 
     let released = state.released.load(Ordering::Acquire);
-    let releasing = state.wda_lifecycle.is_releasing();
-    let reconnecting = state.wda_lifecycle.is_reconnecting();
-    // Cached observations only. `wda_health` is whatever the last completed
+    let releasing = state.runner_lifecycle.is_releasing();
+    let reconnecting = state.runner_lifecycle.is_reconnecting();
+    // Cached observations only. `runner_health` is whatever the last completed
     // probe left behind; this function never starts one.
-    let health = *recover(state.wda_health.lock());
-    let actionable = state.wda_actionable.load(Ordering::Acquire);
+    let health = *recover(state.runner_health.lock());
+    let actionable = state.runner_actionable.load(Ordering::Acquire);
     let ownership = capability_ownership(state, headers);
     let handoff = released && human_handoff_active();
 
@@ -5151,9 +5381,9 @@ fn capability_availability(state: &AppState, headers: &HeaderMap) -> serde_json:
             "releasing": releasing,
             "reconnecting": reconnecting,
             "human_handoff": handoff,
-            "wda_up": health.up,
-            "wda_actionable": actionable,
-            "wda_locked": health.locked,
+            "runner_up": health.up,
+            "runner_actionable": actionable,
+            "runner_locked": health.locked,
             "ownership": match ownership {
                 CapabilityOwnership::Free => "free",
                 CapabilityOwnership::Same => "self",
@@ -5177,7 +5407,7 @@ fn capability_availability(state: &AppState, headers: &HeaderMap) -> serde_json:
 /// Two questions that used to be conflated. `supported` is static: it depends
 /// on the configured backend and the code in this binary, so a caller can plan
 /// against it. `available` is a cached snapshot of whether the phone can be
-/// driven this instant, and reading it costs no WDA connection and takes no
+/// driven this instant, and reading it costs no runner connection and takes no
 /// owner lease — discovery must never wake or steal the device.
 ///
 /// `recovery_owner: external` narrows only the *lifecycle* routes the daemon
@@ -5347,7 +5577,7 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
     // `mode` values this daemon would actually accept. An externally managed
     // endpoint refuses both lifecycle transitions: it does not own the
     // supervisor.
-    let modes: Vec<&str> = if state.managed_wda {
+    let modes: Vec<&str> = if state.managed_runner {
         vec!["agent", "human"]
     } else {
         Vec::new()
@@ -5361,9 +5591,9 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
     let body = serde_json::json!({
         "ok": true,
         "backend": "direct",
-        "recovery_owner": if state.managed_wda {
+        "recovery_owner": if state.managed_runner {
             "daemon"
-        } else if state.managed_wda_pending {
+        } else if state.managed_runner_pending {
             "unconfigured"
         } else {
             "external"
@@ -5385,7 +5615,7 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
                 "settle_ms_max": AGENT_INPUT_SETTLE_MAX_MS,
             },
             "modes": modes,
-            "lifecycle_managed_here": state.managed_wda,
+            "lifecycle_managed_here": state.managed_runner,
         },
         "available": capability_availability(&state, &headers),
         // Owner-set limits (`IPHONE_USE_BLOCKED_APPS`, `IPHONE_USE_MAX_ACTIONS`).
@@ -5438,14 +5668,14 @@ async fn agent_runner_handoff(State(state): State<Arc<AppState>>, headers: Heade
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         )
     };
-    let Some(wda) = state.wda.as_ref().filter(|_| state.managed_wda) else {
+    let Some(runner) = state.runner.as_ref().filter(|_| state.managed_runner) else {
         return json(
             StatusCode::CONFLICT,
-            serde_json::json!({"ok": false, "error": "wda_not_managed"}),
+            serde_json::json!({"ok": false, "error": "runner_not_managed"}),
         );
     };
-    let _priority = state.begin_wda_control();
-    let Ok(mut client) = tokio::time::timeout(std::time::Duration::from_secs(10), wda.lock()).await
+    let _priority = state.begin_runner_control();
+    let Ok(mut client) = tokio::time::timeout(std::time::Duration::from_secs(10), runner.lock()).await
     else {
         tracing::warn!(
             "runner handoff: the device-runner client stayed busy for 10s; nothing was reset"
@@ -5457,7 +5687,7 @@ async fn agent_runner_handoff(State(state): State<Arc<AppState>>, headers: Heade
     };
     client.forget_runner();
     state
-        .wda_read_degraded
+        .runner_read_degraded
         .store(false, std::sync::atomic::Ordering::Release);
     let (mut health, mut error) = handoff_probe(&mut client).await;
     let mut retried = false;
@@ -5478,21 +5708,21 @@ async fn agent_runner_handoff(State(state): State<Arc<AppState>>, headers: Heade
         }
     }
     drop(client);
-    let lifecycle = state.wda_lifecycle.current();
-    if lifecycle == WdaLifecycleTransition::Active {
-        apply_wda_health_probe_tracked(
-            &state.wda_health,
-            &state.wda_actionable,
+    let lifecycle = state.runner_lifecycle.current();
+    if lifecycle == RunnerLifecycleTransition::Active {
+        apply_runner_health_probe_tracked(
+            &state.runner_health,
+            &state.runner_actionable,
             &state.released,
             false,
-            Some(&state.wda_death),
+            Some(&state.runner_death),
             health,
         );
     }
     let lifecycle = match lifecycle {
-        WdaLifecycleTransition::Active => "active",
-        WdaLifecycleTransition::Releasing => "releasing",
-        WdaLifecycleTransition::Reconnecting => "reconnecting",
+        RunnerLifecycleTransition::Active => "active",
+        RunnerLifecycleTransition::Releasing => "releasing",
+        RunnerLifecycleTransition::Reconnecting => "reconnecting",
     };
     json(
         StatusCode::OK,
@@ -5510,8 +5740,8 @@ async fn agent_runner_handoff(State(state): State<Arc<AppState>>, headers: Heade
 
 /// One bounded handoff probe, with why it failed.
 async fn handoff_probe(
-    client: &mut crate::wda::WdaClient,
-) -> (crate::wda::WdaHealth, Option<String>) {
+    client: &mut crate::runner::RunnerClient,
+) -> (crate::runner::RunnerHealth, Option<String>) {
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
         client.probe_health_detailed(),
@@ -5519,7 +5749,7 @@ async fn handoff_probe(
     .await
     .unwrap_or_else(|_| {
         (
-            crate::wda::WdaHealth::down(),
+            crate::runner::RunnerHealth::down(),
             Some("the probe did not finish within 20s".to_string()),
         )
     })
@@ -5528,7 +5758,7 @@ async fn handoff_probe(
 /// `POST /agent/mode` — bring the phone up for remote control, or give it back
 /// to the person holding it.
 ///
-/// * `{"mode":"agent"}` — recover daemon-managed WDA using its persisted
+/// * `{"mode":"agent"}` — recover daemon-managed runner using its persisted
 ///   canonical target. Poll until `reconnecting:false` and `drivable:true`.
 /// * `{"mode":"human"}` — stop the managed runner so the person holding the
 ///   phone has it to themselves; agent input then answers 409
@@ -5585,7 +5815,7 @@ async fn agent_mode_inner(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     }
-    if mode == "agent" && state.wda_lifecycle.is_releasing() {
+    if mode == "agent" && state.runner_lifecycle.is_releasing() {
         return with_security_headers(
             Response::builder()
                 .status(StatusCode::CONFLICT)
@@ -5611,13 +5841,13 @@ async fn agent_mode_inner(
         );
     }
     {
-        if mode == "agent" && state.managed_wda_pending {
+        if mode == "agent" && state.managed_runner_pending {
             return with_security_headers(
                 Response::builder()
                     .status(StatusCode::CONFLICT)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"ok":false,"error":"target_not_configured","hint":"run setup-wda.sh so IPHONE_USE_UDID is persisted before starting managed WDA"}"#,
+                        r#"{"ok":false,"error":"target_not_configured","hint":"run setup-runner.sh so IPHONE_USE_UDID is persisted before starting managed runner"}"#,
                     ))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             );
@@ -5644,13 +5874,13 @@ async fn agent_mode_inner(
     let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
     match mode.as_str() {
         "agent" => {
-            if !state.managed_wda {
+            if !state.managed_runner {
                 if let Some(gateway) = &state.selfrunner_gateway {
                     let mut unlock_error = None;
-                    if let Some(wda) = &state.wda {
-                        let _priority = state.begin_wda_control();
+                    if let Some(runner) = &state.runner {
+                        let _priority = state.begin_runner_control();
                         let Ok(mut client) =
-                            tokio::time::timeout(std::time::Duration::from_secs(10), wda.lock())
+                            tokio::time::timeout(std::time::Duration::from_secs(10), runner.lock())
                                 .await
                         else {
                             return json_response(
@@ -5688,16 +5918,16 @@ async fn agent_mode_inner(
                         )
                         .await
                         {
-                            apply_wda_health_probe(
-                                &state.wda_health,
-                                &state.wda_actionable,
+                            apply_runner_health_probe(
+                                &state.runner_health,
+                                &state.runner_actionable,
                                 &state.released,
                                 health,
                             );
                         }
                     }
-                    let health = *recover(state.wda_health.lock());
-                    let mut result = serde_json::json!({"ok": unlock_error.is_none(), "recovery_owner":"external", "wda": health.up, "wda_actionable":health.actionable, "wda_locked":health.locked, "drivable":health.actionable});
+                    let health = *recover(state.runner_health.lock());
+                    let mut result = serde_json::json!({"ok": unlock_error.is_none(), "recovery_owner":"external", "runner": health.up, "runner_actionable":health.actionable, "runner_locked":health.locked, "drivable":health.actionable});
                     if let Some(error) = &unlock_error {
                         result["error"] = serde_json::json!(error);
                     }
@@ -5724,13 +5954,13 @@ async fn agent_mode_inner(
                 }
             }
 
-            if !state.managed_wda {
+            if !state.managed_runner {
                 return with_security_headers(
                     Response::builder()
                         .status(StatusCode::CONFLICT)
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(
-                            r#"{"ok":false,"error":"wda_is_externally_managed","recovery_owner":"external","hint":"restart the configured WDA endpoint on its owning host; this daemon will not run local setup or launchctl commands"}"#,
+                            r#"{"ok":false,"error":"runner_is_externally_managed","recovery_owner":"external","hint":"restart the configured runner endpoint on its owning host; this daemon will not run local setup or launchctl commands"}"#,
                         ))
                         .unwrap_or_else(|_| {
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -5741,21 +5971,21 @@ async fn agent_mode_inner(
                 return with_security_headers(
                     (
                         StatusCode::CONFLICT,
-                        "setup-wda.sh not installed — run scripts/setup-wda.sh once manually \
+                        "setup-runner.sh not installed — run scripts/setup-runner.sh once manually \
                          (it self-installs to ~/.iphone-use/) before using mode=agent",
                     )
                         .into_response(),
                 );
             }
-            // Run WDA under a DEDICATED LaunchAgent (com.leeguoo.iphone-use.wda)
+            // Run runner under a DEDICATED LaunchAgent (com.leeguoo.iphone-use.runner)
             // with KeepAlive instead of nohup-spawning a child. Two reasons,
             // both hardware-painful bugs:
             //   1. A nohup child lives in THIS daemon's launchd cgroup, so the
             //      next daemon restart (`launchctl bootout`) reaps the runner —
-            //      WDA "randomly" died on every redeploy.
+            //      runner "randomly" died on every redeploy.
             //   2. When the runner dies (WARP reconnect kills the CoreDevice
             //      tunnel, sleep, USB hiccup) nothing brought it back. KeepAlive
-            //      relaunches it; setup-wda.sh's WDA_KEEPALIVE mode blocks until
+            //      relaunches it; setup-runner.sh's IPU_RUNNER_KEEPALIVE mode blocks until
             //      the runner dies so launchd sees the exit and rebuilds.
             // ThrottleInterval caps the rebuild rate so a persistent killer
             // (WARP Always-On) thrashes harmlessly instead of hot-looping.
@@ -5791,7 +6021,7 @@ async fn agent_mode_inner(
             // wait (or ends) instead of staying `reconnecting` forever.
             let spawned = round.await.unwrap_or(false);
             let body = format!(
-                r#"{{"ok":{spawned},"mode":"agent","starting":{spawned},"reconnecting":{spawned},"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — startup remains reconnecting until WDA can perform actions"}}"#
+                r#"{{"ok":{spawned},"mode":"agent","starting":{spawned},"reconnecting":{spawned},"self_healing":true,"log":"{log}","hint":"if the phone is locked, unlock it once now — startup remains reconnecting until runner can perform actions"}}"#
             );
             with_security_headers(
                 Response::builder()
@@ -5810,18 +6040,18 @@ async fn agent_mode_inner(
             // idle watchdog performs, done on request, plus a flag that makes
             // agent input answer 409 instead of starting the runner under
             // their fingers. `{"mode":"agent"}` takes the phone back.
-            if !state.managed_wda {
+            if !state.managed_runner {
                 return with_security_headers(
                     Response::builder()
                         .status(StatusCode::CONFLICT)
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(
-                            r#"{"ok":false,"error":"wda_is_externally_managed","hint":"human hand-off stops the daemon-managed local runner; an external endpoint has nothing to hand off"}"#,
+                            r#"{"ok":false,"error":"runner_is_externally_managed","hint":"human hand-off stops the daemon-managed local runner; an external endpoint has nothing to hand off"}"#,
                         ))
                         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 );
             }
-            let Some(release_token) = state.wda_lifecycle.try_begin_releasing() else {
+            let Some(release_token) = state.runner_lifecycle.try_begin_releasing() else {
                 return with_security_headers(
                     Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -5836,24 +6066,24 @@ async fn agent_mode_inner(
             // The person gets their phone back with notifications on.
             release_agent_focus(&state).await;
             let script = setup_sh.clone();
-            let stopped = tokio::task::spawn_blocking(move || stop_wda_runner_blocking(&script))
+            let stopped = tokio::task::spawn_blocking(move || stop_runner_blocking(&script))
                 .await
                 .unwrap_or(false);
             if stopped {
                 state
-                    .wda_actionable
+                    .runner_actionable
                     .store(false, std::sync::atomic::Ordering::Release);
-                *recover(state.wda_health.lock()) = crate::wda::WdaHealth::down();
+                *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state
                     .released
                     .store(true, std::sync::atomic::Ordering::Release);
                 *recover(state.owner.lock()) = None;
                 HUMAN_HANDOFF.store(true, std::sync::atomic::Ordering::Release);
-                tracing::info!("phone handed to a human: managed WDA stopped on request");
+                tracing::info!("phone handed to a human: managed runner stopped on request");
             }
-            state.wda_lifecycle.finish_releasing(release_token);
+            state.runner_lifecycle.finish_releasing(release_token);
             let body = format!(
-                r#"{{"ok":{stopped},"mode":"human","released":{stopped},"hint":"WDA is stopped and the phone is the holder's; POST {{\"mode\":\"agent\"}} hands it back to remote control"}}"#
+                r#"{{"ok":{stopped},"mode":"human","released":{stopped},"hint":"runner is stopped and the phone is the holder's; POST {{\"mode\":\"agent\"}} hands it back to remote control"}}"#
             );
             with_security_headers(
                 Response::builder()
@@ -5877,18 +6107,18 @@ async fn agent_mode_inner(
     }
 }
 
-/// Perform a WDA on-device scroll/swipe (issue #27). `nx`/`ny` are the
+/// Perform a runner on-device scroll/swipe (issue #27). `nx`/`ny` are the
 /// normalized `[0,1]` gesture anchor; `dx`/`dy` are scroll deltas whose sign
 /// matches the web client's convention (positive `dy` reveals content below, positive
 /// `dx` reveals content to the right). The delta is scaled into a finger travel
 /// that is always a visible swipe (≥15% of the axis) yet stays on-screen (≤75%);
 /// the finger moves opposite to the content reveal.
-fn normalized_wda_axis(value: f64, size: f64) -> anyhow::Result<f64> {
+fn normalized_runner_axis(value: f64, size: f64) -> anyhow::Result<f64> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        anyhow::bail!("normalized WDA coordinate must be within 0..=1");
+        anyhow::bail!("normalized runner coordinate must be within 0..=1");
     }
     if !size.is_finite() || size <= 2.0 {
-        anyhow::bail!("WDA screen axis must be larger than two points");
+        anyhow::bail!("runner screen axis must be larger than two points");
     }
     Ok((value * size).clamp(1.0, size - 1.0))
 }
@@ -5955,8 +6185,8 @@ fn coordinate_swipe_endpoints(
     sw: f64,
     sh: f64,
 ) -> anyhow::Result<(f64, f64, f64, f64)> {
-    let cx = normalized_wda_axis(nx, sw)?;
-    let cy = normalized_wda_axis(ny, sh)?;
+    let cx = normalized_runner_axis(nx, sw)?;
+    let cy = normalized_runner_axis(ny, sh)?;
     let tx = swipe_travel(dx, sw);
     let ty = swipe_travel(dy, sh);
     let (x1, x2) = guard_scroll_span(cx + tx / 2.0, cx - tx / 2.0, sw);
@@ -5964,8 +6194,8 @@ fn coordinate_swipe_endpoints(
     Ok((x1, y1, x2, y2))
 }
 
-pub(crate) async fn wda_swipe(
-    w: &mut crate::wda::WdaClient,
+pub(crate) async fn runner_swipe(
+    w: &mut crate::runner::RunnerClient,
     nx: f64,
     ny: f64,
     dx: f64,
@@ -6104,7 +6334,7 @@ fn detect_connected_device() -> Result<String, DevicectlError> {
 }
 
 /// Uninstall an app (and its data container) from a paired device via
-/// CoreDevice. This is the reliable "Delete App" primitive: WDA cannot remove
+/// CoreDevice. This is the reliable "Delete App" primitive: runner cannot remove
 /// apps, and UI-driven deletion (Settings → Storage, or a home-screen
 /// long-press) is flaky to automate. `udid` defaults to the connected device.
 #[cfg(target_os = "macos")]
@@ -6199,7 +6429,7 @@ fn coordinates_out_of_range(values: &[Option<f64>]) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WdaControlOutcome {
+enum RunnerControlOutcome {
     Applied,
     NotSent,
     Unsupported,
@@ -6222,7 +6452,7 @@ enum WdaControlOutcome {
     Refused(&'static str, &'static str),
     /// An `alert` action while no system alert is showing.
     NoAlert,
-    /// `force_press` on a device without pressure touch: WDA refused before
+    /// `force_press` on a device without pressure touch: runner refused before
     /// touching the screen (issue #90). Nothing was sent.
     ForcePressUnsupported,
     /// `scroll` with `page:true` found no page scroller, or no free spot in it
@@ -6240,7 +6470,7 @@ enum WdaControlOutcome {
     Failed,
 }
 
-fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String> {
+fn element_snapshot_id(rows: &[crate::runner::ElementRow]) -> anyhow::Result<String> {
     Ok(core::control::snapshot_id(rows)?)
 }
 
@@ -6257,7 +6487,7 @@ fn element_snapshot_id(rows: &[crate::wda::ElementRow]) -> anyhow::Result<String
 struct AxStats {
     /// Total serialized rows.
     n: usize,
-    /// Rows whose `kind` is one of [`crate::wda::INTERACTIVE_KINDS`].
+    /// Rows whose `kind` is one of [`crate::runner::INTERACTIVE_KINDS`].
     n_interactive: usize,
     /// Interactive rows with a non-empty label ÷ `n_interactive`; `1.0` when
     /// there are no interactive rows (nothing is missing a label).
@@ -6275,15 +6505,15 @@ struct AxStats {
     max_depth: u32,
 }
 
-/// Compute [`AxStats`] for one flattened tree. `screen` is WDA's point-space
+/// Compute [`AxStats`] for one flattened tree. `screen` is runner's point-space
 /// window size when the lookup succeeded (its failure is non-fatal for the
 /// endpoint, so coverage degrades to `null` rather than failing the read).
-fn ax_stats(rows: &[crate::wda::ElementRow], screen: Option<(f64, f64)>) -> AxStats {
+fn ax_stats(rows: &[crate::runner::ElementRow], screen: Option<(f64, f64)>) -> AxStats {
     const CONTAINER_KINDS: [&str; 4] = ["Application", "Window", "Other", "Image"];
 
-    let interactive: Vec<&crate::wda::ElementRow> = rows
+    let interactive: Vec<&crate::runner::ElementRow> = rows
         .iter()
-        .filter(|row| crate::wda::INTERACTIVE_KINDS.contains(&row.kind.as_str()))
+        .filter(|row| crate::runner::INTERACTIVE_KINDS.contains(&row.kind.as_str()))
         .collect();
     let labeled_frac = if interactive.is_empty() {
         1.0
@@ -6372,14 +6602,14 @@ fn rect_union_area_clipped(rects: &[[f64; 4]], screen_width: f64, screen_height:
 /// How many recent element trees the daemon retains for `?since=` diffs.
 /// An agent diffs against its own previous read, so a handful is plenty; a
 /// miss simply degrades to the full tree.
-const ELEMENT_SNAPSHOT_CACHE_CAP: usize = 8;
+const ELEMENT_SNAPSHOT_CACHE_CAP: usize = 16;
 
 /// Retain `rows` under its snapshot token so a later `?since=` can diff
 /// against it. Re-serving an already-cached snapshot refreshes its position.
 fn remember_element_snapshot(
     state: &AppState,
     snapshot: &str,
-    rows: &Arc<Vec<crate::wda::ElementRow>>,
+    rows: &Arc<Vec<crate::runner::ElementRow>>,
 ) {
     let mut cache = recover(state.element_snapshots.lock());
     if let Some(position) = cache.iter().position(|(id, _)| id == snapshot) {
@@ -6423,7 +6653,7 @@ fn owner_last_snapshot(state: &AppState, headers: &HeaderMap) -> Option<String> 
 fn lookup_element_snapshot(
     state: &AppState,
     snapshot: &str,
-) -> Option<Arc<Vec<crate::wda::ElementRow>>> {
+) -> Option<Arc<Vec<crate::runner::ElementRow>>> {
     recover(state.element_snapshots.lock())
         .iter()
         .find(|(id, _)| id == snapshot)
@@ -6442,8 +6672,8 @@ type ElementRowsDelta = core::control::ElementDelta;
 /// misreport every row after one insertion, so identity matching is what keeps
 /// a small UI change a small diff.
 fn diff_element_rows(
-    baseline: &[crate::wda::ElementRow],
-    current: &[crate::wda::ElementRow],
+    baseline: &[crate::runner::ElementRow],
+    current: &[crate::runner::ElementRow],
 ) -> ElementRowsDelta {
     core::control::diff_rows(baseline, current, |row| {
         (
@@ -6455,7 +6685,7 @@ fn diff_element_rows(
     })
 }
 
-/// `ok:true` means the action was dispatched and WDA acknowledged it, not
+/// `ok:true` means the action was dispatched and runner acknowledged it, not
 /// that the screen responded. A coordinate scroll whose touch lands on an
 /// input or a nested scroller, or a tap on coordinates a keyboard collapse
 /// moved, is acknowledged and changes nothing (#78). When the caller asked
@@ -6479,8 +6709,8 @@ const UNSETTLED_SCROLL_MIN_STILL_ANCHORS: usize = 3;
 fn mark_no_scroll_progress(
     body: &mut serde_json::Value,
     action: &serde_json::Value,
-    baseline: &[crate::wda::ElementRow],
-    current: &[crate::wda::ElementRow],
+    baseline: &[crate::runner::ElementRow],
+    current: &[crate::runner::ElementRow],
     report: &SettleReport,
 ) {
     if report.sparse
@@ -6517,7 +6747,7 @@ fn mark_no_scroll_progress(
 /// no re-read), `removed` is baseline indexes only.
 fn elements_delta_json(
     delta: &ElementRowsDelta,
-    current: &[crate::wda::ElementRow],
+    current: &[crate::runner::ElementRow],
 ) -> serde_json::Value {
     let indexed = |indexes: &[usize]| -> Vec<serde_json::Value> {
         indexes
@@ -6552,19 +6782,19 @@ enum SnapshotElementTapError {
     /// The request carried a value of the wrong shape for this action (a JSON
     /// number where a string is required, a slider position outside 0..1).
     InvalidValue(&'static str),
-    /// WDA acknowledged the action but the element did not change (a picker
+    /// runner acknowledged the action but the element did not change (a picker
     /// wheel given a value that matches none of its options).
     NoEffect(&'static str, &'static str),
     /// Refused before dispatch: `(error code, hint)`.
     Refused(&'static str, &'static str),
-    /// WDA refused the gesture because this device cannot perform it (a
+    /// runner refused the gesture because this device cannot perform it (a
     /// force press on an iPhone without 3D Touch). Nothing was sent.
     DeviceUnsupported,
     BeforeDispatch(anyhow::Error),
     AfterDispatch(anyhow::Error),
 }
 
-/// Did this failure happen before any byte reached WDA? A TCP connect error
+/// Did this failure happen before any byte reached runner? A TCP connect error
 /// (refused / unreachable) means the request was never delivered, so the
 /// action cannot have executed. Hardware-seen tonight (#66/#75 KeepAlive
 /// rounds restart the 8100 socat relay): a `set_value` and a `force_press`
@@ -6572,7 +6802,7 @@ enum SnapshotElementTapError {
 /// `outcome_unknown` / `retry_safe:false` — which forbids the one thing that
 /// was actually safe, retrying. Only a *connect* failure qualifies; anything
 /// after the request was sent (timeout, reset mid-body) stays unknown.
-fn error_never_reached_wda(error: &anyhow::Error) -> bool {
+fn error_never_reached_runner(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect))
@@ -6584,38 +6814,38 @@ fn error_never_reached_wda(error: &anyhow::Error) -> bool {
 /// applied/failed handling.
 fn snapshot_element_outcome(
     result: Result<(), SnapshotElementTapError>,
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     context: &str,
-) -> Result<anyhow::Result<()>, WdaControlOutcome> {
+) -> Result<anyhow::Result<()>, RunnerControlOutcome> {
     match result {
         Ok(()) => Ok(Ok(())),
-        Err(SnapshotElementTapError::Invalid) => Err(WdaControlOutcome::InvalidElementSnapshot),
-        Err(SnapshotElementTapError::Stale) => Err(WdaControlOutcome::StaleElementSnapshot),
-        Err(SnapshotElementTapError::NotFound) => Err(WdaControlOutcome::ElementNotFound),
-        Err(SnapshotElementTapError::Ambiguous) => Err(WdaControlOutcome::AmbiguousElement),
-        Err(SnapshotElementTapError::InvalidTarget) => Err(WdaControlOutcome::InvalidElementTarget),
-        Err(SnapshotElementTapError::InvalidValue(hint)) => Err(WdaControlOutcome::InvalidValue(hint)),
+        Err(SnapshotElementTapError::Invalid) => Err(RunnerControlOutcome::InvalidElementSnapshot),
+        Err(SnapshotElementTapError::Stale) => Err(RunnerControlOutcome::StaleElementSnapshot),
+        Err(SnapshotElementTapError::NotFound) => Err(RunnerControlOutcome::ElementNotFound),
+        Err(SnapshotElementTapError::Ambiguous) => Err(RunnerControlOutcome::AmbiguousElement),
+        Err(SnapshotElementTapError::InvalidTarget) => Err(RunnerControlOutcome::InvalidElementTarget),
+        Err(SnapshotElementTapError::InvalidValue(hint)) => Err(RunnerControlOutcome::InvalidValue(hint)),
         Err(SnapshotElementTapError::NoEffect(error, hint)) => {
-            Err(WdaControlOutcome::NoEffect(error, hint))
+            Err(RunnerControlOutcome::NoEffect(error, hint))
         }
         Err(SnapshotElementTapError::Refused(error, hint)) => {
-            Err(WdaControlOutcome::Refused(error, hint))
+            Err(RunnerControlOutcome::Refused(error, hint))
         }
-        Err(SnapshotElementTapError::DeviceUnsupported) => Err(WdaControlOutcome::ForcePressUnsupported),
+        Err(SnapshotElementTapError::DeviceUnsupported) => Err(RunnerControlOutcome::ForcePressUnsupported),
         Err(SnapshotElementTapError::BeforeDispatch(error)) => {
             w.invalidate_session();
-            tracing::warn!("wda {context} failed before dispatch: {error:#}");
-            Err(WdaControlOutcome::NotSent)
+            tracing::warn!("runner {context} failed before dispatch: {error:#}");
+            Err(RunnerControlOutcome::NotSent)
         }
-        Err(SnapshotElementTapError::AfterDispatch(error)) if error_never_reached_wda(&error) => {
-            tracing::warn!("{context}: not sent, WDA unreachable: {error:#}");
-            Err(WdaControlOutcome::NotSent)
+        Err(SnapshotElementTapError::AfterDispatch(error)) if error_never_reached_runner(&error) => {
+            tracing::warn!("{context}: not sent, runner unreachable: {error:#}");
+            Err(RunnerControlOutcome::NotSent)
         }
         Err(SnapshotElementTapError::AfterDispatch(error)) => Ok(Err(error)),
     }
 }
 
-fn element_center(row: &crate::wda::ElementRow) -> Option<(f64, f64)> {
+fn element_center(row: &crate::runner::ElementRow) -> Option<(f64, f64)> {
     let [x, y, width, height] = row.rect;
     if ![x, y, width, height].into_iter().all(f64::is_finite) || width <= 0.0 || height <= 0.0 {
         return None;
@@ -6623,14 +6853,14 @@ fn element_center(row: &crate::wda::ElementRow) -> Option<(f64, f64)> {
     Some((x + width / 2.0, y + height / 2.0))
 }
 
-fn snapshot_row_locator(row: &crate::wda::ElementRow) -> Option<AgentElementLocator> {
+fn snapshot_row_locator(row: &crate::runner::ElementRow) -> Option<AgentElementLocator> {
     let label = (!row.label.is_empty()).then(|| row.label.clone());
     let kind = (!row.kind.is_empty()).then(|| row.kind.clone());
     let identifier = row.identifier.clone().filter(|value| !value.is_empty());
 
     // A label needs a type to avoid widening a snapshot-bound action into a
     // different control with the same visible text. An accessibility
-    // identifier is independently usable through WDA's native lookup.
+    // identifier is independently usable through runner's native lookup.
     if identifier.is_none() && (label.is_none() || kind.is_none()) {
         return None;
     }
@@ -6650,9 +6880,9 @@ fn snapshot_row_locator(row: &crate::wda::ElementRow) -> Option<AgentElementLoca
 /// live tree, and require the snapshot token to still match before any
 /// mutation. Returns the fresh rows plus the selected index.
 async fn fetch_snapshot_row(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
-) -> Result<(Vec<crate::wda::ElementRow>, usize), SnapshotElementTapError> {
+) -> Result<(Vec<crate::runner::ElementRow>, usize), SnapshotElementTapError> {
     let index = value
         .get("element")
         .and_then(serde_json::Value::as_u64)
@@ -6684,16 +6914,16 @@ const SNAPSHOT_TREE_REUSE: std::time::Duration = std::time::Duration::from_secs(
 
 /// [`fetch_snapshot_row`] without the second whole-tree read when it can be
 /// avoided. If the daemon's own last read carries the caller's snapshot token,
-/// nothing was sent to WDA since, and the selected row has a semantic locator,
+/// nothing was sent to runner since, and the selected row has a semantic locator,
 /// that tree is used and `true` comes back: the caller MUST then prove the
-/// element live (WDA lookup + frame equal to the row's, see
+/// element live (runner lookup + frame equal to the row's, see
 /// [`verify_reused_row`]) before acting. Otherwise this is a fresh read.
-/// Real sessions: the tree read is ~57 % of WDA time and snapshot-bound taps
+/// Real sessions: the tree read is ~57 % of runner time and snapshot-bound taps
 /// paid it twice (once to show the tree, once to check the token).
 async fn fetch_snapshot_row_reusing(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
-) -> Result<(Vec<crate::wda::ElementRow>, usize, bool), SnapshotElementTapError> {
+) -> Result<(Vec<crate::runner::ElementRow>, usize, bool), SnapshotElementTapError> {
     let index = value
         .get("element")
         .and_then(serde_json::Value::as_u64)
@@ -6718,18 +6948,18 @@ async fn fetch_snapshot_row_reusing(
 
 /// A reused tree's row must still be where it was: the live element's frame
 /// equals the row's (`Ok(true)`). A different frame or a vanished element is a
-/// stale snapshot — nothing was sent. A frame WDA cannot read proves nothing
+/// stale snapshot — nothing was sent. A frame runner cannot read proves nothing
 /// either way (`Ok(false)`): the caller drops the reused tree and starts over
 /// with a fresh read.
 async fn verify_reused_row(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     element_id: &str,
-    row: &crate::wda::ElementRow,
+    row: &crate::runner::ElementRow,
 ) -> Result<bool, SnapshotElementTapError> {
     match w.element_rect(element_id).await {
         Ok(rect) if rects_match(rect, row.rect) => Ok(true),
         Ok(_) => Err(SnapshotElementTapError::Stale),
-        Err(error) if wda_error_is_missing_element(&error) => Err(SnapshotElementTapError::Stale),
+        Err(error) if runner_error_is_missing_element(&error) => Err(SnapshotElementTapError::Stale),
         Err(_) => {
             w.forget_tree();
             Ok(false)
@@ -6737,16 +6967,16 @@ async fn verify_reused_row(
     }
 }
 
-/// Resolve a fresh snapshot row to exactly one live WDA element through its
+/// Resolve a fresh snapshot row to exactly one live runner element through its
 /// semantic locator. Rows without semantics cannot be addressed this way.
 async fn resolve_snapshot_row_element(
-    w: &mut crate::wda::WdaClient,
-    rows: &[crate::wda::ElementRow],
+    w: &mut crate::runner::RunnerClient,
+    rows: &[crate::runner::ElementRow],
     index: usize,
 ) -> Result<String, SnapshotElementTapError> {
     let locator =
         snapshot_row_locator(&rows[index]).ok_or(SnapshotElementTapError::InvalidTarget)?;
-    let (using, value) = locator_wda_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
+    let (using, value) = locator_runner_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
     let element_ids = w
         .find_elements(using, &value)
         .await
@@ -6765,13 +6995,13 @@ const SNAPSHOT_PICK_MAX_RECT_READS: usize = 8;
 ///    the same accessibility snapshot, so even a system sheet's offset frame
 ///    agrees);
 /// 2. the row's position among the snapshot rows with the same locator, when
-///    the snapshot and WDA count the same number of them (both walk the tree
+///    the snapshot and runner count the same number of them (both walk the tree
 ///    in document order).
 ///
 /// Anything else stays `Ambiguous`: no guess is dispatched.
 async fn pick_snapshot_element(
-    w: &mut crate::wda::WdaClient,
-    rows: &[crate::wda::ElementRow],
+    w: &mut crate::runner::RunnerClient,
+    rows: &[crate::runner::ElementRow],
     index: usize,
     query: (&str, &str),
     element_ids: Vec<String>,
@@ -6806,7 +7036,7 @@ async fn pick_snapshot_element(
         .enumerate()
         .filter(|(_, row)| {
             snapshot_row_locator(row)
-                .and_then(|locator| locator_wda_query(&locator))
+                .and_then(|locator| locator_runner_query(&locator))
                 .is_some_and(|(using, value)| using == query.0 && value == query.1)
         })
         .map(|(i, _)| i)
@@ -6824,18 +7054,18 @@ fn rects_match(a: [f64; 4], b: [f64; 4]) -> bool {
     a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1.0)
 }
 
-/// WDA answers 404 on `element/:id/*` routes when the resolved element
+/// runner answers 404 on `element/:id/*` routes when the resolved element
 /// reference went stale between lookup and use (live-updating UI such as
 /// Spotlight results churns references within milliseconds — hardware-hit
 /// 2026-09-01). A 404 proves the mutation was NOT dispatched, so callers may
 /// safely surface it as retryable element_not_found instead of a
 /// retry_safe:false unknown outcome.
-fn wda_error_is_missing_element(error: &anyhow::Error) -> bool {
+fn runner_error_is_missing_element(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains("404 Not Found")
 }
 
 async fn tap_snapshot_element(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
 ) -> Result<(), SnapshotElementTapError> {
     // `value` is shadowed by the locator query below.
@@ -6881,7 +7111,7 @@ async fn tap_snapshot_element(
         // snapshot proves which semantic row the caller selected; re-resolve
         // that row and require exactly one native element before dispatching.
         // Never fall back to the suspect rectangle when semantic lookup fails.
-        let (using, value) = locator_wda_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
+        let (using, value) = locator_runner_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
         let element_ids = w
             .find_elements(using, &value)
             .await
@@ -6892,7 +7122,7 @@ async fn tap_snapshot_element(
             return Box::pin(tap_snapshot_element(w, request)).await;
         }
         return w.click_element(&element_id).await.map_err(|error| {
-            if wda_error_is_missing_element(&error) {
+            if runner_error_is_missing_element(&error) {
                 SnapshotElementTapError::NotFound
             } else {
                 SnapshotElementTapError::AfterDispatch(error)
@@ -6907,14 +7137,14 @@ async fn tap_snapshot_element(
 }
 
 /// `{"type":"set_value","element":N,"snapshot":"…","value":"…"}` — write a text
-/// field's contents directly through WDA's `element/:id/value` instead of the
+/// field's contents directly through runner's `element/:id/value` instead of the
 /// focus-tap-then-type dance. Clears first so the value REPLACES stale text;
 /// an empty string means "clear the field".
 /// Text inputs that `set_value` may resolve by frame when the row carries no
 /// label and no identifier.
 const TEXT_INPUT_KINDS: [&str; 4] = ["TextField", "SecureTextField", "SearchField", "TextView"];
 async fn set_value_snapshot_element(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
 ) -> Result<(), SnapshotElementTapError> {
     let text = value
@@ -6941,7 +7171,7 @@ async fn set_value_snapshot_element(
     if text.is_empty() {
         // Clearing IS the requested mutation — report its real outcome.
         return w.clear_element(&element_id).await.map_err(|error| {
-            if wda_error_is_missing_element(&error) {
+            if runner_error_is_missing_element(&error) {
                 SnapshotElementTapError::NotFound
             } else {
                 SnapshotElementTapError::AfterDispatch(error)
@@ -6958,7 +7188,7 @@ async fn set_value_snapshot_element(
     // `text` with `clear:true`): the clear is best-effort, the type is still
     // dispatched at most once.
     if let Err(error) = w.clear_element(&element_id).await {
-        tracing::warn!("wda clear_element before set_value: {error:#}");
+        tracing::warn!("runner clear_element before set_value: {error:#}");
     }
     let typed = w.type_into(&element_id, &text).await;
     if secure {
@@ -6980,15 +7210,15 @@ async fn set_value_snapshot_element(
             "value_not_applied",
             SET_VALUE_NOT_APPLIED_HINT,
         )),
-        // No readback: keep the dispatch outcome as WDA reported it.
+        // No readback: keep the dispatch outcome as runner reported it.
         _ => typed.map_err(set_value_dispatch_error),
     }
 }
 
-const SET_VALUE_NOT_APPLIED_HINT: &str = "WDA acknowledged the write but the field reads back a different value — web inputs and some custom fields ignore direct value writes, and autocorrect can rewrite text. Tap the field to focus it, send {\"type\":\"text\",\"text\":…}, then read the field again";
+const SET_VALUE_NOT_APPLIED_HINT: &str = "runner acknowledged the write but the field reads back a different value — web inputs and some custom fields ignore direct value writes, and autocorrect can rewrite text. Tap the field to focus it, send {\"type\":\"text\",\"text\":…}, then read the field again";
 
 fn set_value_dispatch_error(error: anyhow::Error) -> SnapshotElementTapError {
-    if wda_error_is_missing_element(&error) {
+    if runner_error_is_missing_element(&error) {
         SnapshotElementTapError::NotFound
     } else {
         SnapshotElementTapError::AfterDispatch(error)
@@ -7024,10 +7254,10 @@ const PERFORM_ACTION_NAMES: [&str; 11] = [
 ];
 
 /// Whether the matched row can carry a `perform` action at all. Gestures are
-/// universal; the value-shaped verbs are limited to kinds WDA can actually
+/// universal; the value-shaped verbs are limited to kinds runner can actually
 /// drive (a plain Button cannot `increment`), surfacing as
 /// `invalid_element_target` without any dispatch.
-fn perform_action_kind_permitted(action: &str, row: &crate::wda::ElementRow) -> bool {
+fn perform_action_kind_permitted(action: &str, row: &crate::runner::ElementRow) -> bool {
     match action {
         "increment" | "decrement" => {
             matches!(row.kind.as_str(), "PickerWheel" | "Stepper" | "Slider")
@@ -7044,9 +7274,9 @@ fn perform_action_kind_permitted(action: &str, row: &crate::wda::ElementRow) -> 
     }
 }
 
-/// The value an `adjust` sends to WDA, checked for shape before anything is
+/// The value an `adjust` sends to runner, checked for shape before anything is
 /// dispatched: it must be a JSON string (a picker option's text, or a slider
-/// position), and a slider position must be a normalized 0..1 number — WDA
+/// position), and a slider position must be a normalized 0..1 number — runner
 /// would silently clamp anything else on-device.
 fn adjust_target(kind: &str, value: Option<&serde_json::Value>) -> Result<String, SnapshotElementTapError> {
     let Some(target) = value.and_then(serde_json::Value::as_str) else {
@@ -7067,8 +7297,8 @@ fn adjust_target(kind: &str, value: Option<&serde_json::Value>) -> Result<String
     Ok(target.to_string())
 }
 
-/// Parse a slider row's current `value` into WDA's normalized 0..1 position.
-/// WDA reports sliders as a percent string (`"45%"`) or a bare fraction.
+/// Parse a slider row's current `value` into runner's normalized 0..1 position.
+/// runner reports sliders as a percent string (`"45%"`) or a bare fraction.
 fn slider_normalized_position(value: Option<&str>) -> Option<f64> {
     let value = value?.trim();
     let position = match value.strip_suffix('%') {
@@ -7089,7 +7319,7 @@ fn slider_normalized_position(value: Option<&str>) -> Option<f64> {
 /// This mirrors on a right-to-left device; the localized-label path above
 /// still covers the cases where the label is readable.
 async fn stepper_button_by_geometry(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     element_id: &str,
     action: &str,
 ) -> Result<String, SnapshotElementTapError> {
@@ -7137,7 +7367,7 @@ fn stepper_increment_is_second(first: &[f64; 4], second: &[f64; 4]) -> Option<bo
 }
 
 /// `{"type":"perform","element":N,"snapshot":"…","action":"…"}` — invoke a
-/// named affordance on a snapshot-bound element through WDA's element-scoped
+/// named affordance on a snapshot-bound element through runner's element-scoped
 /// routes (the caller has already checked the action against
 /// [`PERFORM_ACTION_NAMES`]). Reuses the whole fail-closed pipeline: snapshot
 /// token check, semantic re-resolution, and the 404 → `NotFound` remap on
@@ -7149,8 +7379,8 @@ fn stepper_increment_is_second(first: &[f64; 4], second: &[f64; 4]) -> Option<bo
 /// and take the one whose frame equals the row's rect; refuse rather than
 /// guess when two of them do.
 async fn resolve_row_by_frame(
-    w: &mut crate::wda::WdaClient,
-    row: &crate::wda::ElementRow,
+    w: &mut crate::runner::RunnerClient,
+    row: &crate::runner::ElementRow,
     class_chain: &str,
 ) -> Result<String, SnapshotElementTapError> {
     let candidates = w
@@ -7193,7 +7423,7 @@ const PERFORM_VERBS_WITH_FRAME_FALLBACK: &[&str] =
     &["toggle", "increment", "decrement", "adjust", "scroll_to_visible"];
 
 async fn perform_snapshot_element(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
 ) -> Result<(), SnapshotElementTapError> {
     let action = value
@@ -7223,7 +7453,7 @@ async fn perform_snapshot_element(
         Err(error) => return Err(error),
     };
     let after_dispatch = |error: anyhow::Error| {
-        if wda_error_is_missing_element(&error) {
+        if runner_error_is_missing_element(&error) {
             SnapshotElementTapError::NotFound
         } else {
             SnapshotElementTapError::AfterDispatch(error)
@@ -7284,7 +7514,7 @@ async fn perform_snapshot_element(
                     .map_err(after_dispatch)
             }
             "Stepper" => {
-                // A Stepper has no single WDA primitive; its two child
+                // A Stepper has no single runner primitive; its two child
                 // Buttons carry the affordance. Their labels are localized by
                 // iOS, so the literal English "Increment"/"Decrement" only
                 // matches on an English device (#57) — try it first, since it
@@ -7312,7 +7542,7 @@ async fn perform_snapshot_element(
             "Slider" => {
                 // No native slider increment: read the current normalized
                 // position from the snapshot row, step 10% of the range, and
-                // let WDA's adjustToNormalizedSliderPosition land it.
+                // let runner's adjustToNormalizedSliderPosition land it.
                 let position = slider_normalized_position(row.value.as_deref())
                     .ok_or(SnapshotElementTapError::InvalidTarget)?;
                 let step = if action == "increment" { 0.1 } else { -0.1 };
@@ -7329,14 +7559,14 @@ async fn perform_snapshot_element(
                 .await
                 .map_err(after_dispatch)?;
             if row.kind == "PickerWheel" {
-                // WDA answers 200 to a picker value that matches no option and
+                // runner answers 200 to a picker value that matches no option and
                 // leaves the wheel where it was (hardware-hit on the Clock
                 // timer, #57). Read the wheel back so a miss is reported as one.
                 if let Ok(Some(now)) = w.element_value(&element_id).await {
                     if now.trim() != target.trim() {
                         return Err(SnapshotElementTapError::NoEffect(
                             "adjust_no_effect",
-                            "WDA acknowledged the value but the picker did not move; the value must match one of the wheel's options exactly (read the row's value and try the option text as shown)",
+                            "runner acknowledged the value but the picker did not move; the value must match one of the wheel's options exactly (read the row's value and try the option text as shown)",
                         ));
                     }
                 }
@@ -7365,13 +7595,13 @@ async fn perform_snapshot_element(
             .map_err(after_dispatch),
         "scroll_to_visible" => match w.scroll_element_to_visible(&element_id).await {
             Ok(()) => Ok(()),
-            // WDA's scrollTo drives XCUITest's private "scroll then find a hit
+            // runner's scrollTo drives XCUITest's private "scroll then find a hit
             // point"; inside a WKWebView the element scrolls into view and the
-            // hit point still comes back nil, so WDA answers "invalid element
+            // hit point still comes back nil, so runner answers "invalid element
             // state" for a scroll that happened (issue #73, hardware-hit on a
             // bank form). Trust the screen, not the verdict: if the element's
             // frame is now mostly inside the window, the action succeeded.
-            Err(error) if !wda_error_is_missing_element(&error) => {
+            Err(error) if !runner_error_is_missing_element(&error) => {
                 let visible = async {
                     let rect = w.element_rect(&element_id).await?;
                     let (width, height) = w.window_size().await?;
@@ -7380,7 +7610,7 @@ async fn perform_snapshot_element(
                 .await;
                 match visible {
                     Ok(true) => {
-                        tracing::info!("scroll_to_visible: WDA reported failure but the element is on screen; treating as success ({error:#})");
+                        tracing::info!("scroll_to_visible: runner reported failure but the element is on screen; treating as success ({error:#})");
                         Ok(())
                     }
                     _ => Err(after_dispatch(error)),
@@ -7451,10 +7681,10 @@ async fn perform_snapshot_element(
             w.force_touch_element(&element_id, pressure, duration_s)
                 .await
                 .map_err(|error| {
-                    // WDA checks pressure support before it synthesizes any
+                    // runner checks pressure support before it synthesizes any
                     // touch, so this refusal is a definite "not sent" rather
                     // than an unknown outcome (issue #90).
-                    if error.is::<crate::wda::ForcePressUnsupported>() {
+                    if error.is::<crate::runner::ForcePressUnsupported>() {
                         SnapshotElementTapError::DeviceUnsupported
                     } else {
                         after_dispatch(error)
@@ -7499,7 +7729,7 @@ const SCROLLABLE_KINDS: [&str; 6] = [
 /// Looked up live rather than in the snapshot because the flattened tree drops
 /// label-less non-interactive nodes — which is exactly what most tables and
 /// scroll views are.
-async fn scroll_container_candidates(w: &mut crate::wda::WdaClient) -> Vec<[f64; 4]> {
+async fn scroll_container_candidates(w: &mut crate::runner::RunnerClient) -> Vec<[f64; 4]> {
     let mut candidates = Vec::new();
     for kind in SCROLLABLE_KINDS {
         let Ok(ids) = w
@@ -7560,13 +7790,13 @@ const PAGE_SCROLL_OBSTACLE_KINDS: &[&str] = &[
     "TabBar",
 ];
 
-/// A UIScrollView scroll indicator as WDA exposes it: an `Other` row whose value
+/// A UIScrollView scroll indicator as runner exposes it: an `Other` row whose value
 /// is a percentage ("0%", "48%") and whose rect is a thin bar. Its label is
 /// localized ("Vertical scroll bar, 4 pages" / "垂直滚动条, 4页"), so it is
 /// recognized by shape, not by text. A vertical indicator spans exactly the
 /// scroller's visible content area — in Safari that is y 62…894 of a
 /// full-screen scroll view, i.e. it excludes the top and bottom bars.
-fn is_vertical_scroll_indicator(row: &crate::wda::ElementRow) -> bool {
+fn is_vertical_scroll_indicator(row: &crate::runner::ElementRow) -> bool {
     let [_, _, w, h] = row.rect;
     row.kind == "Other"
         && w > 0.0
@@ -7592,9 +7822,9 @@ fn is_vertical_scroll_indicator(row: &crate::wda::ElementRow) -> bool {
 /// - Among start points whose drag stays inside the area, the one farthest
 ///   from any obstacle wins (ties go to the middle).
 ///
-/// Returns `(x1, y1, x2, y2)` in WDA points, or a hint when nothing qualifies.
+/// Returns `(x1, y1, x2, y2)` in runner points, or a hint when nothing qualifies.
 fn page_scroll_endpoints(
-    rows: &[crate::wda::ElementRow],
+    rows: &[crate::runner::ElementRow],
     containers: &[[f64; 4]],
     screen: (f64, f64),
     dx: f64,
@@ -7778,7 +8008,7 @@ fn element_swipe_endpoints(
 /// a specific element's rectangle (both gesture endpoints stay within it), so a
 /// list scrolls without the gesture straying into a neighboring scroll view.
 async fn scroll_snapshot_element(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
     guard_alert: bool,
     detail: &mut Option<serde_json::Value>,
@@ -7850,7 +8080,7 @@ enum UniqueLabelTapError {
     NotFound,
     /// Several rows match; carries `{"snapshot","matches":[...]}` when the
     /// daemon resolved them from the flattened tree (label taps), `None` when
-    /// the ambiguity came from WDA's live query (locator taps).
+    /// the ambiguity came from runner's live query (locator taps).
     Ambiguous(Option<serde_json::Value>),
     InvalidTarget,
     /// Refused before dispatch: `(error code, hint)`.
@@ -7860,7 +8090,7 @@ enum UniqueLabelTapError {
 }
 
 async fn tap_unique_label(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     label: &str,
     request: &serde_json::Value,
 ) -> Result<(), UniqueLabelTapError> {
@@ -7926,12 +8156,12 @@ async fn tap_unique_label(
 /// The row a label tap targets on `rows` and where it would land, or why it
 /// must not be sent.
 fn label_tap_target(
-    rows: &[crate::wda::ElementRow],
+    rows: &[crate::runner::ElementRow],
     label: &str,
     kind: Option<&str>,
     request: &serde_json::Value,
 ) -> Result<(usize, f64, f64), UniqueLabelTapError> {
-    let label_matches = |row: &crate::wda::ElementRow| {
+    let label_matches = |row: &crate::runner::ElementRow| {
         row.label == label && kind.is_none_or(|kind| row.kind == kind)
     };
     let mut matches: Vec<usize> = rows
@@ -8019,10 +8249,10 @@ fn label_tap_target(
 /// semantic locator finds exactly one live element with the same frame.
 /// Anything less (no locator, several matches, a read error) is "not proven",
 /// and the caller reads afresh.
-async fn reused_row_is_live(w: &mut crate::wda::WdaClient, row: &crate::wda::ElementRow) -> bool {
+async fn reused_row_is_live(w: &mut crate::runner::RunnerClient, row: &crate::runner::ElementRow) -> bool {
     let Some((using, value)) = snapshot_row_locator(row)
         .as_ref()
-        .and_then(locator_wda_query)
+        .and_then(locator_runner_query)
     else {
         return false;
     };
@@ -8045,7 +8275,7 @@ const ELEMENT_NOT_VISIBLE_HINT: &str = "nothing was sent: this element is on the
 /// A target outside the screen is no refusal here: a lite read marks every
 /// such row `visible:false`, and the caller scrolls it into view first.
 fn tap_target_refusal(
-    rows: &[crate::wda::ElementRow],
+    rows: &[crate::runner::ElementRow],
     index: usize,
     request: &serde_json::Value,
 ) -> Option<(&'static str, &'static str)> {
@@ -8081,7 +8311,7 @@ fn allows_occluded(request: &serde_json::Value) -> bool {
 
 /// Index one past the last descendant of `rows[index]` (rows are a pre-order
 /// walk with depths).
-fn subtree_end(rows: &[crate::wda::ElementRow], index: usize) -> usize {
+fn subtree_end(rows: &[crate::runner::ElementRow], index: usize) -> usize {
     let depth = rows[index].depth;
     rows.iter()
         .enumerate()
@@ -8092,14 +8322,14 @@ fn subtree_end(rows: &[crate::wda::ElementRow], index: usize) -> usize {
 
 /// The application's frame, from the Application root row when the tree
 /// has one with a real size. No root, no frame: nothing is called off-screen.
-fn screen_rect(rows: &[crate::wda::ElementRow]) -> Option<[f64; 4]> {
+fn screen_rect(rows: &[crate::runner::ElementRow]) -> Option<[f64; 4]> {
     rows.first()
         .filter(|row| row.kind == "Application")
         .map(|row| row.rect)
         .filter(|[_, _, w, h]| *w > 0.0 && *h > 0.0)
 }
 
-fn row_is_on_screen(rows: &[crate::wda::ElementRow], index: usize) -> bool {
+fn row_is_on_screen(rows: &[crate::runner::ElementRow], index: usize) -> bool {
     let row = &rows[index];
     if row.visible == Some(false) {
         return false;
@@ -8135,7 +8365,7 @@ const MAX_BAR_HEIGHT: f64 = 200.0;
 
 /// `rows[index]` is an item of a bar: it sits under a bar-sized
 /// NavigationBar, TabBar or Toolbar in the tree.
-fn bar_item(rows: &[crate::wda::ElementRow], index: usize) -> bool {
+fn bar_item(rows: &[crate::runner::ElementRow], index: usize) -> bool {
     rows[..index].iter().enumerate().any(|(j, row)| {
         BAR_KINDS.contains(&row.kind.as_str())
             && row.rect[3] <= MAX_BAR_HEIGHT
@@ -8149,7 +8379,7 @@ fn bar_item(rows: &[crate::wda::ElementRow], index: usize) -> bool {
 /// 开始使用 button scrolled behind the floating tab bar held the centre of the
 /// 主页 tab, and a locator tap on the visible tab answered
 /// `element_occluded` (a coordinate tap at the same spot worked).
-fn can_cover(rows: &[crate::wda::ElementRow], index: usize, j: usize) -> bool {
+fn can_cover(rows: &[crate::runner::ElementRow], index: usize, j: usize) -> bool {
     let row = &rows[j];
     !inline_siblings(rows, index, j)
         && !larger_sibling(rows, index, j)
@@ -8159,7 +8389,7 @@ fn can_cover(rows: &[crate::wda::ElementRow], index: usize, j: usize) -> bool {
 }
 
 /// The nearest row above `rows[index]` in the tree.
-fn parent_index(rows: &[crate::wda::ElementRow], index: usize) -> Option<usize> {
+fn parent_index(rows: &[crate::runner::ElementRow], index: usize) -> Option<usize> {
     let depth = rows.get(index)?.depth;
     rows[..index].iter().rposition(|row| row.depth < depth)
 }
@@ -8170,7 +8400,7 @@ fn parent_index(rows: &[crate::wda::ElementRow], index: usize) -> Option<usize> 
 /// glyphs are under it, so neither covers the other. Hardware, 17 Pro Max:
 /// inline links of a GitHub README in the in-app Safari sheet refused each
 /// other as `element_occluded`.
-fn inline_siblings(rows: &[crate::wda::ElementRow], index: usize, j: usize) -> bool {
+fn inline_siblings(rows: &[crate::runner::ElementRow], index: usize, j: usize) -> bool {
     rows[index].kind == "Link"
         && rows[j].kind == "Link"
         && parent_index(rows, index).is_some()
@@ -8184,7 +8414,7 @@ fn inline_siblings(rows: &[crate::wda::ElementRow], index: usize, j: usize) -> b
 /// inside the edge of 地址 [26,65,388,44], and a locator tap on the plainly
 /// visible 关闭 answered `element_occluded` (a coordinate tap worked).
 /// Floating overlays (search pill, bars, keyboard) still cover.
-fn larger_sibling(rows: &[crate::wda::ElementRow], index: usize, j: usize) -> bool {
+fn larger_sibling(rows: &[crate::runner::ElementRow], index: usize, j: usize) -> bool {
     let (target, other) = (&rows[index], &rows[j]);
     let area = |rect: [f64; 4]| rect[2].max(0.0) * rect[3].max(0.0);
     !floating_overlay(other)
@@ -8196,7 +8426,7 @@ fn larger_sibling(rows: &[crate::wda::ElementRow], index: usize, j: usize) -> bo
 /// Controls drawn over scrolling content whose glass reaches past their
 /// frame: iOS 26's floating search pill and bars, and the keyboard. Only
 /// these get [`OCCLUDER_MARGIN`]; any other control covers exactly its frame.
-fn floating_overlay(row: &crate::wda::ElementRow) -> bool {
+fn floating_overlay(row: &crate::runner::ElementRow) -> bool {
     row.kind == "SearchField"
         || row.kind == "Keyboard"
         || (BAR_KINDS.contains(&row.kind.as_str()) && row.rect[3] <= MAX_BAR_HEIGHT)
@@ -8208,7 +8438,7 @@ fn floating_overlay(row: &crate::wda::ElementRow) -> bool {
 /// the whole target (a full-row accessibility container is not a cover).
 /// Hardware-reported: a menu row sitting under a fixed header — the label tap
 /// was acknowledged and opened the header's points button instead.
-fn occluding_row(rows: &[crate::wda::ElementRow], index: usize) -> Option<&crate::wda::ElementRow> {
+fn occluding_row(rows: &[crate::runner::ElementRow], index: usize) -> Option<&crate::runner::ElementRow> {
     let target = rows.get(index)?;
     let (cx, cy) = element_center(target)?;
     let end = subtree_end(rows, index);
@@ -8245,7 +8475,7 @@ const OCCLUDER_MARGIN: f64 = 14.0;
 /// other control (a floating overlay grown by [`OCCLUDER_MARGIN`]) is over it, else the middle of
 /// the tallest horizontal band of the target that no control covers.
 /// `None` when every part of it is covered.
-fn clear_tap_point(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64, f64)> {
+fn clear_tap_point(rows: &[crate::runner::ElementRow], index: usize) -> Option<(f64, f64)> {
     let target = rows.get(index)?;
     let (cx, cy) = element_center(target)?;
     let [tx, ty, tw, th] = target.rect;
@@ -8326,7 +8556,7 @@ fn clear_tap_point(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64
 /// there reaches the status bar instead. Hardware, 14 Pro, Settings: a
 /// locator tap on 显示与亮度, scrolled to y 18–70 under the bars, hit the
 /// status bar's "◀ Self Runner" back link and switched apps.
-fn status_bar_band(rows: &[crate::wda::ElementRow], index: usize) -> Option<(f64, f64)> {
+fn status_bar_band(rows: &[crate::runner::ElementRow], index: usize) -> Option<(f64, f64)> {
     let [tx, ty, tw, th] = rows.get(index)?.rect;
     let top = screen_rect(rows).map_or(0.0, |screen| screen[1]);
     let bars = rows.iter().filter(|row| {
@@ -8358,7 +8588,7 @@ const STATUS_BAR_MAX_HEIGHT: f64 = 70.0;
 
 /// The target's centre sits under another control (grown by
 /// [`OCCLUDER_MARGIN`]).
-fn center_covered(rows: &[crate::wda::ElementRow], index: usize) -> bool {
+fn center_covered(rows: &[crate::runner::ElementRow], index: usize) -> bool {
     match (
         clear_tap_point(rows, index),
         rows.get(index).and_then(element_center),
@@ -8371,7 +8601,7 @@ fn center_covered(rows: &[crate::wda::ElementRow], index: usize) -> bool {
 
 /// `(x, y)` lies on the screen the tree describes. No Application frame, no
 /// verdict: the point is taken as on screen.
-fn point_on_screen(rows: &[crate::wda::ElementRow], x: f64, y: f64) -> bool {
+fn point_on_screen(rows: &[crate::runner::ElementRow], x: f64, y: f64) -> bool {
     screen_rect(rows)
         .is_none_or(|[sx, sy, sw, sh]| x >= sx && x <= sx + sw && y >= sy && y <= sy + sh)
 }
@@ -8380,7 +8610,7 @@ fn point_on_screen(rows: &[crate::wda::ElementRow], x: f64, y: f64) -> bool {
 /// Hardware, 17 Pro Max, the in-app Safari sheet: a locator tap on a link
 /// below the visible page answered `ok` and nothing happened — the runner
 /// tapped the link's off-screen centre.
-fn center_off_screen(rows: &[crate::wda::ElementRow], index: usize) -> bool {
+fn center_off_screen(rows: &[crate::runner::ElementRow], index: usize) -> bool {
     rows.get(index)
         .and_then(element_center)
         .is_some_and(|(x, y)| !point_on_screen(rows, x, y))
@@ -8388,7 +8618,7 @@ fn center_off_screen(rows: &[crate::wda::ElementRow], index: usize) -> bool {
 
 /// The target must be brought into view before a tap can reach it: its
 /// centre is under another control or off the screen.
-fn needs_reveal(rows: &[crate::wda::ElementRow], index: usize) -> bool {
+fn needs_reveal(rows: &[crate::runner::ElementRow], index: usize) -> bool {
     center_covered(rows, index) || center_off_screen(rows, index)
 }
 
@@ -8401,13 +8631,13 @@ const ELEMENT_OFF_SCREEN_HINT: &str = "nothing was sent: the element is outside 
 /// tap point we could compute. `None` when the row has no unique live
 /// element to scroll — the caller falls back to tapping by coordinates.
 async fn reveal_and_click(
-    w: &mut crate::wda::WdaClient,
-    row: &crate::wda::ElementRow,
+    w: &mut crate::runner::RunnerClient,
+    row: &crate::runner::ElementRow,
     was_off_screen: bool,
 ) -> Option<Result<(), RevealError>> {
     let (using, value) = snapshot_row_locator(row)
         .as_ref()
-        .and_then(locator_wda_query)?;
+        .and_then(locator_runner_query)?;
     let ids = w.find_elements(using, &value).await.ok()?;
     let [id] = ids.as_slice() else {
         return None;
@@ -8457,7 +8687,7 @@ enum RevealError {
 
 /// `row` again in a fresh read: the single row with its kind, label and
 /// identifier. `None` when it is gone or no longer unique.
-fn same_row(rows: &[crate::wda::ElementRow], row: &crate::wda::ElementRow) -> Option<usize> {
+fn same_row(rows: &[crate::runner::ElementRow], row: &crate::runner::ElementRow) -> Option<usize> {
     let mut matches = rows.iter().enumerate().filter(|(_, candidate)| {
         candidate.kind == row.kind
             && candidate.label == row.label
@@ -8470,8 +8700,8 @@ fn same_row(rows: &[crate::wda::ElementRow], row: &crate::wda::ElementRow) -> Op
 /// Scroll a live element clear of floating bars and wait until it stops
 /// moving. Shared by every element tap whose centre is covered, so snapshot,
 /// label and locator taps (single or batched) reveal the same way.
-async fn reveal_element(w: &mut crate::wda::WdaClient, id: &str) {
-    // Best effort: a scroll WDA calls failed can still have moved it.
+async fn reveal_element(w: &mut crate::runner::RunnerClient, id: &str) {
+    // Best effort: a scroll runner calls failed can still have moved it.
     if let Err(error) = w.scroll_element_to_visible(id).await {
         tracing::info!("reveal before tap: scrollTo said {error:#}");
     }
@@ -8496,7 +8726,7 @@ async fn reveal_element(w: &mut crate::wda::WdaClient, id: &str) {
 }
 
 async fn tap_unique_locator(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     locator: &AgentElementLocator,
     via_point: bool,
 ) -> Result<(), UniqueLabelTapError> {
@@ -8505,7 +8735,7 @@ async fn tap_unique_locator(
     // target; otherwise read afresh.
     // The unique match's index in `rows`; `Err(true)` when several match.
     fn unique_match(
-        rows: &[crate::wda::ElementRow],
+        rows: &[crate::runner::ElementRow],
         locator: &AgentElementLocator,
     ) -> Result<usize, bool> {
         let mut matches = rows
@@ -8549,12 +8779,12 @@ async fn tap_unique_locator(
 
     // `/source?format=json` can report stale/wrong rectangles for elements in
     // system-owned sheets (hardware-reproduced with the iOS share sheet's
-    // "Save to Files" cell). A coordinate tap at that rectangle returns a WDA
+    // "Save to Files" cell). A coordinate tap at that rectangle returns a runner
     // success envelope while landing elsewhere. Re-resolve the already-proven
-    // unique locator through WDA's live element query and invoke XCUIElement's
+    // unique locator through runner's live element query and invoke XCUIElement's
     // click action instead. Requiring exactly one returned element preserves
     // the fail-closed uniqueness contract across the second lookup.
-    let (using, value) = locator_wda_query(locator).ok_or(UniqueLabelTapError::InvalidTarget)?;
+    let (using, value) = locator_runner_query(locator).ok_or(UniqueLabelTapError::InvalidTarget)?;
     let element_ids = w
         .find_elements(using, &value)
         .await
@@ -8621,7 +8851,7 @@ async fn tap_unique_locator(
         // `"via":"point"`: some custom controls ignore XCUIElement's click
         // (hardware: Xiaohongshu's 30×30 back button ACKed two clicks and
         // stayed put; a coordinate tap at its centre worked). Tap the centre
-        // of the element's LIVE frame — from WDA's element query, not the
+        // of the element's LIVE frame — from runner's element query, not the
         // possibly stale /source rect the default path avoids.
         let [x, y, width, height] = w
             .element_rect(element_id)
@@ -8645,7 +8875,7 @@ async fn tap_unique_locator(
             .map_err(UniqueLabelTapError::AfterDispatch);
     }
     w.click_element(element_id).await.map_err(|error| {
-        if wda_error_is_missing_element(&error) {
+        if runner_error_is_missing_element(&error) {
             UniqueLabelTapError::NotFound
         } else {
             UniqueLabelTapError::AfterDispatch(error)
@@ -8653,31 +8883,41 @@ async fn tap_unique_locator(
     })
 }
 
-fn wda_predicate_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+fn runner_predicate_literal(value: &str) -> String {
+    // NSPredicate rejects literal line breaks inside quoted strings. Source
+    // values can contain them (for example a multiline SwiftUI composer).
+    format!(
+        "'{}'",
+        value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
 }
 
-/// Build a fresh WDA element lookup for a strict agent locator.
+/// Build a fresh runner element lookup for a strict agent locator.
 ///
-/// WDA's predicate attributes do not expose the source tree's
+/// runner's predicate attributes do not expose the source tree's
 /// `rawIdentifier`. When an identifier is the only condition, accessibility-id
 /// is the closest native lookup and the caller still requires exactly one
 /// result. When other fields exist, the source-tree precheck above enforces the
-/// identifier while the predicate re-resolves every WDA-queryable condition.
-fn locator_wda_query(locator: &AgentElementLocator) -> Option<(&'static str, String)> {
+/// identifier while the predicate re-resolves every runner-queryable condition.
+fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, String)> {
     let mut clauses = Vec::new();
     if let Some(kind) = &locator.kind {
         clauses.push(format!(
             "type == {}",
-            wda_predicate_literal(&format!("XCUIElementType{kind}"))
+            runner_predicate_literal(&format!("XCUIElementType{kind}"))
         ));
     }
     if let Some(label) = &locator.label {
-        let label = wda_predicate_literal(label);
+        let label = runner_predicate_literal(label);
         clauses.push(format!("(label == {label} OR name == {label})"));
     }
     if let Some(value) = &locator.value {
-        clauses.push(format!("value == {}", wda_predicate_literal(value)));
+        clauses.push(format!("value == {}", runner_predicate_literal(value)));
     }
     if let Some(focused) = locator.focused {
         clauses.push(format!("focused == {}", u8::from(focused)));
@@ -8698,13 +8938,13 @@ fn locator_wda_query(locator: &AgentElementLocator) -> Option<(&'static str, Str
     }
 }
 
-async fn wda_control_with_client(
-    w: &mut crate::wda::WdaClient,
+async fn runner_control_with_client(
+    w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
     guard_alert: bool,
-) -> WdaControlOutcome {
+) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let r: anyhow::Result<()> = match typ {
@@ -8714,27 +8954,27 @@ async fn wda_control_with_client(
                 .and_then(serde_json::Value::as_str)
                 .filter(|label| !label.is_empty())
             else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             match tap_unique_label(w, label, v).await {
                 Ok(()) => Ok(()),
                 Err(UniqueLabelTapError::NotFound) => {
-                    return WdaControlOutcome::ElementNotFound;
+                    return RunnerControlOutcome::ElementNotFound;
                 }
                 Err(UniqueLabelTapError::Ambiguous(candidates)) => {
                     *detail = candidates;
-                    return WdaControlOutcome::AmbiguousElement;
+                    return RunnerControlOutcome::AmbiguousElement;
                 }
                 Err(UniqueLabelTapError::InvalidTarget) => {
-                    return WdaControlOutcome::InvalidElementTarget;
+                    return RunnerControlOutcome::InvalidElementTarget;
                 }
                 Err(UniqueLabelTapError::Refused(error, hint)) => {
-                    return WdaControlOutcome::Refused(error, hint);
+                    return RunnerControlOutcome::Refused(error, hint);
                 }
                 Err(UniqueLabelTapError::BeforeDispatch(error)) => {
                     w.invalidate_session();
-                    tracing::warn!("wda control ({typ}) failed before dispatch: {error:#}");
-                    return WdaControlOutcome::NotSent;
+                    tracing::warn!("runner control ({typ}) failed before dispatch: {error:#}");
+                    return RunnerControlOutcome::NotSent;
                 }
                 Err(UniqueLabelTapError::AfterDispatch(error)) => Err(error),
             }
@@ -8761,7 +9001,7 @@ async fn wda_control_with_client(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|action| PERFORM_ACTION_NAMES.contains(&action))
             {
-                return WdaControlOutcome::UnsupportedPerformAction;
+                return RunnerControlOutcome::UnsupportedPerformAction;
             }
             let result = perform_snapshot_element(w, v).await;
             match snapshot_element_outcome(result, w, "control perform") {
@@ -8769,7 +9009,7 @@ async fn wda_control_with_client(
                 Err(outcome) => return outcome,
             }
         }
-        // System alerts through WDA's native alert routes. Hardware-hit on
+        // System alerts through runner's native alert routes. Hardware-hit on
         // stock Settings: the alert never showed in the flattened tree and an
         // element click on its button was ACKed without effect — the native
         // route is the reliable path. `{"type":"alert","button":"…"}` presses a
@@ -8788,30 +9028,30 @@ async fn wda_control_with_client(
                 Ok(current) => current,
                 Err(error) => {
                     w.invalidate_session();
-                    tracing::warn!("wda alert probe failed before dispatch: {error:#}");
-                    return WdaControlOutcome::NotSent;
+                    tracing::warn!("runner alert probe failed before dispatch: {error:#}");
+                    return RunnerControlOutcome::NotSent;
                 }
             };
             let Some((_, buttons)) = current else {
-                return WdaControlOutcome::NoAlert;
+                return RunnerControlOutcome::NoAlert;
             };
             match (button, action) {
                 (Some(name), None) => {
                     if !buttons.iter().any(|candidate| candidate == name) {
-                        return WdaControlOutcome::ElementNotFound;
+                        return RunnerControlOutcome::ElementNotFound;
                     }
                     w.alert_accept(Some(name)).await
                 }
                 (None, Some("accept")) => w.alert_accept(None).await,
                 (None, Some("dismiss")) => w.alert_dismiss().await,
-                _ => return WdaControlOutcome::Unsupported,
+                _ => return RunnerControlOutcome::Unsupported,
             }
         }
         "scroll" if v.get("page").and_then(serde_json::Value::as_bool) == Some(true) => {
             let dx = v.get("dx").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
             let dy = v.get("dy").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
             if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             }
             // Everything below is a read: a failure before the swipe is a
             // clean not-sent.
@@ -8825,16 +9065,16 @@ async fn wda_control_with_client(
             match plan {
                 Err(error) => {
                     w.invalidate_session();
-                    tracing::warn!("wda control (scroll page) failed before dispatch: {error:#}");
-                    return WdaControlOutcome::NotSent;
+                    tracing::warn!("runner control (scroll page) failed before dispatch: {error:#}");
+                    return RunnerControlOutcome::NotSent;
                 }
-                Ok(Err(hint)) => return WdaControlOutcome::NoPageScroller(hint),
+                Ok(Err(hint)) => return RunnerControlOutcome::NoPageScroller(hint),
                 Ok(Ok((x1, y1, x2, y2))) => {
                     tracing::info!("scroll page: drag ({x1:.0},{y1:.0}) -> ({x2:.0},{y2:.0})");
                     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
                     let duration = (dist * 1.2).clamp(120.0, 600.0) as u64;
                     if refuse_scroll_alert(w, guard_alert, detail).await {
-                        return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+                        return RunnerControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
                     }
                     w.swipe(x1, y1, x2, y2, duration).await
                 }
@@ -8855,15 +9095,15 @@ async fn wda_control_with_client(
                 (Some(x), Some(y)) if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) => {
                     async {
                         let (sw, sh) = w.window_size().await?;
-                        w.tap_point(normalized_wda_axis(x, sw)?, normalized_wda_axis(y, sh)?)
+                        w.tap_point(normalized_runner_axis(x, sw)?, normalized_runner_axis(y, sh)?)
                             .await
                     }
                     .await
                 }
                 (x, y) if coordinates_out_of_range(&[x, y]) => {
-                    return WdaControlOutcome::InvalidValue(COORDINATES_HINT);
+                    return RunnerControlOutcome::InvalidValue(COORDINATES_HINT);
                 }
-                _ => return WdaControlOutcome::Unsupported,
+                _ => return RunnerControlOutcome::Unsupported,
             }
         }
         "longpress" => match (
@@ -8875,8 +9115,8 @@ async fn wda_control_with_client(
                     let (sw, sh) = w.window_size().await?;
                     let duration = v.get("duration_ms").and_then(|x| x.as_u64()).unwrap_or(600);
                     w.longpress_point(
-                        normalized_wda_axis(x, sw)?,
-                        normalized_wda_axis(y, sh)?,
+                        normalized_runner_axis(x, sw)?,
+                        normalized_runner_axis(y, sh)?,
                         duration,
                     )
                     .await
@@ -8884,9 +9124,9 @@ async fn wda_control_with_client(
                 .await
             }
             (x, y) if coordinates_out_of_range(&[x, y]) => {
-                return WdaControlOutcome::InvalidValue(COORDINATES_HINT);
+                return RunnerControlOutcome::InvalidValue(COORDINATES_HINT);
             }
-            _ => return WdaControlOutcome::Unsupported,
+            _ => return RunnerControlOutcome::Unsupported,
         },
         "scroll" => {
             let nx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.5);
@@ -8894,11 +9134,11 @@ async fn wda_control_with_client(
             let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
             let dy = v.get("dy").and_then(|y| y.as_f64()).unwrap_or(0.0);
             if coordinates_out_of_range(&[Some(nx), Some(ny)]) {
-                return WdaControlOutcome::InvalidValue(COORDINATES_HINT);
+                return RunnerControlOutcome::InvalidValue(COORDINATES_HINT);
             }
             if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) || (dx == 0.0 && dy == 0.0)
             {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             }
             if guard_alert {
                 let plan = async {
@@ -8909,7 +9149,7 @@ async fn wda_control_with_client(
                 match plan {
                     Ok((x1, y1, x2, y2)) => {
                         if refuse_scroll_alert(w, guard_alert, detail).await {
-                            return WdaControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+                            return RunnerControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
                         }
                         let duration = (((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt() * 1.2)
                             .clamp(120.0, 600.0) as u64;
@@ -8918,17 +9158,17 @@ async fn wda_control_with_client(
                     Err(error) => Err(error),
                 }
             } else {
-                wda_swipe(w, nx, ny, dx, dy).await
+                runner_swipe(w, nx, ny, dx, dy).await
             }
         }
         "text" => match v.get("text").and_then(|t| t.as_str()) {
             Some(t) => w.keys(t).await,
-            None => return WdaControlOutcome::Unsupported,
+            None => return RunnerControlOutcome::Unsupported,
         },
         "key" => match v.get("name").and_then(|n| n.as_str()) {
             Some("dismiss" | "hide") => w.dismiss_keyboard().await,
             Some(name) => w.named_key(name).await,
-            None => return WdaControlOutcome::Unsupported,
+            None => return RunnerControlOutcome::Unsupported,
         },
         "keyboard" => w.dismiss_keyboard().await,
         "home" => w.press_home().await,
@@ -8940,17 +9180,17 @@ async fn wda_control_with_client(
             // verify the search field before reporting success.
             Some("spotlight") => w.open_spotlight().await,
             // App switcher: the swipe-up-from-the-home-indicator is a system
-            // gesture WDA can't synthesize (hardware-verified: from Home it goes
+            // gesture runner can't synthesize (hardware-verified: from Home it goes
             // Home, from an app the swipe is absorbed — the switcher never opens).
-            // There is no WDA element to tap either, so it's unreachable in agent
+            // There is no runner element to tap either, so it's unreachable in agent
             // mode. Report unhandled; the web client shows a hint instead of
             // sending a no-op.
-            Some("switcher") => return WdaControlOutcome::Unsupported,
-            _ => return WdaControlOutcome::Unsupported,
+            Some("switcher") => return RunnerControlOutcome::Unsupported,
+            _ => return RunnerControlOutcome::Unsupported,
         },
         // A whole swipe gesture as ONE on-device drag (start→end). The web client
         // sends this on pointer-up in agent mode instead of streaming per-move
-        // scroll deltas (WDA has no scroll-wheel; a delta stream turned into a
+        // scroll deltas (runner has no scroll-wheel; a delta stream turned into a
         // storm of discrete swipes that kept scrolling after release — issue: the
         // screen "kept moving" after the finger stopped).
         "swipe" | "drag" => {
@@ -8964,10 +9204,10 @@ async fn wda_control_with_client(
                     let plan = async {
                         let (sw, sh) = w.window_size().await?;
                         let (ax, ay, bx, by) = (
-                            normalized_wda_axis(x1, sw)?,
-                            normalized_wda_axis(y1, sh)?,
-                            normalized_wda_axis(x2, sw)?,
-                            normalized_wda_axis(y2, sh)?,
+                            normalized_runner_axis(x1, sw)?,
+                            normalized_runner_axis(y1, sh)?,
+                            normalized_runner_axis(x2, sw)?,
+                            normalized_runner_axis(y2, sh)?,
                         );
                         let dist = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
                         let duration = v
@@ -8981,7 +9221,7 @@ async fn wda_control_with_client(
                         Ok((ax, ay, bx, by, duration)) => {
                             let hold = v.get("hold_ms").and_then(|x| x.as_u64()).unwrap_or(500);
                             if refuse_scroll_alert(w, guard_alert, detail).await {
-                                return WdaControlOutcome::Refused(
+                                return RunnerControlOutcome::Refused(
                                     "alert_present",
                                     SCROLL_ALERT_HINT,
                                 );
@@ -8996,65 +9236,65 @@ async fn wda_control_with_client(
                     }
                 }
                 (x1, y1, x2, y2) if coordinates_out_of_range(&[x1, y1, x2, y2]) => {
-                    return WdaControlOutcome::InvalidValue(COORDINATES_HINT);
+                    return RunnerControlOutcome::InvalidValue(COORDINATES_HINT);
                 }
-                _ => return WdaControlOutcome::Unsupported,
+                _ => return RunnerControlOutcome::Unsupported,
             }
         }
         // Gestures arrive atomically as tap/longpress/swipe/drag; there is no
         // streaming down/move/up.
-        _ => return WdaControlOutcome::Unsupported,
+        _ => return RunnerControlOutcome::Unsupported,
     };
     match r {
         Ok(()) => {
             actionable.store(true, Ordering::Relaxed);
-            WdaControlOutcome::Applied
+            RunnerControlOutcome::Applied
         }
-        Err(e) if error_never_reached_wda(&e) => {
+        Err(e) if error_never_reached_runner(&e) => {
             // The relay refused the connection: nothing was delivered, so this
             // is a clean not-sent, and retrying is exactly right once the
             // relay is back. Still mark the read path unactionable so status
             // reflects the outage.
             actionable.store(false, Ordering::Relaxed);
             w.invalidate_session();
-            tracing::warn!("wda control ({typ}): not sent, WDA unreachable: {e:#}");
-            WdaControlOutcome::NotSent
+            tracing::warn!("runner control ({typ}): not sent, runner unreachable: {e:#}");
+            RunnerControlOutcome::NotSent
         }
         Err(e) => runner_failure_outcome(w, actionable, &e, typ, detail),
     }
 }
 
 /// A runner call failed after the request reached it. When the runner said it
-/// acted on nothing (see [`crate::wda::RunnerHttpError::nothing_sent`]) the
+/// acted on nothing (see [`crate::runner::RunnerHttpError::nothing_sent`]) the
 /// action was refused: the session and the read path stay as they were, and
 /// the cached window size goes (the refusal is a touch point off the screen
 /// the runner measures, so the daemon's size disagreed with it). Anything
 /// else fails closed as an unknown outcome. Either way the runner's own
 /// reason rides along in `detail.runner_error`.
 fn runner_failure_outcome(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
     error: &anyhow::Error,
     typ: &str,
     detail: &mut Option<serde_json::Value>,
-) -> WdaControlOutcome {
+) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
-    let runner = crate::wda::runner_http_error(error);
+    let runner = crate::runner::runner_http_error(error);
     if let Some(runner) = runner {
         *detail = Some(serde_json::json!({ "runner_error": runner.to_json() }));
     }
-    if runner.is_some_and(crate::wda::RunnerHttpError::nothing_sent) {
+    if runner.is_some_and(crate::runner::RunnerHttpError::nothing_sent) {
         let cached = w.forget_window_size();
         tracing::warn!(
-            "wda control ({typ}): refused by the runner before dispatch (daemon window size {cached:?}): {error:#}"
+            "runner control ({typ}): refused by the runner before dispatch (daemon window size {cached:?}): {error:#}"
         );
-        return WdaControlOutcome::RunnerRejected;
+        return RunnerControlOutcome::RunnerRejected;
     }
-    // A WDA call that should have worked failed. Callers fail closed.
+    // A runner call that should have worked failed. Callers fail closed.
     actionable.store(false, Ordering::Release);
     w.invalidate_session();
-    tracing::warn!("wda control ({typ}): {error:#}");
-    WdaControlOutcome::Failed
+    tracing::warn!("runner control ({typ}): {error:#}");
+    RunnerControlOutcome::Failed
 }
 
 /// `POST /control` — cookie-authenticated browser control for the direct backend.
@@ -9064,7 +9304,7 @@ fn runner_failure_outcome(
 /// Unlike the old data channel this endpoint acknowledges every command; the
 /// client must not show success unless it receives `{"ok":true}`.
 const DIRECT_CONTROL_MAX_TTL_MS: u64 = 2500;
-const AGENT_INPUT_WDA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const AGENT_INPUT_RUNNER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 /// Room for a 20 000-character text step (up to 80 KB of UTF-8) and the rest
 /// of a batch.
 const AGENT_ACTIONS_MAX_BODY_BYTES: usize = 256 * 1024;
@@ -9082,7 +9322,7 @@ const AGENT_ACTIONS_MAX_PAUSE_MS: u64 = 3_000;
 const AGENT_ACTIONS_MAX_DECLARED_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
 
-fn wda_deadline_response(dispatched: bool) -> Response {
+fn runner_deadline_response(dispatched: bool) -> Response {
     let (status, body) = if dispatched {
         (
             StatusCode::GATEWAY_TIMEOUT,
@@ -9110,17 +9350,17 @@ fn wda_deadline_response(dispatched: bool) -> Response {
 /// `None` means the dispatch never started. If the client cannot be read back
 /// promptly the answer stays the cautious "maybe sent".
 async fn posted_since(
-    wda: &tokio::sync::Mutex<crate::wda::WdaClient>,
+    runner: &tokio::sync::Mutex<crate::runner::RunnerClient>,
     mark: Option<Option<std::time::Instant>>,
 ) -> bool {
     let Some(mark) = mark else { return false };
-    match tokio::time::timeout(std::time::Duration::from_millis(500), wda.lock()).await {
+    match tokio::time::timeout(std::time::Duration::from_millis(500), runner.lock()).await {
         Ok(client) => client.last_post() != mark,
         Err(_) => true,
     }
 }
 
-fn wda_failed_after_dispatch_response() -> Response {
+fn runner_failed_after_dispatch_response() -> Response {
     with_security_headers(
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
@@ -9134,9 +9374,9 @@ fn wda_failed_after_dispatch_response() -> Response {
 
 /// `outcome_unknown`, carrying the runner's own reason (`runner_error`) when
 /// it answered with an error status (issue #257).
-fn wda_failed_after_dispatch_response_with(detail: Option<&serde_json::Value>) -> Response {
+fn runner_failed_after_dispatch_response_with(detail: Option<&serde_json::Value>) -> Response {
     let Some(runner_error) = detail.and_then(|d| d.get("runner_error")) else {
-        return wda_failed_after_dispatch_response();
+        return runner_failed_after_dispatch_response();
     };
     let body = serde_json::json!({
         "ok": false,
@@ -9175,13 +9415,13 @@ fn runner_rejected_response(detail: Option<&serde_json::Value>) -> Response {
     )
 }
 
-fn wda_failed_before_dispatch_response() -> Response {
+fn runner_failed_before_dispatch_response() -> Response {
     with_security_headers(
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"ok":false,"error":"wda_pre_dispatch_failed","outcome":"not_sent","retry_safe":true}"#,
+                r#"{"ok":false,"error":"runner_pre_dispatch_failed","outcome":"not_sent","retry_safe":true}"#,
             ))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
@@ -9268,7 +9508,7 @@ fn hinted_control_response(status: StatusCode, error: &str, outcome: &str, hint:
 }
 
 /// Hint for `force_press_unsupported` (issue #90).
-const FORCE_PRESS_UNSUPPORTED_HINT: &str = "this iPhone has no pressure-sensitive touch (3D Touch), so WDA refused force_press before touching the screen; nothing was sent. Use perform action \"menu\" (long press) for the context menu instead";
+const FORCE_PRESS_UNSUPPORTED_HINT: &str = "this iPhone has no pressure-sensitive touch (3D Touch), so runner refused force_press before touching the screen; nothing was sent. Use perform action \"menu\" (long press) for the context menu instead";
 
 fn force_press_unsupported_response() -> Response {
     hinted_control_response(
@@ -9314,7 +9554,7 @@ fn element_resolution_response(body: &'static str) -> Response {
 }
 
 /// Reject a single-step body whose `type` is missing, empty, or not a
-/// single-step action name, before any WDA work happens.
+/// single-step action name, before any runner work happens.
 ///
 /// The catalogue is `CAPABILITY_SINGLE_STEP_ACTIONS`, the same list
 /// `/agent/capabilities` advertises and
@@ -9368,15 +9608,15 @@ const TEXT_CHUNK_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::fro
 ///
 /// At most once, like every action: a chunk that fails is never resent. The
 /// outcome is `Applied` when every chunk was acknowledged, otherwise
-/// [`WdaControlOutcome::TextPartial`] with the acknowledged count — or
+/// [`RunnerControlOutcome::TextPartial`] with the acknowledged count — or
 /// `NotSent` when nothing at all reached the phone (no clear, no chunk).
 async fn type_text_chunked(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
     text: &str,
     clear: bool,
     deadline: tokio::time::Instant,
-) -> WdaControlOutcome {
+) -> RunnerControlOutcome {
     use crate::text_input::{char_count, chunk_timeout, split, typing_time, CHUNK_CHARS};
     use std::sync::atomic::Ordering;
     let deadline = deadline
@@ -9385,7 +9625,7 @@ async fn type_text_chunked(
     if clear {
         // As for short text: the clear is best-effort, the text is sent once.
         if let Err(error) = w.clear_active().await {
-            tracing::warn!("wda clear_active before chunked text: {error:#}");
+            tracing::warn!("runner clear_active before chunked text: {error:#}");
         }
     }
     let mut confirmed = 0;
@@ -9396,9 +9636,9 @@ async fn type_text_chunked(
             // Not enough time to type this chunk: stop before sending it.
             tracing::warn!("chunked text stopped at the deadline after {confirmed} characters");
             if confirmed == 0 && !clear {
-                return WdaControlOutcome::NotSent;
+                return RunnerControlOutcome::NotSent;
             }
-            return WdaControlOutcome::TextPartial {
+            return RunnerControlOutcome::TextPartial {
                 confirmed,
                 uncertain: 0,
             };
@@ -9407,7 +9647,7 @@ async fn type_text_chunked(
             actionable.store(false, Ordering::Release);
             w.invalidate_session();
             tracing::warn!("chunked text failed after {confirmed} characters: {error:#}");
-            return WdaControlOutcome::TextPartial {
+            return RunnerControlOutcome::TextPartial {
                 confirmed,
                 uncertain: n,
             };
@@ -9415,7 +9655,7 @@ async fn type_text_chunked(
         confirmed += n;
     }
     actionable.store(true, Ordering::Release);
-    WdaControlOutcome::Applied
+    RunnerControlOutcome::Applied
 }
 
 /// The body that tells an agent how far a long text got and how to finish it:
@@ -9537,7 +9777,7 @@ fn scroll_alert_guard<E>(
 }
 
 async fn refuse_scroll_alert(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     guard_alert: bool,
     detail: &mut Option<serde_json::Value>,
 ) -> bool {
@@ -9573,17 +9813,17 @@ async fn with_scroll_alert_detail(
 
 /// Execute one Direct agent action exactly once.
 ///
-/// Locator and geometry reads may precede the mutation, but once a mutating WDA
+/// Locator and geometry reads may precede the mutation, but once a mutating runner
 /// request has been sent this function never rebuilds the session and replays
 /// it. A lost response is therefore surfaced as an uncertain outcome rather
 /// than turning a tap, swipe, Home press, or text insertion into two actions.
 async fn direct_agent_action(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
     value: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
     deadline: tokio::time::Instant,
-) -> WdaControlOutcome {
+) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
 
     let typ = value
@@ -9604,7 +9844,7 @@ async fn direct_agent_action(
                         .map(str::to_string)
                 });
             let Some(bundle) = bundle else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             // `fresh`: quit it first, so it opens on its first screen and not
             // the page it was left on (recorded flows start there).
@@ -9626,10 +9866,10 @@ async fn direct_agent_action(
                 .and_then(serde_json::Value::as_str)
                 .filter(|url| crate::guard::parse_url(url).is_ok())
             else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             if crate::guard::Policy::get().check_url(value).is_err() {
-                return WdaControlOutcome::Refused(
+                return RunnerControlOutcome::Refused(
                     "url_scheme_not_allowed",
                     "the phone owner has not allowed this URL scheme (IPHONE_USE_ALLOW_URL_SCHEMES); http and https always open",
                 );
@@ -9642,27 +9882,27 @@ async fn direct_agent_action(
                 .and_then(serde_json::Value::as_str)
                 .filter(|label| !label.is_empty())
             else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             match tap_unique_label(w, label, value).await {
                 Ok(()) => Some(Ok(())),
                 Err(UniqueLabelTapError::NotFound) => {
-                    return WdaControlOutcome::ElementNotFound;
+                    return RunnerControlOutcome::ElementNotFound;
                 }
                 Err(UniqueLabelTapError::Ambiguous(candidates)) => {
                     *detail = candidates;
-                    return WdaControlOutcome::AmbiguousElement;
+                    return RunnerControlOutcome::AmbiguousElement;
                 }
                 Err(UniqueLabelTapError::InvalidTarget) => {
-                    return WdaControlOutcome::InvalidElementTarget;
+                    return RunnerControlOutcome::InvalidElementTarget;
                 }
                 Err(UniqueLabelTapError::Refused(error, hint)) => {
-                    return WdaControlOutcome::Refused(error, hint);
+                    return RunnerControlOutcome::Refused(error, hint);
                 }
                 Err(UniqueLabelTapError::BeforeDispatch(error)) => {
                     w.invalidate_session();
-                    tracing::warn!("wda agent action ({typ}) failed before dispatch: {error:#}");
-                    return WdaControlOutcome::NotSent;
+                    tracing::warn!("runner agent action ({typ}) failed before dispatch: {error:#}");
+                    return RunnerControlOutcome::NotSent;
                 }
                 Err(UniqueLabelTapError::AfterDispatch(error)) => Some(Err(error)),
             }
@@ -9681,35 +9921,35 @@ async fn direct_agent_action(
                 .and_then(|locator| serde_json::from_value::<AgentElementLocator>(locator).ok())
                 .filter(locator_has_condition)
             else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             let via_point = value.get("via").and_then(serde_json::Value::as_str) == Some("point");
             match tap_unique_locator(w, &locator, via_point).await {
                 Ok(()) => Some(Ok(())),
                 Err(UniqueLabelTapError::NotFound) => {
-                    return WdaControlOutcome::ElementNotFound;
+                    return RunnerControlOutcome::ElementNotFound;
                 }
                 Err(UniqueLabelTapError::Ambiguous(candidates)) => {
                     *detail = candidates;
-                    return WdaControlOutcome::AmbiguousElement;
+                    return RunnerControlOutcome::AmbiguousElement;
                 }
                 Err(UniqueLabelTapError::InvalidTarget) => {
-                    return WdaControlOutcome::InvalidElementTarget;
+                    return RunnerControlOutcome::InvalidElementTarget;
                 }
                 Err(UniqueLabelTapError::Refused(error, hint)) => {
-                    return WdaControlOutcome::Refused(error, hint);
+                    return RunnerControlOutcome::Refused(error, hint);
                 }
                 Err(UniqueLabelTapError::BeforeDispatch(error)) => {
                     w.invalidate_session();
-                    tracing::warn!("wda agent action ({typ}) failed before dispatch: {error:#}");
-                    return WdaControlOutcome::NotSent;
+                    tracing::warn!("runner agent action ({typ}) failed before dispatch: {error:#}");
+                    return RunnerControlOutcome::NotSent;
                 }
                 Err(UniqueLabelTapError::AfterDispatch(error)) => Some(Err(error)),
             }
         }
         "picker" => {
             let Some(target) = value.get("value").and_then(serde_json::Value::as_str) else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             let column = value
                 .get("column")
@@ -9745,7 +9985,7 @@ async fn direct_agent_action(
                 .unwrap_or(false) =>
         {
             let Some(text) = value.get("text").and_then(serde_json::Value::as_str) else {
-                return WdaControlOutcome::Unsupported;
+                return RunnerControlOutcome::Unsupported;
             };
             Some(
                 async {
@@ -9753,7 +9993,7 @@ async fn direct_agent_action(
                     // A clear error is best-effort, but the text insertion is
                     // still dispatched at most once.
                     if let Err(error) = w.clear_active().await {
-                        tracing::warn!("wda clear_active before text: {error:#}");
+                        tracing::warn!("runner clear_active before text: {error:#}");
                     }
                     w.keys(text).await
                 }
@@ -9764,12 +10004,12 @@ async fn direct_agent_action(
     };
 
     let Some(result) = custom_result else {
-        return wda_control_with_client(w, actionable, value, detail, true).await;
+        return runner_control_with_client(w, actionable, value, detail, true).await;
     };
     match result {
         Ok(()) => {
             actionable.store(true, Ordering::Release);
-            WdaControlOutcome::Applied
+            RunnerControlOutcome::Applied
         }
         Err(error) => runner_failure_outcome(w, actionable, &error, typ, detail),
     }
@@ -9824,7 +10064,7 @@ async fn direct_control(
     if let Err(refused) = claim_phone_owner(&state, &headers) {
         return refused;
     }
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return target_not_configured_response();
     }
     let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&body) {
@@ -9854,9 +10094,9 @@ async fn direct_control(
     if let Some(refusal) = stale_action_lock_refusal(&state).await {
         return refusal.into_response();
     }
-    let lifecycle = state.wda_lifecycle.current();
-    let releasing = lifecycle == WdaLifecycleTransition::Releasing;
-    let reconnecting = lifecycle == WdaLifecycleTransition::Reconnecting;
+    let lifecycle = state.runner_lifecycle.current();
+    let releasing = lifecycle == RunnerLifecycleTransition::Releasing;
+    let reconnecting = lifecycle == RunnerLifecycleTransition::Reconnecting;
     let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
     if releasing || reconnecting || released {
         let error = if releasing {
@@ -9877,30 +10117,30 @@ async fn direct_control(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     }
-    let Some(wda) = &state.wda else {
+    let Some(runner) = &state.runner else {
         return with_security_headers(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"ok":false,"error":"wda_not_configured"}"#,
+                r#"{"ok":false,"error":"runner_not_configured"}"#,
             )
                 .into_response(),
         );
     };
     if tokio::time::Instant::now() >= deadline {
-        return wda_deadline_response(false);
+        return runner_deadline_response(false);
     }
-    let _priority = state.begin_wda_control();
+    let _priority = state.begin_runner_control();
     let dispatched = Arc::new(std::sync::Mutex::new(None::<Option<std::time::Instant>>));
     let dispatch_marker = dispatched.clone();
     let mut detail: Option<serde_json::Value> = None;
-    // One deadline covers BOTH mutex acquisition and the WDA action. Re-check
+    // One deadline covers BOTH mutex acquisition and the runner action. Re-check
     // lifecycle after acquiring the mutex: a request that sat behind a status
     // probe or previous gesture must never execute after its browser was already
     // told it timed out or after release began.
     let outcome = tokio::time::timeout_at(deadline, async {
-        let mut client = wda.lock().await;
+        let mut client = runner.lock().await;
         if tokio::time::Instant::now() >= deadline
-            || state.wda_lifecycle.is_transitioning()
+            || state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
             return None;
@@ -9913,9 +10153,9 @@ async fn direct_control(
             None
         };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        let outcome = wda_control_with_client(
+        let outcome = runner_control_with_client(
             &mut client,
-            &state.wda_actionable,
+            &state.runner_actionable,
             &value,
             &mut detail,
             false,
@@ -9926,21 +10166,21 @@ async fn direct_control(
     .await;
     let outcome = match outcome {
         Ok(Some((outcome, recorded_locator))) => {
-            if outcome == WdaControlOutcome::Applied {
+            if outcome == RunnerControlOutcome::Applied {
                 record_control_step(&state, &value, recorded_locator);
             }
             outcome
         }
-        Ok(None) => return wda_deadline_response(false),
+        Ok(None) => return runner_deadline_response(false),
         Err(_) => {
             let mark = *recover(dispatched.lock());
-            return wda_deadline_response(posted_since(wda, mark).await);
+            return runner_deadline_response(posted_since(runner, mark).await);
         }
     };
-    if outcome == WdaControlOutcome::Applied {
+    if outcome == RunnerControlOutcome::Applied {
         state.touch_activity();
-        let locked = recover(state.wda_health.lock()).locked;
-        *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+        let locked = recover(state.runner_health.lock()).locked;
+        *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -9954,57 +10194,57 @@ async fn direct_control(
         );
     }
 
-    if outcome == WdaControlOutcome::Failed {
-        let locked = recover(state.wda_health.lock()).locked;
-        *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+    if outcome == RunnerControlOutcome::Failed {
+        let locked = recover(state.runner_health.lock()).locked;
+        *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: false,
             locked,
         };
-        return wda_failed_after_dispatch_response_with(detail.as_ref());
+        return runner_failed_after_dispatch_response_with(detail.as_ref());
     }
-    if outcome == WdaControlOutcome::RunnerRejected {
+    if outcome == RunnerControlOutcome::RunnerRejected {
         return runner_rejected_response(detail.as_ref());
     }
-    if outcome == WdaControlOutcome::NotSent {
-        mark_wda_read_path_unactionable(&state);
-        return wda_failed_before_dispatch_response();
+    if outcome == RunnerControlOutcome::NotSent {
+        mark_runner_read_path_unactionable(&state);
+        return runner_failed_before_dispatch_response();
     }
-    if outcome == WdaControlOutcome::InvalidElementSnapshot {
+    if outcome == RunnerControlOutcome::InvalidElementSnapshot {
         return invalid_element_snapshot_response();
     }
-    if outcome == WdaControlOutcome::StaleElementSnapshot {
+    if outcome == RunnerControlOutcome::StaleElementSnapshot {
         return stale_element_snapshot_response();
     }
-    if outcome == WdaControlOutcome::ElementNotFound {
+    if outcome == RunnerControlOutcome::ElementNotFound {
         return element_not_found_response();
     }
-    if outcome == WdaControlOutcome::AmbiguousElement {
+    if outcome == RunnerControlOutcome::AmbiguousElement {
         return ambiguous_element_response(detail.as_ref());
     }
-    if outcome == WdaControlOutcome::InvalidElementTarget {
+    if outcome == RunnerControlOutcome::InvalidElementTarget {
         return invalid_element_target_response();
     }
-    if outcome == WdaControlOutcome::NoAlert {
+    if outcome == RunnerControlOutcome::NoAlert {
         return no_alert_response();
     }
-    if outcome == WdaControlOutcome::ForcePressUnsupported {
+    if outcome == RunnerControlOutcome::ForcePressUnsupported {
         return force_press_unsupported_response();
     }
-    if let WdaControlOutcome::NoPageScroller(hint) = outcome {
+    if let RunnerControlOutcome::NoPageScroller(hint) = outcome {
         return no_page_scroller_response(hint);
     }
-    if outcome == WdaControlOutcome::UnsupportedPerformAction {
+    if outcome == RunnerControlOutcome::UnsupportedPerformAction {
         return unsupported_perform_action_response();
     }
-    if outcome == WdaControlOutcome::Unsupported {
+    if outcome == RunnerControlOutcome::Unsupported {
         if let Err(response) = reject_unknown_single_step_action(&value) {
             return response;
         }
     }
     match outcome {
-        WdaControlOutcome::InvalidValue(hint) => {
+        RunnerControlOutcome::InvalidValue(hint) => {
             return hinted_control_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_value",
@@ -10012,10 +10252,10 @@ async fn direct_control(
                 hint,
             );
         }
-        WdaControlOutcome::NoEffect(error, hint) => {
+        RunnerControlOutcome::NoEffect(error, hint) => {
             return hinted_control_response(StatusCode::CONFLICT, error, "no_effect", hint);
         }
-        WdaControlOutcome::Refused(error, hint) => {
+        RunnerControlOutcome::Refused(error, hint) => {
             return hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint);
         }
         _ => {}
@@ -10052,7 +10292,7 @@ enum AgentActionStep {
         #[serde(default)]
         after_ms: u64,
     },
-    /// Poll the WDA element tree until every positive locator and the optional
+    /// Poll the runner element tree until every positive locator and the optional
     /// application match, while every negative locator remains absent.
     WaitFor {
         expect: AgentUiExpectation,
@@ -10152,8 +10392,8 @@ impl ControlRefusal {
         .with("reconnecting", serde_json::Value::Bool(false))
     }
 
-    fn wda_not_configured() -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "wda_not_configured", false)
+    fn runner_not_configured() -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "runner_not_configured", false)
     }
 
     /// `/agent/actions` also says, per its batch contract, that no step ran.
@@ -10200,7 +10440,7 @@ fn guard_owner(headers: &HeaderMap) -> String {
 /// Refuse `action` when a blocked app is in front and the action does not
 /// leave it. No read at all without a blocklist.
 async fn guard_foreground(
-    client: &mut crate::wda::WdaClient,
+    client: &mut crate::runner::RunnerClient,
     action: &serde_json::Value,
 ) -> Result<(), crate::guard::Refusal> {
     let policy = crate::guard::Policy::get();
@@ -10237,10 +10477,10 @@ fn should_unlock_before_action(
 /// always did and the lock is reported the usual way.
 async fn unlock_before_action(
     state: &AppState,
-    client: &mut crate::wda::WdaClient,
+    client: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
 ) {
-    let cached = recover(state.wda_health.lock()).locked;
+    let cached = recover(state.runner_health.lock()).locked;
     if !should_unlock_before_action(cached, crate::keep_awake::lock_report()) {
         return;
     }
@@ -10256,11 +10496,11 @@ async fn unlock_before_action(
         Ok(Ok(())) => {
             tracing::info!("the phone was locked; unlocked it (no passcode) before the action");
             crate::keep_awake::note_unlocked();
-            apply_wda_health_probe(
-                &state.wda_health,
-                &state.wda_actionable,
+            apply_runner_health_probe(
+                &state.runner_health,
+                &state.runner_actionable,
                 &state.released,
-                crate::wda::WdaHealth {
+                crate::runner::RunnerHealth {
                     updated_at: std::time::Instant::now(),
                     up: true,
                     actionable: true,
@@ -10274,28 +10514,28 @@ async fn unlock_before_action(
 }
 
 async fn stale_action_lock_refusal(state: &AppState) -> Option<ControlRefusal> {
-    if recover(state.wda_health.lock()).updated_at.elapsed() <= std::time::Duration::from_secs(5) {
+    if recover(state.runner_health.lock()).updated_at.elapsed() <= std::time::Duration::from_secs(5) {
         return None;
     }
-    let wda = state.wda.as_ref()?;
-    let _priority = state.begin_wda_control();
+    let runner = state.runner.as_ref()?;
+    let _priority = state.begin_runner_control();
     let locked = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        wda.lock().await.locked_unattached().await
+        runner.lock().await.locked_unattached().await
     })
     .await;
     if matches!(locked, Ok(Ok(true))) {
-        let health = *recover(state.wda_health.lock());
-        apply_wda_health_probe(
-            &state.wda_health,
-            &state.wda_actionable,
+        let health = *recover(state.runner_health.lock());
+        apply_runner_health_probe(
+            &state.runner_health,
+            &state.runner_actionable,
             &state.released,
-            crate::wda::WdaHealth {
+            crate::runner::RunnerHealth {
                 locked: Some(true),
                 actionable: false,
                 ..health
             },
         );
-        let hint = if !state.managed_wda && state.selfrunner_gateway.is_some() {
+        let hint = if !state.managed_runner && state.selfrunner_gateway.is_some() {
             "the phone is locked; call phone_reconnect once to unlock it remotely, then retry"
         } else {
             "the phone is locked; unlock it before sending an action"
@@ -10309,7 +10549,7 @@ async fn stale_action_lock_refusal(state: &AppState) -> Option<ControlRefusal> {
 }
 
 fn control_readiness_refusal(state: &Arc<AppState>) -> Option<ControlRefusal> {
-    if state.wda_lifecycle.is_releasing() {
+    if state.runner_lifecycle.is_releasing() {
         return Some(ControlRefusal::releasing());
     }
     // If the idle watchdog released the phone, one caller starts recovery while
@@ -10317,18 +10557,18 @@ fn control_readiness_refusal(state: &Arc<AppState>) -> Option<ControlRefusal> {
     // failed recovery therefore remains honest and retryable instead of briefly
     // reporting an active device that never restarted.
     if state.released.load(std::sync::atomic::Ordering::Acquire) {
-        if !state.managed_wda {
+        if !state.managed_runner {
             return Some(
                 ControlRefusal::new(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "wda_is_externally_managed",
+                    "runner_is_externally_managed",
                     false,
                 )
                 .with("recovery_owner", serde_json::json!("external"))
                 .with("reconnecting", serde_json::Value::Bool(false))
                 .with(
                     "hint",
-                    serde_json::json!("restart WDA on the configured endpoint's owning host"),
+                    serde_json::json!("restart runner on the configured endpoint's owning host"),
                 ),
             );
         }
@@ -10343,24 +10583,24 @@ fn control_readiness_refusal(state: &Arc<AppState>) -> Option<ControlRefusal> {
             );
         }
         start_released_recovery(state);
-        if state.wda_lifecycle.is_releasing() {
+        if state.runner_lifecycle.is_releasing() {
             return Some(ControlRefusal::releasing());
         }
         return Some(
             ControlRefusal::new(StatusCode::SERVICE_UNAVAILABLE, "reconnect_in_progress", true)
                 .with("reconnecting", serde_json::Value::Bool(true))
-                .with("hint", serde_json::json!("phone was idle-released to free it for hands-on use; managed WDA is restarting (~30-90s) — retry. If the phone is locked, unlock it once.")),
+                .with("hint", serde_json::json!("phone was idle-released to free it for hands-on use; managed runner is restarting (~30-90s) — retry. If the phone is locked, unlock it once.")),
         );
     }
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return Some(
             ControlRefusal::new(StatusCode::CONFLICT, "target_not_configured", false).with(
                 "hint",
-                serde_json::json!("run setup-wda.sh to select and persist the canonical iPhone before using Direct control"),
+                serde_json::json!("run setup-runner.sh to select and persist the canonical iPhone before using Direct control"),
             ),
         );
     }
-    if state.wda_lifecycle.is_reconnecting() {
+    if state.runner_lifecycle.is_reconnecting() {
         return Some(
             ControlRefusal::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -10914,7 +11154,7 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn agent_locator_matches(row: &crate::wda::ElementRow, locator: &AgentElementLocator) -> bool {
+fn agent_locator_matches(row: &crate::runner::ElementRow, locator: &AgentElementLocator) -> bool {
     locator
         .label
         .as_ref()
@@ -10942,7 +11182,7 @@ fn agent_locator_matches(row: &crate::wda::ElementRow, locator: &AgentElementLoc
 /// Label of the frontmost app as the flattened tree reports it: the single
 /// `Application` row. Satisfies `wait_for`'s `application` expectation, and
 /// lets an applied action say so when it moved the phone to another app.
-fn active_application(rows: &[crate::wda::ElementRow]) -> Option<String> {
+fn active_application(rows: &[crate::runner::ElementRow]) -> Option<String> {
     rows.iter()
         .find(|row| row.kind == "Application")
         .map(|row| row.label.clone())
@@ -10953,8 +11193,8 @@ fn active_application(rows: &[crate::wda::ElementRow]) -> Option<String> {
 /// either side (no `Application` row) is not a change — the tree simply did
 /// not say — so a missing row never fabricates an alarm.
 fn app_changed_json(
-    before: &[crate::wda::ElementRow],
-    after: &[crate::wda::ElementRow],
+    before: &[crate::runner::ElementRow],
+    after: &[crate::runner::ElementRow],
 ) -> Option<serde_json::Value> {
     let (from, to) = (active_application(before)?, active_application(after)?);
     (from != to).then(|| serde_json::json!({ "from": from, "to": to }))
@@ -10963,14 +11203,14 @@ fn app_changed_json(
 /// Evaluate one `wait_for` expectation against one tree read.
 ///
 /// The subtle failure this guards: an `absent` locator is "satisfied" by a tree
-/// that simply has nothing in it. WDA hands back an empty or container-only
+/// that simply has nothing in it. runner hands back an empty or container-only
 /// tree mid-transition and whenever the read path is degraded, so accepting
 /// that as proof of absence turns "I cannot see the screen" into "the thing is
 /// gone" — the single most misleading answer this endpoint could give. A sparse
 /// tree therefore never satisfies an `absent` expectation; the wait keeps
 /// polling and, if it runs out, says exactly why.
 fn agent_expectation_observation(
-    rows: &[crate::wda::ElementRow],
+    rows: &[crate::runner::ElementRow],
     expect: &AgentUiExpectation,
 ) -> (bool, serde_json::Value) {
     let application = active_application(rows);
@@ -11089,7 +11329,7 @@ enum AgentWaitReadError {
     TimedOut,
 }
 
-/// One WDA predicate per `present` locator, when the whole expectation can be
+/// One runner predicate per `present` locator, when the whole expectation can be
 /// polled that way: only `present` locators, each naming a label or an
 /// identifier, and nothing the predicate cannot say the way the flattened tree
 /// does (`value` is normalised there, a Cell can take its child's label, and
@@ -11136,7 +11376,7 @@ fn wait_probe_predicates(expect: &AgentUiExpectation) -> Option<Vec<String>> {
 /// probe that errors or runs out of time says nothing, so the caller reads the
 /// whole tree as before.
 async fn wait_probe_missed(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     probes: &[String],
     deadline: tokio::time::Instant,
 ) -> Option<bool> {
@@ -11153,14 +11393,14 @@ async fn wait_probe_missed(
 }
 
 async fn agent_wait_elements(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
-) -> Result<Vec<crate::wda::ElementRow>, AgentWaitReadError> {
+) -> Result<Vec<crate::runner::ElementRow>, AgentWaitReadError> {
     match tokio::time::timeout_at(deadline, w.elements()).await {
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(first_error)) => {
             // Source reads are idempotent. A WebView transition can invalidate
-            // one WDA session, so rebuild once within the same wait deadline.
+            // one runner session, so rebuild once within the same wait deadline.
             w.invalidate_session();
             match tokio::time::timeout_at(deadline, w.elements()).await {
                 Ok(Ok(rows)) => Ok(rows),
@@ -11263,11 +11503,11 @@ fn agent_actions_failure_body(
     body
 }
 
-/// `POST /agent/actions` — execute a bounded, fail-closed Direct/WDA sequence.
+/// `POST /agent/actions` — execute a bounded, fail-closed Direct/runner sequence.
 ///
 /// The whole request is validated before any action is sent. It supports three
 /// step kinds: one existing input `action`, a short `pause`, and a semantic
-/// `wait_for` over the current application and element locators. The WDA lock is
+/// `wait_for` over the current application and element locators. The runner lock is
 /// held for the sequence so another daemon client cannot interleave gestures.
 /// Any failed action, expectation, read, lifecycle transition, or deadline stops
 /// the sequence immediately; later actions are never attempted.
@@ -11366,8 +11606,8 @@ async fn agent_actions_inner(
     if let Some(refusal) = control_readiness_refusal(&state) {
         return refusal.for_batch().into_response();
     }
-    let Some(wda) = &state.wda else {
-        return ControlRefusal::wda_not_configured()
+    let Some(runner) = &state.runner else {
+        return ControlRefusal::runner_not_configured()
             .for_batch()
             .into_response();
     };
@@ -11411,8 +11651,8 @@ async fn agent_actions_inner(
     });
     // Control priority first: a health probe must not hold the runner while
     // the focus step (or the action after it) waits for it.
-    let _priority = state.begin_wda_control();
-    engage_agent_focus(&state, wda, first_launch.flatten(), true).await;
+    let _priority = state.begin_runner_control();
+    engage_agent_focus(&state, runner, first_launch.flatten(), true).await;
     // Long text steps add their typing time (zero for text up to one chunk).
     let typing_allowance: std::time::Duration = request
         .steps
@@ -11423,7 +11663,7 @@ async fn agent_actions_inner(
         })
         .sum();
     let batch_deadline = tokio::time::Instant::now() + AGENT_ACTIONS_DEADLINE + typing_allowance;
-    let mut w = match tokio::time::timeout_at(batch_deadline, wda.lock()).await {
+    let mut w = match tokio::time::timeout_at(batch_deadline, runner.lock()).await {
         Ok(client) => client,
         Err(_) => {
             return agent_actions_failure(
@@ -11444,7 +11684,7 @@ async fn agent_actions_inner(
     let mut applied_actions = 0_usize;
     let mut step_results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
-        if state.wda_lifecycle.is_transitioning()
+        if state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
             return agent_actions_failure(
@@ -11521,7 +11761,7 @@ async fn agent_actions_inner(
                     batch_deadline,
                     direct_agent_action(
                         &mut w,
-                        &state.wda_actionable,
+                        &state.runner_actionable,
                         action,
                         &mut step_detail,
                         batch_deadline,
@@ -11531,7 +11771,7 @@ async fn agent_actions_inner(
                 {
                     Ok(outcome) => outcome,
                     Err(_) => {
-                        mark_wda_read_path_unactionable(&state);
+                        mark_runner_read_path_unactionable(&state);
                         // Only lookups ran: this step was never sent, so the
                         // batch may be retried from it.
                         let (status, error, outcome_name, retry_safe) =
@@ -11562,7 +11802,7 @@ async fn agent_actions_inner(
                 // alert is a pass: occasional system prompts ("Allow Paste")
                 // can be written into a flow without failing it when they do
                 // not appear.
-                if outcome == WdaControlOutcome::NoAlert && optional_alert(action) {
+                if outcome == RunnerControlOutcome::NoAlert && optional_alert(action) {
                     step_results.push(serde_json::json!({
                         "index": index,
                         "kind": "action",
@@ -11576,7 +11816,7 @@ async fn agent_actions_inner(
                 // "if_present":true}) whose element is not there: an in-app
                 // sheet or banner that shows only sometimes. Not found means
                 // nothing was sent.
-                if outcome == WdaControlOutcome::ElementNotFound && optional_tap(action) {
+                if outcome == RunnerControlOutcome::ElementNotFound && optional_tap(action) {
                     step_results.push(serde_json::json!({
                         "index": index,
                         "kind": "action",
@@ -11587,13 +11827,13 @@ async fn agent_actions_inner(
                     continue;
                 }
                 renew_after_long_text(&state, &headers, action);
-                if let WdaControlOutcome::TextPartial {
+                if let RunnerControlOutcome::TextPartial {
                     confirmed,
                     uncertain,
                 } = outcome
                 {
                     if uncertain > 0 {
-                        mark_wda_read_path_unactionable(&state);
+                        mark_runner_read_path_unactionable(&state);
                     }
                     let partial = text_partial_body(action, confirmed, uncertain);
                     let mut body = agent_actions_failure_body(
@@ -11617,104 +11857,104 @@ async fn agent_actions_inner(
                     }
                     return agent_actions_json(StatusCode::BAD_GATEWAY, body);
                 }
-                if outcome != WdaControlOutcome::Applied {
+                if outcome != RunnerControlOutcome::Applied {
                     let (status, error, outcome_name, current_retry_safe) = match outcome {
-                        WdaControlOutcome::NotSent => (
+                        RunnerControlOutcome::NotSent => (
                             StatusCode::BAD_GATEWAY,
-                            "wda_pre_dispatch_failed",
+                            "runner_pre_dispatch_failed",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::Unsupported => (
+                        RunnerControlOutcome::Unsupported => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "unsupported_control",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::UnsupportedPerformAction => (
+                        RunnerControlOutcome::UnsupportedPerformAction => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "unsupported_perform_action",
                             "not_sent",
                             false,
                         ),
-                        WdaControlOutcome::InvalidElementSnapshot => (
+                        RunnerControlOutcome::InvalidElementSnapshot => (
                             StatusCode::BAD_REQUEST,
                             "invalid_element_snapshot",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::StaleElementSnapshot => (
+                        RunnerControlOutcome::StaleElementSnapshot => (
                             StatusCode::CONFLICT,
                             "stale_element_snapshot",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::ElementNotFound => (
+                        RunnerControlOutcome::ElementNotFound => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "element_not_found",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::AmbiguousElement => (
+                        RunnerControlOutcome::AmbiguousElement => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "ambiguous_element_label",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::NoAlert => (
+                        RunnerControlOutcome::NoAlert => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "no_alert",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::InvalidElementTarget => (
+                        RunnerControlOutcome::InvalidElementTarget => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "invalid_element_target",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::InvalidValue(_) => (
+                        RunnerControlOutcome::InvalidValue(_) => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "invalid_value",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::NoEffect(error, _) => {
+                        RunnerControlOutcome::NoEffect(error, _) => {
                             (StatusCode::CONFLICT, error, "no_effect", true)
                         }
-                        WdaControlOutcome::Refused(error, _) => {
+                        RunnerControlOutcome::Refused(error, _) => {
                             (StatusCode::CONFLICT, error, "not_sent", true)
                         }
-                        WdaControlOutcome::ForcePressUnsupported => (
+                        RunnerControlOutcome::ForcePressUnsupported => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "force_press_unsupported",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::NoPageScroller(_) => (
+                        RunnerControlOutcome::NoPageScroller(_) => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "no_page_scroller",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::RunnerRejected => (
+                        RunnerControlOutcome::RunnerRejected => (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             "runner_rejected",
                             "not_sent",
                             true,
                         ),
-                        WdaControlOutcome::Failed => {
+                        RunnerControlOutcome::Failed => {
                             (StatusCode::BAD_GATEWAY, "outcome_unknown", "unknown", false)
                         }
-                        WdaControlOutcome::Applied | WdaControlOutcome::TextPartial { .. } => {
+                        RunnerControlOutcome::Applied | RunnerControlOutcome::TextPartial { .. } => {
                             unreachable!()
                         }
                     };
                     if matches!(
                         outcome,
-                        WdaControlOutcome::Failed | WdaControlOutcome::NotSent
+                        RunnerControlOutcome::Failed | RunnerControlOutcome::NotSent
                     ) {
-                        mark_wda_read_path_unactionable(&state);
+                        mark_runner_read_path_unactionable(&state);
                     }
                     let mut body = agent_actions_failure_body(
                         index,
@@ -11726,7 +11966,7 @@ async fn agent_actions_inner(
                         &step_results,
                         None,
                     );
-                    if let WdaControlOutcome::Refused(_, hint) = outcome {
+                    if let RunnerControlOutcome::Refused(_, hint) = outcome {
                         body["hint"] = serde_json::json!(hint);
                     }
                     // The runner's own reason for a refused or failed step.
@@ -11817,7 +12057,7 @@ async fn agent_actions_inner(
                 let reserve = std::time::Duration::from_millis((*timeout_ms / 3).min(2500));
                 loop {
                     attempts += 1;
-                    // While the targets are not there yet, ask WDA for just
+                    // While the targets are not there yet, ask runner for just
                     // them (~0.3 s) instead of the whole tree (~0.9–3 s). A
                     // hit, and the last poll of the window, still read the
                     // whole tree, so the verdict and its observation are
@@ -11850,7 +12090,7 @@ async fn agent_actions_inner(
                         Ok(rows) => rows,
                         Err(AgentWaitReadError::Failed(error)) => {
                             last_read_error = Some(format!("{error:#}"));
-                            // System sheets can briefly restart the WDA relay or
+                            // System sheets can briefly restart the runner relay or
                             // invalidate the app-scoped session after an applied
                             // action. A `wait_for` owns a bounded polling window,
                             // so keep rebuilding the read-only session inside that
@@ -11858,9 +12098,9 @@ async fn agent_actions_inner(
                             // connection refusals. No mutation is replayed.
                             if tokio::time::Instant::now() >= wait_deadline {
                                 tracing::warn!(
-                                    "wda batch wait_for source never recovered: {error:#}"
+                                    "runner batch wait_for source never recovered: {error:#}"
                                 );
-                                mark_wda_read_path_unactionable(&state);
+                                mark_runner_read_path_unactionable(&state);
                                 let error = format!("{error:#}");
                                 return agent_actions_failure(
                                     StatusCode::BAD_GATEWAY,
@@ -11870,7 +12110,7 @@ async fn agent_actions_inner(
                                     if probes_answered > 0 {
                                         "expectation_timeout"
                                     } else {
-                                        "wda_source_failed"
+                                        "runner_source_failed"
                                     },
                                     "not_sent",
                                     applied_actions == 0,
@@ -11900,7 +12140,7 @@ async fn agent_actions_inner(
                         Err(AgentWaitReadError::TimedOut) => {
                             if let Some(error) = last_read_error.as_deref() {
                                 tracing::warn!(
-                                    "wda batch wait_for source timed out after retries: {error}"
+                                    "runner batch wait_for source timed out after retries: {error}"
                                 );
                             }
                             w.invalidate_session();
@@ -11986,8 +12226,8 @@ async fn agent_actions_inner(
     }
 
     state.touch_activity();
-    let locked = recover(state.wda_health.lock()).locked;
-    *recover(state.wda_health.lock()) = crate::wda::WdaHealth {
+    let locked = recover(state.runner_health.lock()).locked;
+    *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {
         updated_at: std::time::Instant::now(),
         up: true,
         actionable: true,
@@ -12007,9 +12247,34 @@ async fn agent_actions_inner(
         if let Some((snapshot, rows)) = observed {
             let rows = Arc::new(rows);
             remember_element_snapshot(&state, &snapshot, &rows);
+            // Like an observed single action: against the last screen this
+            // owner saw, answer with what changed. Every batch used to
+            // carry the whole tree (Photos 精选集: 230 rows per batch).
+            let baseline = owner_last_snapshot(&state, &headers).and_then(|since| {
+                lookup_element_snapshot(&state, &since).map(|rows| (since, rows))
+            });
             note_owner_snapshot(&state, &headers, &snapshot);
             result["snapshot"] = serde_json::json!(snapshot);
-            result["elements"] = serde_json::json!(&*rows);
+            match baseline {
+                Some((baseline_id, baseline_rows)) => {
+                    let delta = diff_element_rows(&baseline_rows, &rows);
+                    if let Some(changed) = app_changed_json(&baseline_rows, &rows) {
+                        result["app_changed"] = changed;
+                    }
+                    // Nothing in common (another app, another screen): the
+                    // whole tree is no bigger than a delta of it.
+                    if delta.unchanged == 0 && !rows.is_empty() {
+                        result["elements"] = serde_json::json!(&*rows);
+                    } else {
+                        result["baseline"] = serde_json::json!(baseline_id);
+                        result["delta"] = elements_delta_json(&delta, &rows);
+                        if delta_shows_no_visible_change(&delta, &report) {
+                            result["no_visible_change"] = serde_json::Value::Bool(true);
+                        }
+                    }
+                }
+                None => result["elements"] = serde_json::json!(&*rows),
+            }
         }
         result["settle"] = report.to_json();
         if let Some(alert) = alert_json(probe_alert(&mut w).await) {
@@ -12031,9 +12296,9 @@ async fn agent_actions_inner(
 // ---------------------------------------------------------------------------
 
 /// The runner as a [`crate::collect::Pager`]: a page is the element tree, a
-/// swipe is the coordinate scroll `/agent/input` sends (`wda_swipe`).
+/// swipe is the coordinate scroll `/agent/input` sends (`runner_swipe`).
 struct RunnerPager<'a> {
-    w: &'a mut crate::wda::WdaClient,
+    w: &'a mut crate::runner::RunnerClient,
     screen: Option<(f64, f64)>,
     first_page: Option<crate::collect::Page>,
 }
@@ -12073,7 +12338,7 @@ impl crate::collect::Pager for RunnerPager<'_> {
         let region = region.unwrap_or(crate::collect::Region::FULL);
         let (x, y) = region.center();
         let dy = crate::collect::page_dy(region.h * height, direction);
-        wda_swipe(self.w, x, y, 0.0, dy).await?;
+        runner_swipe(self.w, x, y, 0.0, dy).await?;
         tokio::time::sleep(crate::collect::SWIPE_SETTLE).await;
         Ok(())
     }
@@ -12107,9 +12372,9 @@ fn invalid_list_request(detail: String) -> Response {
 async fn begin_list_control<'a>(
     state: &'a Arc<AppState>,
     headers: &HeaderMap,
-    wda: &'a tokio::sync::Mutex<crate::wda::WdaClient>,
+    runner: &'a tokio::sync::Mutex<crate::runner::RunnerClient>,
     deadline: tokio::time::Instant,
-) -> Result<tokio::sync::MutexGuard<'a, crate::wda::WdaClient>, Response> {
+) -> Result<tokio::sync::MutexGuard<'a, crate::runner::RunnerClient>, Response> {
     claim_phone_owner(state, headers)?;
     if let Some(refusal) = stale_action_lock_refusal(state).await {
         return Err(refusal.into_response());
@@ -12121,13 +12386,13 @@ async fn begin_list_control<'a>(
     state.cancel_settled_frame_prefetch();
     // Inside an app by definition: never a quiet moment for Do Not Disturb,
     // and no foreground look in front of the list read either.
-    engage_agent_focus(state, wda, None, false).await;
+    engage_agent_focus(state, runner, None, false).await;
     // These calls swipe: whatever screen the owner's tracker held is gone.
     if let Some(owner) = trusted_bearer_owner(state, headers) {
         crate::advice::reset(&owner);
     }
-    let mut w = wda.lock().await;
-    if state.wda_lifecycle.is_transitioning()
+    let mut w = runner.lock().await;
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Acquire)
     {
         return Err(json_response(
@@ -12157,7 +12422,7 @@ async fn begin_list_control<'a>(
 fn remember_page(
     state: &AppState,
     headers: &HeaderMap,
-    rows: Vec<crate::wda::ElementRow>,
+    rows: Vec<crate::runner::ElementRow>,
 ) -> Option<String> {
     let snapshot = element_snapshot_id(&rows).ok()?;
     let rows = Arc::new(rows);
@@ -12168,12 +12433,12 @@ fn remember_page(
 
 fn first_read_failed(state: &AppState, error: &anyhow::Error) -> Response {
     tracing::warn!("list read failed before any swipe: {error:#}");
-    mark_wda_read_path_unactionable(state);
+    mark_runner_read_path_unactionable(state);
     json_response(
         StatusCode::BAD_GATEWAY,
         serde_json::json!({
             "ok": false,
-            "error": "wda_source_failed",
+            "error": "runner_source_failed",
             "transitioning": true,
             "retry_safe": true,
             "swipes": 0,
@@ -12239,12 +12504,12 @@ async fn agent_collect(
         Err(detail) => return invalid_list_request(detail),
     };
     let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
-    let Some(wda) = state.wda.clone() else {
-        return ControlRefusal::wda_not_configured().into_response();
+    let Some(runner) = state.runner.clone() else {
+        return ControlRefusal::runner_not_configured().into_response();
     };
     let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
-    let _priority = state.begin_wda_control();
-    let mut w = match begin_list_control(&state, &headers, &wda, deadline).await {
+    let _priority = state.begin_runner_control();
+    let mut w = match begin_list_control(&state, &headers, &runner, deadline).await {
         Ok(w) => w,
         Err(refused) => return refused,
     };
@@ -12300,7 +12565,7 @@ enum FindVerdict {
     Blocked(&'static str),
 }
 
-fn find_verdict(rows: &[crate::wda::ElementRow], label: &str, kind: Option<&str>) -> FindVerdict {
+fn find_verdict(rows: &[crate::runner::ElementRow], label: &str, kind: Option<&str>) -> FindVerdict {
     match label_tap_target(rows, label, kind, &serde_json::json!({})) {
         Ok((index, _, _)) if center_off_screen(rows, index) || !row_is_on_screen(rows, index) => {
             FindVerdict::OffScreen(index)
@@ -12314,7 +12579,7 @@ fn find_verdict(rows: &[crate::wda::ElementRow], label: &str, kind: Option<&str>
     }
 }
 
-fn found_row_json(rows: &[crate::wda::ElementRow], index: usize) -> serde_json::Value {
+fn found_row_json(rows: &[crate::runner::ElementRow], index: usize) -> serde_json::Value {
     let row = &rows[index];
     serde_json::json!({
         "index": index,
@@ -12328,7 +12593,7 @@ fn found_row_json(rows: &[crate::wda::ElementRow], index: usize) -> serde_json::
 
 /// On-screen rows whose label contains `label` (case-insensitively), for a
 /// caller whose exact label did not match. Bounded.
-fn near_miss_candidates(rows: &[crate::wda::ElementRow], label: &str) -> Vec<serde_json::Value> {
+fn near_miss_candidates(rows: &[crate::runner::ElementRow], label: &str) -> Vec<serde_json::Value> {
     let needle = label.to_lowercase();
     rows.iter()
         .enumerate()
@@ -12343,55 +12608,54 @@ fn near_miss_candidates(rows: &[crate::wda::ElementRow], label: &str) -> Vec<ser
         .collect()
 }
 
-/// `POST /agent/scroll_find` — `{"label":"…","kind":"Button","max_swipes":1,
-/// "direction":"down","region":[x,y,w,h]}`: is the label on screen and
-/// tappable? If not, swipe (at most `max_swipes`, default 1) and look again.
-/// An ambiguous, covered or undrawn match stops at once, before any swipe.
-async fn agent_scroll_find(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
-    if let Err(refused) = authorize_list_call(&state, &headers) {
-        return refused;
-    }
-    let request = match serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|e| format!("body is not JSON: {e}"))
-        .and_then(|value| crate::collect::FindRequest::from_json(&value))
-    {
-        Ok(request) => request,
-        Err(detail) => return invalid_list_request(detail),
-    };
-    let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
-    let Some(wda) = state.wda.clone() else {
-        return ControlRefusal::wda_not_configured().into_response();
-    };
-    let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
-    let _priority = state.begin_wda_control();
-    let mut w = match begin_list_control(&state, &headers, &wda, deadline).await {
-        Ok(w) => w,
-        Err(refused) => return refused,
-    };
-    let mut pager = RunnerPager {
-        w: &mut w,
-        screen: None,
-        first_page: None,
-    };
-    use crate::collect::Pager as _;
-    let mut page = match pager.read().await {
-        Ok(page) => page,
-        Err(error) => {
-            drop(w);
-            return first_read_failed(&state, &error);
-        }
-    };
-    if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
-        return refusal;
-    }
+/// How [`run_scroll_find`] ended.
+struct FindRun {
+    verdict: FindVerdict,
+    /// The last page read; the verdict is about it.
+    page: crate::collect::Page,
+    swipes: u32,
+    stop_error: Option<(&'static str, String)>,
+    /// `page` is the screen as it stands: no gesture went out after it was
+    /// read (a failed read after a swipe leaves an older page).
+    current: bool,
+    /// Near misses seen on earlier pages and gone from the last one.
+    seen_earlier: Vec<serde_json::Value>,
+}
+
+/// Near misses kept from pages a swipe carried away.
+const SEEN_EARLIER_CAP: usize = 5;
+
+/// Look for `request.label` on `page`, swiping toward it at most
+/// `max_swipes` times. Every way out reads the screen after its last
+/// gesture: a swipe that reports failure may still have scrolled (hardware,
+/// Photos › 相簿: the third swipe "failed", the target was on screen), so the
+/// page is read once more and judged before giving up.
+async fn run_scroll_find<P: crate::collect::Pager>(
+    pager: &mut P,
+    mut page: crate::collect::Page,
+    request: &crate::collect::FindRequest,
+    deadline: tokio::time::Instant,
+) -> FindRun {
     let mut swipes = 0u32;
     let mut stop_error: Option<(&'static str, String)> = None;
+    let mut current = true;
+    let mut pages_read = 1u32;
+    let mut seen: Vec<(u32, serde_json::Value)> = Vec::new();
+    let mut note_near_misses = |page: &crate::collect::Page, number: u32| {
+        for candidate in near_miss_candidates(&page.rows, &request.label) {
+            let known = seen
+                .iter()
+                .any(|(_, old)| old["label"] == candidate["label"] && old["kind"] == candidate["kind"]);
+            if !known && seen.len() < SEEN_EARLIER_CAP * 2 {
+                seen.push((number, candidate));
+            }
+        }
+    };
     let verdict = loop {
         let verdict = find_verdict(&page.rows, &request.label, request.kind.as_deref());
+        if matches!(verdict, FindVerdict::NotFound) {
+            note_near_misses(&page, pages_read);
+        }
         let direction = match &verdict {
             FindVerdict::NotFound => request.direction,
             // Toward the row: below the screen means reveal what is below.
@@ -12414,19 +12678,116 @@ async fn agent_scroll_find(
         }
         if let Err(error) = pager.swipe(request.region, direction).await {
             stop_error = Some(("swipe_failed", format!("{error:#}")));
-            break verdict;
+            // The gesture may have landed anyway: judge the screen it left.
+            match pager.read().await {
+                Ok(next) => {
+                    page = next;
+                    pages_read += 1;
+                    let verdict =
+                        find_verdict(&page.rows, &request.label, request.kind.as_deref());
+                    if matches!(verdict, FindVerdict::NotFound) {
+                        note_near_misses(&page, pages_read);
+                    }
+                    break verdict;
+                }
+                Err(_) => {
+                    current = false;
+                    break verdict;
+                }
+            }
         }
         swipes += 1;
         match pager.read().await {
-            Ok(next) => page = next,
+            Ok(next) => {
+                page = next;
+                pages_read += 1;
+            }
             Err(error) => {
                 stop_error = Some(("read_failed", format!("{error:#}")));
+                current = false;
                 break verdict;
             }
         }
     };
+    let on_last: Vec<serde_json::Value> = near_miss_candidates(&page.rows, &request.label);
+    let seen_earlier = seen
+        .into_iter()
+        .filter(|(_, candidate)| {
+            !on_last
+                .iter()
+                .any(|last| last["label"] == candidate["label"] && last["kind"] == candidate["kind"])
+        })
+        .take(SEEN_EARLIER_CAP)
+        .map(|(number, candidate)| {
+            serde_json::json!({"kind": candidate["kind"], "label": candidate["label"], "page": number})
+        })
+        .collect();
+    FindRun {
+        verdict,
+        page,
+        swipes,
+        stop_error,
+        current,
+        seen_earlier,
+    }
+}
+
+/// `POST /agent/scroll_find` — `{"label":"…","kind":"Button","max_swipes":1,
+/// "direction":"down","region":[x,y,w,h]}`: is the label on screen and
+/// tappable? If not, swipe (at most `max_swipes`, default 1) and look again.
+/// An ambiguous, covered or undrawn match stops at once, before any swipe.
+async fn agent_scroll_find(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(refused) = authorize_list_call(&state, &headers) {
+        return refused;
+    }
+    let request = match serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|e| format!("body is not JSON: {e}"))
+        .and_then(|value| crate::collect::FindRequest::from_json(&value))
+    {
+        Ok(request) => request,
+        Err(detail) => return invalid_list_request(detail),
+    };
+    let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
+    let Some(runner) = state.runner.clone() else {
+        return ControlRefusal::runner_not_configured().into_response();
+    };
+    let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
+    let _priority = state.begin_runner_control();
+    let mut w = match begin_list_control(&state, &headers, &runner, deadline).await {
+        Ok(w) => w,
+        Err(refused) => return refused,
+    };
+    let mut pager = RunnerPager {
+        w: &mut w,
+        screen: None,
+        first_page: None,
+    };
+    use crate::collect::Pager as _;
+    let page = match pager.read().await {
+        Ok(page) => page,
+        Err(error) => {
+            drop(w);
+            return first_read_failed(&state, &error);
+        }
+    };
+    if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
+        return refusal;
+    }
+    let FindRun {
+        verdict,
+        page,
+        swipes,
+        stop_error,
+        current,
+        seen_earlier,
+    } = run_scroll_find(&mut pager, page, &request, deadline).await;
     drop(w);
     let mut body = serde_json::json!({"swipes": swipes, "max_swipes": request.max_swipes});
+    let found = matches!(verdict, FindVerdict::Found(_));
     if let Some(app) = active_application(&page.rows).filter(|app| !app.is_empty()) {
         body["app"] = app.into();
     }
@@ -12469,17 +12830,26 @@ async fn agent_scroll_find(
             body["stop_reason"] = "not_found".into();
             body["candidates"] = near_miss_candidates(&page.rows, &request.label).into();
             body["hint"] = "no row carries exactly this label after the allowed swipes; candidates are on-screen labels that contain it. Absence is not proof: check the screen before swiping again".into();
+            if !seen_earlier.is_empty() {
+                body["hint"] = "no row carries exactly this label after the allowed swipes; candidates are on-screen labels that contain it, seen_earlier lists ones a swipe carried off the screen (swipe back the other way to reach them). Absence is not proof: check the screen before swiping again".into();
+            }
         }
     }
-    if !matches!(verdict, FindVerdict::Found(_)) {
+    if !found {
         body["ok"] = false.into();
         body["found"] = false.into();
+        // Near misses a swipe carried off the screen: the row the caller
+        // meant may be among them, one swipe back.
+        if !seen_earlier.is_empty() {
+            body["seen_earlier"] = seen_earlier.into();
+        }
     }
-    // After a failed swipe or read the last tree read is no longer the
-    // screen: no snapshot to act on.
-    let current = !matches!(stop_error, Some(("swipe_failed" | "read_failed", _)));
+    // A found label wins over a failed gesture: the read after it showed
+    // the row, so the error is only reported alongside.
     if let Some((reason, error)) = stop_error {
-        body["stop_reason"] = reason.into();
+        if !found {
+            body["stop_reason"] = reason.into();
+        }
         body["stop_error"] = error.into();
     }
     if let Some(snapshot) = current.then(|| remember_page(&state, &headers, page.rows)).flatten() {
@@ -12567,7 +12937,7 @@ struct SettleReport {
     /// describe the tree, never the alert.
     budget_ms: u64,
     /// The observed tree carried nothing to act on — no rows at all, or only
-    /// container/decoration kinds (`ax_stats.container_only`). WDA returns a
+    /// container/decoration kinds (`ax_stats.container_only`). runner returns a
     /// bare tree mid transition, and two identical bare reads are NOT evidence
     /// the screen settled — they are evidence we cannot see it. A genuinely
     /// simple screen (an Application plus one real Button) is NOT sparse and
@@ -12627,19 +12997,19 @@ impl SettleReport {
 /// or only container/decoration rows. Reuses the same `container_only` fact
 /// `/agent/elements` already publishes via `ax_stats`, rather than inventing a
 /// second row-count threshold that would disagree with it.
-fn settle_tree_is_sparse(rows: &[crate::wda::ElementRow]) -> bool {
+fn settle_tree_is_sparse(rows: &[crate::runner::ElementRow]) -> bool {
     let stats = ax_stats(rows, None);
     stats.n == 0 || stats.container_only
 }
 
 /// One post-action tree read with a single stale-session retry (mirroring
 /// `/agent/elements`' read loop). BOTH the first read and the retry are bounded
-/// by the observation deadline: the WDA HTTP client's own 20s timeout, taken
+/// by the observation deadline: the runner HTTP client's own 20s timeout, taken
 /// twice, would otherwise outlive the action deadline and turn an applied
 /// action into an unknown outcome.
 enum SettleRead {
     /// A tree was read.
-    Read(String, Vec<crate::wda::ElementRow>),
+    Read(String, Vec<crate::runner::ElementRow>),
     /// The observation budget ran out mid-read. Running out of time is NOT the
     /// read path failing, and must not be reported as one.
     Deadline,
@@ -12648,7 +13018,7 @@ enum SettleRead {
 }
 
 async fn read_elements_once(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
 ) -> SettleRead {
     let rows = match tokio::time::timeout_at(deadline, w.elements()).await {
@@ -12680,11 +13050,11 @@ async fn read_elements_once(
 /// One screenshot for the settle check, capped well below the settle budget:
 /// a slow frame must cost at most this, never the observation.
 async fn settle_frame(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
 ) -> Option<Vec<u8>> {
     const SETTLE_FRAME_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
-    // WDA answers one request at a time: a frame that timed out still holds
+    // runner answers one request at a time: a frame that timed out still holds
     // it, and the tree read behind it waits. After one slow or failed frame
     // the settle check stays tree-vs-tree for a while.
     const SLOW_FRAME_BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
@@ -12719,7 +13089,7 @@ const SETTLED_FRAME_MAX_SIDE: u32 = 1600;
 /// request cancels it (see [`AppState::cancel_settled_frame_prefetch`]).
 fn capture_settled_frame_later(
     state: &AppState,
-    wda: Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
+    runner: Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>,
     post_mark: Option<std::time::Instant>,
 ) {
     let mut slot = recover(state.settled_frame_prefetch.lock());
@@ -12727,14 +13097,14 @@ fn capture_settled_frame_later(
         previous.abort();
     }
     let task = tokio::spawn(async move {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         if w.last_post() != post_mark || w.settled_frame(SETTLED_FRAME_MAX_AGE).is_some() {
             return;
         }
         // Sized on the phone: the agent that looks next asks for a size
         // (phone_screenshot: 1200), and over Wi-Fi a full PNG of a big phone
         // is megabytes the 3 s budget may not carry.
-        let shot = crate::wda::ShotRequest::jpeg(Some(SETTLED_FRAME_MAX_SIDE));
+        let shot = crate::runner::ShotRequest::jpeg(Some(SETTLED_FRAME_MAX_SIDE));
         let budget = std::time::Duration::from_secs(3);
         if let Ok(Ok(frame)) = tokio::time::timeout(budget, w.screenshot_sized(shot, budget)).await
         {
@@ -12763,12 +13133,12 @@ fn frame_is_blank(png: &[u8]) -> bool {
 /// what is left of the budget — when the runner has no such route, or its
 /// captures are blank (an app hiding its screen: frames prove nothing).
 async fn settle_on_device(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     started: tokio::time::Instant,
     deadline: tokio::time::Instant,
     budget: std::time::Duration,
     device_cap: std::time::Duration,
-) -> Option<(Option<(String, Vec<crate::wda::ElementRow>)>, SettleReport)> {
+) -> Option<(Option<(String, Vec<crate::runner::ElementRow>)>, SettleReport)> {
     /// Unchanged this long counts as settled; a push or a sheet animates
     /// continuously, so a quiet gap this long means it ended.
     const QUIET: std::time::Duration = std::time::Duration::from_millis(150);
@@ -12826,10 +13196,10 @@ async fn settle_on_device(
 }
 
 async fn settle_and_read_elements(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     budget: std::time::Duration,
     device_cap: std::time::Duration,
-) -> (Option<(String, Vec<crate::wda::ElementRow>)>, SettleReport) {
+) -> (Option<(String, Vec<crate::runner::ElementRow>)>, SettleReport) {
     let started = tokio::time::Instant::now();
     let mut report = SettleReport::new(budget.as_millis() as u64);
     // A zero budget is the caller declining observation, not a failure.
@@ -12871,7 +13241,7 @@ async fn settle_and_read_elements(
     report.captures = 1;
     report.sparse = settle_tree_is_sparse(&rows);
     // Settled already? Frames taken right before and right after the read are
-    // byte-identical when nothing moved while WDA built the tree — then that
+    // byte-identical when nothing moved while runner built the tree — then that
     // tree is the settled screen and a second whole-tree read (≈1.5 s on real
     // sessions) is not needed; two screenshots cost ≈0.4 s. A focused text
     // field's blinking caret never lets frames match, so those screens keep
@@ -12886,7 +13256,7 @@ async fn settle_and_read_elements(
                 // That frame IS the settled screen: keep it for a screenshot
                 // request, which then costs no capture.
                 if let Some(after) = after {
-                    w.remember_settled_frame(crate::wda::Capture::full_png(after));
+                    w.remember_settled_frame(crate::runner::Capture::full_png(after));
                 }
                 report.settled = true;
                 report.reason = SettleReason::Stable;
@@ -13088,7 +13458,7 @@ async fn agent_input_inner(
             }
         }
     }
-    // App uninstall via CoreDevice (`devicectl`) — WDA can't remove apps and
+    // App uninstall via CoreDevice (`devicectl`) — runner can't remove apps and
     // UI-driven deletion is unreliable to automate, so this is the dependable
     // "Delete App (with data)" primitive (e.g. resetting a wedged app to its
     // login state). `{"type":"uninstall","bundle":"com.example.app"}`; optional
@@ -13209,10 +13579,10 @@ async fn agent_input_inner(
     // Every real driving request resets the idle clock so the watchdog only
     // fires during genuine inactivity.
     state.touch_activity();
-    if state.wda_lifecycle.is_releasing() {
+    if state.runner_lifecycle.is_releasing() {
         return ControlRefusal::releasing().into_response();
     }
-    // Direct is a single at-most-once WDA path. One server deadline covers lock
+    // Direct is a single at-most-once runner path. One server deadline covers lock
     // acquisition plus the whole compound action, and no failure is replayed.
     let value = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(value) if value.is_object() => value,
@@ -13227,11 +13597,11 @@ async fn agent_input_inner(
         }
     };
     // A malformed request is the caller's problem, not the device's. Name
-    // the action BEFORE the WDA guard is taken: an unknown or missing
+    // the action BEFORE the runner guard is taken: an unknown or missing
     // `type` used to fall through to the dispatcher, whose catch-all
-    // `Unsupported` is rendered as `wda_unavailable_or_unsupported` — a
+    // `Unsupported` is rendered as `runner_unavailable_or_unsupported` — a
     // 503 blaming a perfectly healthy phone for a typo. Answer 400 here
-    // and never touch WDA.
+    // and never touch runner.
     if let Err(response) = reject_unknown_single_step_action(&value) {
         return response;
     }
@@ -13254,14 +13624,14 @@ async fn agent_input_inner(
     {
         return guard_refusal(&refusal, false);
     }
-    // The MCP client waits 30 seconds. Keep the daemon's complete Direct WDA
+    // The MCP client waits 30 seconds. Keep the daemon's complete Direct runner
     // budget comfortably below that so the authoritative HTTP outcome arrives
     // before the client can abandon a still-running action. It starts AFTER
     // `launch_app {"app": …}` resolution: a cold inventory read must not eat
     // the device's budget (resolution never holds the device lock).
-    let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;
-    let Some(wda) = &state.wda else {
-        return ControlRefusal::wda_not_configured()
+    let agent_runner_deadline = tokio::time::Instant::now() + AGENT_INPUT_RUNNER_DEADLINE;
+    let Some(runner) = &state.runner else {
+        return ControlRefusal::runner_not_configured()
             .with("fallback", serde_json::json!("disabled"))
             .into_response();
     };
@@ -13272,31 +13642,31 @@ async fn agent_input_inner(
     // charged to the action's own budget.
     // Control priority first: a health probe must not hold the runner while
     // the focus step (or the action after it) waits for it.
-    let _priority = state.begin_wda_control();
+    let _priority = state.begin_runner_control();
     let focus_started = tokio::time::Instant::now();
-    engage_agent_focus(&state, wda, crate::focus::launch_bundle(&value), true).await;
+    engage_agent_focus(&state, runner, crate::focus::launch_bundle(&value), true).await;
     // A long text gets its typing time on top (zero for text up to one chunk),
     // so the per-chunk timeouts, not this deadline, decide how it ends.
-    let agent_wda_deadline = agent_wda_deadline
+    let agent_runner_deadline = agent_runner_deadline
         + focus_started.elapsed()
         + crate::text_input::action_allowance(&value);
-    if tokio::time::Instant::now() >= agent_wda_deadline {
-        return wda_deadline_response(false);
+    if tokio::time::Instant::now() >= agent_runner_deadline {
+        return runner_deadline_response(false);
     }
     // Owner limits (`crate::guard`), checked last so a refused action costs
     // no budget; the foreground read happens only with a blocklist.
     let policy = crate::guard::Policy::get();
     if policy.is_active() {
         if policy.needs_foreground(&value) {
-            let checked = tokio::time::timeout_at(agent_wda_deadline, async {
-                let mut client = wda.lock().await;
+            let checked = tokio::time::timeout_at(agent_runner_deadline, async {
+                let mut client = runner.lock().await;
                 guard_foreground(&mut client, &value).await
             })
             .await;
             match checked {
                 Ok(Ok(())) => {}
                 Ok(Err(refusal)) => return guard_refusal(&refusal, false),
-                Err(_) => return wda_deadline_response(false),
+                Err(_) => return runner_deadline_response(false),
             }
         }
         if let Err(refusal) =
@@ -13313,30 +13683,30 @@ async fn agent_input_inner(
         .unwrap_or(AGENT_INPUT_SETTLE_DEFAULT_MS)
         .min(AGENT_INPUT_SETTLE_MAX_MS);
     // The action deadline and the observation deadline are DELIBERATELY
-    // separate scopes over one WDA guard. Only acquiring the guard and
-    // dispatching the mutation run under `agent_wda_deadline` — once
+    // separate scopes over one runner guard. Only acquiring the guard and
+    // dispatching the mutation run under `agent_runner_deadline` — once
     // `direct_agent_action` returns, its outcome is a plain local and no
     // later timeout can rewrite it. The best-effort observation that
     // follows gets its own, strictly shorter deadline, so a slow `/source`
     // or `/alert/text` can never turn an applied action into
     // `outcome_unknown` and can never cause the mutation to be re-sent.
-    let dispatch = tokio::time::timeout_at(agent_wda_deadline, async {
-        let mut client = wda.lock().await;
-        if tokio::time::Instant::now() >= agent_wda_deadline
-            || state.wda_lifecycle.is_transitioning()
+    let dispatch = tokio::time::timeout_at(agent_runner_deadline, async {
+        let mut client = runner.lock().await;
+        if tokio::time::Instant::now() >= agent_runner_deadline
+            || state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
             return None;
         }
-        unlock_before_action(&state, &mut client, agent_wda_deadline).await;
+        unlock_before_action(&state, &mut client, agent_runner_deadline).await;
         *recover(dispatch_marker.lock()) = Some(client.last_post());
         let mut detail = None;
         let outcome = direct_agent_action(
             &mut client,
-            &state.wda_actionable,
+            &state.runner_actionable,
             &value,
             &mut detail,
-            agent_wda_deadline,
+            agent_runner_deadline,
         )
         .await;
         Some((client, outcome, detail))
@@ -13344,10 +13714,10 @@ async fn agent_input_inner(
     .await;
     let (mut client, outcome, detail) = match dispatch {
         Ok(Some(dispatched)) => dispatched,
-        Ok(None) => return wda_deadline_response(false),
+        Ok(None) => return runner_deadline_response(false),
         Err(_) => {
             let mark = *recover(dispatched.lock());
-            return wda_deadline_response(posted_since(wda, mark).await);
+            return runner_deadline_response(posted_since(runner, mark).await);
         }
     };
     renew_after_long_text(&state, &headers, &value);
@@ -13357,7 +13727,7 @@ async fn agent_input_inner(
     // `settle_ms` and what is left of the endpoint deadline.
     let mut settled = None;
     let mut alert = None;
-    if want_delta && outcome == WdaControlOutcome::Applied {
+    if want_delta && outcome == RunnerControlOutcome::Applied {
         // The observation's clock starts HERE, after the action is
         // confirmed — it is not carved out of what the action left of its
         // own deadline. Otherwise a slow action silently eats the
@@ -13366,7 +13736,7 @@ async fn agent_input_inner(
         // were unreadable rather than never looked at.
         //
         // The two deadlines therefore compose rather than compete:
-        // dispatch is bounded by `agent_wda_deadline`, observation by this
+        // dispatch is bounded by `agent_runner_deadline`, observation by this
         // budget, and the client's timeout has to cover their sum (see
         // `OBSERVE_TIMEOUT` in the MCP client).
         let budget = std::time::Duration::from_millis(settle_budget_ms);
@@ -13396,12 +13766,12 @@ async fn agent_input_inner(
     let post_mark = client.last_post();
     drop(client);
     if frame_needed {
-        capture_settled_frame_later(&state, Arc::clone(wda), post_mark);
+        capture_settled_frame_later(&state, Arc::clone(runner), post_mark);
     }
     match outcome {
-        WdaControlOutcome::Applied => {
+        RunnerControlOutcome::Applied => {
             let body = match settled {
-                None => r#"{"ok":true,"transport":"wda"}"#.to_string(),
+                None => r#"{"ok":true,"transport":"runner"}"#.to_string(),
                 Some((observed, report)) => {
                     // The action DID apply. Everything below is observation
                     // quality reported ALONGSIDE that success — never a
@@ -13409,7 +13779,7 @@ async fn agent_input_inner(
                     let mut body = match observed {
                         None => serde_json::json!({
                             "ok": true,
-                            "transport": "wda",
+                            "transport": "runner",
                         }),
                         Some((snapshot, rows)) => {
                             remember_element_snapshot(&state, &snapshot, &rows);
@@ -13418,24 +13788,27 @@ async fn agent_input_inner(
                             // carrying the token. Read before noting the new one.
                             let owner_baseline = owner_last_snapshot(&state, &headers);
                             note_owner_snapshot(&state, &headers, &snapshot);
-                            let baseline = query
-                                .since
-                                .as_deref()
-                                .filter(|since| !since.is_empty())
-                                .or_else(|| {
-                                    value.get("snapshot").and_then(serde_json::Value::as_str)
-                                })
-                                .or(owner_baseline.as_deref())
-                                .and_then(|since| {
-                                    lookup_element_snapshot(&state, since)
-                                        .map(|baseline| (since, baseline))
-                                });
+                            // The first of these still cached: a named
+                            // baseline evicted from the cache falls back to
+                            // the owner's last screen rather than to the
+                            // whole tree.
+                            let baseline = [
+                                query.since.as_deref().filter(|since| !since.is_empty()),
+                                value.get("snapshot").and_then(serde_json::Value::as_str),
+                                owner_baseline.as_deref(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .find_map(|since| {
+                                lookup_element_snapshot(&state, since)
+                                    .map(|baseline| (since, baseline))
+                            });
                             match baseline {
                                 Some((baseline_id, baseline_rows)) => {
                                     let delta = diff_element_rows(&baseline_rows, &rows);
                                     let mut body = serde_json::json!({
                                         "ok": true,
-                                        "transport": "wda",
+                                        "transport": "runner",
                                         "snapshot": snapshot,
                                         "baseline": baseline_id,
                                         "delta": elements_delta_json(&delta, &rows),
@@ -13460,7 +13833,7 @@ async fn agent_input_inner(
                                 }
                                 None => serde_json::json!({
                                     "ok": true,
-                                    "transport": "wda",
+                                    "transport": "runner",
                                     "snapshot": snapshot,
                                     "elements": &*rows,
                                 }),
@@ -13489,55 +13862,55 @@ async fn agent_input_inner(
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
             )
         }
-        WdaControlOutcome::NotSent => {
-            mark_wda_read_path_unactionable(&state);
-            wda_failed_before_dispatch_response()
+        RunnerControlOutcome::NotSent => {
+            mark_runner_read_path_unactionable(&state);
+            runner_failed_before_dispatch_response()
         }
-        WdaControlOutcome::Unsupported => with_security_headers(
+        RunnerControlOutcome::Unsupported => with_security_headers(
             Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"ok":false,"error":"wda_unavailable_or_unsupported","fallback":"disabled"}"#,
+                    r#"{"ok":false,"error":"runner_unavailable_or_unsupported","fallback":"disabled"}"#,
                 ))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         ),
-        WdaControlOutcome::UnsupportedPerformAction => unsupported_perform_action_response(),
-        WdaControlOutcome::InvalidElementSnapshot => invalid_element_snapshot_response(),
-        WdaControlOutcome::StaleElementSnapshot => stale_element_snapshot_response(),
-        WdaControlOutcome::ElementNotFound if optional_tap(&value) => with_security_headers(
+        RunnerControlOutcome::UnsupportedPerformAction => unsupported_perform_action_response(),
+        RunnerControlOutcome::InvalidElementSnapshot => invalid_element_snapshot_response(),
+        RunnerControlOutcome::StaleElementSnapshot => stale_element_snapshot_response(),
+        RunnerControlOutcome::ElementNotFound if optional_tap(&value) => with_security_headers(
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"ok":true,"skipped":"not_present","outcome":"not_sent"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         ),
-        WdaControlOutcome::ElementNotFound => element_not_found_response(),
-        WdaControlOutcome::AmbiguousElement => ambiguous_element_response(detail.as_ref()),
-        WdaControlOutcome::InvalidElementTarget => invalid_element_target_response(),
-        WdaControlOutcome::InvalidValue(hint) => hinted_control_response(
+        RunnerControlOutcome::ElementNotFound => element_not_found_response(),
+        RunnerControlOutcome::AmbiguousElement => ambiguous_element_response(detail.as_ref()),
+        RunnerControlOutcome::InvalidElementTarget => invalid_element_target_response(),
+        RunnerControlOutcome::InvalidValue(hint) => hinted_control_response(
             StatusCode::UNPROCESSABLE_ENTITY, "invalid_value", "not_sent", hint,
         ),
-        WdaControlOutcome::NoEffect(error, hint) => {
+        RunnerControlOutcome::NoEffect(error, hint) => {
             hinted_control_response(StatusCode::CONFLICT, error, "no_effect", hint)
         }
-        WdaControlOutcome::Refused(error, hint) => {
+        RunnerControlOutcome::Refused(error, hint) => {
             with_scroll_alert_detail(hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint), detail.as_ref()).await
         }
-        WdaControlOutcome::NoAlert if optional_alert(&value) => with_security_headers(
+        RunnerControlOutcome::NoAlert if optional_alert(&value) => with_security_headers(
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"ok":true,"skipped":"no_alert","outcome":"not_sent"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         ),
-        WdaControlOutcome::NoAlert => no_alert_response(),
-        WdaControlOutcome::ForcePressUnsupported => force_press_unsupported_response(),
-        WdaControlOutcome::NoPageScroller(hint) => no_page_scroller_response(hint),
-        WdaControlOutcome::TextPartial {
+        RunnerControlOutcome::NoAlert => no_alert_response(),
+        RunnerControlOutcome::ForcePressUnsupported => force_press_unsupported_response(),
+        RunnerControlOutcome::NoPageScroller(hint) => no_page_scroller_response(hint),
+        RunnerControlOutcome::TextPartial {
             confirmed,
             uncertain,
         } => {
             if uncertain > 0 {
-                mark_wda_read_path_unactionable(&state);
+                mark_runner_read_path_unactionable(&state);
             }
             with_security_headers(
                 (
@@ -13547,8 +13920,8 @@ async fn agent_input_inner(
                     .into_response(),
             )
         }
-        WdaControlOutcome::RunnerRejected => runner_rejected_response(detail.as_ref()),
-        WdaControlOutcome::Failed => wda_failed_after_dispatch_response_with(detail.as_ref()),
+        RunnerControlOutcome::RunnerRejected => runner_rejected_response(detail.as_ref()),
+        RunnerControlOutcome::Failed => runner_failed_after_dispatch_response_with(detail.as_ref()),
     }
 }
 
@@ -13590,14 +13963,14 @@ const AGENT_FOCUS_ENGAGE_BUDGET: std::time::Duration = std::time::Duration::from
 /// lets a deferred session look (throttled) for the Home Screen.
 async fn engage_agent_focus(
     state: &AppState,
-    wda: &tokio::sync::Mutex<crate::wda::WdaClient>,
+    runner: &tokio::sync::Mutex<crate::runner::RunnerClient>,
     launch: Option<String>,
     may_probe_home: bool,
 ) {
-    // Only the daemon's own phone: an external WDA endpoint belongs to
+    // Only the daemon's own phone: an external runner endpoint belongs to
     // someone else's setup (and test daemons never touch the real registry).
     // A simulator has no Focus to engage.
-    if !state.managed_wda
+    if !state.managed_runner
         || state.simulator.is_some()
         || recover(state.agent_focus.lock()).attempted()
     {
@@ -13617,7 +13990,7 @@ async fn engage_agent_focus(
             let probe = may_probe_home
                 && recover(state.agent_focus.lock()).take_probe(Instant::now());
             if probe {
-                let client = w.insert(wda.lock().await);
+                let client = w.insert(runner.lock().await);
                 match client.active_bundle().await {
                     Ok(Some(bundle)) if bundle == "com.apple.springboard" => {
                         crate::focus::Moment::HomeScreen
@@ -13644,7 +14017,7 @@ async fn engage_agent_focus(
     }
     let mut w = match w {
         Some(guard) => guard,
-        None => wda.lock().await,
+        None => runner.lock().await,
     };
     let started = tokio::time::Instant::now();
     let deadline = started + AGENT_FOCUS_ENGAGE_BUDGET;
@@ -13722,7 +14095,7 @@ async fn engage_agent_focus(
 /// SpringBoard among the active apps; on the Home Screen SpringBoard is the
 /// app itself, so there the banner is looked for in the tree instead.
 async fn wait_for_focus_notice_gone(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     on_home_screen: bool,
     deadline: tokio::time::Instant,
 ) {
@@ -13764,7 +14137,7 @@ async fn sleep_until_or(deadline: tokio::time::Instant, step: std::time::Duratio
 }
 
 async fn watch_bridge_run(
-    w: &mut crate::wda::WdaClient,
+    w: &mut crate::runner::RunnerClient,
     bridge: &str,
     look_for_notice: bool,
     deadline: tokio::time::Instant,
@@ -13855,7 +14228,7 @@ async fn release_agent_focus(state: &AppState) -> Option<serde_json::Value> {
         IntentsRegistryLoad::Loaded(registry) => registry.bridge_name,
         _ => return None,
     };
-    let wda = state.wda.as_ref()?;
+    let runner = state.runner.as_ref()?;
     let link = intent_deep_link(
         &bridge,
         crate::focus::FOCUS_OFF_VERB,
@@ -13863,7 +14236,7 @@ async fn release_agent_focus(state: &AppState) -> Option<serde_json::Value> {
         &serde_json::json!({}),
     );
     let sent = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         let opened = w.open_url(&link).await;
         let deadline = tokio::time::Instant::now() + crate::focus::SHORTCUT_RUN_TIMEOUT;
         if opened.is_ok()
@@ -13900,7 +14273,7 @@ const FLOW_RUN_HEADER: &str = "x-phone-flow-run";
 /// `registry` block for the first tree read in a newly entered app.
 fn flow_registry_for_tree(
     state: &AppState,
-    rows: &[crate::wda::ElementRow],
+    rows: &[crate::runner::ElementRow],
 ) -> Option<serde_json::Value> {
     let label = active_application(rows);
     let due = recover(state.flow_trail.lock()).saw_app(label.as_deref(), Instant::now());
@@ -14115,7 +14488,7 @@ fn recording_tap(state: &AppState, value: &serde_json::Value) -> bool {
 }
 
 /// The locator of what a normalized `(x, y)` tap hits on the current screen.
-async fn locate_tap(client: &mut crate::wda::WdaClient, value: &serde_json::Value) -> Option<serde_json::Value> {
+async fn locate_tap(client: &mut crate::runner::RunnerClient, value: &serde_json::Value) -> Option<serde_json::Value> {
     let x = value.get("x").and_then(serde_json::Value::as_f64)?;
     let y = value.get("y").and_then(serde_json::Value::as_f64)?;
     let (width, height) = client.window_size().await.ok()?;
@@ -14241,13 +14614,13 @@ async fn agent_flow_save(
             serde_json::json!({"ok": false, "error": "id_required", "hint": "an id like \"myapp/daily-check\""}),
         );
     };
-    let flow = match request.get("flow") {
-        Some(flow) => Some(flow.clone()),
-        None => {
-            let mut trail = recover(state.flow_trail.lock());
-            let draft = trail.stop_recording().or_else(|| trail.draft());
-            draft.and_then(|draft| draft.get("flow").cloned())
-        }
+    let (flow, recording_revision) = {
+        let mut trail = recover(state.flow_trail.lock());
+        let flow = match request.get("flow") {
+            Some(flow) => Some(flow.clone()),
+            None => trail.draft_for_save().and_then(|draft| draft.get("flow").cloned()),
+        };
+        (flow, trail.recording_revision())
     };
     let Some(mut flow) = flow else {
         return agent_json_response(
@@ -14255,6 +14628,7 @@ async fn agent_flow_save(
             serde_json::json!({"ok": false, "error": "no_trail", "hint": "record first (POST /agent/flow/record {\"action\":\"start\"}) or send \"flow\""}),
         );
     };
+    let recorded_flow = flow.clone();
     for key in ["name", "description"] {
         if let Some(value) = request.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
             flow[key] = value.clone();
@@ -14262,7 +14636,10 @@ async fn agent_flow_save(
     }
     let result = tokio::task::spawn_blocking(move || save_local_flow(&id, &flow)).await;
     match result {
-        Ok(Ok(saved)) => agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "saved": saved})),
+        Ok(Ok(saved)) => {
+            recover(state.flow_trail.lock()).acknowledge_recording(&recorded_flow, recording_revision);
+            agent_json_response(StatusCode::OK, serde_json::json!({"ok": true, "saved": saved}))
+        }
         Ok(Err(error)) => agent_json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             serde_json::json!({"ok": false, "error": "invalid_flow", "message": format!("{error:#}")}),
@@ -14507,12 +14884,12 @@ async fn agent_flow_draft(State(state): State<Arc<AppState>>, headers: HeaderMap
 }
 
 /// `GET /agent/elements` — the phone's element tree, flattened to
-/// agent-friendly rows `{kind, label, rect:[x,y,w,h], depth}` (L2 / WDA).
+/// agent-friendly rows `{kind, label, rect:[x,y,w,h], depth}` (L2 / runner).
 ///
 /// An agent reasons over this the way it reasons over a screenshot, but it's
 /// text — an order of magnitude cheaper. Prefer snapshot-bound element indexes;
 /// exact label taps are accepted only when one current row matches. 503 when
-/// WDA is not configured; 502 when it's configured but unreachable.
+/// runner is not configured; 502 when it's configured but unreachable.
 ///
 /// `?since=<snapshot>` (optional): when the daemon still holds that snapshot's
 /// tree, the response replaces `elements` with a `delta`
@@ -14625,7 +15002,7 @@ async fn agent_elements(
                 .headers()
                 .get("x-screenshot-source")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("wda-capture")
+                .unwrap_or("runner-capture")
                 .to_string();
             let redacted = shot
                 .headers()
@@ -14706,15 +15083,15 @@ async fn agent_elements_inner(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         )
     };
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return json_body(
             StatusCode::CONFLICT,
-            r#"{"elements":[],"error":"target_not_configured","hint":"run setup-wda.sh to select and persist the canonical iPhone before using Direct control"}"#.to_string(),
+            r#"{"elements":[],"error":"target_not_configured","hint":"run setup-runner.sh to select and persist the canonical iPhone before using Direct control"}"#.to_string(),
         );
     }
     // Inspecting the element tree is part of driving — keep the phone held.
     state.touch_activity();
-    if state.wda_lifecycle.is_transitioning()
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Acquire)
     {
         return json_body(
@@ -14723,25 +15100,33 @@ async fn agent_elements_inner(
                 .to_string(),
         );
     }
-    let Some(wda) = &state.wda else {
+    let Some(runner) = &state.runner else {
         return json_body(
             StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"elements":[],"error":"wda_not_configured"}"#.to_string(),
+            r#"{"elements":[],"error":"runner_not_configured"}"#.to_string(),
         );
     };
-    let _priority = state.begin_wda_control();
+    let _priority = state.begin_runner_control();
     // MCP waits 45 seconds for this endpoint. Bound mutex wait + optional
     // read-only stale-session retry + screen-size lookup to 35 seconds so the
     // daemon, not a disconnected client, owns the final outcome.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(35);
     let result = tokio::time::timeout_at(deadline, async {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         let mut first_source_error = None;
         let read_started = tokio::time::Instant::now();
         let mut alert_probes = 0u8;
         let mut source_failures = 0u32;
+        // Set once a read failed while the runner was still working on it
+        // (a heavy screen): later reads are bounded, the answer `partial`.
+        let mut bounded = false;
         let rows = loop {
-            match w.elements().await {
+            let attempt = if bounded {
+                w.elements_bounded().await
+            } else {
+                w.elements().await
+            };
+            match attempt {
                 Ok(rows) => break rows,
                 Err(error) => {
                     let error = format!("{error:#}");
@@ -14749,6 +15134,33 @@ async fn agent_elements_inner(
                     if first_source_error.is_none() {
                         first_source_error = Some(error.clone());
                     }
+                    // The runner may still be serializing the read this
+                    // request gave up on (hardware, iOS 27 Photos search
+                    // grid: 4 reads, 29 s, 0 bytes back). Anything sent now —
+                    // another read, an alert probe, a `POST /session` — only
+                    // queues behind it on the runner's main thread. Wait for
+                    // it to finish, then read bounded; if it does not finish
+                    // in time, answer 504 and leave the runner alone.
+                    let waited = if crate::runner::busy_working(w.main_busy_ms().await) {
+                        let until = deadline
+                            .checked_sub(BOUNDED_READ_RESERVE)
+                            .unwrap_or(deadline);
+                        if let Err(busy_ms) = wait_runner_idle(&w, until).await {
+                            tracing::info!(
+                                "runner still busy on a slow screen read after {source_failures} failed reads ({} ms, main busy {busy_ms} ms); answering 504, runner kept",
+                                read_started.elapsed().as_millis()
+                            );
+                            return Err(anyhow::Error::new(SourceBusy {
+                                attempts: source_failures,
+                                elapsed_ms: read_started.elapsed().as_millis() as u64,
+                                busy_ms,
+                            }));
+                        }
+                        bounded = true;
+                        true
+                    } else {
+                        false
+                    };
                     // A system alert holding the app makes every /source
                     // fail until it is answered (hardware: Xiaohongshu's
                     // "Allow Paste" — 109 failures, 35 s). Look right away and
@@ -14762,17 +15174,19 @@ async fn agent_elements_inner(
                         }
                     }
                     // Source reads are idempotent. System document pickers can
-                    // briefly restart the WDA relay/session, so two immediate
+                    // briefly restart the runner relay/session, so two immediate
                     // attempts are not a meaningful recovery window. Keep
                     // rebuilding, but back off and stop after a few failures:
                     // a fixed 250 ms retry against a runner that keeps failing
                     // was 137 /source calls in 35 s (agent-loop A/B, iPhone 13)
                     // and still ended in a bare 504. No mutation is replayed.
-                    w.invalidate_session();
+                    // The session is kept: `/source` does not use one, and
+                    // dropping it only made the next alert probe or health
+                    // probe queue a `POST /session` behind the stalled read.
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() || source_failures >= SOURCE_READ_MAX_FAILURES {
                         tracing::warn!(
-                            "wda source gave up after {source_failures} failed reads in {} ms; \
+                            "runner source gave up after {source_failures} failed reads in {} ms; \
                              last error: {error}; first error: {}",
                             read_started.elapsed().as_millis(),
                             first_source_error.as_deref().unwrap_or("unknown")
@@ -14782,11 +15196,13 @@ async fn agent_elements_inner(
                             elapsed_ms: read_started.elapsed().as_millis() as u64,
                         }));
                     }
-                    tokio::time::sleep(std::cmp::min(
-                        source_retry_delay(source_failures),
-                        remaining,
-                    ))
-                    .await;
+                    if !waited {
+                        tokio::time::sleep(std::cmp::min(
+                            source_retry_delay(source_failures),
+                            remaining,
+                        ))
+                        .await;
+                    }
                 }
             }
         };
@@ -14794,13 +15210,13 @@ async fn agent_elements_inner(
         // non-fatal; the element tree itself is still useful.
         let screen = w.window_size().await.ok();
         // Best-effort: a system alert is reported as its own block because the
-        // flattened tree misses or misrepresents it (see WdaClient::alert_summary).
+        // flattened tree misses or misrepresents it (see RunnerClient::alert_summary).
         let alert = probe_alert(&mut w).await;
         let geometric = w.visibility_is_geometric();
-        Ok::<_, anyhow::Error>((rows, screen, alert, geometric))
+        Ok::<_, anyhow::Error>((rows, screen, alert, geometric, bounded))
     })
     .await;
-    let (rows, screen, alert, geometric) = match result {
+    let (rows, screen, alert, geometric, partial) = match result {
         Ok(Ok(result)) => result,
         Ok(Err(error)) if error.downcast_ref::<BlockingAlert>().is_some() => {
             // The phone is fine; an alert is waiting for an answer.
@@ -14816,43 +15232,63 @@ async fn agent_elements_inner(
                 .to_string(),
             );
         }
+        Ok(Err(error)) if error.downcast_ref::<SourceBusy>().is_some() => {
+            // A slow screen, not a broken runner: no degraded mark, no alert
+            // probe (it would queue behind the read too).
+            let busy = error.downcast_ref::<SourceBusy>().expect("checked above");
+            return json_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                source_busy_body(busy).to_string(),
+            );
+        }
         Ok(Err(error)) => {
-            tracing::warn!("wda elements failed: {error:#}");
-            mark_wda_read_path_unactionable(&state);
-            let mut body = serde_json::json!({"elements": [], "error": "wda_source_failed", "transitioning": true});
+            tracing::warn!("runner elements failed: {error:#}");
+            mark_runner_read_path_unactionable(&state);
+            let mut body = serde_json::json!({"elements": [], "error": "runner_source_failed", "transitioning": true});
             if let Some(gave_up) = error.downcast_ref::<SourceGaveUp>() {
                 body["source_attempts"] = gave_up.attempts.into();
                 body["elapsed_ms"] = gave_up.elapsed_ms.into();
-                body["retry_after_secs"] = WDA_SOURCE_TIMEOUT_RETRY_AFTER_SECS.into();
+                body["retry_after_secs"] = RUNNER_SOURCE_TIMEOUT_RETRY_AFTER_SECS.into();
                 body["hint"] = SOURCE_GAVE_UP_HINT.into();
             }
-            let body = with_blocking_alert(wda, body).await;
+            let body = with_blocking_alert(runner, body).await;
             return json_body(StatusCode::BAD_GATEWAY, body.to_string());
         }
         Err(_) => {
-            mark_wda_read_path_unactionable(&state);
+            // A runner still working on the read is slow, not broken: leave
+            // it drivable (a degraded runner is what the KeepAlive supervisor
+            // and scheduled runs restart), and do not queue an alert probe
+            // behind the read.
+            let busy = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                runner.lock().await.main_busy_ms().await
+            })
+            .await
+            .ok()
+            .flatten();
             // `retry_after_secs` so the caller waits instead of hammering a
             // page that is already too heavy to serialize — without it the
             // only signal was `transitioning:true`, which says "this may
             // clear" but not when to look again (#74).
-            let body = with_blocking_alert(
-                wda,
-                serde_json::json!({
-                    "elements": [],
-                    "error": "wda_source_timeout",
-                    "transitioning": true,
-                    "retry_after_secs": WDA_SOURCE_TIMEOUT_RETRY_AFTER_SECS,
-                    "hint": "the accessibility tree took too long to serialize (heavy page or stalled app); wait retry_after_secs and read again, or bring a lighter screen to the foreground first"
-                }),
-            )
-            .await;
+            let mut body = serde_json::json!({
+                "elements": [],
+                "error": "runner_source_timeout",
+                "transitioning": true,
+                "retry_after_secs": RUNNER_SOURCE_TIMEOUT_RETRY_AFTER_SECS,
+                "hint": "the accessibility tree took too long to serialize (heavy page or stalled app); wait retry_after_secs and read again, or bring a lighter screen to the foreground first"
+            });
+            if crate::runner::busy_working(busy) {
+                body["runner_busy_ms"] = busy.unwrap_or(0).into();
+            } else {
+                mark_runner_read_path_unactionable(&state);
+                body = with_blocking_alert(runner, body).await;
+            }
             return json_body(StatusCode::GATEWAY_TIMEOUT, body.to_string());
         }
     };
     let snapshot = match element_snapshot_id(&rows) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            tracing::warn!("serialize WDA element snapshot: {error:#}");
+            tracing::warn!("serialize runner element snapshot: {error:#}");
             return json_body(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"elements":[],"error":"serialization_failed"}"#.to_string(),
@@ -14874,7 +15310,7 @@ async fn agent_elements_inner(
     let mut body = match query
         .since
         .as_deref()
-        .filter(|since| !since.is_empty())
+        .filter(|since| !since.is_empty() && !partial)
         .and_then(|since| lookup_element_snapshot(&state, since).map(|rows| (since, rows)))
     {
         Some((since, baseline)) => {
@@ -14897,13 +15333,16 @@ async fn agent_elements_inner(
             "ax_stats": ax_stats,
         }),
     };
-    // A tree too large to read with WDA's `isVisible` (see
-    // WdaClient::bounded_source) carries a geometric `visible`: off-root rows
+    // A tree too large to read with runner's `isVisible` (see
+    // RunnerClient::bounded_source) carries a geometric `visible`: off-root rows
     // are `visible:false`, but rows hidden inside the root rect (a collapsed
     // cell, Chrome's tab grid) are not, so occlusion refusals are weaker.
     // Say so where the caller already looks for tree quality.
     if geometric {
         body["ax_stats"]["visibility"] = serde_json::json!("geometric");
+    }
+    if partial {
+        mark_partial(&mut body);
     }
     if let (Some(object), Some(alert)) = (body.as_object_mut(), alert_json(alert)) {
         object.insert("alert".to_string(), alert);
@@ -14951,11 +15390,11 @@ impl std::error::Error for BlockingAlert {}
 /// whole 35 s budget). Look once, bounded, and name it in the error so the
 /// agent answers the alert instead of waiting and re-reading.
 async fn with_blocking_alert(
-    wda: &tokio::sync::Mutex<crate::wda::WdaClient>,
+    runner: &tokio::sync::Mutex<crate::runner::RunnerClient>,
     mut body: serde_json::Value,
 ) -> serde_json::Value {
     let alert = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         probe_alert(&mut w).await
     })
     .await
@@ -14973,7 +15412,7 @@ async fn with_blocking_alert(
 /// Best-effort, time-bounded alert probe for read paths. Any failure (no
 /// session yet, relay mid-recovery, slow runner) simply means "no alert
 /// block" — the read it decorates must never be slowed or failed by it.
-async fn probe_alert(w: &mut crate::wda::WdaClient) -> Option<(String, Vec<String>)> {
+async fn probe_alert(w: &mut crate::runner::RunnerClient) -> Option<(String, Vec<String>)> {
     tokio::time::timeout(std::time::Duration::from_millis(1500), w.alert_summary())
         .await
         .ok()
@@ -15021,7 +15460,7 @@ const AGENT_HOLD_MAX_SECS: u64 = 4 * 3600;
 /// `is_releasing()` check followed by a locked write left a window where the
 /// hold was accepted with 200 and the phone was released anyway.
 fn try_take_hold(
-    lifecycle: &WdaLifecycle,
+    lifecycle: &RunnerLifecycle,
     hold_until: &Mutex<Option<Instant>>,
     secs: u64,
 ) -> bool {
@@ -15106,11 +15545,11 @@ fn hold_owner_lease(
 }
 
 /// The gate every `/agent/login*` call passes: auth, the control header, the
-/// phone lease, and a drivable runner. On success, the WDA client.
+/// phone lease, and a drivable runner. On success, the runner client.
 fn login_gate(
     state: &Arc<AppState>,
     headers: &HeaderMap,
-) -> Result<Arc<tokio::sync::Mutex<crate::wda::WdaClient>>, Response> {
+) -> Result<Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>, Response> {
     match agent_auth(state, headers) {
         AgentAuth::Locked => {
             return Err(with_security_headers(
@@ -15128,10 +15567,10 @@ fn login_gate(
         return Err(missing_phone_control_header_response());
     }
     claim_phone_owner(state, headers)?;
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return Err(target_not_configured_response());
     }
-    if state.wda_lifecycle.is_transitioning()
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Acquire)
     {
         return Err(agent_actions_json(
@@ -15143,10 +15582,10 @@ fn login_gate(
             }),
         ));
     }
-    state.wda.clone().ok_or_else(|| {
+    state.runner.clone().ok_or_else(|| {
         agent_actions_json(
             StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({ "ok": false, "error": "wda_not_configured" }),
+            serde_json::json!({ "ok": false, "error": "runner_not_configured" }),
         )
     })
 }
@@ -15170,8 +15609,8 @@ async fn agent_login(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let wda = match login_gate(&state, &headers) {
-        Ok(wda) => wda,
+    let runner = match login_gate(&state, &headers) {
+        Ok(runner) => runner,
         Err(refused) => return refused,
     };
     let request: crate::login::LoginRequest = if body.trim().is_empty() {
@@ -15199,8 +15638,8 @@ async fn agent_login(
     // A recorded trail must never splice a login into a flow: the steps
     // before it were their own task, and the login itself is not replayable.
     recover(state.flow_trail.lock()).flow_ran();
-    let _priority = state.begin_wda_control();
-    let mut w = wda.lock().await;
+    let _priority = state.begin_runner_control();
+    let mut w = runner.lock().await;
     let result = crate::login::sign_in(&mut w, &vault, &request).await;
     drop(w);
     recover(state.flow_trail.lock()).flow_ran();
@@ -15215,8 +15654,8 @@ async fn agent_login_code(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let wda = match login_gate(&state, &headers) {
-        Ok(wda) => wda,
+    let runner = match login_gate(&state, &headers) {
+        Ok(runner) => runner,
         Err(refused) => return refused,
     };
     let request: crate::login::CodeRequest = if body.trim().is_empty() {
@@ -15237,8 +15676,8 @@ async fn agent_login_code(
         }
     };
     state.touch_activity();
-    let _priority = state.begin_wda_control();
-    let mut w = wda.lock().await;
+    let _priority = state.begin_runner_control();
+    let mut w = runner.lock().await;
     let result = crate::login::enter_code(&mut w, &request).await;
     drop(w);
     recover(state.flow_trail.lock()).flow_ran();
@@ -15300,7 +15739,7 @@ async fn agent_hold(
         Ok(OwnerClaim::Named(name) | OwnerClaim::Takeover(name)) => Some(name.to_string()),
         _ => None,
     };
-    if !try_take_hold(&state.wda_lifecycle, &state.hold_until, secs) {
+    if !try_take_hold(&state.runner_lifecycle, &state.hold_until, secs) {
         return with_security_headers(
             Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -15362,16 +15801,16 @@ struct AgentElementsQuery {
 }
 
 /// A read-path failure is enough to revoke `drivable`, even when the last
-/// background health probe still says the WDA runner was up.
+/// background health probe still says the runner was up.
 ///
 /// Keep reachability and lock knowledge intact: a WebView transition can make
-/// `/source` fail while WDA itself remains reachable. The next bounded status
+/// `/source` fail while runner itself remains reachable. The next bounded status
 /// probe decides whether the runner is down; until then, actions fail closed.
 /// How long a caller should wait before re-reading after a `/source` timeout.
 ///
 /// Long enough that a retry is not just a second timeout on the same heavy
 /// page, short enough that a transient stall does not stall the agent.
-const WDA_SOURCE_TIMEOUT_RETRY_AFTER_SECS: u64 = 3;
+const RUNNER_SOURCE_TIMEOUT_RETRY_AFTER_SECS: u64 = 3;
 
 /// Failed `/source` reads one elements request tolerates before answering.
 /// With [`source_retry_delay`] that is about 11 s, not the 35 s deadline.
@@ -15402,17 +15841,92 @@ impl std::fmt::Display for SourceGaveUp {
 
 impl std::error::Error for SourceGaveUp {}
 
+/// Time kept back from the elements deadline for the bounded read that
+/// follows a wait on a busy runner.
+const BOUNDED_READ_RESERVE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Poll the runner's off-main `/status` until its main thread is free.
+/// `Err(busy_ms)` when it is still working at `until`; a runner busy past
+/// [`crate::runner::RUNNER_WEDGED_MS`] counts as free here, so the caller's
+/// usual failure path (and the health probe) judges it instead.
+async fn wait_runner_idle(
+    w: &crate::runner::RunnerClient,
+    until: tokio::time::Instant,
+) -> Result<(), u64> {
+    loop {
+        let busy = w.main_busy_ms().await;
+        if !crate::runner::busy_working(busy) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() + RUNNER_IDLE_POLL >= until {
+            return Err(busy.unwrap_or(0));
+        }
+        tokio::time::sleep(RUNNER_IDLE_POLL).await;
+    }
+}
+
+const RUNNER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The element read gave up while the runner was still serializing a read:
+/// a heavy screen, answered 504 with the runner kept.
+#[derive(Debug)]
+struct SourceBusy {
+    attempts: u32,
+    elapsed_ms: u64,
+    busy_ms: u64,
+}
+
+impl std::fmt::Display for SourceBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the device runner was still reading a heavy screen after {} reads ({} ms, busy {} ms)",
+            self.attempts, self.elapsed_ms, self.busy_ms
+        )
+    }
+}
+
+impl std::error::Error for SourceBusy {}
+
+/// Seconds to wait before reading again a screen the runner is still busy
+/// serializing: about what it has spent so far, within 3–30 s.
+fn source_busy_retry_after(busy_ms: u64) -> u64 {
+    (busy_ms / 1000).clamp(RUNNER_SOURCE_TIMEOUT_RETRY_AFTER_SECS, 30)
+}
+
+fn source_busy_body(busy: &SourceBusy) -> serde_json::Value {
+    serde_json::json!({
+        "elements": [],
+        "error": "runner_source_timeout",
+        "transitioning": true,
+        "runner_busy": true,
+        "runner_busy_ms": busy.busy_ms,
+        "source_attempts": busy.attempts,
+        "elapsed_ms": busy.elapsed_ms,
+        "retry_after_secs": source_busy_retry_after(busy.busy_ms),
+        "hint": "the device runner is healthy but still serializing this screen's accessibility tree (a heavy page such as a large photo grid); it is not restarted. Wait retry_after_secs and read again — the next read falls back to a bounded tree marked partial — or bring a lighter screen to the foreground",
+    })
+}
+
+/// A tree read with depth and node caps after a full read stalled.
+fn mark_partial(body: &mut serde_json::Value) {
+    body["partial"] = serde_json::json!(true);
+    body["partial_hint"] = serde_json::json!(
+        "the full tree was too heavy to read in time; this one is capped in depth and size, so deeply nested rows may be missing — read again for the full tree once the screen settles, and do not use this snapshot as a ?since= baseline"
+    );
+}
+
 const SOURCE_GAVE_UP_HINT: &str = "the device runner kept failing to read the screen (not a slow page: every read errored). Wait retry_after_secs and read once more; if it keeps failing, check /agent/status and reconnect the phone rather than reading in a loop";
 
-fn mark_wda_read_path_unactionable(state: &AppState) {
+fn mark_runner_read_path_unactionable(state: &AppState) {
     state
-        .wda_actionable
+        .runner_actionable
         .store(false, std::sync::atomic::Ordering::Release);
     state
-        .wda_read_degraded
+        .runner_read_degraded
         .store(true, std::sync::atomic::Ordering::Release);
     {
-        let mut health = recover(state.wda_health.lock());
+        let mut health = recover(state.runner_health.lock());
         health.actionable = false;
         health.updated_at = Instant::now();
     }
@@ -15422,10 +15936,10 @@ fn mark_wda_read_path_unactionable(state: &AppState) {
 /// read succeeds again. `read_ok` is `None` when no read was attempted.
 /// Returns the health to publish and whether the read path is still degraded.
 fn gate_on_read_path(
-    mut health: crate::wda::WdaHealth,
+    mut health: crate::runner::RunnerHealth,
     degraded: bool,
     read_ok: Option<bool>,
-) -> (crate::wda::WdaHealth, bool) {
+) -> (crate::runner::RunnerHealth, bool) {
     if !degraded {
         return (health, false);
     }
@@ -15440,7 +15954,7 @@ fn gate_on_read_path(
 
 /// `GET /agent/screenshot` — current phone screen as a PNG.
 ///
-/// Captured on-device through WDA; fails closed if WDA is unavailable.
+/// Captured on-device through runner; fails closed if runner is unavailable.
 ///
 /// Auth: agent bearer **or** a valid session cookie. The cookie path exists for
 /// the web client's stills fallback (when the MJPEG feed stalls the page polls
@@ -15449,12 +15963,12 @@ fn gate_on_read_path(
 /// touches the bearer auth-limiter (5 misses there lock the agent API for 30s).
 #[derive(Default, Deserialize)]
 struct ScreenshotQuery {
-    /// `raw=1`: the capture as WDA returned it, even when the app blanked it.
+    /// `raw=1`: the capture as runner returned it, even when the app blanked it.
     raw: Option<String>,
     /// Longest side in pixels (200–4000); the full capture when absent. A
     /// model sees ~1.5k image tokens for a full-resolution phone screen and
     /// ~0.9k at 1200. Asking for a size also lets a live frame answer, when
-    /// someone is watching and it is current, instead of a WDA capture.
+    /// someone is watching and it is current, instead of a runner capture.
     max_side: Option<u32>,
     /// `fresh=1`: capture now, even when the screen as it settled after the
     /// last action is already in memory.
@@ -15469,15 +15983,15 @@ struct ScreenshotQuery {
 /// (`raw` skips both). A JPEG sized on the phone is decoded and re-encoded
 /// here — small, so cheap — and callers keep getting `image/png`.
 async fn finish_screenshot(
-    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
-    capture: crate::wda::Capture,
+    runner: &Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>,
+    capture: crate::runner::Capture,
     raw: bool,
     max_side: Option<u32>,
     source: Option<&'static str>,
 ) -> Response {
-    let jpeg = capture.format == crate::wda::ImageFormat::Jpeg;
+    let jpeg = capture.format == crate::runner::ImageFormat::Jpeg;
     let bytes = capture.bytes;
-    // `raw` is WDA's capture untouched, size included.
+    // `raw` is runner's capture untouched, size included.
     if raw && !jpeg {
         return png_response(bytes, source, false);
     }
@@ -15507,7 +16021,7 @@ async fn finish_screenshot(
     let image = if check {
         let checked = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            redacted_capture_wireframe(wda, image),
+            redacted_capture_wireframe(runner, image),
         )
         .await;
         match checked {
@@ -15585,8 +16099,8 @@ async fn png_or_reencoded(bytes: Vec<u8>, jpeg: bool, source: Option<&'static st
 /// Decode a capture whatever its encoding (PNG from the full path, JPEG
 /// from a sized one).
 fn decode_capture(bytes: &[u8]) -> Option<crate::redaction::Image> {
-    match crate::wda::ImageFormat::of(bytes) {
-        crate::wda::ImageFormat::Jpeg => crate::redaction::decode_jpeg(bytes),
+    match crate::runner::ImageFormat::of(bytes) {
+        crate::runner::ImageFormat::Jpeg => crate::redaction::decode_jpeg(bytes),
         _ => crate::redaction::decode_png(bytes),
     }
 }
@@ -15632,7 +16146,7 @@ fn refresh_capture_verdict(state: &Arc<AppState>, hub: &Arc<crate::video::VideoH
     if !hub.begin_verdict(std::time::Duration::from_secs(8)) {
         return;
     }
-    let Some(wda) = state.wda.clone() else {
+    let Some(runner) = state.runner.clone() else {
         hub.finish_verdict(None);
         return;
     };
@@ -15640,12 +16154,12 @@ fn refresh_capture_verdict(state: &Arc<AppState>, hub: &Arc<crate::video::VideoH
     tokio::spawn(async move {
         let verdict = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let (rows, window, png) = {
-                let mut w = wda.lock().await;
+                let mut w = runner.lock().await;
                 let rows = w.elements().await.ok()?;
                 let window = w.window_size().await.ok()?;
                 // The check reads rows against pixels at any scale: a sized
                 // JPEG is plenty and a fraction of the full PNG on the wire.
-                let shot = crate::wda::ShotRequest::jpeg(Some(1024));
+                let shot = crate::runner::ShotRequest::jpeg(Some(1024));
                 let png = w
                     .screenshot_sized(shot, std::time::Duration::from_secs(8))
                     .await
@@ -15681,7 +16195,7 @@ const REDACTION_CHECK_MAX_PNG_BYTES: usize = 600 * 1024;
 /// elements in the tree), `Ok` with the tree drawn over the capture; `Err`
 /// hands the capture back untouched.
 async fn redacted_capture_wireframe(
-    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
+    runner: &Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>,
     image: crate::redaction::Image,
 ) -> Option<Result<crate::redaction::Image, crate::redaction::Image>> {
     // A sampled pass over the band: cheap enough for the runtime thread.
@@ -15689,7 +16203,7 @@ async fn redacted_capture_wireframe(
         return Some(Err(image));
     }
     let read = {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         match (w.elements().await, w.window_size().await) {
             (Ok(rows), Ok(window)) => Some((rows, window)),
             _ => None,
@@ -15740,10 +16254,10 @@ async fn agent_screenshot_capture(
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.wda_lifecycle.is_transitioning()
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Relaxed)
     {
         return with_security_headers(
@@ -15756,12 +16270,12 @@ async fn agent_screenshot_capture(
     }
     // A screenshot means someone is looking at the phone — keep it held.
     state.touch_activity();
-    let _priority = state.wda.as_ref().map(|_| state.begin_wda_control());
-    let Some(wda) = &state.wda else {
+    let _priority = state.runner.as_ref().map(|_| state.begin_runner_control());
+    let Some(runner) = &state.runner else {
         return with_security_headers(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "direct device screenshot unavailable (WDA is not configured)",
+                "direct device screenshot unavailable (runner is not configured)",
             )
                 .into_response(),
         );
@@ -15778,14 +16292,14 @@ async fn agent_screenshot_capture(
     // The screen as it settled after the last action was captured then (see
     // `SETTLED_FRAME_MAX_AGE`); nothing was sent since, so it is this screen.
     if !raw && !fresh {
-        let settled = wda
+        let settled = runner
             .lock()
             .await
             .settled_frame(SETTLED_FRAME_MAX_AGE)
             .filter(|frame| frame.covers(max_side));
         if let Some(frame) = settled {
             return finish_screenshot(
-                wda,
+                runner,
                 (*frame).clone(),
                 false,
                 max_side,
@@ -15797,15 +16311,15 @@ async fn agent_screenshot_capture(
     // Someone is watching, so the stream is already producing this screen:
     // its newest frame answers in milliseconds instead of a ~0.5–1.5 s
     // capture. Only for a sized request (the stream is half resolution) and
-    // never for `raw`, whose caller wants WDA's own capture.
+    // never for `raw`, whose caller wants runner's own capture.
     if let (Some(max_side), false, false, Some(hub)) =
         (max_side, raw, fresh, state.video.as_ref())
     {
-        let not_before = wda.lock().await.last_post();
+        let not_before = runner.lock().await.last_post();
         if let Some(jpeg) = hub.live_frame(not_before) {
             let png = tokio::task::spawn_blocking(move || {
                 // The stream checks for a blank picture only every few
-                // frames; a blank one here goes to the WDA path, which draws
+                // frames; a blank one here goes to the runner path, which draws
                 // the wireframe of a screen hidden from capture.
                 crate::redaction::decode_jpeg(&jpeg)
                     .filter(|image| !crate::redaction::content_band_is_blank(image))
@@ -15822,18 +16336,18 @@ async fn agent_screenshot_capture(
         }
     }
     let request = if raw || max_side.is_none() {
-        crate::wda::ShotRequest::full_png()
+        crate::runner::ShotRequest::full_png()
     } else {
         // Sized on the phone: the full PNG of a 17 Pro Max is megabytes,
         // which a degraded Wi-Fi link cut mid-body after 18 s.
-        crate::wda::ShotRequest::jpeg(max_side)
+        crate::runner::ShotRequest::jpeg(max_side)
     };
-    match capture_with_retry(wda, request, !raw).await {
+    match capture_with_retry(runner, request, !raw).await {
         Ok((capture, degraded)) if is_valid_capture(&capture) => {
             // After a smaller retry the image is held to the retry's size,
             // whatever the runner sent.
             let side = degraded.or(max_side);
-            let mut response = finish_screenshot(wda, capture, raw, side, None).await;
+            let mut response = finish_screenshot(runner, capture, raw, side, None).await;
             if let Some(side) = degraded {
                 if let Ok(value) = header::HeaderValue::from_str(&format!("max_side={side}")) {
                     response.headers_mut().insert("x-screenshot-degraded", value);
@@ -15846,7 +16360,7 @@ async fn agent_screenshot_capture(
                 "agent screenshot: the runner returned {} bytes, not a valid image",
                 capture.bytes.len()
             );
-            mark_wda_read_path_unactionable(&state);
+            mark_runner_read_path_unactionable(&state);
             screenshot_failure_response(
                 &state,
                 StatusCode::BAD_GATEWAY,
@@ -15863,7 +16377,7 @@ async fn agent_screenshot_capture(
                 failure.cause,
                 failure.detail
             );
-            mark_wda_read_path_unactionable(&state);
+            mark_runner_read_path_unactionable(&state);
             let status = if failure.cause == "timeout" {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -15888,13 +16402,13 @@ const SCREENSHOT_FIRST_ATTEMPT: std::time::Duration = std::time::Duration::from_
 
 /// The smaller retry after a capture the link cut or timed out: half the
 /// asked size (at least 320 px), or 1024 px for a full-resolution request.
-fn retry_shot(first: crate::wda::ShotRequest) -> crate::wda::ShotRequest {
+fn retry_shot(first: crate::runner::ShotRequest) -> crate::runner::ShotRequest {
     let side = match first.max_side {
         Some(side) if side <= 320 => side,
         Some(side) => (side / 2).max(320),
         None => 1024,
     };
-    crate::wda::ShotRequest {
+    crate::runner::ShotRequest {
         max_side: Some(side),
         jpeg: true,
         quality: 0.6,
@@ -15911,22 +16425,22 @@ struct ScreenshotFailure {
 /// request times out, retries once smaller (see [`retry_shot`]) if `retry`;
 /// `Ok((capture, Some(side)))` then says the image is smaller than asked.
 async fn capture_with_retry(
-    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
-    first: crate::wda::ShotRequest,
+    runner: &Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>,
+    first: crate::runner::ShotRequest,
     retry: bool,
-) -> Result<(crate::wda::Capture, Option<u32>), ScreenshotFailure> {
+) -> Result<(crate::runner::Capture, Option<u32>), ScreenshotFailure> {
     let deadline = tokio::time::Instant::now() + SCREENSHOT_DEADLINE;
     let budget = if retry {
         SCREENSHOT_FIRST_ATTEMPT
     } else {
         SCREENSHOT_DEADLINE
     };
-    let first_error = match attempt_capture(wda, first, budget).await {
+    let first_error = match attempt_capture(runner, first, budget).await {
         Ok(capture) => return Ok((capture, None)),
         Err(error) => error,
     };
     let cause = first_error.0;
-    if !retry || !crate::wda::screenshot_failure_retryable(cause) {
+    if !retry || !crate::runner::screenshot_failure_retryable(cause) {
         return Err(ScreenshotFailure {
             cause,
             attempts: 1,
@@ -15946,7 +16460,7 @@ async fn capture_with_retry(
         "agent screenshot: {cause} on the first capture; retrying once at max_side={}",
         second.max_side.unwrap_or_default()
     );
-    match attempt_capture(wda, second, left).await {
+    match attempt_capture(runner, second, left).await {
         Ok(capture) => Ok((capture, second.max_side)),
         Err((cause, detail)) => Err(ScreenshotFailure {
             cause,
@@ -15957,14 +16471,14 @@ async fn capture_with_retry(
 }
 
 async fn attempt_capture(
-    wda: &Arc<tokio::sync::Mutex<crate::wda::WdaClient>>,
-    request: crate::wda::ShotRequest,
+    runner: &Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>,
+    request: crate::runner::ShotRequest,
     budget: std::time::Duration,
-) -> Result<crate::wda::Capture, (&'static str, String)> {
+) -> Result<crate::runner::Capture, (&'static str, String)> {
     let started = tokio::time::Instant::now();
     // The lock wait counts against the budget, the request gets what is left.
     let captured = tokio::time::timeout(budget, async {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         let left = budget.saturating_sub(started.elapsed());
         w.screenshot_sized(request, left.max(std::time::Duration::from_millis(100)))
             .await
@@ -15973,7 +16487,7 @@ async fn attempt_capture(
     match captured {
         Ok(Ok(capture)) => Ok(capture),
         Ok(Err(error)) => Err((
-            crate::wda::screenshot_failure_cause(&error),
+            crate::runner::screenshot_failure_cause(&error),
             format!("{error:#}"),
         )),
         Err(_) => Err((
@@ -16014,12 +16528,12 @@ async fn screenshot_failure_response(
     )
 }
 
-/// `GET /agent/mjpeg` — LIVE video in agent mode by proxying WDA's on-device
+/// `GET /agent/mjpeg` — LIVE video in agent mode by proxying runner's on-device
 /// MJPEG stream (`multipart/x-mixed-replace`). The MJPEG server runs inside the
 /// same XCUITest session as control, so video and driving coexist. A browser renders
 /// this directly in an `<img src="/agent/mjpeg">`. ~28 fps at the tuned
 /// settings applied here (framerate/scaling/quality), regardless of USB vs Wi-Fi
-/// (the cap is WDA's screenshot rate, not the transport).
+/// (the cap is runner's screenshot rate, not the transport).
 fn is_mjpeg_content_type(value: &str) -> bool {
     value.split(';').next().is_some_and(|media_type| {
         media_type
@@ -16059,10 +16573,10 @@ async fn agent_mjpeg(
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.wda_lifecycle.is_transitioning()
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Relaxed)
     {
         return with_security_headers(
@@ -16077,7 +16591,7 @@ async fn agent_mjpeg(
     // guard (below) for the whole connection so the idle watchdog won't release
     // the phone while a viewer is on it.
     state.touch_activity();
-    if state.wda_lifecycle.is_transitioning()
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Acquire)
     {
         return with_security_headers(
@@ -16102,18 +16616,18 @@ async fn agent_mjpeg(
     };
     let Some(url) = state.mjpeg_url.clone() else {
         return with_security_headers(
-            (StatusCode::SERVICE_UNAVAILABLE, "no WDA MJPEG configured").into_response(),
+            (StatusCode::SERVICE_UNAVAILABLE, "no runner MJPEG configured").into_response(),
         );
     };
     // Best-effort: tune the stream for a smooth feed (idempotent). A failure
-    // here just leaves WDA's defaults (~9 fps) — still usable. Never wait behind
+    // here just leaves runner's defaults (~9 fps) — still usable. Never wait behind
     // a control/status holder: opening video must not outlive the browser's own
     // first-frame timeout merely to change optional settings.
     let (framerate, scaling, quality) =
         crate::video::VideoMode::parse(query.mode.as_deref()).mjpeg_settings();
-    if let Some(wda) = &state.wda {
-        let _priority = state.begin_wda_control();
-        if let Ok(mut client) = wda.try_lock() {
+    if let Some(runner) = &state.runner {
+        let _priority = state.begin_runner_control();
+        if let Ok(mut client) = runner.try_lock() {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(750),
                 client.set_mjpeg_settings(framerate, scaling, quality),
@@ -16142,7 +16656,7 @@ async fn agent_mjpeg(
             return with_security_headers(
                 (
                     StatusCode::GATEWAY_TIMEOUT,
-                    "WDA MJPEG did not return response headers before the deadline",
+                    "runner MJPEG did not return response headers before the deadline",
                 )
                     .into_response(),
             )
@@ -16159,7 +16673,7 @@ async fn agent_mjpeg(
                 return with_security_headers(
                     (
                         StatusCode::BAD_GATEWAY,
-                        "WDA MJPEG upstream returned a non-MJPEG content type",
+                        "runner MJPEG upstream returned a non-MJPEG content type",
                     )
                         .into_response(),
                 );
@@ -16173,7 +16687,7 @@ async fn agent_mjpeg(
             let guard = stream_guard;
             let upstream = Box::pin(up.bytes_stream());
             // This is an inactivity timeout, not a total stream timeout. Every
-            // received chunk resets the 8-second window; if WDA silently stalls
+            // received chunk resets the 8-second window; if runner silently stalls
             // after its first frame, close the response so the browser's
             // img.onerror/fallback logic can reconnect.
             let activity_guard = stream_id.map(|stream_id| {
@@ -16213,7 +16727,7 @@ async fn agent_mjpeg(
                         Err(_) => Some((
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
-                                "WDA MJPEG stream was idle for 8 seconds",
+                                "runner MJPEG stream was idle for 8 seconds",
                             )),
                             (upstream, guard, activity_guard, true),
                         )),
@@ -16232,7 +16746,7 @@ async fn agent_mjpeg(
         Ok(up) => with_security_headers(
             (
                 StatusCode::BAD_GATEWAY,
-                format!("WDA MJPEG upstream {}", up.status()),
+                format!("runner MJPEG upstream {}", up.status()),
             )
                 .into_response(),
         ),
@@ -16241,7 +16755,7 @@ async fn agent_mjpeg(
             with_security_headers(
                 (
                     StatusCode::BAD_GATEWAY,
-                    "WDA MJPEG unreachable — is the :9100 relay up? (restart WDA via mode=agent)",
+                    "runner MJPEG unreachable — is the :9100 relay up? (restart runner via mode=agent)",
                 )
                     .into_response(),
             )
@@ -16288,10 +16802,10 @@ async fn agent_h264(
             (StatusCode::NOT_IMPLEMENTED, "H.264 video is unavailable on this daemon").into_response(),
         );
     };
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.wda_lifecycle.is_transitioning()
+    if state.runner_lifecycle.is_transitioning()
         || state.released.load(std::sync::atomic::Ordering::Acquire)
     {
         return with_security_headers(
@@ -16312,9 +16826,9 @@ async fn agent_h264(
     };
     let mode = crate::video::VideoMode::parse(query.mode.as_deref());
     let (framerate, scaling, quality) = mode.mjpeg_settings();
-    if let Some(wda) = &state.wda {
-        let _priority = state.begin_wda_control();
-        if let Ok(mut client) = wda.try_lock() {
+    if let Some(runner) = &state.runner {
+        let _priority = state.begin_runner_control();
+        if let Ok(mut client) = runner.try_lock() {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(750),
                 client.set_mjpeg_settings(framerate, scaling, quality),
@@ -16399,11 +16913,11 @@ async fn agent_h264_keyframe(
 /// enough length to carry an IHDR. Guards the agent's decoder against the
 /// runt/garbage frames a capture can emit mid-transition (issue #14).
 /// A capture worth decoding: a PNG (see [`is_valid_png`]) or a JPEG.
-fn is_valid_capture(capture: &crate::wda::Capture) -> bool {
+fn is_valid_capture(capture: &crate::runner::Capture) -> bool {
     match capture.format {
-        crate::wda::ImageFormat::Png => is_valid_png(&capture.bytes),
-        crate::wda::ImageFormat::Jpeg => capture.bytes.len() >= 4,
-        crate::wda::ImageFormat::Other => false,
+        crate::runner::ImageFormat::Png => is_valid_png(&capture.bytes),
+        crate::runner::ImageFormat::Jpeg => capture.bytes.len() >= 4,
+        crate::runner::ImageFormat::Other => false,
     }
 }
 
@@ -16538,7 +17052,7 @@ async fn agent_inbox_drain(State(state): State<Arc<AppState>>, headers: HeaderMa
 // ---------------------------------------------------------------------------
 //
 // Curated Shortcuts verbs ("intents") dispatched on-device: the daemon opens a
-// `shortcuts://run-shortcut?...` deep link through WDA's sessionless
+// `shortcuts://run-shortcut?...` deep link through runner's sessionless
 // `POST /url`, the one reviewed bridge shortcut dispatches on `verb` and POSTs
 // its structured result back to the existing `/agent/inbox`. The registry file
 // (`~/.iphone-use/intents-registry.json`) — not the phone — is the capability
@@ -16806,12 +17320,12 @@ enum IntentError {
     /// Registry marks the verb `confirm:"operator"` and the request lacks
     /// `"operator_confirmed":true`. Nothing dispatched.
     OperatorConfirmationRequired { name: String },
-    /// WDA (the only dispatch path) is unreachable/not configured/recovering —
+    /// runner (the only dispatch path) is unreachable/not configured/recovering —
     /// failed before anything was sent.
     BridgeUnavailable { reason: String },
     /// Deadline or lifecycle pre-check fired before dispatch. Nothing sent.
     NotSent,
-    /// WDA accepted the request but answered an error — the deep link may or
+    /// runner accepted the request but answered an error — the deep link may or
     /// may not have fired. Outcome unknown; never blind-retry.
     DispatchFailed { id: String, detail: String },
     /// Deadline expired after the request went out. Outcome unknown.
@@ -16962,7 +17476,7 @@ impl InventoryFailure {
                     "ok": false,
                     "error": "target_required",
                     "connected_candidates": count,
-                    "hint": "configure IPHONE_USE_UDID (run setup-wda.sh) so the daemon knows which phone to ask",
+                    "hint": "configure IPHONE_USE_UDID (run setup-runner.sh) so the daemon knows which phone to ask",
                 }),
             ),
             Self::Unavailable(reason) => agent_apps_json(
@@ -17364,7 +17878,7 @@ async fn agent_intents(State(state): State<Arc<AppState>>, headers: HeaderMap) -
 /// `POST /agent/intent` — dispatch one registered semantic intent:
 /// `{"name":"battery","args":{}}`. The daemon looks the name up in the curated
 /// registry, builds the `shortcuts://run-shortcut` deep link, and opens it
-/// on-device through WDA's sessionless `POST /url` under the same auth,
+/// on-device through runner's sessionless `POST /url` under the same auth,
 /// lifecycle gating, control-priority, and 15-second deadline as
 /// [`agent_input`]'s Direct branch. The response acknowledges the *dispatch*
 /// only — the bridge shortcut's result arrives on `/agent/inbox`, matched by
@@ -17398,7 +17912,7 @@ async fn agent_intent(
     }
     // Same total server deadline as `/agent/input`: the authoritative outcome
     // must arrive before a 30-second MCP client can abandon the call.
-    let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;
+    let agent_runner_deadline = tokio::time::Instant::now() + AGENT_INPUT_RUNNER_DEADLINE;
     let parsed = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(value) if value.is_object() => value,
         _ => {
@@ -17474,32 +17988,32 @@ async fn agent_intent(
     // deliberate difference: a released device does NOT start recovery here —
     // that stays `/agent/input`/`/agent/mode`'s job, and this pre-dispatch
     // failure is honestly retry-safe.
-    if state.wda_lifecycle.is_releasing() {
+    if state.runner_lifecycle.is_releasing() {
         return intent_error_response(&IntentError::BridgeUnavailable {
             reason: "device_release_in_progress — retry in a few seconds".to_string(),
         });
     }
     if state.released.load(std::sync::atomic::Ordering::Acquire) {
         return intent_error_response(&IntentError::BridgeUnavailable {
-            reason: "phone was idle-released; POST /agent/mode {\"mode\":\"agent\"} to restart managed WDA, then retry".to_string(),
+            reason: "phone was idle-released; POST /agent/mode {\"mode\":\"agent\"} to restart managed runner, then retry".to_string(),
         });
     }
-    if state.managed_wda_pending {
+    if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.wda_lifecycle.is_reconnecting() {
+    if state.runner_lifecycle.is_reconnecting() {
         return intent_error_response(&IntentError::BridgeUnavailable {
             reason: "reconnect_in_progress — poll /agent/status until drivable, then retry"
                 .to_string(),
         });
     }
     state.touch_activity();
-    let Some(wda) = &state.wda else {
+    let Some(runner) = &state.runner else {
         return intent_error_response(&IntentError::BridgeUnavailable {
-            reason: "WDA is not configured (IPHONE_USE_WDA_URL / setup)".to_string(),
+            reason: "runner is not configured (IPHONE_USE_RUNNER_URL / setup)".to_string(),
         });
     };
-    if tokio::time::Instant::now() >= agent_wda_deadline {
+    if tokio::time::Instant::now() >= agent_runner_deadline {
         return intent_error_response(&IntentError::NotSent);
     }
     // An intent is one action against the run budget (`crate::guard`).
@@ -17511,15 +18025,15 @@ async fn agent_intent(
     ) {
         return guard_refusal(&refusal, false);
     }
-    let _priority = state.begin_wda_control();
+    let _priority = state.begin_runner_control();
     let correlation_id = new_intent_correlation_id();
     let deep_link = intent_deep_link(&registry.bridge_name, &name, &correlation_id, &args);
     let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dispatch_marker = dispatched.clone();
-    let result = tokio::time::timeout_at(agent_wda_deadline, async {
-        let mut client = wda.lock().await;
-        if tokio::time::Instant::now() >= agent_wda_deadline
-            || state.wda_lifecycle.is_transitioning()
+    let result = tokio::time::timeout_at(agent_runner_deadline, async {
+        let mut client = runner.lock().await;
+        if tokio::time::Instant::now() >= agent_runner_deadline
+            || state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
             return None;
@@ -17835,7 +18349,7 @@ fn lockdown_udid(state: &AppState) -> Result<String, Response> {
         None => Err(agent_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "device_not_configured",
-            "this daemon has no target iPhone yet (IPHONE_USE_UDID, which setup-wda.sh writes); device logs, crash reports and simulated location talk to that phone directly. Ask the user to finish setup.",
+            "this daemon has no target iPhone yet (IPHONE_USE_UDID, which setup-runner.sh writes); device logs, crash reports and simulated location talk to that phone directly. Ask the user to finish setup.",
         )),
     }
 }
@@ -18902,7 +19416,7 @@ async fn agent_app_notes_put(
 /// `(index, rect)` of each interactive row worth drawing, indexes as in the
 /// full `/agent/elements` read of `rows` (the same rows `scope=interactive`
 /// keeps).
-fn overlay_marks(rows: &[crate::wda::ElementRow], window: (f64, f64)) -> Vec<(usize, [f64; 4])> {
+fn overlay_marks(rows: &[crate::runner::ElementRow], window: (f64, f64)) -> Vec<(usize, [f64; 4])> {
     let mut view = serde_json::json!({ "elements": rows });
     crate::scope::apply(&mut view, "interactive");
     view["elements"]
@@ -18971,11 +19485,11 @@ async fn agent_screenshot(
             .insert("x-overlay", HeaderValue::from_static("unavailable"));
         Response::from_parts(parts, Body::from(png))
     };
-    let Some(wda) = state.wda.clone() else {
+    let Some(runner) = state.runner.clone() else {
         return unavailable(parts, png);
     };
     let read = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        let mut w = wda.lock().await;
+        let mut w = runner.lock().await;
         let rows = w.elements().await.ok()?;
         let window = w.window_size().await.ok()?;
         Some((rows, window))
@@ -18990,8 +19504,10 @@ async fn agent_screenshot(
     let count = marks.len();
     let snapshot = element_snapshot_id(&rows).ok();
     if let Some(snapshot) = &snapshot {
+        // Not the owner's delta baseline: the caller gets the picture, not
+        // these rows, so a later batch diffed against them could not be
+        // rebuilt into a screen.
         remember_element_snapshot(&state, snapshot, &Arc::new(rows));
-        note_owner_snapshot(&state, &headers, snapshot);
     }
     let source = png.clone();
     let drawn = tokio::task::spawn_blocking(move || {
@@ -19114,7 +19630,7 @@ mod tests {
     fn scroll_alert_present_refuses_all_gesture_modes() {
         let source = include_str!("http.rs");
         let shared = source
-            .split("async fn wda_control_with_client(")
+            .split("async fn runner_control_with_client(")
             .nth(1)
             .unwrap()
             .split("fn no_alert_response")
@@ -19157,7 +19673,7 @@ mod tests {
             let alert = Some((text.to_string(), vec![]));
             let expected = serde_json::json!({"text":text,"buttons":[]});
             // Failed source reads use this conversion to detect BlockingAlert
-            // and return 409 alert_blocking, including an empty WDA alert.
+            // and return 409 alert_blocking, including an empty runner alert.
             assert_eq!(alert_json(alert.clone()), Some(expected.clone()));
             // Successful reads must also preserve the empty alert block.
             let body = attach_alert(r#"{"elements":[]}"#.into(), alert.clone());
@@ -19184,7 +19700,7 @@ mod tests {
                     serde_json::json!({"type":"swipe","x1":0.5,"y1":0.8,"x2":195,"y2":100}),
                     serde_json::json!({"type":"drag","x1":0.5,"y1":0.8,"x2":195,"y2":100}),
                 ] {
-                    let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                    let mut w = crate::runner::RunnerClient::new("http://127.0.0.1:1").unwrap();
                     let actionable = std::sync::atomic::AtomicBool::new(true);
                     let mut detail = None;
                     {
@@ -19198,7 +19714,7 @@ mod tests {
                         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
                         assert_eq!(
                             std::future::Future::poll(action.as_mut(), &mut cx),
-                            std::task::Poll::Ready(WdaControlOutcome::InvalidValue(
+                            std::task::Poll::Ready(RunnerControlOutcome::InvalidValue(
                                 COORDINATES_HINT
                             ))
                         );
@@ -19215,7 +19731,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                let mut w = crate::runner::RunnerClient::new("http://127.0.0.1:1").unwrap();
                 let actionable = std::sync::atomic::AtomicBool::new(true);
                 for typ in ["tap", "text", "key", "longpress"] {
                     let mut detail = None;
@@ -19239,7 +19755,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let mut w = crate::wda::WdaClient::new("http://127.0.0.1:1").unwrap();
+                let mut w = crate::runner::RunnerClient::new("http://127.0.0.1:1").unwrap();
                 assert!(!refuse_scroll_alert(&mut w, false, &mut None).await);
             });
         let source = include_str!("http.rs");
@@ -19342,9 +19858,9 @@ mod tests {
 
     #[test]
     fn launchctl_print_pid_is_the_jobs_own_line() {
-        let running = "gui/501/com.leeguoo.iphone-use.wda = {\n\tactive count = 1\n\tstate = running\n\tpid = 72917\n\tresource coalition = {\n\t\tID = 42823\n\t}\n}\n";
+        let running = "gui/501/com.leeguoo.iphone-use.runner = {\n\tactive count = 1\n\tstate = running\n\tpid = 72917\n\tresource coalition = {\n\t\tID = 42823\n\t}\n}\n";
         assert!(launchctl_print_has_pid(running));
-        let waiting = "gui/501/com.leeguoo.iphone-use.wda = {\n\tstate = waiting\n\tlast exit code = 0\n\tjetsam coalition = {\n\t\tpid = 12\n\t}\n}\n";
+        let waiting = "gui/501/com.leeguoo.iphone-use.runner = {\n\tstate = waiting\n\tlast exit code = 0\n\tjetsam coalition = {\n\t\tpid = 12\n\t}\n}\n";
         assert!(
             !launchctl_print_has_pid(waiting),
             "a nested pid is not the job's"
@@ -19621,7 +20137,7 @@ mod tests {
 
     #[test]
     fn element_snapshot_changes_with_the_actionable_tree() {
-        let first = vec![crate::wda::ElementRow {
+        let first = vec![crate::runner::ElementRow {
             kind: "Button".to_string(),
             label: "继续".to_string(),
             identifier: Some("continue-button".to_string()),
@@ -19635,7 +20151,7 @@ mod tests {
             placeholder: None,
             ..Default::default()
         }];
-        let mut changed = vec![crate::wda::ElementRow {
+        let mut changed = vec![crate::runner::ElementRow {
             kind: "Button".to_string(),
             label: "继续".to_string(),
             identifier: Some("continue-button".to_string()),
@@ -19734,8 +20250,8 @@ mod tests {
         );
     }
 
-    fn stats_row(kind: &str, label: &str, rect: [f64; 4], depth: u32) -> crate::wda::ElementRow {
-        crate::wda::ElementRow {
+    fn stats_row(kind: &str, label: &str, rect: [f64; 4], depth: u32) -> crate::runner::ElementRow {
+        crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             rect,
@@ -19833,8 +20349,8 @@ mod tests {
         assert_eq!(before, element_snapshot_id(&rows).unwrap());
     }
 
-    fn delta_row(kind: &str, label: &str, y: f64) -> crate::wda::ElementRow {
-        crate::wda::ElementRow {
+    fn delta_row(kind: &str, label: &str, y: f64) -> crate::runner::ElementRow {
+        crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             identifier: None,
@@ -19893,8 +20409,8 @@ mod tests {
     // resumes — well past the daemon's readiness window. Clearing it must hit
     // exactly one file: deleting anything else in ~/.iphone-use would be worse
     // than the bug.
-    fn protocol_status(active: bool, terminal: bool, heartbeat_ts: u64) -> WdaSetupStatus {
-        WdaSetupStatus {
+    fn protocol_status(active: bool, terminal: bool, heartbeat_ts: u64) -> RunnerSetupStatus {
+        RunnerSetupStatus {
             phase: "building".into(),
             blocked_on: String::new(),
             message: String::new(),
@@ -19998,7 +20514,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp home");
         assert!(!setup_in_flight(&dir), "no status file: nothing is being set up");
         std::fs::write(
-            dir.join("wda-setup-status.json"),
+            dir.join("runner-setup-status.json"),
             format!(
                 r#"{{"schema_version":1,"phase":"building-fail","ts":{now},"heartbeat_ts":{now},"active":false,"terminal":true,"owner_pid":{pid},"owner_start":"x"}}"#,
                 now = now_secs(),
@@ -20018,7 +20534,7 @@ mod tests {
     fn a_hold_and_a_release_never_both_win_under_contention() {
         use std::sync::{Arc, Barrier};
         for _ in 0..500 {
-            let lifecycle = Arc::new(WdaLifecycle::new());
+            let lifecycle = Arc::new(RunnerLifecycle::new());
             let hold_until: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
             let barrier = Arc::new(Barrier::new(2));
             let holder = {
@@ -20060,7 +20576,7 @@ mod tests {
     // time (the contention test above cannot force either interleaving).
     #[test]
     fn a_hold_that_lands_first_makes_the_release_back_out() {
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let hold_until: Mutex<Option<Instant>> = Mutex::new(None);
         assert!(try_take_hold(&lifecycle, &hold_until, 30));
         let token = lifecycle.try_begin_releasing().expect("release begins");
@@ -20071,7 +20587,7 @@ mod tests {
 
     #[test]
     fn a_release_that_begins_first_refuses_the_hold_until_it_is_done() {
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let hold_until: Mutex<Option<Instant>> = Mutex::new(None);
         let token = lifecycle.try_begin_releasing().expect("release begins");
         assert!(!try_take_hold(&lifecycle, &hold_until, 30), "503 while releasing");
@@ -20098,7 +20614,7 @@ mod tests {
     /// popup and scrolled the page. The popup's CollectionView ran from y=92
     /// to y=1049 on a 956pt screen, so the old centre-based gesture started
     /// at y≈570 — below the visible menu (92..487) — i.e. outside the popup.
-    /// A refused TCP connect never reached WDA; a response-level failure may
+    /// A refused TCP connect never reached runner; a response-level failure may
     /// have. The classifier must tell them apart, and only the first is
     /// "not sent".
     #[test]
@@ -20112,12 +20628,12 @@ mod tests {
                 .map_err(anyhow::Error::from)
         })
         .unwrap_err();
-        assert!(error_never_reached_wda(&refused), "{refused:#}");
+        assert!(error_never_reached_runner(&refused), "{refused:#}");
         // Wrapped with context, still detected through the chain.
         let wrapped = refused.context("POST element/value");
-        assert!(error_never_reached_wda(&wrapped));
+        assert!(error_never_reached_runner(&wrapped));
         // A plain error that is not a connect failure must not be reclassified.
-        assert!(!error_never_reached_wda(&anyhow::anyhow!("HTTP status 400 Bad Request")));
+        assert!(!error_never_reached_runner(&anyhow::anyhow!("HTTP status 400 Bad Request")));
     }
 
     #[test]
@@ -20282,7 +20798,7 @@ mod tests {
         assert!(!valid_owner_name(&"x".repeat(65)));
     }
 
-    // Issue #73: WDA says scrollTo failed while the element is plainly on
+    // Issue #73: runner says scrollTo failed while the element is plainly on
     // screen. The screen decides.
     #[test]
     fn an_element_counts_as_on_screen_when_at_least_half_of_it_is() {
@@ -20315,34 +20831,34 @@ mod tests {
         let home = std::env::temp_dir().join(format!("iu-backoff-{}", std::process::id()));
         let dir = home.join(".iphone-use");
         std::fs::create_dir_all(&dir).expect("temp home");
-        let target = dir.join(WDA_RETRY_STATE_FILE);
-        let bystander = dir.join("wda-setup-status.json");
+        let target = dir.join(RUNNER_RETRY_STATE_FILE);
+        let bystander = dir.join("runner-setup-status.json");
         std::fs::write(&target, b"version=1").expect("write target");
         std::fs::write(&bystander, b"{}").expect("write bystander");
 
-        clear_wda_retry_backoff(&dir);
+        clear_runner_retry_backoff(&dir);
         assert!(!target.exists(), "the backoff state must be gone");
         assert!(bystander.exists(), "no other state file may be touched");
 
         // Idempotent: a second call with nothing to remove is not an error.
-        clear_wda_retry_backoff(&dir);
+        clear_runner_retry_backoff(&dir);
         // And an unknown home is a no-op rather than a panic or a stray delete.
-        clear_wda_retry_backoff(std::path::Path::new(""));
+        clear_runner_retry_backoff(std::path::Path::new(""));
 
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn a_parked_supervisor_is_read_from_print_disabled() {
-        let label = "com.leeguoo.iphone-use.wda";
-        let sonoma = "disabled services = {\n\t\t\"com.leeguoo.iphone-use.wda\" => disabled\n\t\t\"com.leeguoo.iphone-use\" => enabled\n\t}\n";
+        let label = "com.leeguoo.iphone-use.runner";
+        let sonoma = "disabled services = {\n\t\t\"com.leeguoo.iphone-use.runner\" => disabled\n\t\t\"com.leeguoo.iphone-use\" => enabled\n\t}\n";
         assert!(launchd_label_disabled(sonoma, label));
         assert!(!launchd_label_disabled(sonoma, "com.leeguoo.iphone-use"));
         // Older macOS prints booleans.
-        assert!(launchd_label_disabled("\t\"com.leeguoo.iphone-use.wda\" => true\n", label));
-        assert!(!launchd_label_disabled("\t\"com.leeguoo.iphone-use.wda\" => false\n", label));
+        assert!(launchd_label_disabled("\t\"com.leeguoo.iphone-use.runner\" => true\n", label));
+        assert!(!launchd_label_disabled("\t\"com.leeguoo.iphone-use.runner\" => false\n", label));
         // A label that merely starts with ours is somebody else's job.
-        assert!(!launchd_label_disabled("\t\"com.leeguoo.iphone-use.wda.old\" => disabled\n", label));
+        assert!(!launchd_label_disabled("\t\"com.leeguoo.iphone-use.runner.old\" => disabled\n", label));
         assert!(!launchd_label_disabled("", label));
     }
 
@@ -20963,7 +21479,7 @@ mod tests {
         assert_eq!(block["text"], "确认?");
         assert_eq!(block["buttons"][1], "取消");
 
-        let plain = r#"{"ok":true,"transport":"wda"}"#.to_string();
+        let plain = r#"{"ok":true,"transport":"runner"}"#.to_string();
         assert_eq!(attach_alert(plain.clone(), None), plain);
         let with = attach_alert(plain, Some(("t".to_string(), vec![])));
         let parsed: serde_json::Value = serde_json::from_str(&with).unwrap();
@@ -21119,7 +21635,7 @@ mod tests {
 
     #[test]
     fn perform_kind_gating_limits_value_verbs_to_drivable_kinds() {
-        let row = |kind: &str| crate::wda::ElementRow {
+        let row = |kind: &str| crate::runner::ElementRow {
             kind: kind.to_string(),
             label: "目标".to_string(),
             rect: [10.0, 20.0, 80.0, 44.0],
@@ -21159,7 +21675,7 @@ mod tests {
 
         // The shape that triggered it: a popup-menu Cell carrying nothing but
         // a rect. No locator can be built from it.
-        let cell = crate::wda::ElementRow {
+        let cell = crate::runner::ElementRow {
             kind: "Cell".to_string(),
             label: String::new(),
             identifier: None,
@@ -21194,7 +21710,7 @@ mod tests {
     }
 
     #[test]
-    fn locator_wda_query_uses_element_clickable_predicate_fields() {
+    fn locator_runner_query_uses_element_clickable_predicate_fields() {
         let locator = AgentElementLocator {
             label: Some("保存到“文件”".to_string()),
             identifier: Some("actionGroupCell".to_string()),
@@ -21205,7 +21721,7 @@ mod tests {
             visible: Some(true),
         };
 
-        let (using, value) = locator_wda_query(&locator).unwrap();
+        let (using, value) = locator_runner_query(&locator).unwrap();
         assert_eq!(using, "predicate string");
         assert_eq!(
             value,
@@ -21214,7 +21730,23 @@ mod tests {
     }
 
     #[test]
-    fn locator_wda_query_falls_back_to_identifier_and_escapes_predicates() {
+    fn locator_runner_query_escapes_multiline_field_value() {
+        let locator: AgentElementLocator = serde_json::from_value(serde_json::json!({
+            "kind": "TextField", "label": "local-agent-goal",
+            "value": "\nQA\r\t'\\n"
+        }))
+        .unwrap();
+        let (using, query) = locator_runner_query(&locator).unwrap();
+        assert_eq!(using, "predicate string");
+        assert_eq!(
+            query,
+            "type == 'XCUIElementTypeTextField' AND (label == 'local-agent-goal' OR name == 'local-agent-goal') AND value == '\\nQA\\r\\t\\'\\\\n'"
+        );
+        assert!(!query.contains(['\n', '\r', '\t']));
+    }
+
+    #[test]
+    fn locator_runner_query_falls_back_to_identifier_and_escapes_predicates() {
         let locator = AgentElementLocator {
             label: None,
             identifier: Some("unique-control".to_string()),
@@ -21225,18 +21757,18 @@ mod tests {
             visible: None,
         };
         assert_eq!(
-            locator_wda_query(&locator),
+            locator_runner_query(&locator),
             Some(("accessibility id", "unique-control".to_string()))
         );
         assert_eq!(
-            wda_predicate_literal("O'Reilly\\Files"),
+            runner_predicate_literal("O'Reilly\\Files"),
             "'O\\'Reilly\\\\Files'"
         );
     }
 
     #[test]
     fn snapshot_row_locator_uses_semantics_instead_of_system_rectangle() {
-        let row = crate::wda::ElementRow {
+        let row = crate::runner::ElementRow {
             kind: "Button".to_string(),
             label: "保存".to_string(),
             identifier: None,
@@ -21260,7 +21792,7 @@ mod tests {
 
     #[test]
     fn snapshot_row_locator_allows_coordinate_only_without_semantics() {
-        let row = crate::wda::ElementRow {
+        let row = crate::runner::ElementRow {
             kind: String::new(),
             label: String::new(),
             identifier: None,
@@ -21313,7 +21845,7 @@ mod tests {
 
     #[test]
     fn a_floating_bar_over_the_centre_moves_the_tap_to_the_clear_part() {
-        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::wda::ElementRow {
+        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             rect,
@@ -21340,7 +21872,7 @@ mod tests {
 
     #[test]
     fn a_tab_bar_never_covers_its_own_items() {
-        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::wda::ElementRow {
+        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             rect,
@@ -21375,7 +21907,7 @@ mod tests {
 
     #[test]
     fn inline_links_on_wrapped_lines_never_cover_each_other() {
-        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::wda::ElementRow {
+        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             rect,
@@ -21421,7 +21953,7 @@ mod tests {
 
     #[test]
     fn a_small_header_button_is_not_covered_by_a_bar_wide_sibling() {
-        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::wda::ElementRow {
+        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             rect,
@@ -21454,14 +21986,14 @@ mod tests {
 
     #[test]
     fn an_off_screen_target_needs_a_reveal_and_its_point_is_off_screen() {
-        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::wda::ElementRow {
+        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
             kind: kind.to_string(),
             label: label.to_string(),
             rect,
             depth,
             ..Default::default()
         };
-        let hidden = |row: crate::wda::ElementRow| crate::wda::ElementRow {
+        let hidden = |row: crate::runner::ElementRow| crate::runner::ElementRow {
             visible: Some(false),
             ..row
         };
@@ -21486,8 +22018,8 @@ mod tests {
             tap_target_refusal(&rows, 4, &request),
             Some(("element_not_visible", ELEMENT_NOT_VISIBLE_HINT))
         );
-        assert!(!ELEMENT_NOT_VISIBLE_HINT.contains("WDA"));
-        assert!(!ELEMENT_OFF_SCREEN_HINT.contains("WDA"));
+        assert!(!ELEMENT_NOT_VISIBLE_HINT.contains("runner"));
+        assert!(!ELEMENT_OFF_SCREEN_HINT.contains("runner"));
         assert!(point_on_screen(&rows, 440.0, 956.0));
         assert!(!point_on_screen(&rows, 80.0, 1510.0));
         // No Application frame: no verdict, taken as on screen.
@@ -21512,7 +22044,7 @@ mod tests {
             "xcode_too_old",
             "ios_too_old",
             "locked",
-            "wda",
+            "runner",
         ] {
             assert!(setup_blocker_hint(blocker).is_some(), "{blocker}");
             let (zh, en) = human_next_step("blocker", blocker, "").expect(blocker);
@@ -21537,9 +22069,45 @@ mod tests {
     }
 
     #[test]
+    fn a_setup_at_work_says_what_it_is_doing_instead_of_paused() {
+        let upgrade = crate::setup::runner::UPGRADE_BUILD_MESSAGE;
+        for (phase, message, advice) in [
+            ("building", upgrade, "setting_up_upgrade"),
+            ("building", "building the device runner", "setting_up_build"),
+            ("building", "building + launching the device runner", "setting_up_build"),
+            ("building", "launching the device runner (58s elapsed)", "setting_up_launch"),
+            (
+                "building",
+                "reusing the verified runner product from the last bring-up",
+                "setting_up_launch",
+            ),
+            ("ddi-wait", "waiting for developer services", "setting_up_ddi"),
+            ("prereq", "checking prerequisites", "setting_up"),
+            ("starting", "starting setup", "setting_up"),
+            ("serving", "verifying the relay", "setting_up"),
+        ] {
+            let (got, hint) = setup_working_advice(phase, message).expect(message);
+            assert_eq!(got, advice, "{phase}: {message}");
+            assert!(hint.contains("drivable=true"), "{hint}");
+            let (zh, en) = human_next_step(got, "", "").expect(advice);
+            assert!(!en.contains("Paused") && !zh.contains("暂停"), "{en}");
+        }
+        let (zh, en) = human_next_step("setting_up_upgrade", "", "").unwrap();
+        assert!(zh.contains("升级") && zh.contains("一次"), "{zh}");
+        assert!(en.contains("once after the upgrade"), "{en}");
+        // Not work in progress: finished, failed, backing off, waiting.
+        for phase in [
+            "", "ready", "building-fail", "ddi-fail", "waiting", "lock-backoff", "lock-wait",
+            "interrupted", "stopped", "completed",
+        ] {
+            assert_eq!(setup_working_advice(phase, "x"), None, "{phase}");
+        }
+    }
+
+    #[test]
     fn batch_expectations_match_application_and_strict_element_state() {
         let rows = vec![
-            crate::wda::ElementRow {
+            crate::runner::ElementRow {
                 kind: "Application".to_string(),
                 label: "招商银行".to_string(),
                 identifier: None,
@@ -21553,7 +22121,7 @@ mod tests {
                 placeholder: None,
                 ..Default::default()
             },
-            crate::wda::ElementRow {
+            crate::runner::ElementRow {
                 kind: "TextField".to_string(),
                 label: "搜索".to_string(),
                 identifier: Some("search-field".to_string()),
@@ -21626,7 +22194,7 @@ mod tests {
             "ddi_needs_reboot",
             "legacy_needs_usb",
             "locked",
-            "wda",
+            "runner",
         ] {
             let payload = format!(r#"{{"blocked_on":"{blocker}","ts":1000}}"#);
             assert_eq!(parse_setup_blocked_on(&payload, 1100), blocker);
@@ -21650,19 +22218,19 @@ mod tests {
         let locked = setup_blocker_hint("locked").unwrap();
         assert!(locked.contains("unlock"), "{locked}");
         assert!(locked.contains("on its own"), "{locked}");
-        assert!(!locked.contains("wda-agent.log"), "{locked}");
+        assert!(!locked.contains("runner-agent.log"), "{locked}");
         assert!(!locked.contains("doctor"), "{locked}");
     }
 
     #[test]
     fn next_steps_name_the_cli_for_this_instance() {
-        let (zh, en) = human_next_step("blocker", "wda", "").unwrap();
+        let (zh, en) = human_next_step("blocker", "runner", "").unwrap();
         assert!(
             en.contains("iphone-use doctor") && zh.contains("iphone-use doctor"),
             "{en}"
         );
         assert!(
-            !en.contains("setup-wda.sh") && !zh.contains("setup-wda.sh"),
+            !en.contains("setup-runner.sh") && !zh.contains("setup-runner.sh"),
             "{en}"
         );
         let default = crate::instance::Instance::derive("", "/Users/x", None).unwrap();
@@ -21672,14 +22240,11 @@ mod tests {
             for_instance("run iphone-use setup, then iphone-use doctor", &second),
             "run iphone-use setup --instance i13, then iphone-use doctor --instance i13"
         );
-        // No next step sends a person to a script path or calls the runner WDA.
+        // No next step sends a person to a script path.
         for advice in ["unconfigured", "offline", "external", "died"] {
             let (zh, en) = human_next_step(advice, "", "unreachable").unwrap();
             for text in [zh, en] {
-                assert!(
-                    !text.contains("setup-wda.sh") && !text.contains("WDA"),
-                    "{text}"
-                );
+                assert!(!text.contains("setup-runner.sh"), "{text}");
             }
         }
     }
@@ -21695,7 +22260,7 @@ mod tests {
         assert!(hint.contains("the 8538/9538 relays"), "{hint}");
         assert!(hint.contains("iphone-use doctor --instance i13"), "{hint}");
         assert!(!hint.contains("8100"), "{hint}");
-        let died = hint_for_this_daemon(wda_death_hint("unreachable"), &second, "8538/9538");
+        let died = hint_for_this_daemon(runner_death_hint("unreachable"), &second, "8538/9538");
         assert!(died.contains("the 8538/9538 relay died"), "{died}");
         assert!(died.contains("iphone-use setup --instance i13"), "{died}");
         let default = crate::instance::Instance::derive("", "/Users/x", None).unwrap();
@@ -21706,18 +22271,18 @@ mod tests {
     }
 
     #[test]
-    fn wda_blocker_hint_names_the_instance_log_not_the_default_one() {
+    fn runner_blocker_hint_names_the_instance_log_not_the_default_one() {
         // #126: a second phone keeps its state outside ~/.iphone-use, so the
         // hint must send the operator to that instance's own log and helper.
         let second = crate::instance::Instance::derive("i14", "/Users/x", None).unwrap();
-        let hint = instance_setup_blocker_hint("wda", &second).unwrap();
+        let hint = instance_setup_blocker_hint("runner", &second).unwrap();
         assert!(hint.contains(&second.agent_log().display().to_string()), "{hint}");
         assert!(hint.contains(&second.setup_sh().display().to_string()), "{hint}");
         assert!(!hint.contains("~/.iphone-use"), "{hint}");
 
         let default = crate::instance::Instance::derive("", "/Users/x", None).unwrap();
-        let hint = instance_setup_blocker_hint("wda", &default).unwrap();
-        assert!(hint.contains("/Users/x/.iphone-use/wda-agent.log"), "{hint}");
+        let hint = instance_setup_blocker_hint("runner", &default).unwrap();
+        assert!(hint.contains("/Users/x/.iphone-use/runner-agent.log"), "{hint}");
 
         // Every other blocker keeps its instance-independent text.
         assert_eq!(
@@ -21729,7 +22294,7 @@ mod tests {
 
     #[test]
     fn automation_mode_blocker_names_the_phone_setting_not_a_log() {
-        // setup-wda publishes this when the runner log says "The test runner
+        // setup-runner publishes this when the runner log says "The test runner
         // failed to initialize for UI testing. (Underlying Error: Timed out
         // while enabling automation mode.)" on an unlocked phone.
         let payload = r#"{"phase":"building-fail","blocked_on":"automation_mode_disabled","message":"enable UI automation on the iPhone","ts":1000}"#;
@@ -21742,7 +22307,7 @@ mod tests {
         );
         assert!(hint.contains("Allow automation"), "{hint}");
         assert!(hint.contains("unlocked"), "{hint}");
-        assert!(!hint.contains("wda-agent.log"), "{hint}");
+        assert!(!hint.contains("runner-agent.log"), "{hint}");
         // The hint is spliced into the status JSON unescaped.
         assert!(!hint.contains('"') && !hint.contains('{') && !hint.contains('}'));
     }
@@ -21802,7 +22367,7 @@ mod tests {
             &crate::setup::legacy_ios::Record {
                 ios: "16.5".into(),
                 udid: "63f53bbb05918cbf4154ba9d1d1f95b28e532597".into(),
-                bundle: "com.example.wda".into(),
+                bundle: "com.example.runner".into(),
                 launcher: "/x/iphone-use-legacy-launch".into(),
                 launch_transport: "wifi".into(),
                 wifi_mac: None,
@@ -21953,7 +22518,7 @@ mod tests {
         assert_eq!(parse_setup_blocked_on(payload, 1000 + 1300), "");
         let hint = setup_blocker_hint("ios_too_old").unwrap();
         // iOS 15/16 needs no update: the legacy path wants an ASC key.
-        assert!(hint.contains("WDA_ASC_KEY_PATH"), "{hint}");
+        assert!(hint.contains("IPU_RUNNER_ASC_KEY_PATH"), "{hint}");
         assert!(hint.contains("iOS 14 and older"), "{hint}");
         assert!(
             hint.contains("do not send another reconnect request"),
@@ -21971,7 +22536,7 @@ mod tests {
     #[test]
     fn xcode_too_old_blocker_says_to_install_xcode_and_outlives_the_backoff() {
         // #126: the runner exits with code 74 when the phone runs a newer iOS
-        // than the Xcode SDK; setup names that instead of the generic `wda`.
+        // than the Xcode SDK; setup names that instead of the generic `runner`.
         let payload = r#"{"phase":"building-fail","blocked_on":"xcode_too_old","message":"iPhone runs iOS 27.2 but this Xcode's SDK is iOS 27.0","ts":1000}"#;
         let status = parse_setup_status(payload, 1100).expect("fresh status");
         assert_eq!(status.blocked_on, "xcode_too_old");
@@ -21981,7 +22546,7 @@ mod tests {
             hint.contains("do not send another reconnect request"),
             "{hint}"
         );
-        assert!(!hint.contains("wda-agent.log"), "{hint}");
+        assert!(!hint.contains("runner-agent.log"), "{hint}");
         assert!(!hint.contains('"') && !hint.contains('{') && !hint.contains('}'));
         let (zh, en) = human_next_step("blocker", "xcode_too_old", "").unwrap();
         assert!(
@@ -22006,16 +22571,22 @@ mod tests {
             ✓ Xcode: Xcode 26.6\n\
             ✗ Xcode has no signed-in Apple account. Open Xcode → Settings → Accounts,\n";
         assert_eq!(parse_setup_log_blocked_on(signed_out), "account");
+        assert_eq!(
+            parse_setup_log_blocked_on(
+                "== Checking prerequisites\n✓ Team: EXAMPLE123\nXcode reported No Accounts while signing the device runner."
+            ),
+            "account"
+        );
 
         // A later attempt that got past signing must clear the stale blocker.
         let recovered = format!("{signed_out}== Checking prerequisites\n✓ Team: 43G3AR9DT8\n");
         assert_eq!(parse_setup_log_blocked_on(&recovered), "");
     }
 
-    // --- wda_died_reason (#26 §2) ------------------------------------------
+    // --- runner_died_reason (#26 §2) ------------------------------------------
 
-    fn health(up: bool, actionable: bool, locked: Option<bool>) -> crate::wda::WdaHealth {
-        crate::wda::WdaHealth {
+    fn health(up: bool, actionable: bool, locked: Option<bool>) -> crate::runner::RunnerHealth {
+        crate::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up,
             actionable,
@@ -22025,16 +22596,16 @@ mod tests {
 
     #[test]
     fn a_severed_session_is_not_blamed_on_a_human() {
-        // The reported symptom: WDA still answers /status but every action
+        // The reported symptom: runner still answers /status but every action
         // fails Code=41 after a WARP reconnect or a sleep.
-        let reason = classify_wda_death(
+        let reason = classify_runner_death(
             health(true, true, Some(false)),
             health(true, false, Some(false)),
             false,
             false,
         );
         assert_eq!(reason, Some("session_severed"));
-        assert!(wda_death_hint("session_severed").contains("WARP"));
+        assert!(runner_death_hint("session_severed").contains("WARP"));
     }
 
     #[test]
@@ -22042,21 +22613,21 @@ mod tests {
         let alive = health(true, true, Some(false));
         // Runner/relay gone entirely, or the phone's Wi-Fi address moved.
         assert_eq!(
-            classify_wda_death(alive, health(false, false, None), false, false),
+            classify_runner_death(alive, health(false, false, None), false, false),
             Some("unreachable")
         );
         // Phone locked under a live runner.
         assert_eq!(
-            classify_wda_death(alive, health(true, false, Some(true)), false, false),
+            classify_runner_death(alive, health(true, false, Some(true)), false, false),
             Some("device_locked")
         );
         // We stopped it ourselves — nobody needs to go repair anything.
         assert_eq!(
-            classify_wda_death(alive, health(false, false, None), true, false),
+            classify_runner_death(alive, health(false, false, None), true, false),
             Some("idle_release")
         );
         assert_eq!(
-            classify_wda_death(alive, health(false, false, None), false, true),
+            classify_runner_death(alive, health(false, false, None), false, true),
             Some("idle_release")
         );
     }
@@ -22066,12 +22637,12 @@ mod tests {
         let alive = health(true, true, Some(false));
         let dead = health(false, false, None);
         // Still fine → not a death.
-        assert_eq!(classify_wda_death(alive, alive, false, false), None);
+        assert_eq!(classify_runner_death(alive, alive, false, false), None);
         // Was already down → not a NEW death; must not overwrite the real cause
         // recorded at the original transition with a later generic one.
-        assert_eq!(classify_wda_death(dead, dead, false, false), None);
+        assert_eq!(classify_runner_death(dead, dead, false, false), None);
         // Coming back up is not a death either.
-        assert_eq!(classify_wda_death(dead, alive, false, false), None);
+        assert_eq!(classify_runner_death(dead, alive, false, false), None);
     }
 
     #[test]
@@ -22080,7 +22651,7 @@ mod tests {
         // `unreachable` would send agents chasing a phantom outage.
         let alive = health(true, true, Some(false));
         assert_eq!(
-            classify_wda_death(alive, health(true, false, Some(true)), true, false),
+            classify_runner_death(alive, health(true, false, Some(true)), true, false),
             Some("idle_release")
         );
     }
@@ -22094,12 +22665,12 @@ mod tests {
             "unreachable",
         ] {
             assert!(
-                !wda_death_hint(reason).is_empty(),
+                !runner_death_hint(reason).is_empty(),
                 "{reason} has no recovery hint"
             );
         }
-        assert_eq!(wda_death_hint(""), "");
-        assert_eq!(wda_death_hint("something-new"), "");
+        assert_eq!(runner_death_hint(""), "");
+        assert_eq!(runner_death_hint("something-new"), "");
     }
 
     #[test]
@@ -22108,10 +22679,10 @@ mod tests {
         let slot = Mutex::new(health(true, true, Some(false)));
         let actionable = AtomicBool::new(true);
         let released = AtomicBool::new(false);
-        let death = Mutex::new(WdaDeath::default());
+        let death = Mutex::new(RunnerDeath::default());
 
         // Dies...
-        apply_wda_health_probe_tracked(
+        apply_runner_health_probe_tracked(
             &slot,
             &actionable,
             &released,
@@ -22124,7 +22695,7 @@ mod tests {
 
         // ...and comes back. A stale epitaph next to a healthy runner would be
         // read as a live problem.
-        apply_wda_health_probe_tracked(
+        apply_runner_health_probe_tracked(
             &slot,
             &actionable,
             &released,
@@ -22136,10 +22707,10 @@ mod tests {
         assert!(actionable.load(Ordering::Acquire));
     }
 
-    // --- wda_build (#26 §1) ------------------------------------------------
+    // --- runner_build (#26 §1) ------------------------------------------------
 
-    fn build_status(phase: &str, ts: u64) -> WdaSetupStatus {
-        WdaSetupStatus {
+    fn build_status(phase: &str, ts: u64) -> RunnerSetupStatus {
+        RunnerSetupStatus {
             phase: phase.to_string(),
             blocked_on: String::new(),
             message: String::new(),
@@ -22149,9 +22720,34 @@ mod tests {
     }
 
     #[test]
+    fn a_live_setup_at_work_is_a_reconnect_and_nothing_else_is() {
+        let building = RunnerSetupStatus {
+            message: "building the device runner".into(),
+            ..build_status("building", 1)
+        };
+        let alive = || true;
+        assert_eq!(
+            setup_working(true, Some(&building), alive).map(|a| a.0),
+            Some("setting_up_build")
+        );
+        // A dead owner, an ineligible daemon state, no status, a finished run.
+        assert_eq!(setup_working(true, Some(&building), || false), None);
+        assert_eq!(
+            setup_working(false, Some(&building), || panic!("not asked")),
+            None
+        );
+        assert_eq!(setup_working(true, None, alive), None);
+        assert_eq!(setup_working(true, Some(&build_status("ready", 1)), alive), None);
+        assert_eq!(
+            setup_working(true, Some(&build_status("building-fail", 1)), alive),
+            None
+        );
+    }
+
+    #[test]
     fn build_state_separates_working_from_gave_up() {
         // The whole point of #26 §1: these two look identical in
-        // `setup_blocked_on` (both empty, both wda:false).
+        // `setup_blocked_on` (both empty, both runner:false).
         assert_eq!(classify_build_state("building", 90), "building");
         assert_eq!(classify_build_state("building-fail", 90), "failed");
     }
@@ -22176,7 +22772,7 @@ mod tests {
 
     #[test]
     fn build_state_calls_a_silent_helper_stalled_not_building() {
-        // setup-wda.sh rewrites its status every poll while building, so this
+        // setup-runner.sh rewrites its status every poll while building, so this
         // much silence means the process died without writing a -fail phase.
         assert_eq!(
             classify_build_state("building", BUILD_STALE_SECS + 1),
@@ -22188,10 +22784,10 @@ mod tests {
     }
 
     #[test]
-    fn wda_build_attaches_a_log_tail_only_when_the_log_is_the_answer() {
+    fn runner_build_attaches_a_log_tail_only_when_the_log_is_the_answer() {
         let log = || "line one\n\nline two\nboom: xcodebuild failed\n".to_string();
 
-        let failed = derive_wda_build(Some(&build_status("building-fail", 1000)), 1100, log);
+        let failed = derive_runner_build(Some(&build_status("building-fail", 1000)), 1100, log);
         assert_eq!(failed.state, "failed");
         assert_eq!(failed.age_secs, 100);
         assert_eq!(failed.since, 1000);
@@ -22200,35 +22796,35 @@ mod tests {
         assert!(!failed.log_tail.contains("\n\n"));
 
         // Mid-build and ready poll constantly; don't ship a log on every poll.
-        let building = derive_wda_build(Some(&build_status("building", 1000)), 1100, log);
+        let building = derive_runner_build(Some(&build_status("building", 1000)), 1100, log);
         assert_eq!(building.state, "building");
         assert!(building.log_tail.is_empty());
 
-        let ready = derive_wda_build(Some(&build_status("ready", 1000)), 1100, log);
+        let ready = derive_runner_build(Some(&build_status("ready", 1000)), 1100, log);
         assert_eq!(ready.state, "ready");
         assert!(ready.log_tail.is_empty());
 
         // A stalled helper is the other case where you must read the log.
-        let stalled = derive_wda_build(Some(&build_status("building", 1000)), 9000, log);
+        let stalled = derive_runner_build(Some(&build_status("building", 1000)), 9000, log);
         assert_eq!(stalled.state, "stalled");
         assert!(stalled.log_tail.contains("boom"));
     }
 
     #[test]
-    fn wda_build_without_a_status_file_is_unknown_not_failed() {
-        let b = derive_wda_build(None, 1000, || "irrelevant".to_string());
+    fn runner_build_without_a_status_file_is_unknown_not_failed() {
+        let b = derive_runner_build(None, 1000, || "irrelevant".to_string());
         assert_eq!(b.state, "unknown");
         assert_eq!(b.since, 0);
         assert!(b.log_tail.is_empty());
     }
 
     #[test]
-    fn wda_build_json_is_valid_and_escapes_log_text() {
-        let b = derive_wda_build(Some(&build_status("building-fail", 1000)), 1100, || {
+    fn runner_build_json_is_valid_and_escapes_log_text() {
+        let b = derive_runner_build(Some(&build_status("building-fail", 1000)), 1100, || {
             "error: \"quoted\"\n\tand a backslash \\ and a newline".to_string()
         });
         let v: serde_json::Value = serde_json::from_str(&b.to_json())
-            .expect("wda_build must be valid JSON inside the status body");
+            .expect("runner_build must be valid JSON inside the status body");
         assert_eq!(v["state"], "failed");
         assert_eq!(v["phase"], "building-fail");
         assert_eq!(v["age_secs"], 100);
@@ -22263,7 +22859,7 @@ mod tests {
     #[test]
     fn setup_status_rejects_stale_unknown_or_invalid_input() {
         assert_eq!(
-            parse_setup_blocked_on(r#"{"blocked_on":"wda","ts":1000}"#, 1301),
+            parse_setup_blocked_on(r#"{"blocked_on":"runner","ts":1000}"#, 1301),
             ""
         );
         assert_eq!(
@@ -22276,13 +22872,13 @@ mod tests {
     #[test]
     fn setup_status_preserves_fresh_progress_without_calling_it_a_blocker() {
         let status = parse_setup_status(
-            r#"{"phase":"building","blocked_on":"","message":"building + launching WDA (90s elapsed)","ts":1000}"#,
+            r#"{"phase":"building","blocked_on":"","message":"building + launching runner (90s elapsed)","ts":1000}"#,
             1100,
         )
         .unwrap();
         assert_eq!(status.phase, "building");
         assert_eq!(status.blocked_on, "");
-        assert_eq!(status.message, "building + launching WDA (90s elapsed)");
+        assert_eq!(status.message, "building + launching runner (90s elapsed)");
     }
 
     #[test]
@@ -22323,11 +22919,11 @@ mod tests {
     #[test]
     fn setup_log_fallback_recognizes_warp_from_latest_attempt_only() {
         let connected = "== Checking prerequisites\n\
-            WARP is ON and will block WDA (the CoreDevice tunnel dies).";
+            WARP is ON and will block runner (the CoreDevice tunnel dies).";
         assert_eq!(parse_setup_log_blocked_on(connected), "warp");
 
         let recovered = "== Checking prerequisites\n\
-            WARP is ON and will block WDA (the CoreDevice tunnel dies).\n\
+            WARP is ON and will block runner (the CoreDevice tunnel dies).\n\
             == Checking prerequisites\n\
             System proxies (HTTP/HTTPS/SOCKS): none enabled\n\
             prerequisites passed";
@@ -22400,15 +22996,34 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_static("foo=bar; phone_session=abc.def.ghi; baz=qux"),
         );
-        assert_eq!(session_cookie(&headers), Some("abc.def.ghi".to_string()));
+        assert_eq!(session_cookies(&headers), vec!["abc.def.ghi".to_string()]);
     }
 
     #[test]
     fn session_cookie_absent() {
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, HeaderValue::from_static("foo=bar"));
-        assert_eq!(session_cookie(&headers), None);
-        assert_eq!(session_cookie(&HeaderMap::new()), None);
+        assert!(session_cookies(&headers).is_empty());
+        assert!(session_cookies(&HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn every_session_cookie_is_tried() {
+        // Two daemons under different base paths on one host: the browser
+        // sends both `phone_session` cookies; ours may come second.
+        let state = fixture_app_state(Some("pw"));
+        let ours = make_session_cookie(&state, false);
+        let token = ours
+            .strip_prefix("phone_session=")
+            .and_then(|rest| rest.split(';').next())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("phone_session=someone.elses.token; phone_session={token}"))
+                .unwrap(),
+        );
+        assert!(is_authed(&state, &headers));
     }
 
     #[test]
@@ -22419,22 +23034,22 @@ mod tests {
             header::COOKIE,
             format!("other=1; {SESSION_COOKIE}=abc").parse().unwrap(),
         );
-        assert_eq!(session_cookie(&headers).as_deref(), Some("abc"));
-        assert_eq!(session_cookie(&HeaderMap::new()), None);
+        assert_eq!(session_cookies(&headers), vec!["abc".to_string()]);
+        assert!(session_cookies(&HeaderMap::new()).is_empty());
     }
 
     #[test]
     fn embedded_index_html_is_the_client() {
         // include_str! must pick up web/index.html (the browser client).
         assert!(INDEX_HTML.contains("iphone-use"));
-        // WDA-only since v0.9: no WebRTC signaling or TURN in the client.
+        // runner-only since v0.9: no WebRTC signaling or TURN in the client.
         assert!(!INDEX_HTML.contains("/ws"));
         assert!(!INDEX_HTML.contains("turn-creds"));
         assert!(!INDEX_HTML.contains("RTCPeerConnection"));
         assert!(INDEX_HTML.contains("id=\"flowPanel\""));
         // Pairing the app with the daemon on its own phone.
         assert!(INDEX_HTML.contains("id=\"pairSelf\""));
-        assert!(INDEX_HTML.contains("'/agent/phone-daemon/pair'"));
+        assert!(INDEX_HTML.contains("BASE + '/agent/phone-daemon/pair'"));
         // Lock readiness: the daemon's own hint for phones that will lock.
         assert!(INDEX_HTML.contains("id=\"lockNotice\""));
         assert!(INDEX_HTML.contains("status?.lock_readiness"));
@@ -22457,7 +23072,7 @@ mod tests {
         assert!(INDEX_HTML.contains("界面检查点"));
         assert!(INDEX_HTML.contains("chooseFlowCheckpoint"));
         assert!(INDEX_HTML.contains("kind: 'wait_for'"));
-        assert!(INDEX_HTML.contains("fetch('/agent/actions'"));
+        assert!(INDEX_HTML.contains("fetch(BASE + '/agent/actions'"));
         assert!(INDEX_HTML.contains("X-Phone-Control"));
         assert!(INDEX_HTML.contains("function managedSetupWillRetry"));
         assert!(INDEX_HTML.contains("连接后会自动继续"));
@@ -22484,11 +23099,11 @@ mod tests {
     #[test]
     fn embedded_setup_html_is_the_connection_guide() {
         assert!(SETUP_HTML.contains("连接真实 iPhone"));
-        assert!(SETUP_HTML.contains("fetch('/agent/status'"));
+        assert!(SETUP_HTML.contains("fetch(BASE + '/agent/status'"));
         assert!(SETUP_HTML.contains("setup_blocked_on"));
         assert!(SETUP_HTML.contains("recovery_owner"));
         assert!(SETUP_HTML.contains("aria-disabled=\"true\""));
-        assert!(SETUP_HTML.contains("href=\"/phone\""));
+        assert!(SETUP_HTML.contains("href=\"phone\""));
         assert!(SETUP_HTML.contains("fd00::/8"));
         assert!(SETUP_HTML.contains("fe80::/10"));
         assert!(SETUP_HTML.contains("Traffic only mode"));
@@ -22537,20 +23152,20 @@ mod tests {
     }
 
     #[test]
-    fn managed_wda_target_requires_a_canonical_udid() {
-        assert!(valid_wda_udid("00008110-001234567890001E"));
-        assert!(!valid_wda_udid(""));
-        assert!(!valid_wda_udid("phone one"));
-        assert!(!valid_wda_udid("../other-device"));
+    fn managed_runner_target_requires_a_canonical_udid() {
+        assert!(valid_runner_udid("00008110-001234567890001E"));
+        assert!(!valid_runner_udid(""));
+        assert!(!valid_runner_udid("phone one"));
+        assert!(!valid_runner_udid("../other-device"));
     }
 
     #[test]
-    fn normalized_wda_coordinates_stay_inside_touchable_bounds() {
-        assert_eq!(normalized_wda_axis(0.0, 390.0).unwrap(), 1.0);
-        assert_eq!(normalized_wda_axis(1.0, 390.0).unwrap(), 389.0);
-        assert_eq!(normalized_wda_axis(0.5, 390.0).unwrap(), 195.0);
-        assert!(normalized_wda_axis(0.5, 2.0).is_err());
-        assert!(normalized_wda_axis(f64::NAN, 390.0).is_err());
+    fn normalized_runner_coordinates_stay_inside_touchable_bounds() {
+        assert_eq!(normalized_runner_axis(0.0, 390.0).unwrap(), 1.0);
+        assert_eq!(normalized_runner_axis(1.0, 390.0).unwrap(), 389.0);
+        assert_eq!(normalized_runner_axis(0.5, 390.0).unwrap(), 195.0);
+        assert!(normalized_runner_axis(0.5, 2.0).is_err());
+        assert!(normalized_runner_axis(f64::NAN, 390.0).is_err());
     }
 
     #[test]
@@ -22584,8 +23199,8 @@ mod tests {
     }
 
     #[test]
-    fn wda_lifecycle_serializes_release_and_reconnect_in_both_orders() {
-        let lifecycle = WdaLifecycle::new();
+    fn runner_lifecycle_serializes_release_and_reconnect_in_both_orders() {
+        let lifecycle = RunnerLifecycle::new();
 
         let reconnect = lifecycle
             .try_begin_reconnecting()
@@ -22614,8 +23229,8 @@ mod tests {
     }
 
     #[test]
-    fn simultaneous_wda_lifecycle_starts_have_exactly_one_owner() {
-        let lifecycle = std::sync::Arc::new(WdaLifecycle::new());
+    fn simultaneous_runner_lifecycle_starts_have_exactly_one_owner() {
+        let lifecycle = std::sync::Arc::new(RunnerLifecycle::new());
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
 
         let reconnect_lifecycle = lifecycle.clone();
@@ -22650,21 +23265,21 @@ mod tests {
     fn locked_but_up_reconnect_clears_released_before_timeout_finishes() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let health_slot = Mutex::new(crate::wda::WdaHealth::down());
+        let health_slot = Mutex::new(crate::runner::RunnerHealth::down());
         let actionable = AtomicBool::new(false);
         let released = AtomicBool::new(true);
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let token = lifecycle
             .try_begin_reconnecting()
             .expect("reconnect begins");
-        let locked = crate::wda::WdaHealth {
+        let locked = crate::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: false,
             locked: Some(true),
         };
 
-        assert!(!apply_wda_health_probe(
+        assert!(!apply_runner_health_probe(
             &health_slot,
             &actionable,
             &released,
@@ -22680,13 +23295,13 @@ mod tests {
         // Model the readiness deadline expiring without actionability: the
         // runner still owns the device, while reconnecting ends and status can
         // honestly tell the user to unlock instead of reconnecting again.
-        finish_wda_readiness_wait(&lifecycle, token, WdaReadinessOutcome::Deadline);
+        finish_runner_readiness_wait(&lifecycle, token, RunnerReadinessOutcome::Deadline);
         assert!(!lifecycle.is_reconnecting());
         assert_eq!(recover(health_slot.lock()).locked, Some(true));
     }
 
     // ---------------------------------------------------------------------
-    // Readiness lifecycle: real router, real loop, synthetic WDA.
+    // Readiness lifecycle: real router, real loop, synthetic runner.
     // ---------------------------------------------------------------------
 
     fn block<F: std::future::Future>(future: F) -> F::Output {
@@ -22742,19 +23357,19 @@ mod tests {
         }
     }
 
-    /// A synthetic WDA on loopback that the test owns and shuts down.
+    /// A synthetic runner on loopback that the test owns and shuts down.
     ///
     /// Serves an unbounded number of requests until [`Self::shutdown`] (or
     /// `Drop`) stops it, then joins its thread — so a panic inside the
     /// responder surfaces in the test instead of being swallowed by a
     /// detached thread, and no thread outlives the test.
-    struct MockWda {
+    struct MockRunner {
         base: String,
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
-    impl MockWda {
+    impl MockRunner {
         fn start(responder: impl Fn(&str) -> String + Send + 'static) -> Self {
             use std::io::{Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -22814,12 +23429,12 @@ mod tests {
             let address = self.base.trim_start_matches("http://").to_string();
             let _ = std::net::TcpStream::connect(address);
             if let Some(thread) = self.thread.take() {
-                thread.join().expect("mock WDA responder panicked");
+                thread.join().expect("mock runner responder panicked");
             }
         }
     }
 
-    impl Drop for MockWda {
+    impl Drop for MockRunner {
         fn drop(&mut self) {
             if self.thread.is_some() {
                 self.shutdown();
@@ -22827,18 +23442,18 @@ mod tests {
         }
     }
 
-    fn readiness_state_with_wda(base: &str) -> Arc<AppState> {
+    fn readiness_state_with_runner(base: &str) -> Arc<AppState> {
         let state = readiness_test_state();
         let mut state = Arc::try_unwrap(state).ok().expect("fresh state");
-        state.wda = Some(Arc::new(tokio::sync::Mutex::new(
-            crate::wda::WdaClient::new(base).unwrap(),
+        state.runner = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::runner::RunnerClient::new(base).unwrap(),
         )));
-        state.managed_wda = true;
+        state.managed_runner = true;
         Arc::new(state)
     }
 
-    fn short_budget() -> WdaReadinessBudget {
-        WdaReadinessBudget {
+    fn short_budget() -> RunnerReadinessBudget {
+        RunnerReadinessBudget {
             total: std::time::Duration::from_millis(300),
             probe: std::time::Duration::from_millis(80),
             poll: std::time::Duration::from_millis(10),
@@ -22854,7 +23469,7 @@ mod tests {
     impl SetupStatusFixture {
         fn absent() -> Self {
             let dir = tempfile::tempdir().expect("temp status dir");
-            let path = dir.path().join("wda-setup-status.json");
+            let path = dir.path().join("runner-setup-status.json");
             Self {
                 _dir: dir,
                 path: path.to_string_lossy().to_string(),
@@ -22912,8 +23527,8 @@ mod tests {
                 }
             };
 
-            let mut wda = MockWda::start(respond(true));
-            let mut w = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let mut runner = MockRunner::start(respond(true));
+            let mut w = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let started = tokio::time::Instant::now();
             let run = watch_bridge_run(
                 &mut w,
@@ -22928,10 +23543,10 @@ mod tests {
                 "waited out a fixed sleep: {:?}",
                 started.elapsed()
             );
-            wda.shutdown();
+            runner.shutdown();
 
-            let mut wda = MockWda::start(respond(false));
-            let mut w = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let mut runner = MockRunner::start(respond(false));
+            let mut w = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let started = tokio::time::Instant::now();
             let run = watch_bridge_run(
                 &mut w,
@@ -22946,11 +23561,11 @@ mod tests {
                 "outlived its deadline: {:?}",
                 started.elapsed()
             );
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
-    fn healthy_wda_responder(request: &str) -> String {
+    fn healthy_runner_responder(request: &str) -> String {
         if request.contains("/wda/locked") {
             r#"{"value":false}"#.to_string()
         } else if request.contains("/wda/apps/list") {
@@ -22985,8 +23600,8 @@ mod tests {
     #[test]
     fn status_reports_lock_readiness() {
         block(async {
-            let mut wda = MockWda::start(healthy_wda_responder);
-            let state = readiness_state_with_wda(wda.base());
+            let mut runner = MockRunner::start(healthy_runner_responder);
+            let state = readiness_state_with_runner(runner.base());
             let body = status_json(&state).await;
             let value: serde_json::Value = serde_json::from_str(&body).expect("status is JSON");
             let readiness = &value["lock_readiness"];
@@ -23011,7 +23626,7 @@ mod tests {
             assert!(readiness["hint"]["zh"].is_string());
             assert!(readiness["hint"]["en"].is_string());
             assert!(readiness["keep_awake"]["enabled"].is_boolean());
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -23020,8 +23635,8 @@ mod tests {
     #[test]
     fn status_reports_device_identity() {
         block(async {
-            let mut wda = MockWda::start(healthy_wda_responder);
-            let state = readiness_state_with_wda(wda.base());
+            let mut runner = MockRunner::start(healthy_runner_responder);
+            let state = readiness_state_with_runner(runner.base());
             let body = status_json(&state).await;
             let value: serde_json::Value = serde_json::from_str(&body).expect("status is JSON");
             let device = value.get("device").expect("status has device");
@@ -23030,7 +23645,7 @@ mod tests {
                     assert!(device.get(key).is_some(), "device lacks {key}: {body}");
                 }
             }
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -23042,15 +23657,15 @@ mod tests {
     #[test]
     fn status_never_ends_a_reconnect_that_cached_actionability_precedes() {
         block(async {
-            let mut wda = MockWda::start(healthy_wda_responder);
-            let state = readiness_state_with_wda(wda.base());
+            let mut runner = MockRunner::start(healthy_runner_responder);
+            let state = readiness_state_with_runner(runner.base());
 
-            // Evidence from before the bring-up: WDA was actionable.
-            assert!(apply_wda_health_probe(
-                &state.wda_health,
-                &state.wda_actionable,
+            // Evidence from before the bring-up: runner was actionable.
+            assert!(apply_runner_health_probe(
+                &state.runner_health,
+                &state.runner_actionable,
                 &state.released,
-                crate::wda::WdaHealth {
+                crate::runner::RunnerHealth {
                     updated_at: std::time::Instant::now(),
                     up: true,
                     actionable: true,
@@ -23058,12 +23673,12 @@ mod tests {
                 },
             ));
             assert!(state
-                .wda_actionable
+                .runner_actionable
                 .load(std::sync::atomic::Ordering::Acquire));
 
             // A new bring-up starts; the cached value is still true.
             let token = state
-                .wda_lifecycle
+                .runner_lifecycle
                 .try_begin_reconnecting()
                 .expect("bring-up starts");
 
@@ -23077,37 +23692,37 @@ mod tests {
                     body.contains(r#""drivable":false"#),
                     "status reported a rebuilding runner as drivable: {body}"
                 );
-                assert!(state.wda_lifecycle.is_reconnecting());
+                assert!(state.runner_lifecycle.is_reconnecting());
             }
 
             // The owner can still finish normally after those observations.
-            assert!(state.wda_lifecycle.finish_reconnecting(token));
-            assert!(!state.wda_lifecycle.is_transitioning());
-            wda.shutdown();
+            assert!(state.runner_lifecycle.finish_reconnecting(token));
+            assert!(!state.runner_lifecycle.is_transitioning());
+            runner.shutdown();
         });
     }
 
-    /// Drive the real loop to `Ready` against a healthy synthetic WDA.
+    /// Drive the real loop to `Ready` against a healthy synthetic runner.
     #[test]
     fn readiness_loop_reaches_ready_and_publishes_evidence() {
         block(async {
-            let mut wda = MockWda::start(healthy_wda_responder);
+            let mut runner = MockRunner::start(healthy_runner_responder);
             let status = SetupStatusFixture::absent();
-            let state = readiness_state_with_wda(wda.base());
+            let state = readiness_state_with_runner(runner.base());
             state
                 .released
                 .store(true, std::sync::atomic::Ordering::Release);
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
 
             let outcome =
-                run_wda_readiness_wait(&state, token, short_budget(), status.path(), 0).await;
+                run_runner_readiness_wait(&state, token, short_budget(), status.path(), 0).await;
 
-            assert_eq!(outcome, WdaReadinessOutcome::Ready);
+            assert_eq!(outcome, RunnerReadinessOutcome::Ready);
             assert!(state
-                .wda_actionable
+                .runner_actionable
                 .load(std::sync::atomic::Ordering::Acquire));
             assert!(!state.released.load(std::sync::atomic::Ordering::Acquire));
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -23115,7 +23730,7 @@ mod tests {
     #[test]
     fn readiness_loop_ends_on_a_locked_phone() {
         block(async {
-            let mut wda = MockWda::start(|request| {
+            let mut runner = MockRunner::start(|request| {
                 if request.contains("/wda/locked") {
                     r#"{"value":true}"#.to_string()
                 } else {
@@ -23123,24 +23738,24 @@ mod tests {
                 }
             });
             let status = SetupStatusFixture::absent();
-            let state = readiness_state_with_wda(wda.base());
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner(runner.base());
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
 
             let budget = short_budget();
             let started = std::time::Instant::now();
-            let outcome = run_wda_readiness_wait(&state, token, budget, status.path(), 0).await;
+            let outcome = run_runner_readiness_wait(&state, token, budget, status.path(), 0).await;
 
-            assert_eq!(outcome, WdaReadinessOutcome::Locked);
+            assert_eq!(outcome, RunnerReadinessOutcome::Locked);
             assert!(
                 started.elapsed() < budget.total,
                 "a locked phone burned the whole budget"
             );
             assert_eq!(
-                recover(state.wda_health.lock()).locked,
+                recover(state.runner_health.lock()).locked,
                 Some(true),
                 "the lock state must be published"
             );
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -23151,7 +23766,7 @@ mod tests {
     #[test]
     fn readiness_loop_ignores_a_blocker_written_before_the_bootstrap() {
         block(async {
-            let mut wda = MockWda::start(healthy_wda_responder);
+            let mut runner = MockRunner::start(healthy_runner_responder);
             let kicked_at = now_secs();
             let status = SetupStatusFixture::blocked_on_at("usb", kicked_at - 30);
             assert_eq!(read_structured_setup_blocked_on_at(status.path(), 0), "usb");
@@ -23159,46 +23774,46 @@ mod tests {
                 read_structured_setup_blocked_on_at(status.path(), kicked_at),
                 ""
             );
-            let state = readiness_state_with_wda(wda.base());
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner(runner.base());
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
 
             let outcome =
-                run_wda_readiness_wait(&state, token, short_budget(), status.path(), kicked_at)
+                run_runner_readiness_wait(&state, token, short_budget(), status.path(), kicked_at)
                     .await;
 
-            assert_eq!(outcome, WdaReadinessOutcome::Ready);
-            wda.shutdown();
+            assert_eq!(outcome, RunnerReadinessOutcome::Ready);
+            runner.shutdown();
         });
     }
 
-    /// A published prerequisite ends the wait before WDA is ever contacted:
+    /// A published prerequisite ends the wait before runner is ever contacted:
     /// the retry loop cannot clear something only a person can.
     #[test]
-    fn readiness_loop_ends_on_a_setup_blocker_without_touching_wda() {
+    fn readiness_loop_ends_on_a_setup_blocker_without_touching_runner() {
         block(async {
             let contacted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let seen = contacted.clone();
-            let mut wda = MockWda::start(move |request| {
+            let mut runner = MockRunner::start(move |request| {
                 seen.fetch_add(1, std::sync::atomic::Ordering::Release);
-                healthy_wda_responder(request)
+                healthy_runner_responder(request)
             });
             let status = SetupStatusFixture::blocked_on("locked");
-            let state = readiness_state_with_wda(wda.base());
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner(runner.base());
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
 
             let outcome =
-                run_wda_readiness_wait(&state, token, short_budget(), status.path(), 0).await;
+                run_runner_readiness_wait(&state, token, short_budget(), status.path(), 0).await;
 
-            assert_eq!(outcome, WdaReadinessOutcome::SetupBlocked);
+            assert_eq!(outcome, RunnerReadinessOutcome::SetupBlocked);
             assert_eq!(
                 contacted.load(std::sync::atomic::Ordering::Acquire),
                 0,
-                "a published blocker must end the wait before probing WDA"
+                "a published blocker must end the wait before probing runner"
             );
             assert!(!state
-                .wda_actionable
+                .runner_actionable
                 .load(std::sync::atomic::Ordering::Acquire));
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -23207,15 +23822,15 @@ mod tests {
     #[test]
     fn a_hanging_probe_cannot_push_the_wait_past_its_deadline() {
         block(async {
-            let mut wda = MockWda::start(|_| {
+            let mut runner = MockRunner::start(|_| {
                 // Longer than the whole budget below.
                 std::thread::sleep(std::time::Duration::from_millis(1_500));
                 r#"{"value":{"ready":true}}"#.to_string()
             });
             let status = SetupStatusFixture::absent();
-            let state = readiness_state_with_wda(wda.base());
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
-            let budget = WdaReadinessBudget {
+            let state = readiness_state_with_runner(runner.base());
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
+            let budget = RunnerReadinessBudget {
                 total: std::time::Duration::from_millis(200),
                 // Deliberately larger than `total`: only the absolute deadline
                 // can stop this probe.
@@ -23224,37 +23839,37 @@ mod tests {
             };
 
             let started = std::time::Instant::now();
-            let outcome = run_wda_readiness_wait(&state, token, budget, status.path(), 0).await;
+            let outcome = run_runner_readiness_wait(&state, token, budget, status.path(), 0).await;
             let elapsed = started.elapsed();
 
-            assert_eq!(outcome, WdaReadinessOutcome::Deadline);
+            assert_eq!(outcome, RunnerReadinessOutcome::Deadline);
             assert!(
                 elapsed < std::time::Duration::from_millis(900),
                 "a hanging probe ran past the budget: {elapsed:?}"
             );
             assert!(!state
-                .wda_actionable
+                .runner_actionable
                 .load(std::sync::atomic::Ordering::Acquire));
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
-    /// With WDA refusing connections, the wait ends at its deadline and not
+    /// With runner refusing connections, the wait ends at its deadline and not
     /// meaningfully beyond it.
     #[test]
     fn readiness_loop_ends_at_its_deadline_without_overrunning() {
         block(async {
             let status = SetupStatusFixture::absent();
             // Port 1 refuses instantly, so `is_up` fails every round.
-            let state = readiness_state_with_wda("http://127.0.0.1:1");
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner("http://127.0.0.1:1");
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
             let budget = short_budget();
 
             let started = std::time::Instant::now();
-            let outcome = run_wda_readiness_wait(&state, token, budget, status.path(), 0).await;
+            let outcome = run_runner_readiness_wait(&state, token, budget, status.path(), 0).await;
             let elapsed = started.elapsed();
 
-            assert_eq!(outcome, WdaReadinessOutcome::Deadline);
+            assert_eq!(outcome, RunnerReadinessOutcome::Deadline);
             assert!(
                 elapsed >= budget.total,
                 "returned before the budget: {elapsed:?}"
@@ -23272,20 +23887,20 @@ mod tests {
     fn readiness_loop_reports_superseded_when_another_round_takes_over() {
         block(async {
             let status = SetupStatusFixture::absent();
-            let state = readiness_state_with_wda("http://127.0.0.1:1");
-            let first = state.wda_lifecycle.try_begin_reconnecting().unwrap();
-            assert!(state.wda_lifecycle.finish_reconnecting(first));
-            let second = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner("http://127.0.0.1:1");
+            let first = state.runner_lifecycle.try_begin_reconnecting().unwrap();
+            assert!(state.runner_lifecycle.finish_reconnecting(first));
+            let second = state.runner_lifecycle.try_begin_reconnecting().unwrap();
 
             let outcome =
-                run_wda_readiness_wait(&state, first, short_budget(), status.path(), 0).await;
+                run_runner_readiness_wait(&state, first, short_budget(), status.path(), 0).await;
 
-            assert_eq!(outcome, WdaReadinessOutcome::Superseded);
+            assert_eq!(outcome, RunnerReadinessOutcome::Superseded);
             assert!(
-                state.wda_lifecycle.is_reconnecting(),
+                state.runner_lifecycle.is_reconnecting(),
                 "a superseded round ended the current one"
             );
-            assert!(state.wda_lifecycle.finish_reconnecting(second));
+            assert!(state.runner_lifecycle.finish_reconnecting(second));
         });
     }
 
@@ -23295,16 +23910,16 @@ mod tests {
     fn a_cancelled_readiness_wait_still_ends_its_reconnect() {
         block(async {
             let status = SetupStatusFixture::absent();
-            let state = readiness_state_with_wda("http://127.0.0.1:1");
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner("http://127.0.0.1:1");
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
             {
-                let _ownership = WdaReadinessOwnership::new(state.wda_lifecycle.clone(), token);
-                let wait = run_wda_readiness_wait(&state, token, short_budget(), status.path(), 0);
+                let _ownership = RunnerReadinessOwnership::new(state.runner_lifecycle.clone(), token);
+                let wait = run_runner_readiness_wait(&state, token, short_budget(), status.path(), 0);
                 tokio::pin!(wait);
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(5), &mut wait).await;
             }
             assert!(
-                !state.wda_lifecycle.is_transitioning(),
+                !state.runner_lifecycle.is_transitioning(),
                 "a cancelled readiness wait left the reconnect set"
             );
         });
@@ -23325,18 +23940,18 @@ mod tests {
     #[test]
     fn transport_is_read_from_the_recorded_relay() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(wda_transport(dir.path()), "unknown");
-        std::fs::write(dir.path().join("wda-relay.pid"), "1|now|relay:/opt/homebrew/bin/iproxy -s 127.0.0.1 8100:8100 -u X").unwrap();
-        assert_eq!(wda_transport(dir.path()), "usb");
-        std::fs::write(dir.path().join("wda-relay.pid"), "1|now|relay:/Users/u/Applications/iPhoneUse.app/Contents/MacOS/iphone-use relay --udid X --listen 127.0.0.1:8100 --device-port 8100").unwrap();
-        assert_eq!(wda_transport(dir.path()), "usb");
-        std::fs::write(dir.path().join("wda-relay.pid"), "1|now|relay:/opt/homebrew/bin/socat TCP-LISTEN:8100,fork TCP:192.168.0.236:8100").unwrap();
-        assert_eq!(wda_transport(dir.path()), "wifi");
+        assert_eq!(runner_transport(dir.path()), "unknown");
+        std::fs::write(dir.path().join("runner-relay.pid"), "1|now|relay:/opt/homebrew/bin/iproxy -s 127.0.0.1 8100:8100 -u X").unwrap();
+        assert_eq!(runner_transport(dir.path()), "usb");
+        std::fs::write(dir.path().join("runner-relay.pid"), "1|now|relay:/Users/u/Applications/iPhoneUse.app/Contents/MacOS/iphone-use relay --udid X --listen 127.0.0.1:8100 --device-port 8100").unwrap();
+        assert_eq!(runner_transport(dir.path()), "usb");
+        std::fs::write(dir.path().join("runner-relay.pid"), "1|now|relay:/opt/homebrew/bin/socat TCP-LISTEN:8100,fork TCP:192.168.0.236:8100").unwrap();
+        assert_eq!(runner_transport(dir.path()), "wifi");
         assert!(!native_relay(dir.path()), "socat is not the native relay");
         assert!(transport_hint("wifi", Some(180)).unwrap().contains("~180 ms"));
         assert!(transport_hint("usb", Some(5)).is_none());
         // The native relay follows the phone onto its CoreDevice Wi-Fi tunnel.
-        std::fs::write(dir.path().join("wda-relay.pid"), "1|now|relay:/Users/u/Applications/iPhoneUse.app/Contents/MacOS/iphone-use relay --udid X --listen 127.0.0.1:8100 --device-port 8100").unwrap();
+        std::fs::write(dir.path().join("runner-relay.pid"), "1|now|relay:/Users/u/Applications/iPhoneUse.app/Contents/MacOS/iphone-use relay --udid X --listen 127.0.0.1:8100 --device-port 8100").unwrap();
         assert!(native_relay(dir.path()));
         assert!(transport_hint("wifi-tunnel", Some(40)).unwrap().contains("~40 ms"));
     }
@@ -23419,9 +24034,9 @@ mod tests {
 
         let source = include_str!("http.rs");
         // Single step = what direct_agent_action handles itself, plus what it
-        // delegates to wda_control_with_client.
+        // delegates to runner_control_with_client.
         let mut single = arms_of(source, "async fn direct_agent_action(");
-        single.extend(arms_of(source, "async fn wda_control_with_client("));
+        single.extend(arms_of(source, "async fn runner_control_with_client("));
         single.sort();
         single.dedup();
         let batch = arms_of(source, "fn validate_agent_action_value(");
@@ -23511,7 +24126,7 @@ mod tests {
             use http_body_util::BodyExt;
             use tower::ServiceExt;
 
-            let state = readiness_test_state(); // managed_wda = false
+            let state = readiness_test_state(); // managed_runner = false
             let json = capabilities_json(&state, None).await;
             assert_eq!(json["recovery_owner"], "external");
             assert_eq!(json["supported"]["modes"], serde_json::json!([]));
@@ -23532,7 +24147,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            assert!(String::from_utf8_lossy(&bytes).contains("wda_is_externally_managed"));
+            assert!(String::from_utf8_lossy(&bytes).contains("runner_is_externally_managed"));
         });
     }
 
@@ -23611,7 +24226,7 @@ mod tests {
 
     /// Discovery must not wake the phone or take it from whoever holds it.    /// Discovery must not wake the phone or take it from whoever holds it.
     #[test]
-    fn capabilities_contacts_no_wda_and_takes_no_lease() {
+    fn capabilities_contacts_no_runner_and_takes_no_lease() {
         block(async {
             use axum::body::Body;
             use http_body_util::BodyExt;
@@ -23619,11 +24234,11 @@ mod tests {
 
             let contacted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let seen = contacted.clone();
-            let mut wda = MockWda::start(move |request| {
+            let mut runner = MockRunner::start(move |request| {
                 seen.fetch_add(1, std::sync::atomic::Ordering::Release);
-                healthy_wda_responder(request)
+                healthy_runner_responder(request)
             });
-            let state = readiness_state_with_wda(wda.base());
+            let state = readiness_state_with_runner(runner.base());
             let owner_before = recover(state.owner.lock()).clone();
 
             let response = router(state.clone())
@@ -23642,7 +24257,7 @@ mod tests {
             assert_eq!(
                 contacted.load(std::sync::atomic::Ordering::Acquire),
                 0,
-                "capability discovery opened a WDA connection: {json}"
+                "capability discovery opened a runner connection: {json}"
             );
             assert_eq!(
                 recover(state.owner.lock()).clone().map(|o| o.name),
@@ -23650,7 +24265,7 @@ mod tests {
                 "capability discovery touched the owner lease"
             );
             assert_eq!(json["available"]["evidence"], "cache");
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -23698,18 +24313,18 @@ mod tests {
     #[test]
     fn a_readiness_future_dropped_before_its_first_poll_releases_its_generation() {
         block(async {
-            let state = readiness_state_with_wda("http://127.0.0.1:1");
-            let token = state.wda_lifecycle.try_begin_reconnecting().unwrap();
+            let state = readiness_state_with_runner("http://127.0.0.1:1");
+            let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
             {
-                let ownership = WdaReadinessOwnership::new(state.wda_lifecycle.clone(), token);
+                let ownership = RunnerReadinessOwnership::new(state.runner_lifecycle.clone(), token);
                 let never_polled = async move {
                     let mut ownership = ownership;
-                    ownership.resolve(WdaReadinessOutcome::Ready);
+                    ownership.resolve(RunnerReadinessOutcome::Ready);
                 };
                 drop(never_polled);
             }
             assert!(
-                !state.wda_lifecycle.is_transitioning(),
+                !state.runner_lifecycle.is_transitioning(),
                 "a never-polled readiness future kept its reconnect"
             );
         });
@@ -23721,15 +24336,15 @@ mod tests {
     fn a_superseded_task_publishes_nothing_and_finishes_nothing() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let first = lifecycle.try_begin_reconnecting().expect("first round");
         assert!(lifecycle.finish_reconnecting(first));
         let second = lifecycle.try_begin_reconnecting().expect("second round");
 
-        let health_slot = Mutex::new(crate::wda::WdaHealth::down());
+        let health_slot = Mutex::new(crate::runner::RunnerHealth::down());
         let actionable = AtomicBool::new(false);
         let released = AtomicBool::new(true);
-        let stale = crate::wda::WdaHealth {
+        let stale = crate::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -23737,7 +24352,7 @@ mod tests {
         };
         // The first round's late probe tries to land its evidence.
         let published = lifecycle.publish_if_current(first, || {
-            apply_wda_health_probe(&health_slot, &actionable, &released, stale)
+            apply_runner_health_probe(&health_slot, &actionable, &released, stale)
         });
         assert!(
             published.is_none(),
@@ -23748,7 +24363,7 @@ mod tests {
         assert!(!recover(health_slot.lock()).up);
 
         // And its late finish must not end the round that replaced it.
-        finish_wda_readiness_wait(&lifecycle, first, WdaReadinessOutcome::Deadline);
+        finish_runner_readiness_wait(&lifecycle, first, RunnerReadinessOutcome::Deadline);
         assert!(
             lifecycle.is_reconnecting(),
             "a stale task ended a newer generation"
@@ -23760,12 +24375,12 @@ mod tests {
     /// A token that lost ownership must not end a *release* either.
     #[test]
     fn a_stale_reconnect_token_cannot_end_a_release() {
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let reconnect = lifecycle.try_begin_reconnecting().expect("reconnect");
         assert!(lifecycle.finish_reconnecting(reconnect));
         let release = lifecycle.try_begin_releasing().expect("release");
 
-        finish_wda_readiness_wait(&lifecycle, reconnect, WdaReadinessOutcome::Superseded);
+        finish_runner_readiness_wait(&lifecycle, reconnect, RunnerReadinessOutcome::Superseded);
         assert!(
             lifecycle.is_releasing(),
             "a reconnect token ended a release"
@@ -23777,14 +24392,14 @@ mod tests {
     /// must be reported rather than asserted — debug builds run these too.
     #[test]
     fn repeated_finishes_report_false_instead_of_panicking() {
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let token = lifecycle.try_begin_reconnecting().expect("reconnect");
         assert!(lifecycle.finish_reconnecting(token));
         assert!(
             !lifecycle.finish_reconnecting(token),
             "second finish is a no-op"
         );
-        finish_wda_readiness_wait(&lifecycle, token, WdaReadinessOutcome::Ready);
+        finish_runner_readiness_wait(&lifecycle, token, RunnerReadinessOutcome::Ready);
         assert!(!lifecycle.is_transitioning());
     }
 
@@ -23793,9 +24408,9 @@ mod tests {
     /// current again.
     #[test]
     fn a_superseded_outcome_never_finishes_even_its_own_generation() {
-        let lifecycle = WdaLifecycle::new();
+        let lifecycle = RunnerLifecycle::new();
         let token = lifecycle.try_begin_reconnecting().expect("reconnect");
-        finish_wda_readiness_wait(&lifecycle, token, WdaReadinessOutcome::Superseded);
+        finish_runner_readiness_wait(&lifecycle, token, RunnerReadinessOutcome::Superseded);
         assert!(
             lifecycle.is_reconnecting(),
             "a superseded outcome must leave the transition to its owner"
@@ -23894,13 +24509,13 @@ mod tests {
 
     /// A mock runner that counts `/wda/keys` requests and fails the
     /// `fail_at`-th one (1-based; 0 = never).
-    fn counting_keys_wda(
+    fn counting_keys_runner(
         fail_at: usize,
-    ) -> (MockWda, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (MockRunner, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
         let keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (seen_keys, seen_clears) = (keys.clone(), clears.clone());
-        let wda = MockWda::start(move |request| {
+        let runner = MockRunner::start(move |request| {
             if request.contains("/wda/keys") {
                 let n = seen_keys.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if n == fail_at {
@@ -23912,9 +24527,9 @@ mod tests {
             if request.contains("/clear") || request.contains("/element/active") {
                 seen_clears.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            healthy_wda_responder(request)
+            healthy_runner_responder(request)
         });
-        (wda, keys, clears)
+        (runner, keys, clears)
     }
 
     fn far_deadline() -> tokio::time::Instant {
@@ -23924,8 +24539,8 @@ mod tests {
     #[test]
     fn short_text_is_still_one_runner_request() {
         block(async {
-            let (mut wda, keys, _) = counting_keys_wda(0);
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let (mut runner, keys, _) = counting_keys_runner(0);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let actionable = std::sync::atomic::AtomicBool::new(false);
             let text = "字".repeat(crate::text_input::CHUNK_CHARS);
             let outcome = direct_agent_action(
@@ -23936,17 +24551,17 @@ mod tests {
                 far_deadline(),
             )
             .await;
-            assert_eq!(outcome, WdaControlOutcome::Applied);
+            assert_eq!(outcome, RunnerControlOutcome::Applied);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 1);
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
     #[test]
     fn long_text_is_typed_in_chunks() {
         block(async {
-            let (mut wda, keys, _) = counting_keys_wda(0);
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let (mut runner, keys, _) = counting_keys_runner(0);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let actionable = std::sync::atomic::AtomicBool::new(false);
             let text = "Hello 世界 👨‍👩‍👧 ".repeat(60); // 900+ characters
             let chunks = crate::text_input::split(&text, crate::text_input::CHUNK_CHARS).len();
@@ -23959,18 +24574,18 @@ mod tests {
                 far_deadline(),
             )
             .await;
-            assert_eq!(outcome, WdaControlOutcome::Applied);
+            assert_eq!(outcome, RunnerControlOutcome::Applied);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), chunks);
             assert!(actionable.load(std::sync::atomic::Ordering::SeqCst));
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
     #[test]
     fn a_chunk_failure_reports_what_was_confirmed_and_is_never_resent() {
         block(async {
-            let (mut wda, keys, _) = counting_keys_wda(3);
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let (mut runner, keys, _) = counting_keys_runner(3);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let actionable = std::sync::atomic::AtomicBool::new(true);
             let text = "a".repeat(1000);
             let action = serde_json::json!({"type":"text","text":text});
@@ -23979,7 +24594,7 @@ mod tests {
                     .await;
             assert_eq!(
                 outcome,
-                WdaControlOutcome::TextPartial {
+                RunnerControlOutcome::TextPartial {
                     confirmed: 400,
                     uncertain: 200
                 }
@@ -23994,15 +24609,15 @@ mod tests {
             assert_eq!(body["characters_confirmed"], 400);
             assert_eq!(body["characters_total"], 1000);
             assert_eq!(body["remaining_text"].as_str().unwrap().len(), 600);
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
     #[test]
     fn a_deadline_stops_typing_between_chunks() {
         block(async {
-            let (mut wda, keys, _) = counting_keys_wda(0);
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let (mut runner, keys, _) = counting_keys_runner(0);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let actionable = std::sync::atomic::AtomicBool::new(false);
             // Too little time for even the first chunk: nothing is sent.
             let soon = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -24014,9 +24629,9 @@ mod tests {
                 soon,
             )
             .await;
-            assert_eq!(outcome, WdaControlOutcome::NotSent);
+            assert_eq!(outcome, RunnerControlOutcome::NotSent);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 0);
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -24024,14 +24639,14 @@ mod tests {
 
     /// A runner that answers `POST /actions` with `status` and the W3C error
     /// envelope `{code, message}`, and a 393×852 window otherwise.
-    fn refusing_actions_wda(
+    fn refusing_actions_runner(
         status: &'static str,
         code: &'static str,
         message: &'static str,
-    ) -> (MockWda, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (MockRunner, Arc<std::sync::atomic::AtomicUsize>) {
         let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = posts.clone();
-        let wda = MockWda::start(move |request| {
+        let runner = MockRunner::start(move |request| {
             if request.starts_with("POST /session/SESSION/actions ") {
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let body =
@@ -24044,9 +24659,9 @@ mod tests {
             if request.contains("/window/size") {
                 return r#"{"value":{"width":393,"height":852}}"#.to_string();
             }
-            healthy_wda_responder(request)
+            healthy_runner_responder(request)
         });
-        (wda, posts)
+        (runner, posts)
     }
 
     const OFF_SCREEN_REFUSAL: &str =
@@ -24055,9 +24670,9 @@ mod tests {
     #[test]
     fn a_scroll_the_runner_refused_before_dispatch_is_not_sent_with_its_reason() {
         block(async {
-            let (mut wda, posts) =
-                refusing_actions_wda("400 Bad Request", "invalid argument", OFF_SCREEN_REFUSAL);
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let (mut runner, posts) =
+                refusing_actions_runner("400 Bad Request", "invalid argument", OFF_SCREEN_REFUSAL);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let actionable = std::sync::atomic::AtomicBool::new(true);
             let mut detail = None;
             let outcome = direct_agent_action(
@@ -24068,7 +24683,7 @@ mod tests {
                 far_deadline(),
             )
             .await;
-            assert_eq!(outcome, WdaControlOutcome::RunnerRejected);
+            assert_eq!(outcome, RunnerControlOutcome::RunnerRejected);
             assert_eq!(
                 posts.load(std::sync::atomic::Ordering::SeqCst),
                 1,
@@ -24078,18 +24693,18 @@ mod tests {
                 actionable.load(std::sync::atomic::Ordering::SeqCst),
                 "a refused request says nothing about the runner's health"
             );
-            let runner = &detail.as_ref().unwrap()["runner_error"];
-            assert_eq!(runner["status"], 400);
-            assert_eq!(runner["code"], "invalid argument");
-            assert_eq!(runner["message"], OFF_SCREEN_REFUSAL);
-            assert_eq!(runner["call"], "POST /actions (swipe)");
+            let error = &detail.as_ref().unwrap()["runner_error"];
+            assert_eq!(error["status"], 400);
+            assert_eq!(error["code"], "invalid argument");
+            assert_eq!(error["message"], OFF_SCREEN_REFUSAL);
+            assert_eq!(error["call"], "POST /actions (swipe)");
 
             let body = runner_rejected_body(detail.as_ref());
             assert_eq!(body["error"], "runner_rejected");
             assert_eq!(body["outcome"], "not_sent");
             assert_eq!(body["retry_safe"], true);
             assert_eq!(body["runner_error"]["message"], OFF_SCREEN_REFUSAL);
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -24097,9 +24712,9 @@ mod tests {
     fn any_other_runner_error_stays_unknown_but_keeps_its_reason() {
         block(async {
             // A 400 alone does not prove nothing happened.
-            let (mut wda, _) =
-                refusing_actions_wda("400 Bad Request", "invalid argument", "typing failed");
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let (mut runner, _) =
+                refusing_actions_runner("400 Bad Request", "invalid argument", "typing failed");
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let actionable = std::sync::atomic::AtomicBool::new(true);
             let mut detail = None;
             let outcome = direct_agent_action(
@@ -24110,20 +24725,20 @@ mod tests {
                 far_deadline(),
             )
             .await;
-            assert_eq!(outcome, WdaControlOutcome::Failed);
+            assert_eq!(outcome, RunnerControlOutcome::Failed);
             assert!(!actionable.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(
                 detail.as_ref().unwrap()["runner_error"]["message"],
                 "typing failed"
             );
-            wda.shutdown();
+            runner.shutdown();
 
-            let (mut wda, _) = refusing_actions_wda(
+            let (mut runner, _) = refusing_actions_runner(
                 "500 Internal Server Error",
                 "unknown error",
                 "actions failed: synthesis error",
             );
-            let mut client = crate::wda::WdaClient::new(wda.base()).unwrap();
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
             let mut detail = None;
             let outcome = direct_agent_action(
                 &mut client,
@@ -24133,8 +24748,8 @@ mod tests {
                 far_deadline(),
             )
             .await;
-            assert_eq!(outcome, WdaControlOutcome::Failed);
-            let response = wda_failed_after_dispatch_response_with(detail.as_ref());
+            assert_eq!(outcome, RunnerControlOutcome::Failed);
+            let response = runner_failed_after_dispatch_response_with(detail.as_ref());
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             use http_body_util::BodyExt;
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -24146,7 +24761,7 @@ mod tests {
                 body["runner_error"]["message"],
                 "actions failed: synthesis error"
             );
-            wda.shutdown();
+            runner.shutdown();
         });
     }
 
@@ -24280,7 +24895,7 @@ mod tests {
         let body = &source[start..];
         let resolve = body.find("resolve_launch_app_action(&state, &mut value)").unwrap();
         let deadline = body
-            .find("let agent_wda_deadline = tokio::time::Instant::now() + AGENT_INPUT_WDA_DEADLINE;")
+            .find("let agent_runner_deadline = tokio::time::Instant::now() + AGENT_INPUT_RUNNER_DEADLINE;")
             .unwrap();
         assert!(resolve < deadline, "the deadline is set before resolution");
     }
@@ -24698,7 +25313,7 @@ mod tests {
 
     #[test]
     fn overlay_marks_are_the_interactive_rows_on_screen_by_full_index() {
-        let row = |kind: &str, rect: [f64; 4]| crate::wda::ElementRow {
+        let row = |kind: &str, rect: [f64; 4]| crate::runner::ElementRow {
             kind: kind.to_string(),
             rect,
             ..Default::default()
@@ -24727,7 +25342,7 @@ mod page_scroll_tests {
     //! captured from Safari on an iPhone 17 Pro Max (iOS 27.0, 440x956pt) on the
     //! Bootstrap checkout demo form.
     use super::*;
-    use crate::wda::ElementRow;
+    use crate::runner::ElementRow;
 
     const SCREEN: (f64, f64) = (440.0, 956.0);
     /// Safari's live scroll containers: the full-screen ScrollView and the two
@@ -24896,10 +25511,10 @@ mod page_scroll_tests {
 #[cfg(test)]
 mod read_path_gate_tests {
     use super::gate_on_read_path;
-    use crate::wda::WdaHealth;
+    use crate::runner::RunnerHealth;
 
-    fn up() -> WdaHealth {
-        WdaHealth {
+    fn up() -> RunnerHealth {
+        RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -25041,14 +25656,14 @@ mod selfrunner_p2_tests {
                 }
                 let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
                 state.selfrunner_gateway = Some(gateway);
-                *state.wda_health.lock().unwrap() = crate::wda::WdaHealth {
+                *state.runner_health.lock().unwrap() = crate::runner::RunnerHealth {
                     updated_at: Instant::now(),
                     up: case == 4,
                     actionable: false,
                     locked: Some(case == 4),
                 };
                 // Keep status on the cache, independent of a runner mock.
-                let _ = state.wda_lifecycle.try_begin_reconnecting();
+                let _ = state.runner_lifecycle.try_begin_reconnecting();
                 let body = response_json(
                     agent_status(
                         State(Arc::new(state)),
@@ -25138,9 +25753,9 @@ mod selfrunner_p2_tests {
         block(async {
             let (base, _, task) = locked_runner().await;
             let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
-            state.wda = Some(Arc::new(tokio::sync::Mutex::new(crate::wda::WdaClient::new(&base).unwrap())));
-            state.wda_health.lock().unwrap().updated_at = Instant::now() - std::time::Duration::from_secs(6);
-            let health = cached_wda_health(&state).await;
+            state.runner = Some(Arc::new(tokio::sync::Mutex::new(crate::runner::RunnerClient::new(&base).unwrap())));
+            state.runner_health.lock().unwrap().updated_at = Instant::now() - std::time::Duration::from_secs(6);
+            let health = cached_runner_health(&state).await;
             assert!(health.up);
             assert_eq!(health.locked, Some(true));
             assert!(!health.actionable);
@@ -25153,10 +25768,10 @@ mod selfrunner_p2_tests {
         block(async {
             let (base, mutations, task) = locked_runner().await;
             let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
-            state.wda = Some(Arc::new(tokio::sync::Mutex::new(
-                crate::wda::WdaClient::new(&base).unwrap(),
+            state.runner = Some(Arc::new(tokio::sync::Mutex::new(
+                crate::runner::RunnerClient::new(&base).unwrap(),
             )));
-            state.wda_health.lock().unwrap().updated_at =
+            state.runner_health.lock().unwrap().updated_at =
                 Instant::now() - std::time::Duration::from_secs(6);
             let refusal = stale_action_lock_refusal(&state).await.unwrap();
             let body = response_json(refusal.into_response()).await;
@@ -25164,7 +25779,7 @@ mod selfrunner_p2_tests {
             assert_eq!(body["outcome"], "not_sent");
             assert_eq!(body["retry_safe"], true);
             assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!(state.wda_health.lock().unwrap().locked, Some(true));
+            assert_eq!(state.runner_health.lock().unwrap().locked, Some(true));
             task.abort();
         });
     }
@@ -25184,8 +25799,8 @@ mod selfrunner_p2_tests {
                 let (base, mutations, runner_task) = runner_locked_for(locked_reads).await;
                 let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
                 state.selfrunner_gateway = Some(gateway);
-                state.wda = Some(Arc::new(tokio::sync::Mutex::new(
-                    crate::wda::WdaClient::new(&base).unwrap(),
+                state.runner = Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::runner::RunnerClient::new(&base).unwrap(),
                 )));
                 let mut headers = HeaderMap::new();
                 headers.insert("x-phone-control", HeaderValue::from_static("1"));
@@ -25207,7 +25822,7 @@ mod selfrunner_p2_tests {
                         assert!(!hint.contains("phone_reconnect"), "{body}");
                     }
                     // The open phone's health probe opens a session (POSTs).
-                    None => assert_ne!(body["wda_locked"], true, "{body}"),
+                    None => assert_ne!(body["runner_locked"], true, "{body}"),
                 }
                 if expected.is_some() {
                     assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -25222,16 +25837,16 @@ mod selfrunner_p2_tests {
         block(async {
             for stale in [false, true] {
                 let state = fixture_app_state(None);
-                state.wda_health.lock().unwrap().updated_at =
+                state.runner_health.lock().unwrap().updated_at =
                     Instant::now() - std::time::Duration::from_secs(if stale { 6 } else { 0 });
-                let cache = state.wda_health.clone();
-                *state.wda_health_probe.lock().unwrap() = Some(tokio::spawn(async move {
+                let cache = state.runner_health.clone();
+                *state.runner_health_probe.lock().unwrap() = Some(tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     let mut health = cache.lock().unwrap();
                     health.up = true;
                     health.updated_at = Instant::now();
                 }));
-                assert_eq!(cached_wda_health(&state).await.up, stale);
+                assert_eq!(cached_runner_health(&state).await.up, stale);
             }
         });
     }
@@ -25264,8 +25879,8 @@ mod selfrunner_p2_tests {
         assert!(!needs_scroll_settle(&[], &tap));
     }
 
-    fn row(kind: &str, rect: [f64; 4], depth: u32) -> crate::wda::ElementRow {
-        crate::wda::ElementRow {
+    fn row(kind: &str, rect: [f64; 4], depth: u32) -> crate::runner::ElementRow {
+        crate::runner::ElementRow {
             kind: kind.into(),
             label: kind.into(),
             rect,

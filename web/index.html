@@ -19,6 +19,10 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
+  <meta name="iphone-use-base" content="">
+  <!-- The daemon fills in its base path (IPHONE_USE_BASE_PATH) above;
+       every request below is made under it. -->
+  <script>const BASE = document.querySelector('meta[name="iphone-use-base"]').content;</script>
   <!-- [iOS-notes §Fullscreen/PWA] viewport-fit=cover for safe-area; initial-scale=1 required -->
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <!-- [iOS-notes §Fullscreen/PWA] standalone PWA meta -->
@@ -947,7 +951,7 @@
               <code id="setupCommand"></code>
               <button id="copySetupBtn" type="button">复制命令</button>
             </div>
-            <a id="setupGuideLink" href="/setup" hidden>打开连接向导</a>
+            <a id="setupGuideLink" href="setup" hidden>打开连接向导</a>
             <div id="overlayActions">
               <button id="reconnectBtn" type="button">重新连接</button>
             </div>
@@ -1356,7 +1360,7 @@ const I18N_EN = {
   'Wi-Fi 下无法授权 UI 自动化': 'UI Automation cannot be allowed over Wi-Fi',
   '通过 Wi-Fi 时手机弹不出输密码的提示（有些 iOS 版本干脆拒绝）；请用 USB 连接这台 iPhone，并在它要求时输入密码。插上 USB 后会立刻重试；如果之后走 Wi-Fi 仍然失败，就让这台手机一直用 USB': 'Over Wi-Fi the phone cannot show the passcode prompt (some iOS versions refuse outright); connect this iPhone over USB and enter the passcode when asked. It retries as soon as USB is plugged in; if Wi-Fi still fails afterwards, keep this phone on USB',
   '这台 Mac 还驱动不了这台 iPhone 的系统': 'This Mac cannot drive this iPhone’s iOS version yet',
-  'iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了': 'iOS 15 and 16 need no update, but they need an App Store Connect API key from a paid developer account (WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID); set it and run iphone-use setup again. iOS 14 and earlier can only be fixed by updating the phone. A new cable, retrying or reconnecting won’t help',
+  'iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了': 'iOS 15 and 16 need no update, but they need an App Store Connect API key from a paid developer account (IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID); set it and run iphone-use setup again. iOS 14 and earlier can only be fixed by updating the phone. A new cable, retrying or reconnecting won’t help',
   '请重启一次 iPhone': 'Restart the iPhone once',
   'iPhone 上残留了旧的开发者磁盘映像，开发者服务起不来；重启手机、解锁并保持插线后会自动接着连接': 'An old developer disk image is left on the iPhone, so developer services cannot start; restart the phone, unlock it and keep it plugged in, and it connects automatically',
   '请用数据线连接 iPhone': 'Connect the iPhone with a cable',
@@ -1826,9 +1830,9 @@ if (reconnectBtn) reconnectBtn.onclick = async () => {
     RECONNECT_REQUEST_TIMEOUT_MS,
   );
   try {
-    // Every recovery starts the on-device WDA path.
+    // Every recovery starts the on-device runner path.
     invalidateDirectControlQueue();
-    const r = await fetch('/agent/mode', {
+    const r = await fetch(BASE + '/agent/mode', {
       method: 'POST', cache: 'no-store',
       credentials: 'same-origin',
       signal: controller.signal,
@@ -1836,7 +1840,7 @@ if (reconnectBtn) reconnectBtn.onclick = async () => {
       body: JSON.stringify({ mode: 'agent' }),
     });
     if (r.status === 401) {
-      location.replace('/login');
+      location.replace(BASE + '/login');
       return;
     }
     const result = await r.json().catch(() => ({}));
@@ -1932,7 +1936,7 @@ function recoveryFailureText(result = {}) {
   switch (result.error) {
     case 'target_not_configured':
       return t('尚未选择 iPhone，请先运行设备设置');
-    case 'wda_is_externally_managed':
+    case 'runner_is_externally_managed':
       return t('设备 runner 由外部服务管理，请在来源主机恢复');
     case 'device_release_in_progress':
       return t('设备正在释放，请稍后再试');
@@ -1973,14 +1977,14 @@ function setupBlockerCopy(blockedOn) {
     case 'wifi_automation_refused':
       return [t('Wi-Fi 下无法授权 UI 自动化'), t('通过 Wi-Fi 时手机弹不出输密码的提示（有些 iOS 版本干脆拒绝）；请用 USB 连接这台 iPhone，并在它要求时输入密码。插上 USB 后会立刻重试；如果之后走 Wi-Fi 仍然失败，就让这台手机一直用 USB')];
     case 'ios_too_old':
-      return [t('这台 Mac 还驱动不了这台 iPhone 的系统'), t('iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（WDA_ASC_KEY_PATH / WDA_ASC_KEY_ID / WDA_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了')];
+      return [t('这台 Mac 还驱动不了这台 iPhone 的系统'), t('iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了')];
     case 'ddi_needs_reboot':
       return [t('请重启一次 iPhone'), t('iPhone 上残留了旧的开发者磁盘映像，开发者服务起不来；重启手机、解锁并保持插线后会自动接着连接')];
     case 'legacy_needs_usb':
       return [t('请用数据线连接 iPhone'), t('这台 iOS 15/16 的 iPhone 没插线，这台 Mac 也连不到它的 Wi-Fi；插一次线并保持解锁，大约 20 秒连上；之后只要手机和这台 Mac 在同一网络就可以拔线（状态里 unplug_ok 为 true 时）')];
     case 'xcode_too_old':
       return [t('Xcode 版本太旧'), t('iPhone 的 iOS 比这台 Mac 上的 Xcode 新；请安装支持该 iOS 的 Xcode（测试版 iOS 需要测试版 Xcode），再运行 iphone-use setup --xcode <那个 Xcode.app> 让这台手机用它；重试和重连都解决不了')];
-    case 'wda':
+    case 'runner':
       return [t('设备服务启动失败'), t('请保持 USB、解锁和亮屏，然后重新运行下方设置命令')];
     default:
       return [t('设备设置尚未完成'), t('请处理第一个阻塞项，然后重新运行下方设置命令')];
@@ -1988,7 +1992,7 @@ function setupBlockerCopy(blockedOn) {
 }
 
 /* Blockers that clear only when a person does something to the phone or the
-   Mac. `wda` and `account` are excluded on purpose: they are not a single
+   Mac. `runner` and `account` are excluded on purpose: they are not a single
    physical gesture, and their copy sends the operator to a log or to Xcode.
    `xcode_too_old` and `ios_too_old` are included: their one action is
    installing an Xcode or updating the iPhone, and a reconnect spinner over
@@ -2026,7 +2030,7 @@ function effectiveSetupBlocker(status) {
 
 function managedSetupWillRetry(status) {
   const managed = status?.recovery_owner === 'daemon' ||
-    status?.managed_wda === true;
+    status?.managed_runner === true;
   return managed && new Set(['warp', 'proxy', 'not_connected', 'usb', 'trust', 'ddi', 'automation_mode_disabled', 'automation_not_allowed', 'needs_passcode_on_phone', 'locked_after_restart', 'locked'])
     .has(status?.setup_blocked_on);
 }
@@ -2048,7 +2052,7 @@ function directHintText(status, fallback) {
   if (hint.includes('locked')) {
     return LANG === 'en' ? hint : '请解锁 iPhone 并保持亮屏，连接会自动恢复';
   }
-  if (hint.includes('start or repair WDA')) {
+  if (hint.includes('start or repair runner')) {
     return LANG === 'en' ? hint : '请运行下方状态检查，修复设备服务与 USB 中继';
   }
   // Server hints are diagnostic English for API callers. The Chinese UI must
@@ -2091,8 +2095,8 @@ function updateSetupHelp(kind) {
 }
 
 function directUnavailableKind(status) {
-  if (status?.wda_locked === true) return 'locked';
-  /* WDA is down during a rebuild, so the probe cannot read the lock state;
+  if (status?.runner_locked === true) return 'locked';
+  /* runner is down during a rebuild, so the probe cannot read the lock state;
      setup's own `locked` blocker is then the only lock signal there is. */
   if (status?.setup_blocked_on === 'locked') return 'locked';
   if (status?.setup_blocked_on) return 'setup-blocked';
@@ -2100,10 +2104,10 @@ function directUnavailableKind(status) {
     status?.recovery_owner === 'unconfigured' ||
     (status?.recovery_owner == null && status?.target_configured === false)
   ) return 'unconfigured';
-  if (status?.recovery_owner === 'external' && status?.wda !== true) {
+  if (status?.recovery_owner === 'external' && status?.runner !== true) {
     return 'external';
   }
-  if (status?.mode !== 'agent' || status?.wda !== true) return 'offline';
+  if (status?.mode !== 'agent' || status?.runner !== true) return 'offline';
   return 'blocked';
 }
 
@@ -2205,7 +2209,9 @@ function showOverlay(kind) {
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'reconnecting') {
     setTextIfChanged(olTitle, t('正在重新连接设备'));
-    setTextIfChanged(olSub, t('正在恢复设备端控制服务，请稍候'));
+    /* The daemon names the setup step (building, a one-time build after an
+       upgrade, starting on the phone) in `next_step`; it can take minutes. */
+    setTextIfChanged(olSub, pick(backendStatus?.next_step) || t('正在恢复设备端控制服务，请稍候'));
     offlineOverlay.classList.add('disconnected');
   } else {
     setTextIfChanged(olTitle, t('画面已停止'));
@@ -2221,7 +2227,7 @@ function showOverlay(kind) {
    the latest GitHub release daily. Show a dismissible pill when behind. */
 (async () => {
   try {
-    const r = await fetch('/agent/status', { cache: 'no-store' });
+    const r = await fetch(BASE + '/agent/status', { cache: 'no-store' });
     if (!r.ok) return;
     const s = await r.json();
     if (s.update_available && s.latest && !sessionStorage.getItem('updateDismissed')) {
@@ -2360,7 +2366,7 @@ async function refreshRedactedFrame() {
   if (redactedBusy || document.visibilityState !== 'visible') return;
   redactedBusy = true;
   try {
-    const r = await fetch('/agent/screenshot', { cache: 'no-store', credentials: 'same-origin' });
+    const r = await fetch(BASE + '/agent/screenshot', { cache: 'no-store', credentials: 'same-origin' });
     if (!r.ok) return;
     if (r.headers.get('x-capture-redacted') !== '1') { hideRedactedFrame(); return; }
     const url = URL.createObjectURL(await r.blob());
@@ -2395,9 +2401,9 @@ function syncPrivateCover(s) {
   if (cover) cover.hidden = !(Number(s?.screen_private_secs) > 0);
 }
 async function pollAgentMode() {
-  // A degraded WDA can take several seconds to answer its action-level probe.
+  // A degraded runner can take several seconds to answer its action-level probe.
   // Never let the 3s timer stack duplicate probes behind the daemon's single
-  // WDA session lock; one authoritative poll at a time is enough.
+  // runner session lock; one authoritative poll at a time is enough.
   if (statusPollBusy) return backendStatus;
   statusPollBusy = true;
   const generation = ++statusPollGeneration;
@@ -2406,8 +2412,8 @@ async function pollAgentMode() {
   const timeoutId = setTimeout(() => controller.abort(), STATUS_REQUEST_TIMEOUT_MS);
   const polledStreamId = mjpegStreamId;
   const statusUrl = polledStreamId
-    ? `/agent/status?stream_id=${encodeURIComponent(polledStreamId)}`
-    : '/agent/status';
+    ? `${BASE}/agent/status?stream_id=${encodeURIComponent(polledStreamId)}`
+    : BASE + '/agent/status';
   try {
     const r = await fetch(statusUrl, {
       cache: 'no-store',
@@ -2415,7 +2421,7 @@ async function pollAgentMode() {
     });
     if (generation !== statusPollGeneration) return backendStatus;
     if (r.status === 401) {
-      location.replace('/login');
+      location.replace(BASE + '/login');
       return null;
     }
     if (!r.ok) throw new Error('status rejected');
@@ -2670,12 +2676,12 @@ async function fetchStill(generation = stillsGeneration) {
   stillsAbortController = controller;
   const timeout = setTimeout(() => controller.abort(), STILL_REQUEST_TIMEOUT_MS);
   try {
-    const r = await fetch('/agent/screenshot?t=' + Date.now(), {
+    const r = await fetch(BASE + '/agent/screenshot?t=' + Date.now(), {
       cache: 'no-store',
       signal: controller.signal,
     });
     if (r.status === 401) {
-      location.replace('/login');
+      location.replace(BASE + '/login');
       return;
     }
     if (r.ok) {
@@ -2864,7 +2870,7 @@ function h264RequestKeyframe(session) {
   const now = performance.now();
   if (session.keyAskedAt && now - session.keyAskedAt < 1000) return;
   session.keyAskedAt = now;
-  fetch('/agent/h264/keyframe', {
+  fetch(BASE + '/agent/h264/keyframe', {
     method: 'POST', credentials: 'same-origin', headers: { 'X-Phone-Control': '1' },
   }).catch(() => {});
 }
@@ -2927,7 +2933,7 @@ async function pumpH264(session) {
   let response;
   try {
     response = await fetch(
-      `/agent/h264?stream_id=${encodeURIComponent(session.streamId)}&mode=${videoMode}&t=${Date.now()}`,
+      `${BASE}/agent/h264?stream_id=${encodeURIComponent(session.streamId)}&mode=${videoMode}&t=${Date.now()}`,
       { credentials: 'same-origin', cache: 'no-store', signal: session.controller.signal },
     );
   } catch (e) {
@@ -2936,7 +2942,7 @@ async function pumpH264(session) {
   }
   if (session !== h264Session) return;
   if (response.status === 401) {
-    location.replace('/login');
+    location.replace(BASE + '/login');
     return;
   }
   if (!response.ok || !response.body) {
@@ -3062,7 +3068,7 @@ function startMjpegAttempt(generation) {
   }
   mjpegFrame.onload = () => mjpegReady(generation);
   mjpegFrame.onerror = () => mjpegFailed(generation);
-  mjpegFrame.src = `/agent/mjpeg?stream_id=${encodeURIComponent(mjpegStreamId)}&mode=${videoMode}&t=${Date.now()}`;
+  mjpegFrame.src = `${BASE}/agent/mjpeg?stream_id=${encodeURIComponent(mjpegStreamId)}&mode=${videoMode}&t=${Date.now()}`;
   // Streaming images need not dispatch load until the multipart response ends.
   // naturalWidth becomes non-zero after the first decoded frame, so poll that
   // as the authoritative readiness signal and bound a silent TCP connection.
@@ -3410,7 +3416,7 @@ function sendDirectControl(obj) {
   const queuedAt = performance.now();
   directControlQueued++;
   const request = directControlTail.then(async () => {
-    // Never replay gestures captured against an older screen/session. A WDA
+    // Never replay gestures captured against an older screen/session. A runner
     // timeout, backend transition, release, or reconnect invalidates the epoch;
     // a bounded queue age also drops commands that waited too long behind one
     // slow request.
@@ -3428,7 +3434,7 @@ function sendDirectControl(obj) {
     const timeout = setTimeout(() => controller.abort(), CONTROL_TIMEOUT_MS);
     const sentAt = performance.now();
     try {
-      const r = await fetch('/control', {
+      const r = await fetch(BASE + '/control', {
         method: 'POST',
         cache: 'no-store',
         credentials: 'same-origin',
@@ -3445,7 +3451,7 @@ function sendDirectControl(obj) {
       });
       if (r.status === 401) {
         invalidateDirectControlQueue();
-        location.replace('/login');
+        location.replace(BASE + '/login');
         return controlResult(false, 'unauthorized');
       }
       const result = await r.json().catch(() => ({}));
@@ -3600,7 +3606,7 @@ videoArea.addEventListener('gesturestart',  e => e.preventDefault(), { passive: 
 videoArea.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
 videoArea.addEventListener('gestureend',    e => e.preventDefault(), { passive: false });
 
-/* Gesture model (sent to WDA as one /control action on pointerup):
+/* Gesture model (sent to runner as one /control action on pointerup):
    - quick tap (no move)              → `tap`
    - swipe (move before hold)         → `swipe`
    - long-press (held, still)         → `longpress`
@@ -4306,13 +4312,13 @@ async function readFlowObservation(timeoutMs = 4500) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch('/agent/elements', {
+    const response = await fetch(BASE + '/agent/elements', {
       cache: 'no-store',
       credentials: 'same-origin',
       signal: controller.signal,
     });
     if (response.status === 401) {
-      location.replace('/login');
+      location.replace(BASE + '/login');
       return null;
     }
     if (!response.ok) return null;
@@ -5232,7 +5238,7 @@ flowRun.addEventListener('click', async () => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 80000);
   try {
-    const response = await fetch('/agent/actions', {
+    const response = await fetch(BASE + '/agent/actions', {
       method: 'POST',
       cache: 'no-store',
       credentials: 'same-origin',
@@ -5246,7 +5252,7 @@ flowRun.addEventListener('click', async () => {
       }),
     });
     if (response.status === 401) {
-      location.replace('/login');
+      location.replace(BASE + '/login');
       return;
     }
     const result = await response.json().catch(() => ({}));
@@ -5355,7 +5361,7 @@ textInput.addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); void sendText(); }
 });
 
-/* One button both ways: 交还 stops WDA and gives the phone back to the person
+/* One button both ways: 交还 stops runner and gives the phone back to the person
    holding it; once it is theirs the same button gives it back to the agent. */
 function syncHandoffButton() {
   if (!btnHandoff) return;
@@ -5372,9 +5378,9 @@ function updateModeControls() {
   if (typeof syncToolbarReserve === 'function') syncToolbarReserve();
 }
 
-document.getElementById('btnLogout').addEventListener('click', () => { location.href = '/logout'; });
+document.getElementById('btnLogout').addEventListener('click', () => { location.href = BASE + '/logout'; });
 /* Hand the phone back to the person holding it: the daemon stops the on-phone
-   WDA runner and agent input is refused until someone asks for the agent
+   runner and agent input is refused until someone asks for the agent
    again ("交给 agent" or 「连接手机」). */
 const btnHandoff = document.getElementById('btnHandoff');
 async function takePhoneBackForAgent() {
@@ -5382,12 +5388,12 @@ async function takePhoneBackForAgent() {
   btnHandoff.disabled = true;
   try {
     invalidateDirectControlQueue();
-    const r = await fetch('/agent/mode', {
+    const r = await fetch(BASE + '/agent/mode', {
       method: 'POST', cache: 'no-store', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'X-Phone-Control': '1' },
       body: JSON.stringify({ mode: 'agent' }),
     });
-    if (r.status === 401) { location.replace('/login'); return; }
+    if (r.status === 401) { location.replace(BASE + '/login'); return; }
     const result = await r.json().catch(() => ({}));
     toast(r.ok && result.ok === true ? t('已交回 agent，正在连接设备') : t('交回失败，请查看服务日志'));
     cancelStatusPoll();
@@ -5408,12 +5414,12 @@ if (btnHandoff) btnHandoff.addEventListener('click', async () => {
   btnHandoff.disabled = true;
   try {
     invalidateDirectControlQueue();
-    const r = await fetch('/agent/mode', {
+    const r = await fetch(BASE + '/agent/mode', {
       method: 'POST', cache: 'no-store', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'X-Phone-Control': '1' },
       body: JSON.stringify({ mode: 'human' }),
     });
-    if (r.status === 401) { location.replace('/login'); return; }
+    if (r.status === 401) { location.replace(BASE + '/login'); return; }
     const result = await r.json().catch(() => ({}));
     if (!r.ok || result.ok !== true) {
       toast(result?.error === 'lifecycle_busy' ? t('设备正在切换，稍后再试') : t('交还失败，请查看服务日志'));
@@ -5451,11 +5457,11 @@ async function loadPairCode(host) {
   pairQr.classList.remove('expired');
   try {
     const q = host ? '?host=' + encodeURIComponent(host) : '';
-    const r = await fetch('/pair/new' + q, {
+    const r = await fetch(BASE + '/pair/new' + q, {
       method: 'POST', cache: 'no-store', credentials: 'same-origin',
       headers: { 'X-Phone-Control': '1' },
     });
-    if (r.status === 401) { location.replace('/login'); return; }
+    if (r.status === 401) { location.replace(BASE + '/login'); return; }
     const res = await r.json().catch(() => ({}));
     if (!r.ok || !res.ok) {
       pairQr.replaceChildren();
@@ -5497,11 +5503,11 @@ async function loadSelfPairCode() {
   pairQr.classList.remove('expired');
   pairHostRow.hidden = true;
   try {
-    const r = await fetch('/agent/phone-daemon/pair', {
+    const r = await fetch(BASE + '/agent/phone-daemon/pair', {
       method: 'POST', cache: 'no-store', credentials: 'same-origin',
       headers: { 'X-Phone-Control': '1' },
     });
-    if (r.status === 401) { location.replace('/login'); return; }
+    if (r.status === 401) { location.replace(BASE + '/login'); return; }
     const res = await r.json().catch(() => ({}));
     if (!r.ok || !res.ok) {
       pairQr.replaceChildren();
@@ -5625,10 +5631,10 @@ function elementFailureText(error) {
       return t('设备正在切换连接状态，请稍后刷新');
     case 'target_not_configured':
       return t('尚未选择 iPhone，请先完成设备设置');
-    case 'wda_source_timeout':
+    case 'runner_source_timeout':
       return t('读取控件超时，请保持 iPhone 解锁和亮屏');
-    case 'wda_source_failed':
-    case 'wda_not_configured':
+    case 'runner_source_failed':
+    case 'runner_not_configured':
       return t('当前无法读取 iPhone 控件，请检查设备连接');
     default:
       return t('控件列表读取失败，请稍后刷新');
@@ -5721,13 +5727,13 @@ async function loadAccessibleElements() {
   setTextIfChanged(elementStatus, t('正在读取当前 iPhone 控件…'));
   elementList.replaceChildren();
   try {
-    const response = await fetch('/agent/elements', {
+    const response = await fetch(BASE + '/agent/elements', {
       cache: 'no-store',
       credentials: 'same-origin',
       signal: controller.signal,
     });
     if (response.status === 401) {
-      location.replace('/login');
+      location.replace(BASE + '/login');
       return;
     }
     const body = await response.json().catch(() => ({}));
@@ -6025,7 +6031,7 @@ function renderMetrics() {
     parts.push([t('截图'), '2.5 s']);
   }
   if (controlRttMs != null) parts.push([t('操作'), `${Math.round(controlRttMs)} ms`]);
-  else if (Number.isFinite(backendStatus?.wda_rtt_ms)) parts.push([t('设备'), `${backendStatus.wda_rtt_ms} ms`]);
+  else if (Number.isFinite(backendStatus?.runner_rtt_ms)) parts.push([t('设备'), `${backendStatus.runner_rtt_ms} ms`]);
   const transport = TRANSPORT_LABEL[backendStatus?.transport];
   if (transport) parts.push([transport, '']);
   const nodes = [];
@@ -6105,7 +6111,7 @@ async function pollAgentActivity() {
   try {
     const since = agentActivityCursor ?? 0;
     const limit = agentActivityCursor === null ? 0 : 20;
-    const r = await fetch(`/agent/activity?since=${since}&limit=${limit}`, { cache: 'no-store' });
+    const r = await fetch(`${BASE}/agent/activity?since=${since}&limit=${limit}`, { cache: 'no-store' });
     if (!r.ok) return;
     const feed = await r.json();
     if (Number.isFinite(feed?.next)) agentActivityCursor = feed.next;
@@ -6130,7 +6136,7 @@ async function pollAgentActivity() {
 /* ── Boot ─────────────────────────────────────────────────────── */
 videoArea.addEventListener('contextmenu', e => e.preventDefault());
 function pollAgentModeOnInterval() {
-  // A hidden tab must not continually trigger action-level WDA probes;
+  // A hidden tab must not continually trigger action-level runner probes;
   // visibilitychange/pageshow performs an authoritative poll before restoring
   // its feed and input.
   if (document.visibilityState !== 'visible') return;

@@ -106,6 +106,7 @@ struct FlowDraft: Equatable, Identifiable, Sendable {
 struct RecordingState: Equatable, Sendable {
     var recording: Bool
     var steps: Int
+    var draft: FlowDraft? = nil
 }
 
 /// A flow run's answer (`POST /agent/flow/run`).
@@ -396,16 +397,25 @@ extension DaemonClient {
     func recordingState() async throws -> RecordingState {
         let (data, response) = try await send(request("agent/flow/record"))
         try Self.checkAgent(response, data)
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        return RecordingState(recording: json["recording"] as? Bool ?? false, steps: json["steps"] as? Int ?? 0)
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let recording = json["recording"] as? Bool,
+              let steps = json["steps"] as? Int ?? (recording ? nil : 0), steps >= 0 else {
+            throw NSError(domain: "FlowRecording", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: String(localized: "录制状态回复不完整，请重新检查")])
+        }
+        return RecordingState(recording: recording, steps: steps, draft: FlowDraft(json: json))
     }
 
     /// `POST /agent/flow/record {"action": "start"}`.
     func startRecording() async throws {
         var urlRequest = agentRequest("agent/flow/record", method: "POST")
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: ["action": "start"])
-        let (data, response) = try await send(urlRequest)
+        let (data, response) = try await send(urlRequest, repeatable: false)
         try Self.checkAgent(response, data)
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              json["recording"] as? Bool == true else {
+            throw URLError(.cannotParseResponse)
+        }
     }
 
     /// `POST /agent/flow/record {"action": "stop"}` → the recording's draft
@@ -413,9 +423,13 @@ extension DaemonClient {
     func stopRecording() async throws -> FlowDraft? {
         var urlRequest = agentRequest("agent/flow/record", method: "POST")
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: ["action": "stop"])
-        let (data, response) = try await send(urlRequest)
+        let (data, response) = try await send(urlRequest, repeatable: false)
         try Self.checkAgent(response, data)
-        return FlowDraft(json: try? JSONSerialization.jsonObject(with: data))
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              json["recording"] as? Bool == false, json["draft"] != nil else {
+            throw URLError(.cannotParseResponse)
+        }
+        return FlowDraft(json: json)
     }
 
     /// `GET /agent/flow/draft`: what the last task did, as a draft; nil when
@@ -432,14 +446,10 @@ extension DaemonClient {
     @discardableResult
     func saveFlow(id: String, name: String, description: String?, flow: Data?) async throws -> String {
         var urlRequest = agentRequest("agent/flow/save", method: "POST")
-        var body: [String: Any] = ["id": id, "name": name]
-        if let description, !description.isEmpty { body["description"] = description }
-        if let flow, let object = try? JSONSerialization.jsonObject(with: flow) { body["flow"] = object }
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+        urlRequest.httpBody = try FlowSavePayload.encode(id: id, name: name, description: description, flow: flow)
         let (data, response) = try await send(urlRequest, repeatable: false)
         try Self.checkAgent(response, data)
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        return ((json?["saved"] as? [String: Any])?["id"] as? String) ?? id
+        return try FlowSavePayload.savedID(from: data, expectedID: id)
     }
 
     /// `GET /agent/schedules`.

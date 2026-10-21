@@ -11,11 +11,11 @@ use std::{
     },
     time::Duration,
 };
-use support::{block, build_state_with_wda, mock_native_runner};
+use support::{block, build_state_with_runner, mock_native_runner};
 use tower::ServiceExt;
 
 async fn batch(base: &str, body: String) -> (StatusCode, serde_json::Value) {
-    let response = server::http::router(build_state_with_wda(base))
+    let response = server::http::router(build_state_with_runner(base))
         .oneshot(
             Request::builder()
                 .method("POST")

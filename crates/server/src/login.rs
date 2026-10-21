@@ -7,12 +7,12 @@
 //! on a pipe and go straight into the phone's fields through the runner.
 //! Nothing that leaves the daemon carries them:
 //! - the HTTP response names the entry and a masked account only;
-//! - nothing is logged from the fill path, and WDA error text is never relayed
+//! - nothing is logged from the fill path, and runner error text is never relayed
 //!   (a failed type could echo its argument);
 //! - timing records hold the route and byte counts only;
 //! - the flow trail is cut at a login (see `http::agent_login`);
 //! - secure-field values are masked where every element row is built
-//!   (`wda::flatten_node`), so a read after the login cannot echo a password.
+//!   (`runner::flatten_node`), so a read after the login cannot echo a password.
 //!
 //! Second factors follow the chrome-use playbook: a TOTP from the same entry
 //! is filled automatically; SMS and email codes go through `message-use` /
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::wda::{ElementRow, WdaClient};
+use crate::runner::{ElementRow, RunnerClient};
 
 // ---------------------------------------------------------------------------
 // Secrets
@@ -73,8 +73,18 @@ pub struct VaultEntry {
     pub name: String,
     #[serde(default)]
     pub user: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vault_uris")]
     pub uris: Vec<Value>,
+}
+
+// `bwu list --raw` emits null for entries without website URIs (including
+// non-login items). One such entry must not prevent every login in the vault.
+fn deserialize_vault_uris<'de, D>(deserializer: D) -> Result<Vec<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<Vec<Value>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl VaultEntry {
@@ -138,7 +148,7 @@ impl LoginError {
 }
 
 fn phone_error(step: &str) -> LoginError {
-    // The WDA error text is deliberately dropped: a failed type can quote what
+    // The runner error text is deliberately dropped: a failed type can quote what
     // it was asked to type.
     LoginError::new(
         502,
@@ -584,7 +594,7 @@ const PHONE_HINTS: &[&str] = &["phone", "mobile", "tel", "手机", "电话", "�
 /// Words that make an account field also take something other than a number
 /// (`手机号/邮箱`, "Email or phone").
 const NOT_ONLY_PHONE_HINTS: &[&str] = &[
-    "mail", "user", "account", "邮箱", "用户名", "账号", "帐号", "账户", "メール", "ユーザー", "アカウント",
+    "mail", "user", "account", "邮箱", "邮件", "郵件", "用户名", "账号", "帐号", "账户", "メール", "ユーザー", "アカウント",
 ];
 
 /// An account field that takes a phone number and nothing else.
@@ -725,7 +735,7 @@ fn code_channel(rows: &[ElementRow]) -> &'static str {
 /// toolbar settling after a load moved a login form on hardware), so when no
 /// frame matches exactly, the one element of the same class and size that
 /// moved the least is taken — only when it is unambiguous.
-async fn element_for(w: &mut WdaClient, row: &ElementRow) -> Result<String, LoginError> {
+async fn element_for(w: &mut RunnerClient, row: &ElementRow) -> Result<String, LoginError> {
     let ids = w
         .find_elements("class chain", &format!("**/XCUIElementType{}", row.kind))
         .await
@@ -794,7 +804,7 @@ fn same_text(a: &str, b: &str) -> bool {
 /// Whether the field now holds the secret, judged inside the daemon. A text
 /// field must read back equal; a password field cannot be read, so it must at
 /// least have left its placeholder.
-async fn holds(w: &mut WdaClient, id: &str, row: &ElementRow, secret: &Secret) -> bool {
+async fn holds(w: &mut RunnerClient, id: &str, row: &ElementRow, secret: &Secret) -> bool {
     let Ok(now) = w.element_value(id).await else {
         return false;
     };
@@ -862,7 +872,7 @@ fn autofill_sheet_close(rows: &[ElementRow]) -> Option<usize> {
 
 /// Close the system password sheet if it is up. `Ok(true)` when the screen is
 /// clear of it; `Ok(false)` when it is still there after trying.
-async fn close_autofill_sheet(w: &mut WdaClient) -> Result<bool, LoginError> {
+async fn close_autofill_sheet(w: &mut RunnerClient) -> Result<bool, LoginError> {
     for _ in 0..2 {
         let rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
         if !autofill_sheet_up(&rows) {
@@ -910,7 +920,7 @@ fn live_frame(rows: &[ElementRow], row: &ElementRow) -> Option<[f64; 4]> {
 /// text field is checked afterwards, and a value that landed in one is
 /// cleared at once.
 async fn fill(
-    w: &mut WdaClient,
+    w: &mut RunnerClient,
     row: &ElementRow,
     secret: &Secret,
     what: &'static str,
@@ -1015,7 +1025,7 @@ async fn fill(
 /// on hardware while Safari's page was still settling. Returns the screen just
 /// before the click, to compare the next one against; `None` when there is no
 /// such button.
-async fn press(w: &mut WdaClient, verbs: &[&str]) -> Result<Option<Vec<ElementRow>>, LoginError> {
+async fn press(w: &mut RunnerClient, verbs: &[&str]) -> Result<Option<Vec<ElementRow>>, LoginError> {
     let _ = w.dismiss_keyboard().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
@@ -1029,7 +1039,7 @@ async fn press(w: &mut WdaClient, verbs: &[&str]) -> Result<Option<Vec<ElementRo
     Ok(Some(rows))
 }
 
-async fn tap_row(w: &mut WdaClient, row: &ElementRow) -> Result<(), LoginError> {
+async fn tap_row(w: &mut RunnerClient, row: &ElementRow) -> Result<(), LoginError> {
     let [x, y, width, height] = row.rect;
     w.tap_point(x + width / 2.0, y + height / 2.0)
         .await
@@ -1080,7 +1090,7 @@ fn save_prompt_later(rows: &[ElementRow]) -> Option<usize> {
 /// unlock sheet over the page (hardware: Bitwarden asked for its master
 /// password). Returns the screen after, when a prompt was declined.
 async fn decline_save_password(
-    w: &mut WdaClient,
+    w: &mut RunnerClient,
     rows: &[ElementRow],
 ) -> Result<Option<Vec<ElementRow>>, LoginError> {
     let mut current = rows.to_vec();
@@ -1106,7 +1116,7 @@ fn unreadable(rows: &[ElementRow]) -> bool {
 
 /// Wait for the screen to change after a tap, then for it to hold still.
 async fn next_screen(
-    w: &mut WdaClient,
+    w: &mut RunnerClient,
     before: &[ElementRow],
     budget: Duration,
 ) -> Vec<ElementRow> {
@@ -1339,7 +1349,7 @@ fn pick_entry<'a>(
 
 /// Fill and submit the login form on screen.
 pub async fn sign_in(
-    w: &mut WdaClient,
+    w: &mut RunnerClient,
     vault: &Vault,
     request: &LoginRequest,
 ) -> Result<Value, LoginError> {
@@ -1602,7 +1612,7 @@ fn done(
 
 /// Fetch an SMS / email / authenticator code for the login in progress and
 /// enter it.
-pub async fn enter_code(w: &mut WdaClient, request: &CodeRequest) -> Result<Value, LoginError> {
+pub async fn enter_code(w: &mut RunnerClient, request: &CodeRequest) -> Result<Value, LoginError> {
     let (entry_id, elapsed) = {
         let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
         let Some(current) = session
@@ -1808,6 +1818,38 @@ pub fn mail_code(stdout: &[u8], from: Option<&str>) -> Option<Secret> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn vault_list_accepts_null_missing_and_empty_uris_without_losing_logins() {
+        let entries: Vec<VaultEntry> = serde_json::from_value(json!([
+            {"id":"note", "name":"Secure note", "user":null, "uris":null},
+            {"id":"missing", "name":"No URI field"},
+            {"id":"empty", "name":"Empty URIs", "uris":[]},
+            {"id":"login", "name":"Example", "user":"example-user",
+             "uris":["https://example.com", {"uri":"https://login.example.com"}]}
+        ]))
+        .unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(entries[..3].iter().all(|entry| entry.uris.is_empty()));
+        assert_eq!(
+            entries[3].uri_strings().collect::<Vec<_>>(),
+            vec!["https://example.com", "https://login.example.com"]
+        );
+        assert_eq!(by_item(&entries, "login", None)[0].name, "Example");
+    }
+
+    #[test]
+    fn vault_list_still_rejects_malformed_uri_containers() {
+        for uris in [
+            json!("https://example.com"),
+            json!({"uri":"https://example.com"}),
+        ] {
+            assert!(serde_json::from_value::<VaultEntry>(json!({
+                "id":"login", "name":"Example", "uris":uris
+            }))
+            .is_err());
+        }
+    }
+
     fn row(kind: &str, label: &str, y: f64) -> ElementRow {
         ElementRow {
             kind: kind.to_string(),
@@ -1899,6 +1941,15 @@ mod tests {
         assert!(!phone_shaped("someone@example.com"));
         assert!(!phone_shaped("player_one99"));
         assert!(!phone_shaped("123"));
+    }
+
+    #[test]
+    fn auth_email_or_phone_placeholder_accepts_email() {
+        let mut apple_account = row("TextField", "", 240.0);
+        apple_account.placeholder = Some("电子邮件或电话号码".to_string());
+        assert!(!phone_only_field(&apple_account));
+        apple_account.placeholder = Some("電子郵件或電話號碼".to_string());
+        assert!(!phone_only_field(&apple_account));
     }
 
     #[test]

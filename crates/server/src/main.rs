@@ -32,7 +32,7 @@ mod onboarding;
 
 /// PID file name inside the runtime dir.
 const PID_FILE: &str = "iphone-use.pid";
-/// Secret file name inside the runtime dir.
+/// Signing-key file name (legacy runtime dir, now the durable auth dir).
 const SECRET_FILE: &str = server::runtime_dir::SECRET_FILE;
 const PID_RECORD_VERSION: u8 = 1;
 const STOP_WAIT_SECS: u64 = 5;
@@ -108,21 +108,21 @@ fn http_authority(host: &str, port: u16) -> String {
     }
 }
 
-fn resolve_managed_wda(
+fn resolve_managed_runner(
     endpoints_are_local: bool,
     target_udid: Option<&str>,
     configured: Option<bool>,
 ) -> Result<bool> {
     // Auto-ownership is safe only when the daemon can restart the exact device
     // it stopped. A hand-run daemon with loopback defaults but no persisted
-    // target may use an already-running WDA, but must never idle-stop it.
+    // target may use an already-running runner, but must never idle-stop it.
     let requested = configured.unwrap_or(endpoints_are_local && target_udid.is_some());
     if !requested {
         return Ok(false);
     }
     if !endpoints_are_local {
         anyhow::bail!(
-            "IPHONE_USE_WDA_MANAGED=true requires loopback WDA and MJPEG endpoints; \
+            "IPHONE_USE_RUNNER_MANAGED=true requires loopback runner and MJPEG endpoints; \
              remote device services are externally managed"
         );
     }
@@ -132,7 +132,7 @@ fn resolve_managed_wda(
     Ok(target_udid.is_some())
 }
 
-fn wda_management_pending(
+fn runner_management_pending(
     endpoints_are_local: bool,
     target_udid: Option<&str>,
     configured: Option<bool>,
@@ -174,7 +174,7 @@ enum Command {
     ///
     /// Read-only: derives the instance from IPHONE_USE_INSTANCE / HOME /
     /// IPHONE_USE_STATE_DIR (+ IPHONE_USE_UDID) without opening a socket,
-    /// touching launchd, or starting WDA. Installers run this on a staged
+    /// touching launchd, or starting runner. Installers run this on a staged
     /// binary before switching services over: a binary that predates
     /// instances rejects the subcommand outright, so it can never be started
     /// against the wrong phone (#67).
@@ -206,7 +206,7 @@ enum Command {
         #[command(subcommand)]
         query: DeviceQuery,
     },
-    /// The device-layer setup engine `setup-wda.sh` hands its commands to
+    /// The device-layer setup engine `setup-runner.sh` hands its commands to
     /// (same environment, same files). Not for direct use.
     #[command(hide = true, disable_help_flag = true)]
     SetupNative {
@@ -241,6 +241,20 @@ enum Command {
     /// other phones and the Mac's xcode-select choice are untouched.
     /// `--xcode system` goes back to the Mac's choice.
     Setup {
+        /// A named instance (a second phone); default: IPHONE_USE_INSTANCE.
+        #[arg(long)]
+        instance: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Build the iOS app (Phone Use) with your own signing team and install it.
+    ///
+    /// Run after `iphone-use setup`: it reuses that phone, team and runner. A
+    /// paid team gets local control (the phone runs its own device service, no
+    /// Mac needed); a free Apple ID gets the remote app. The app is not in the
+    /// App Store. `--remote-only` skips local control; `--no-install` only
+    /// builds; `--no-pair` skips the first USB pairing for local control.
+    SetupApp {
         /// A named instance (a second phone); default: IPHONE_USE_INSTANCE.
         #[arg(long)]
         instance: Option<String>,
@@ -478,7 +492,8 @@ fn upgrade(check_only: bool, json: bool) -> i32 {
         .as_deref()
         .map(update::find_skills)
         .unwrap_or_default();
-    let report = update::UpgradeReport::new(current, &fetched, skills);
+    let mut report = update::UpgradeReport::new(current, &fetched, skills);
+    report.auto_update = home.as_deref().map(update::AutoUpdateState::read_in);
 
     if json {
         println!(
@@ -560,8 +575,8 @@ fn instance_context() -> Result<()> {
         "name": instance.name,
         "state_dir": instance.state_dir,
         "daemon_label": instance.daemon_label,
-        "wda_label": instance.wda_label,
-        "wda_plist": instance.wda_plist(),
+        "runner_label": instance.runner_label,
+        "runner_plist": instance.runner_plist(),
         "udid": udid,
         "state_dir_ok": state_dir_ok.is_ok(),
         "state_dir_error": state_dir_ok.err(),
@@ -622,9 +637,11 @@ fn open_console() -> Result<()> {
 /// One value from the installed LaunchAgent's EnvironmentVariables, which a
 /// Finder launch does not inherit.
 fn launch_agent_env(label: &str, key: &str) -> Option<String> {
-    // A plist written before the rename spells the key PHONE_REMOTE_*.
+    // A plist written before a rename spells the key the old way.
     launch_agent_env_as(label, key).or_else(|| {
-        core::env::legacy_name(key).and_then(|old| launch_agent_env_as(label, &old))
+        core::env::legacy_names(key)
+            .into_iter()
+            .find_map(|old| launch_agent_env_as(label, &old))
     })
 }
 
@@ -852,6 +869,12 @@ fn main() -> Result<()> {
             std::process::exit(onboarding::run_setup(&target, &args))
         }
         Command::SetupNative { args } => std::process::exit(server::setup::main(&args)),
+        Command::SetupApp { instance, args } => {
+            if let Some(name) = instance {
+                std::env::set_var("IPHONE_USE_INSTANCE", name);
+            }
+            std::process::exit(server::setup::app::run(&args))
+        }
         Command::Doctor { instance } => {
             let target = onboarding::Target::resolve(instance.as_deref())?;
             let code = onboarding::run_doctor(&target);
@@ -976,19 +999,19 @@ fn serve() -> Result<()> {
         .verify_on_disk()
         .map_err(|error| anyhow::anyhow!(error))?;
     tracing::info!(
-        "instance {} (state_dir={}, wda_label={})",
+        "instance {} (state_dir={}, runner_label={})",
         instance.name,
         instance.state_dir.display(),
-        instance.wda_label
+        instance.runner_label
     );
 
     // The iPhone Mirroring backend was removed in v0.9. An old plist may still
-    // ask for it; say so once and serve the phone over WDA as usual.
+    // ask for it; say so once and serve the phone over runner as usual.
     if std::env::var("IPHONE_USE_BACKEND")
         .is_ok_and(|v| matches!(v.trim(), "mirror" | "legacy-mirror"))
     {
         tracing::warn!(
-            "IPHONE_USE_BACKEND=mirror is no longer supported (iPhone Mirroring was removed in v0.9); serving over WDA"
+            "IPHONE_USE_BACKEND=mirror is no longer supported (iPhone Mirroring was removed in v0.9); serving over runner"
         );
     }
 
@@ -996,20 +1019,20 @@ fn serve() -> Result<()> {
     //    listener binds, so a failed second start cannot replace the live
     //    daemon's identity.
     let dir = server::runtime_dir::runtime_dir().context("create runtime dir")?;
-    let secret = load_or_make_secret(&dir, &cfg)?;
+    let secret = load_or_make_secret(&dir, &server::instance::current().state_dir, &cfg)?;
 
     // Direct mode has stable localhost relay defaults. The setup script creates
-    // these relays; keeping the client configured while WDA is down lets the web
+    // these relays; keeping the client configured while runner is down lets the web
     // UI report setup/recovery state instead of crash-looping the daemon.
-    let configured_wda_url = std::env::var("IPHONE_USE_WDA_URL")
+    let configured_runner_url = std::env::var("IPHONE_USE_RUNNER_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let wda_url = configured_wda_url.unwrap_or_else(|| "http://127.0.0.1:8100".to_string());
-    let mjpeg_url = std::env::var("IPHONE_USE_WDA_MJPEG_URL")
+    let runner_url = configured_runner_url.unwrap_or_else(|| "http://127.0.0.1:8100".to_string());
+    let mjpeg_url = std::env::var("IPHONE_USE_RUNNER_MJPEG_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:9100".to_string());
-    let endpoints_are_local = endpoint_is_loopback(&wda_url) && endpoint_is_loopback(&mjpeg_url);
+    let endpoints_are_local = endpoint_is_loopback(&runner_url) && endpoint_is_loopback(&mjpeg_url);
     // A simulator (IPHONE_USE_SIMULATOR, preview): device services go through
     // simctl, and its runner is started by `iphone-use simulator start`, never
     // by this daemon's launchd supervisor.
@@ -1017,14 +1040,14 @@ fn serve() -> Result<()> {
     let managed_setting = if simulator.is_some() {
         Some(false)
     } else {
-        optional_env_bool("IPHONE_USE_WDA_MANAGED")?
+        optional_env_bool("IPHONE_USE_RUNNER_MANAGED")?
     };
-    let managed_wda_pending = wda_management_pending(
+    let managed_runner_pending = runner_management_pending(
         endpoints_are_local,
         cfg.device_udid.as_deref(),
         managed_setting,
     );
-    let managed_wda = resolve_managed_wda(
+    let managed_runner = resolve_managed_runner(
         endpoints_are_local,
         cfg.device_udid.as_deref(),
         managed_setting,
@@ -1041,10 +1064,10 @@ fn serve() -> Result<()> {
     let state = server::boot::app_state(server::boot::StateInputs {
         cfg: &cfg,
         secret,
-        wda_url: &wda_url,
+        runner_url: &runner_url,
         mjpeg_url,
-        managed_wda,
-        managed_wda_pending,
+        managed_runner,
+        managed_runner_pending,
         simulator: simulator.clone(),
     });
 
@@ -1180,10 +1203,10 @@ fn run_server(cfg: Config, state: Arc<AppState>, runtime_dir: std::path::PathBuf
             false,
         );
 
-        // Idle auto-release owns only the local supervisor. Remote WDA
+        // Idle auto-release owns only the local supervisor. Remote runner
         // endpoints are externally managed and must never trigger local
         // launchctl/setup commands.
-        if state.managed_wda {
+        if state.managed_runner {
             http::spawn_idle_release_watchdog(state.clone());
         }
         if let Some(simulator) = state.simulator.clone() {
@@ -1263,22 +1286,35 @@ async fn shutdown_signal() {
 // ---------------------------------------------------------------------------
 
 /// Load the signing secret, preferring (in order): the configured
-/// `IPHONE_USE_SECRET`, an existing secret file, or a freshly generated one.
-fn load_or_make_secret(dir: &std::path::Path, cfg: &Config) -> Result<Vec<u8>> {
+/// `IPHONE_USE_SECRET`, durable state, the legacy runtime key, or a new key.
+/// Copy the old key on upgrade so existing cookies and paired phones survive.
+fn load_or_make_secret(
+    runtime: &std::path::Path,
+    state_dir: &std::path::Path,
+    cfg: &Config,
+) -> Result<Vec<u8>> {
     if let Some(s) = &cfg.secret {
         return Ok(s.clone().into_bytes());
     }
 
-    match server::runtime_dir::read_secret(dir, SECRET_FILE) {
-        Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+    let dir = server::runtime_dir::persistent_auth_dir(state_dir)
+        .context("prepare persistent authentication state")?;
+    match server::runtime_dir::read_secret(&dir, SECRET_FILE) {
+        Ok(bytes) if bytes.len() == 32 => return Ok(bytes),
         Ok(_) => anyhow::bail!(
-            "persisted session secret is empty; remove it only after stopping every daemon"
+            "persisted session secret is incomplete; refusing to rotate paired-device credentials"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("read persisted session secret"),
     }
 
-    persist_generated_secret(dir, gen_secret()?)
+    let secret = match server::runtime_dir::read_secret(runtime, SECRET_FILE) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        Ok(_) => anyhow::bail!("legacy session secret is incomplete; refusing to rotate paired-device credentials"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => gen_secret()?,
+        Err(error) => return Err(error).context("read legacy session secret for migration"),
+    };
+    persist_generated_secret(&dir, secret)
 }
 
 /// Generate the session-cookie HMAC key directly from the operating system's
@@ -1295,7 +1331,21 @@ fn gen_secret() -> Result<Vec<u8>> {
 /// Persist a freshly generated secret. If another process wins the exclusive
 /// create race, use that process's complete secret so both daemons agree.
 fn persist_generated_secret(dir: &std::path::Path, secret: Vec<u8>) -> Result<Vec<u8>> {
-    match server::runtime_dir::write_secret(dir, SECRET_FILE, &secret) {
+    // Publish only a complete key. An O_EXCL destination alone exposes an
+    // empty/partial file to a simultaneous start between create and write.
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let nonce = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, gen_secret()?);
+    let pending = dir.join(format!(".secret-{nonce}"));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&pending)?;
+    let published = (|| -> std::io::Result<()> {
+        file.write_all(&secret)?;
+        file.sync_all()?;
+        std::fs::hard_link(&pending, dir.join(SECRET_FILE))
+    })();
+    let _ = std::fs::remove_file(&pending);
+    match published {
         Ok(()) => Ok(secret),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // `write_secret` uses O_EXCL, so the losing process can observe the
@@ -1715,8 +1765,8 @@ fn stop() -> Result<()> {
 mod tests {
     use super::{
         atomic_replace_private, current_euid, endpoint_is_loopback, gen_secret, http_authority,
-        load_or_make_secret, persist_generated_secret, read_process_identity, resolve_managed_wda,
-        socket_host, validate_pid_identity, wda_management_pending, Config, PidRecord,
+        load_or_make_secret, persist_generated_secret, read_process_identity, resolve_managed_runner,
+        socket_host, validate_pid_identity, runner_management_pending, Config, PidRecord,
         ProcessIdentity, SECRET_FILE,
     };
 
@@ -1731,16 +1781,17 @@ mod tests {
             owner_lease_secs: 300,
             agent_token: None,
             device_udid: None,
+            base_path: String::new(),
         }
     }
 
     #[test]
-    fn managed_wda_endpoint_must_be_loopback() {
+    fn managed_runner_endpoint_must_be_loopback() {
         assert!(endpoint_is_loopback("http://127.0.0.1:8100"));
         assert!(endpoint_is_loopback("http://localhost:9100"));
         assert!(endpoint_is_loopback("http://[::1]:8100"));
         assert!(!endpoint_is_loopback("http://192.168.1.20:8100"));
-        assert!(!endpoint_is_loopback("https://wda.example.com"));
+        assert!(!endpoint_is_loopback("https://runner.example.com"));
         assert!(!endpoint_is_loopback("ftp://127.0.0.1:8100"));
         assert!(!endpoint_is_loopback("http://127.0.0.1"));
         assert!(!endpoint_is_loopback("http://user@127.0.0.1:8100"));
@@ -1763,18 +1814,18 @@ mod tests {
     }
 
     #[test]
-    fn managed_wda_requires_both_loopback_relays_and_a_target() {
+    fn managed_runner_requires_both_loopback_relays_and_a_target() {
         let udid = Some("00008110-001234567890001E");
-        assert!(resolve_managed_wda(true, udid, None).unwrap());
-        assert!(!resolve_managed_wda(true, None, None).unwrap());
-        assert!(!resolve_managed_wda(true, udid, Some(false)).unwrap());
-        assert!(resolve_managed_wda(false, udid, Some(true)).is_err());
-        assert!(!resolve_managed_wda(true, None, Some(true)).unwrap());
+        assert!(resolve_managed_runner(true, udid, None).unwrap());
+        assert!(!resolve_managed_runner(true, None, None).unwrap());
+        assert!(!resolve_managed_runner(true, udid, Some(false)).unwrap());
+        assert!(resolve_managed_runner(false, udid, Some(true)).is_err());
+        assert!(!resolve_managed_runner(true, None, Some(true)).unwrap());
 
-        assert!(wda_management_pending(true, None, None));
-        assert!(wda_management_pending(true, None, Some(true)));
-        assert!(!wda_management_pending(true, None, Some(false)));
-        assert!(!wda_management_pending(false, None, Some(true)));
+        assert!(runner_management_pending(true, None, None));
+        assert!(runner_management_pending(true, None, Some(true)));
+        assert!(!runner_management_pending(true, None, Some(false)));
+        assert!(!runner_management_pending(false, None, Some(true)));
     }
 
     #[test]
@@ -1791,18 +1842,65 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
         let cfg = test_config();
-        let first = load_or_make_secret(dir.path(), &cfg).unwrap();
-        let second = load_or_make_secret(dir.path(), &cfg).unwrap();
+        let first = load_or_make_secret(dir.path(), state.path(), &cfg).unwrap();
+        let second = load_or_make_secret(dir.path(), state.path(), &cfg).unwrap();
 
         assert_eq!(first.len(), 32);
         assert_eq!(first, second);
-        let mode = std::fs::metadata(dir.path().join(SECRET_FILE))
+        let mode = std::fs::metadata(state.path().join("auth").join(SECRET_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn session_secret_migrates_without_unpairing_and_survives_runtime_cleanup() {
+        let runtime = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let original = vec![0x51; 32];
+        server::runtime_dir::write_secret(runtime.path(), SECRET_FILE, &original).unwrap();
+        let cookie = core::auth::make_token(&original, 28_800, 1_000);
+        let device_key = server::pairing::device_key(&original, Some("synthetic-password"));
+        let device = core::auth::make_token(&device_key, 180 * 86_400, 1_000);
+        let migrated = load_or_make_secret(runtime.path(), state.path(), &test_config()).unwrap();
+        assert_eq!(migrated, original);
+        runtime.close().unwrap();
+        let another_runtime = tempfile::TempDir::new().unwrap();
+        server::runtime_dir::write_secret(another_runtime.path(), SECRET_FILE, &[0x71;32]).unwrap();
+        let restarted = load_or_make_secret(another_runtime.path(), state.path(), &test_config()).unwrap();
+        assert_eq!(restarted, original);
+        assert!(core::auth::check_token(&restarted, &cookie, 2_000));
+        let renewed_key = server::pairing::device_key(&restarted, Some("synthetic-password"));
+        assert!(core::auth::check_token(&renewed_key, &device, 2_000));
+    }
+
+    #[test]
+    fn session_secret_refuses_corrupt_state_and_honors_explicit_configuration() {
+        let runtime = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let auth = server::runtime_dir::persistent_auth_dir(state.path()).unwrap();
+        server::runtime_dir::write_secret(&auth, SECRET_FILE, b"partial").unwrap();
+        assert!(load_or_make_secret(runtime.path(), state.path(), &test_config()).is_err());
+        assert_eq!(std::fs::read(auth.join(SECRET_FILE)).unwrap(), b"partial");
+        let mut cfg = test_config();
+        cfg.secret = Some("explicit-synthetic-key".into());
+        assert_eq!(load_or_make_secret(runtime.path(), state.path(), &cfg).unwrap(),
+                   b"explicit-synthetic-key");
+    }
+
+    #[test]
+    fn session_secret_is_separate_for_each_instance() {
+        let runtime_a = tempfile::TempDir::new().unwrap();
+        let runtime_b = tempfile::TempDir::new().unwrap();
+        let state_a = tempfile::TempDir::new().unwrap();
+        let state_b = tempfile::TempDir::new().unwrap();
+        let a = load_or_make_secret(runtime_a.path(), state_a.path(), &test_config()).unwrap();
+        let b = load_or_make_secret(runtime_b.path(), state_b.path(), &test_config()).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]

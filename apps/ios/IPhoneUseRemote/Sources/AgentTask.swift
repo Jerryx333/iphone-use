@@ -140,6 +140,12 @@ struct AgentConfirm: Decodable, Equatable, Sendable {
 /// A task as `GET /agent/task/<id>` reports it (and, without steps, each
 /// row of `GET /agent/tasks`). Every field but `id` may be missing or null.
 struct AgentTaskSnapshot: Decodable, Equatable, Identifiable, Sendable {
+    var hasUncertainAction: Bool {
+        steps.contains { step in
+            let error = step.error ?? ""
+            return error.contains("outcome_unknown") || error.range(of: #""retry_safe"\s*:\s*false"#, options: .regularExpression) != nil
+        }
+    }
     struct PlannedAction: Decodable, Equatable, Sendable {
         var action: String
         var target: String?
@@ -329,13 +335,7 @@ extension DaemonClient: AgentTaskAPI {
     func recentTasks() async throws -> [AgentTaskSnapshot] {
         let (data, response) = try await send(request("agent/tasks"))
         try Self.checkAgent(response, data)
-        let json = try? JSONSerialization.jsonObject(with: data)
-        // A bare list, or `{"tasks": [...]}`.
-        let list = (json as? [[String: Any]]) ?? ((json as? [String: Any])?["tasks"] as? [[String: Any]]) ?? []
-        return list.compactMap { item in
-            guard let row = try? JSONSerialization.data(withJSONObject: item) else { return nil }
-            return try? JSONDecoder().decode(AgentTaskSnapshot.self, from: row)
-        }
+        return try AgentTaskList.decode(data)
     }
 
     /// A write to the agent API: JSON, with `X-Phone-Control: 1`.

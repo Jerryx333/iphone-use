@@ -434,7 +434,7 @@ pub enum Gate {
 pub fn status_locked(status: &serde_json::Value) -> bool {
     status.get("device_state").and_then(|v| v.as_str()) == Some("locked")
         || status.get("setup_blocked_on").and_then(|v| v.as_str()) == Some("locked")
-        || status.get("wda_locked").and_then(|v| v.as_bool()) == Some(true)
+        || status.get("runner_locked").and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// Decide from one `/agent/status` body. `me` is this run's owner name.
@@ -1530,9 +1530,11 @@ fn valid_id(id: &str) -> bool {
 
 pub async fn page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !crate::http::is_authed(&state, &headers) {
-        return secured(Redirect::to("/login?next=%2Fschedules").into_response());
+        return secured(
+            Redirect::to(&crate::http::based(&state, "/login?next=%2Fschedules")).into_response(),
+        );
     }
-    secured(Html(SCHEDULES_HTML).into_response())
+    secured(Html(crate::http::with_base(&state, SCHEDULES_HTML)).into_response())
 }
 
 pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

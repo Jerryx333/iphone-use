@@ -1,0 +1,14 @@
+{
+  "endpoint": {
+    "host": "192.168.50.8",
+    "port": 49152
+  },
+  "executor": "Mac network control",
+  "result": {
+    "outcome": "remote_pairing_handshake",
+    "wire_protocol": 26
+  },
+  "schema": 1,
+  "scope": "unauthenticated RemotePairing handshake only",
+  "timestamp": "2026-10-11T04:40:04.208199+00:00"
+}

@@ -21,6 +21,7 @@ url.txt
 # build/dev artifacts
 /target-browser-session/
 /apps/ios/SessionLibraries/
+/apps/ios/build-single-app/
 /iPhoneUse.app/
 assets/icon-1024-old.png
 
@@ -29,3 +30,6 @@ assets/icon-1024-old.png
 /spikes/self-runner-app/SelfRunnerSpike.xcodeproj/
 # Apple DDI research assets (stage locally; never commit)
 /spikes/self-runner-app/Resources/DDI/
+# Local build inputs may be immutable symlinks, never source artifacts.
+/apps/ios/SessionLibraries
+/experiments/phone-self-host/Resources/

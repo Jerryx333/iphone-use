@@ -94,6 +94,13 @@ enum ConnectProblem: Equatable, Sendable {
         }
     }
 
+    /// A locked Keychain can temporarily look empty. Once the app is in
+    /// front and saved credentials are readable again, retry those states;
+    /// a rejected password or revoked pairing still needs the person.
+    var resumesWhenCredentialsReturn: Bool {
+        self == .noCredentials || self == .sessionExpired
+    }
+
     /// Worth trying again on its own (the Mac may wake, the network may come back).
     var retryable: Bool {
         switch self {
@@ -564,7 +571,7 @@ struct ConnectionPresentation: Equatable {
         case "ddi":
             title = String(localized: "Mac 正在准备设备")
             symbol = "hourglass"
-        case "wda":
+        case "runner", "wda":  // "wda": daemons before v0.20
             title = String(localized: "设备服务启动失败")
         default:
             title = String(localized: "需要处理一下")

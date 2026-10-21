@@ -14,7 +14,7 @@ pass=0
 ok_t() { pass=$((pass + 1)); printf 'ok %d - %s\n' "$pass" "$1"; }
 bad()  { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
-READERS="$(sed -n '/^plist_env_get_from() {$/,/^}$/p;/^plist_env_get() {$/,/^}$/p;/^env_or_existing() {$/,/^}$/p' "$ROOT/install.sh")"
+READERS="$(sed -n '/^plist_env_get_from() {$/,/^}$/p;/^plist_env_get() {$/,/^}$/p;/^env_or_existing() {$/,/^}$/p;/^legacy_env_names() {$/,/^}$/p' "$ROOT/install.sh")"
 DAEMON_ENV="$(sed -n '/^daemon_env() {/,/^}$/p' "$ROOT/scripts/auto-update.sh")"
 [ -n "$READERS" ] || bad "plist readers not found in install.sh"
 [ -n "$DAEMON_ENV" ] || bad "daemon_env not found in auto-update.sh"
@@ -26,7 +26,7 @@ cat > "$TMP/old.plist" <<'PLIST'
 <key>PHONE_REMOTE_PORT</key><string>45432</string>
 <key>PHONE_REMOTE_PASSWORD</key><string>old-password</string>
 <key>PHONE_REMOTE_AGENT_TOKEN</key><string>old-token</string>
-<key>PHONE_REMOTE_WDA_URL</key><string>http://127.0.0.1:8100</string>
+<key>PHONE_REMOTE_RUNNER_URL</key><string>http://127.0.0.1:8100</string>
 <key>IPHONE_USE_UDID</key><string>new-udid</string>
 <key>PHONE_REMOTE_UDID</key><string>old-udid</string>
 </dict></dict></plist>
@@ -46,7 +46,7 @@ ok_t "an old plist's settings are carried forward under the new names"
 [ "$(read_key IPHONE_USE_UDID)" = new-udid ] || bad "the old key won over the new one"
 ok_t "a new key wins over the old one"
 
-[ -z "$(read_key WDA_URL)" ] || bad "WDA_URL borrowed PHONE_REMOTE_WDA_URL"
+[ -z "$(read_key IPU_RUNNER_URL)" ] || bad "IPU_RUNNER_URL borrowed PHONE_REMOTE_RUNNER_URL"
 [ -z "$(read_key IPHONE_USE_MISSING)" ] || bad "a missing key read as non-empty"
 ok_t "names outside the prefix and missing keys stay empty"
 
@@ -78,8 +78,8 @@ IPHONE_USE_SELFRUNNER_GATEWAY_TOKEN_FILE=/x/client-token" ] \
     || bad "an upgrade dropped the Self Runner gateway settings (got '$got')"
 ok_t "an upgrade carries the Self Runner gateway settings forward"
 
-got="$(DAEMON_PLIST="$TMP/old.plist" bash -c "$DAEMON_ENV
-daemon_env")"
+got="$(bash -c "$DAEMON_ENV
+daemon_env '$TMP/old.plist'")"
 [ "$got" = "45432 old-token 0.0.0.0" ] || bad "auto-update read '$got' from an old plist"
 ok_t "auto-update reads port, token and host from an old plist"
 

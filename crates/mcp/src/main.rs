@@ -296,14 +296,21 @@ enum FlowCommand {
 fn main() -> anyhow::Result<()> {
     // While the process is still single-threaded (see `core::env`).
     iu_core::env::adopt_legacy_names();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    let cli = Cli::parse();
+    // A stdio bridge mostly waits on pipes and HTTP. Do not allocate one
+    // worker per CPU for every agent conversation. The shared HTTP listener
+    // has bounded workers for its concurrent sessions.
+    let mut runtime = if cli.listen.is_some() {
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(2);
+        runtime
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    runtime.enable_all().build()?.block_on(run(cli))
 }
 
-async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // Log to stderr so it does not interfere with the MCP stdio protocol on
     // stdout/stdin.  MCP clients typically capture stderr for diagnostics.
@@ -553,10 +560,10 @@ async fn run() -> anyhow::Result<()> {
         http::check_bind(addr, mcp_token.as_deref())?;
     }
 
-    // A session that drove the phone recently is likely to again: let the
-    // daemon start bringing a released phone back now, in the background.
-    // `IPHONE_USE_MCP_PREWARM=0` turns this off for this server.
-    if std::env::var("IPHONE_USE_MCP_PREWARM").map_or(true, |v| v.trim() != "0") {
+    // Discovery and idle conversations must not wake a phone or contact the
+    // daemon. Startup pre-warming is an explicit opt-in; tool calls still
+    // use the existing readiness/reconnect path.
+    if std::env::var("IPHONE_USE_MCP_PREWARM").is_ok_and(|v| v.trim() == "1") {
         let daemon = daemon.clone();
         tokio::spawn(async move {
             match daemon.prewarm("session_start").await {

@@ -20,6 +20,13 @@ final class AddressParsingTests: XCTestCase {
         XCTAssertEqual(parse("https://phone.example.com/phone"), "https://phone.example.com")
     }
 
+    func testABasePathIsKeptAndAPageNameDropped() {
+        XCTAssertEqual(parse("https://phone.example.com/ix"), "https://phone.example.com/ix")
+        XCTAssertEqual(parse("phone.example.com/ix/"), "https://phone.example.com/ix")
+        XCTAssertEqual(parse("https://phone.example.com/ix/phone?x=1"), "https://phone.example.com/ix")
+        XCTAssertEqual(parse("http://192.168.1.11:45561/lab/login"), "http://192.168.1.11:45561/lab")
+    }
+
     func testPublicNamesAreTunnelsOverHTTPS() {
         XCTAssertEqual(parse("abc-def.trycloudflare.com"), "https://abc-def.trycloudflare.com")
         XCTAssertEqual(parse("Phone.Example.com:443"), "https://phone.example.com")
@@ -44,6 +51,10 @@ final class AddressParsingTests: XCTestCase {
         XCTAssertEqual(input, .pair(PairLink(base: URL(string: "http://192.168.1.11:44321")!, code: "ABCD1234")))
         let landing = AddressInput("iphoneuse://pair?u=http%3A%2F%2F10.0.0.2%3A44321&c=XYZ")
         XCTAssertEqual(landing, .pair(PairLink(base: URL(string: "http://10.0.0.2:44321")!, code: "XYZ")))
+        let prefixed = AddressInput("https://phone.example.com/ix/pair?c=P1")
+        XCTAssertEqual(prefixed, .pair(PairLink(base: URL(string: "https://phone.example.com/ix")!, code: "P1")))
+        let prefixedLanding = AddressInput("iphoneuse://pair?u=https%3A%2F%2Fphone.example.com%2Fix&c=P2")
+        XCTAssertEqual(prefixedLanding, .pair(PairLink(base: URL(string: "https://phone.example.com/ix")!, code: "P2")))
         XCTAssertEqual(AddressInput("10.0.0.2"), .address(URL(string: "http://10.0.0.2:44321")!))
         XCTAssertNil(AddressInput("not a url at all ://"))
     }
@@ -176,7 +187,7 @@ final class ConnectionPresentationTests: XCTestCase {
         let tooOld = present(.connected, #"{"setup_blocked_on":"ios_too_old","device_state":"blocked"}"#)
         XCTAssertEqual(tooOld.title, String(localized: "iPhone 系统太旧"))
         XCTAssertNil(tooOld.primary)
-        let runner = present(.connected, #"{"setup_blocked_on":"wda","device_state":"blocked","recovery_owner":"daemon"}"#)
+        let runner = present(.connected, #"{"setup_blocked_on":"runner","device_state":"blocked","recovery_owner":"daemon"}"#)
         XCTAssertEqual(runner.primary, .wakePhone)
     }
 
@@ -220,7 +231,7 @@ final class ConnectionPresentationTests: XCTestCase {
     }
 
     func testLockedAndHandedBack() {
-        XCTAssertEqual(present(.connected, #"{"wda_locked":true,"wda":true}"#).symbol, "lock")
+        XCTAssertEqual(present(.connected, #"{"runner_locked":true,"runner":true}"#).symbol, "lock")
         XCTAssertEqual(present(.connected, #"{"released":true,"human_handoff":true}"#).primary, .wakePhone)
     }
 

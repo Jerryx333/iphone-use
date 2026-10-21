@@ -1,5 +1,23 @@
 import Foundation
 
+#if DEBUG
+struct PrivateModelProfile: Decodable {
+    var name: String
+    var baseURL: String
+    var model: String
+    var key: String
+    @MainActor func provider() throws -> ModelProvider {
+        guard let url = URL(string: baseURL), url.scheme == "https", url.host != nil,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw BrowserToolError.invalidResult
+        }
+        return ModelProvider(kind: .custom, name: name, baseURL: baseURL, model: model)
+    }
+}
+#endif
+
 // Which models a task may use, chosen by the person once for every device:
 // an ordered list of "assist" chat models (the first that answers wins), and
 // optionally Jev (TypeSafe) with its text model. Sent with each task as
@@ -108,6 +126,8 @@ extension ModelProvider.Kind {
 struct ModelSettings: Codable, Equatable, Sendable {
     /// Off: send no `models`, so the daemon uses its own (a Mac's environment).
     var sendModels = true
+    /// Switching services requires an explicit choice in model settings.
+    var allowModelFallback = false
     /// Tried in this order; the first that answers is used.
     var assist: [ModelProvider] = [ModelProvider(kind: .zen), ModelProvider(kind: .free)]
     var jevModel = "jev-latest"
@@ -124,6 +144,7 @@ struct ModelSettings: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let fresh = ModelSettings()
         sendModels = try c.decodeIfPresent(Bool.self, forKey: .sendModels) ?? fresh.sendModels
+        allowModelFallback = try c.decodeIfPresent(Bool.self, forKey: .allowModelFallback) ?? false
         assist = try c.decodeIfPresent([ModelProvider].self, forKey: .assist) ?? fresh.assist
         jevModel = try c.decodeIfPresent(String.self, forKey: .jevModel) ?? fresh.jevModel
         textBaseURL = try c.decodeIfPresent(String.self, forKey: .textBaseURL) ?? fresh.textBaseURL
@@ -143,7 +164,9 @@ struct ModelSettings: Codable, Equatable, Sendable {
         func secret(_ account: String) -> String {
             (key(account) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        let assist: [ModelsPayload.Assist] = self.assist.compactMap { provider in
+        let enabled = self.assist.filter(\.enabled)
+        let selected = allowModelFallback ? enabled : Array(enabled.prefix(1))
+        let assist: [ModelsPayload.Assist] = selected.compactMap { provider in
             let base = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let model = provider.model.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = provider.requestKey(provider.needsKey ? secret(provider.keyAccount) : nil)

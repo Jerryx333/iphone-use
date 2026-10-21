@@ -196,6 +196,8 @@ struct BrowserImportReview: View {
                 }
                 Text("登录状态仅写入所选账号的独立浏览器。更新已有账号登录状态时，会清理该账号旧的网站数据；其他账号不会被修改。localStorage 只写入列表中的首个 HTTPS 网站，请确认它就是登录来源。")
                     .font(.footnote).foregroundStyle(.secondary)
+                Text("已有账号的网站范围改变时，会清理超出新范围的旧登录数据；首个网站改变时，不会沿用原网站的 localStorage。")
+                    .font(.footnote).foregroundStyle(.secondary)
                 if sites { Text("网站适配器会以当前登录账号执行。只信任来自你自己 chrome-use 安装的网站库；写入操作仍需单独确认。") }
                 if let error { Text(error).foregroundStyle(Theme.attention) }
                 Button("确认导入所选范围") {

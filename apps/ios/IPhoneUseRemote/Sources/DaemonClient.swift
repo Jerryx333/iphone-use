@@ -50,7 +50,7 @@ struct PhoneStatus: Decodable, Equatable, Sendable {
         case deviceState = "device_state"
         case drivable, released, reconnecting, releasing
         case humanHandoff = "human_handoff"
-        case locked = "wda_locked"
+        case locked = "runner_locked"
         case hint
         case nextStep = "next_step"
         case setupBlockedOn = "setup_blocked_on"
@@ -63,7 +63,10 @@ struct PhoneStatus: Decodable, Equatable, Sendable {
         case lockReadiness = "lock_readiness"
         case device
         case transport
-        case phoneRttMs = "wda_rtt_ms"
+        case phoneRttMs = "runner_rtt_ms"
+        // The same fields from daemons before v0.20 (runner named after WebDriverAgent).
+        case preRenameLocked = "wda_locked"
+        case preRenamePhoneRttMs = "wda_rtt_ms"
     }
 
     init(from decoder: Decoder) throws {
@@ -75,6 +78,7 @@ struct PhoneStatus: Decodable, Equatable, Sendable {
         releasing = try c.decodeIfPresent(Bool.self, forKey: .releasing) ?? false
         humanHandoff = try c.decodeIfPresent(Bool.self, forKey: .humanHandoff) ?? false
         locked = try c.decodeIfPresent(Bool.self, forKey: .locked)
+            ?? c.decodeIfPresent(Bool.self, forKey: .preRenameLocked)
         hint = try c.decodeIfPresent(String.self, forKey: .hint) ?? ""
         let steps = try c.decodeIfPresent([String: String].self, forKey: .nextStep) ?? [:]
         nextStep = AppLanguage.pick(steps)
@@ -89,7 +93,8 @@ struct PhoneStatus: Decodable, Equatable, Sendable {
         let identity = (try? c.decodeIfPresent(PhoneIdentity.self, forKey: .device)) ?? nil
         device = identity?.label == nil ? nil : identity
         transport = (try? c.decodeIfPresent(String.self, forKey: .transport)) ?? ""
-        phoneRttMs = (try? c.decodeIfPresent(Int.self, forKey: .phoneRttMs)) ?? nil
+        phoneRttMs = (try? c.decodeIfPresent(Int.self, forKey: .phoneRttMs))
+            ?? (try? c.decodeIfPresent(Int.self, forKey: .preRenamePhoneRttMs)) ?? nil
     }
 
     /// The Mac-to-phone link in a person's words.
@@ -218,17 +223,19 @@ final class DaemonClient: @unchecked Sendable {
     /// before it is sent any credential; nil from older daemons.
     var lanKey: Data? { routes.withLock { $0.lanKey } }
 
-    init(base: URL, lanCandidates: [URL] = [], lanKey: Data? = nil) {
+    init(base: URL, lanCandidates: [URL] = [], lanKey: Data? = nil,
+         configuration: URLSessionConfiguration? = nil,
+         probeConfiguration: URLSessionConfiguration? = nil) {
         self.publicBase = base
         routes = LockedState(initialState: Routes(active: base, lan: lanCandidates, lanKey: lanKey))
-        let probe = URLSessionConfiguration.ephemeral
+        let probe = probeConfiguration ?? URLSessionConfiguration.ephemeral
         probe.httpShouldSetCookies = false
         probe.httpCookieAcceptPolicy = .never
         probe.timeoutIntervalForRequest = 0.6
         probe.timeoutIntervalForResource = 1
         probe.waitsForConnectivity = false
         probeSession = URLSession(configuration: probe)
-        let config = URLSessionConfiguration.ephemeral
+        let config = configuration ?? URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
         config.timeoutIntervalForRequest = 8
@@ -240,9 +247,12 @@ final class DaemonClient: @unchecked Sendable {
 
     /// The daemon's base URL for whatever a person typed or pasted:
     /// `192.168.1.11`, `192.168.1.11:44321`, `http://…`, `https://…`, a
-    /// tunnel host, `mac.local`, with or without a path or full-width
+    /// tunnel host, `mac.local`, with or without a page path or full-width
     /// punctuation. A bare LAN host gets the daemon's port 44321; a bare
     /// public name is a tunnel and gets https on 443.
+    /// The daemon's own pages, which a pasted address may end with.
+    private static let pageNames: Set<String> = ["phone", "login", "logout", "setup", "pair", "schedules"]
+
     static func parse(address: String) -> URL? {
         var text = AddressInput.clean(address)
         if text.isEmpty { return nil }
@@ -259,7 +269,12 @@ final class DaemonClient: @unchecked Sendable {
         } else if components.port == nil, scheme == "http" {
             components.port = 44321
         }
-        components.path = ""
+        // Keep a base path: several daemons can share one host, each under
+        // its own prefix (`…/ix`, IPHONE_USE_BASE_PATH). A page name pasted
+        // with the address (`…/phone`, `…/ix/login`) is not part of it.
+        var segments = components.path.split(separator: "/").map(String.init)
+        if let last = segments.last, pageNames.contains(last) { segments.removeLast() }
+        components.path = segments.isEmpty ? "" : "/" + segments.joined(separator: "/")
         components.query = nil
         components.fragment = nil
         components.user = nil
@@ -268,6 +283,7 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     func login(password: String) async throws {
+        try await prepareAuthenticationRoute()
         var request = URLRequest(url: base.appendingPathComponent( "login"))
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -310,6 +326,7 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     private func postPair(_ body: [String: String]) async throws -> (Data, HTTPURLResponse) {
+        try await prepareAuthenticationRoute()
         var request = URLRequest(url: base.appendingPathComponent( "pair"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -328,7 +345,17 @@ final class DaemonClient: @unchecked Sendable {
             }
             return (data, response)
         case 401:
-            throw body["code"] != nil ? DaemonError.pairingCodeInvalid : DaemonError.pairingRevoked
+            // A proxy's login page or another service's 401 is not proof
+            // that this daemon revoked the pairing. Do not erase the saved
+            // device token because an intermediary demanded authentication.
+            let error = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            if body["code"] != nil, error == "pairing_code_invalid" {
+                throw DaemonError.pairingCodeInvalid
+            }
+            if body["device_token"] != nil, error == "device_token_invalid" {
+                throw DaemonError.pairingRevoked
+            }
+            throw DaemonError.notIphoneUse
         case 429:
             throw DaemonError.lockedOut
         case 404:
@@ -402,7 +429,7 @@ final class DaemonClient: @unchecked Sendable {
         _ = try? await send(request)
     }
 
-    /// `agent` brings WDA up for remote control; `human` gives the phone back
+    /// `agent` brings runner up for remote control; `human` gives the phone back
     /// to the person holding it.
     func setMode(_ mode: String) async throws {
         var request = URLRequest(url: base.appendingPathComponent( "agent/mode"))
@@ -430,7 +457,44 @@ final class DaemonClient: @unchecked Sendable {
         return (data, response.value(forHTTPHeaderField: "X-Capture-Redacted") == "1")
     }
 
+    func readScreenText() async throws -> String {
+        guard try await status().drivable else { throw BrowserToolError.actionFailed("手机当前不可读屏，请先恢复执行服务") }
+        var request = request("agent/elements"); request.timeoutInterval = 45
+        let (data, response) = try await send(request)
+        guard response.statusCode == 200, data.count <= 4_194_304 else { throw BrowserToolError.actionFailed("当前屏幕读取失败") }
+        return try Self.screenText(data)
+    }
+
+    static func screenText(_ data: Data) throws -> String {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["elements"] as? [[String: Any]] else { throw BrowserToolError.invalidResult }
+        let visible = rows.filter { $0["visible"] as? Bool != false }
+        guard !visible.contains(where: { ($0["kind"] as? String ?? "").lowercased().contains("secure") }) else {
+            throw BrowserToolError.actionFailed("当前页面有私密输入区域，请在手机上查看")
+        }
+        var labels: [String] = [], seen = Set<String>()
+        for row in visible {
+            let kind = (row["kind"] as? String ?? "").lowercased()
+            guard !kind.contains("textfield"), !kind.contains("textview"),
+                  let label = row["label"] as? String else { continue }
+            let text = String(label.trimmingCharacters(in: .whitespacesAndNewlines).prefix(180))
+            if !text.isEmpty && seen.insert(text).inserted { labels.append(text) }
+            if labels.count == 24 { break }
+        }
+        guard !labels.isEmpty else { throw BrowserToolError.actionFailed("当前页面没有读到可见文字，不能推测页面内容") }
+        return "当前屏幕文字：" + String(labels.joined(separator: "，").prefix(900))
+    }
+
     // MARK: routes
+
+    /// Saved public tunnel URLs can disappear while the same Mac is still
+    /// reachable locally. Authenticate on a LAN route only after its nonce
+    /// proof succeeds, before sending any saved password or device token.
+    private func prepareAuthenticationRoute() async throws {
+        let direct = await probeLAN()
+        try Task.checkCancellation()
+        use(direct)
+    }
 
     /// The first LAN address that proves, within the probe timeout, that it
     /// is the daemon this app paired with, or nil. The probe carries no

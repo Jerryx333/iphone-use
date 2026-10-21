@@ -1239,8 +1239,8 @@ impl PhoneHandler {
         session currently driving the phone (this session presents IPHONE_USE_OWNER, \
         else mcp-<pid>); if it is someone else, do not drive the phone — control calls \
         will be refused with phone_owned. The JSON preserves \
-        backend, target_configured, managed_wda, managed_wda_pending, recovery_owner, \
-        device_state, screen_state, wda, wda_actionable, locked, drivable, released, \
+        backend, target_configured, managed_runner, managed_runner_pending, recovery_owner, \
+        device_state, screen_state, runner, runner_actionable, locked, drivable, released, \
         hint, setup_blocked_on, setup_phase, and setup_message. Gate actions on drivable=true. \
         `lock_readiness` says whether the phone locks on its own when idle (passcode_protected, \
         auto_lock_secs, keep_awake, verdict, hint): will_lock_needs_person means a person must \
@@ -1258,11 +1258,10 @@ impl PhoneHandler {
     async fn phone_status(&self) -> CallToolResult {
         match self.daemon.status().await {
             Ok(s) => {
-                // A model reading status is about to act more often than
-                // not; a released phone starts coming back now (the daemon
-                // gates this on recent use and an unlocked phone).
+                // Health checks stay read-only by default. Pre-warming a
+                // released phone is an explicit opt-in.
                 if s.released == Some(true)
-                    && std::env::var("IPHONE_USE_MCP_PREWARM").map_or(true, |v| v.trim() != "0")
+                    && std::env::var("IPHONE_USE_MCP_PREWARM").is_ok_and(|v| v.trim() == "1")
                 {
                     let daemon = self.daemon.clone();
                     tokio::spawn(async move {
@@ -1339,7 +1338,9 @@ impl PhoneHandler {
         `snapshot` token for phone_tap_element; indexes and snapshot tokens are valid for this read \
         only. `query` keeps only rows containing that text (label, identifier, value, placeholder) \
         and `limit` caps the rows — both keep each row's index and the snapshot, so taps still \
-        work. On the first read in a newly entered app a `registry` block lists saved flows for \
+        work. Screen text shows at most 200 rows and 32 KiB of row text; an omission notice \
+        means a partial view, not absence or list completion. Narrow with query when needed. \
+        On the first read in a newly entered app a `registry` block lists saved flows for \
         it: if one does the task, phone_flow_run it instead of tapping step by step. An `alert` \
         block means a system alert is up: answer it with an `alert` step, taps on alerts do not act. \
         ocr=auto adds text read from pixels when the tree has no interactive rows (games, \
@@ -3853,7 +3854,7 @@ mod tests {
     fn an_observed_tap_returns_the_whole_observation_not_a_truncated_preview() {
         let filler = "x".repeat(64 * 1024);
         let body = format!(
-            r#"{{"ok":true,"transport":"wda","tree":"{filler}","snapshot":"snap-1","settle":{{"settled":true,"reason":"stable","captures":2}},"delta":{{"added":["搜索"]}}}}"#
+            r#"{{"ok":true,"transport":"runner","tree":"{filler}","snapshot":"snap-1","settle":{{"settled":true,"reason":"stable","captures":2}},"delta":{{"added":["搜索"]}}}}"#
         );
         assert!(body.len() > 64 * 1024);
         let (url, task) = scripted_daemon("200 OK", body.into_bytes());
@@ -3883,7 +3884,7 @@ mod tests {
     fn an_unobserved_tap_keeps_its_plain_result() {
         let (url, task) = scripted_daemon(
             "200 OK",
-            br#"{"ok":true,"transport":"wda"}"#.to_vec(),
+            br#"{"ok":true,"transport":"runner"}"#.to_vec(),
         );
         let handler = handler_for(&url);
 
@@ -5042,6 +5043,32 @@ mod tests {
         let text = text_of(&result);
         assert!(text.contains("Nothing was sent") || text.contains("nothing was sent"), "{text}");
         text
+    }
+
+    #[test]
+    fn filtered_elements_keep_indexes_and_coverage_in_the_model_summary() {
+        let body = serde_json::json!({"snapshot":"S", "elements":[
+            {"index":17,"kind":"Button","label":"目标"}
+        ], "filter":{"query":"目标","matched":3,"returned":1,"omitted":2,"of":30}});
+        let (result, line, _, _) = device_call("200 OK", &body.to_string(), |h| async move {
+            h.phone_elements(Parameters(ElementsParams {
+                query: Some("目标".into()), limit: Some(1), ..Default::default()
+            })).await
+        });
+        assert!(line.contains("limit=1"), "{line}");
+        assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+        for mode in [StructuredMode::Slim, StructuredMode::Full, StructuredMode::Off] {
+            let shaped = shape_structured(result.clone(), mode);
+            let text = text_of(&shaped);
+            assert!(text.contains("#17 [Button]"), "{text}");
+            assert!(!text.contains("#0 [Button]"), "{text}");
+            assert!(text.contains("\"omitted\":2"), "{text}");
+            if mode == StructuredMode::Slim {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["summary"], text);
+            } else if mode == StructuredMode::Full {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["elements"], body["elements"]);
+            }
+        }
     }
 
     #[test]

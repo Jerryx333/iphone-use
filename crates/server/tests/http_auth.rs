@@ -40,27 +40,27 @@ fn build_state(password: Option<&str>) -> Arc<AppState> {
     fixture_app_state(password)
 }
 
-fn build_state_with_wda(base_url: &str) -> Arc<AppState> {
+fn build_state_with_runner(base_url: &str) -> Arc<AppState> {
     let state = build_state(None);
     let mut state = match Arc::try_unwrap(state) {
         Ok(state) => state,
         Err(_) => panic!("test state unexpectedly shared"),
     };
-    state.wda = Some(Arc::new(tokio::sync::Mutex::new(
-        server::wda::WdaClient::new(base_url).unwrap(),
+    state.runner = Some(Arc::new(tokio::sync::Mutex::new(
+        server::runner::RunnerClient::new(base_url).unwrap(),
     )));
     Arc::new(state)
 }
 
-fn assert_no_wda_connection(listener: &TcpListener) {
+fn assert_no_runner_connection(listener: &TcpListener) {
     match listener.accept() {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-        Ok(_) => panic!("Mirror backend unexpectedly connected to WDA"),
-        Err(error) => panic!("could not inspect mock WDA listener: {error}"),
+        Ok(_) => panic!("Mirror backend unexpectedly connected to runner"),
+        Err(error) => panic!("could not inspect mock runner listener: {error}"),
     }
 }
 
-fn mock_wda(
+fn mock_runner(
     requests: usize,
     responder: impl Fn(&str, usize) -> Option<(std::time::Duration, String)> + Send + 'static,
 ) -> (String, std::thread::JoinHandle<()>) {
@@ -73,7 +73,7 @@ fn mock_wda(
             let mut request = [0_u8; 8_192];
             let read = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..read]);
-            // Session setup writes WDA's idle-wait settings; answer them here,
+            // Session setup writes runner's idle-wait settings; answer them here,
             // outside the scripted count and index.
             if request.starts_with("POST ") && request.contains("/appium/settings") {
                 let body = r#"{"value":null}"#;
@@ -552,7 +552,7 @@ fn agent_status_requires_bearer_when_password_set() {
         let json = String::from_utf8_lossy(&body);
         assert!(json.contains("\"ok\":true"), "{json}");
         assert!(json.contains(r#""backend":"direct""#), "{json}");
-        assert!(json.contains(r#""managed_wda":false"#), "{json}");
+        assert!(json.contains(r#""managed_runner":false"#), "{json}");
         assert!(json.contains(r#""recovery_owner":"external""#), "{json}");
         assert!(json.contains(r#""reconnecting":false"#), "{json}");
         // The iPhone Mirroring fields went with the backend (v0.9).
@@ -589,9 +589,9 @@ fn agent_status_serializes_release_tags_as_json_data() {
 fn agent_status_reports_freshness_only_for_the_requested_mjpeg_stream() {
     block(async {
         let stream_id = "browser_01234567";
-        let state = build_state_with_wda("http://127.0.0.1:9");
-        state.wda_actionable.store(true, Ordering::Release);
-        *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+        let state = build_state_with_runner("http://127.0.0.1:9");
+        state.runner_actionable.store(true, Ordering::Release);
+        *state.runner_health.lock().unwrap() = server::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -771,7 +771,7 @@ fn direct_browser_control_requires_cookie_and_custom_header() {
 }
 
 #[test]
-fn direct_browser_control_fails_closed_when_wda_is_unavailable() {
+fn direct_browser_control_fails_closed_when_runner_is_unavailable() {
     block(async {
         let app = http::router(build_state(None));
         let resp = app
@@ -790,7 +790,7 @@ fn direct_browser_control_fails_closed_when_wda_is_unavailable() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("wda_not_configured"));
+        assert!(String::from_utf8_lossy(&body).contains("runner_not_configured"));
     });
 }
 
@@ -823,7 +823,7 @@ fn pending_managed_direct_backend_requires_a_persisted_target() {
             Ok(state) => state,
             Err(_) => panic!("test state unexpectedly shared"),
         };
-        state.managed_wda_pending = true;
+        state.managed_runner_pending = true;
         let app = http::router(Arc::new(state));
         let resp = app
             .oneshot(
@@ -861,7 +861,7 @@ fn external_direct_backend_without_local_target_stays_externally_owned() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("wda_is_externally_managed"));
+        assert!(String::from_utf8_lossy(&body).contains("runner_is_externally_managed"));
     });
 }
 
@@ -871,15 +871,15 @@ fn pending_managed_target_is_reported_as_unconfigured() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let state = build_state_with_wda(&base_url);
+        let state = build_state_with_runner(&base_url);
         let mut state = match Arc::try_unwrap(state) {
             Ok(state) => state,
             Err(_) => panic!("test state unexpectedly shared"),
         };
-        state.managed_wda_pending = true;
+        state.managed_runner_pending = true;
         state.mjpeg_url = Some(base_url);
-        state.wda_actionable.store(true, Ordering::Release);
-        *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+        state.runner_actionable.store(true, Ordering::Release);
+        *state.runner_health.lock().unwrap() = server::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -899,12 +899,12 @@ fn pending_managed_target_is_reported_as_unconfigured() {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(status["managed_wda"], false);
-        assert_eq!(status["managed_wda_pending"], true);
+        assert_eq!(status["managed_runner"], false);
+        assert_eq!(status["managed_runner_pending"], true);
         assert_eq!(status["target_configured"], false);
         assert_eq!(status["recovery_owner"], "unconfigured");
-        assert_eq!(status["wda"], false);
-        assert_eq!(status["wda_actionable"], false);
+        assert_eq!(status["runner"], false);
+        assert_eq!(status["runner_actionable"], false);
         assert!(status["hint"]
             .as_str()
             .is_some_and(|hint| hint.contains("iphone-use setup")));
@@ -954,7 +954,7 @@ fn pending_managed_target_is_reported_as_unconfigured() {
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_no_wda_connection(&listener);
+        assert_no_runner_connection(&listener);
     });
 }
 
@@ -996,9 +996,9 @@ fn direct_browser_control_requires_a_short_server_deadline() {
 #[test]
 fn direct_browser_control_timeout_before_dispatch_is_retry_safe_408() {
     block(async {
-        let state = build_state_with_wda("http://127.0.0.1:9");
-        let wda = state.wda.as_ref().unwrap().clone();
-        let held = wda.lock().await;
+        let state = build_state_with_runner("http://127.0.0.1:9");
+        let runner = state.runner.as_ref().unwrap().clone();
+        let held = runner.lock().await;
         let app = http::router(state);
 
         let response = app
@@ -1036,7 +1036,7 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed = action_count.clone();
-        let (base, server) = mock_wda(3, move |request, _| {
+        let (base, server) = mock_runner(3, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1055,7 +1055,7 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
                 ))
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let response = app
             .oneshot(
@@ -1096,7 +1096,7 @@ fn direct_browser_control_timeout_during_lookups_is_retry_safe_408() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed = action_count.clone();
-        let (base, server) = mock_wda(2, move |request, _| {
+        let (base, server) = mock_runner(2, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1112,7 +1112,7 @@ fn direct_browser_control_timeout_during_lookups_is_retry_safe_408() {
                 Some((std::time::Duration::ZERO, r#"{"value":null}"#.to_string()))
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let response = app
             .oneshot(
@@ -1142,9 +1142,9 @@ fn agent_elements_surfaces_a_populated_system_alert() {
     block(async {
         // A single button plus a live UIAlertController. The flattened tree
         // handles alerts badly, so the daemon reports it as a first-class
-        // `alert:{text,buttons}` block via WDA's native /alert routes.
+        // `alert:{text,buttons}` block via runner's native /alert routes.
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"继续","rect":{"x":10,"y":20,"width":80,"height":44},"children":[]}]}}"#;
-        let (base, server) = mock_wda(5, move |request, _| {
+        let (base, server) = mock_runner(5, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1165,7 +1165,7 @@ fn agent_elements_surfaces_a_populated_system_alert() {
             } else {
                 assert!(
                     request.contains("/wda/alert/buttons"),
-                    "unexpected WDA request: {request}"
+                    "unexpected runner request: {request}"
                 );
                 Some((
                     std::time::Duration::ZERO,
@@ -1173,7 +1173,7 @@ fn agent_elements_surfaces_a_populated_system_alert() {
                 ))
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let response = app
             .oneshot(
@@ -1206,7 +1206,7 @@ fn direct_browser_control_can_tap_an_accessibility_label() {
     block(async {
         let click_count = Arc::new(AtomicUsize::new(0));
         let observed = click_count.clone();
-        let (base, server) = mock_wda(3, move |request, _| {
+        let (base, server) = mock_runner(3, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1221,10 +1221,10 @@ fn direct_browser_control_can_tap_an_accessibility_label() {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Some((std::time::Duration::ZERO, r#"{"value":null}"#.to_string()))
             } else {
-                panic!("unexpected WDA request: {request}");
+                panic!("unexpected runner request: {request}");
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let response = app
             .oneshot(
@@ -1248,7 +1248,7 @@ fn direct_browser_control_can_tap_an_accessibility_label() {
 #[test]
 fn direct_browser_label_tap_rejects_ambiguous_matches_without_tapping() {
     block(async {
-        let (base, server) = mock_wda(1, move |request, _| {
+        let (base, server) = mock_runner(1, move |request, _| {
             assert!(
                 request.contains("/source?format=json"),
                 "ambiguous label resolution must stop before an action: {request}"
@@ -1258,7 +1258,7 @@ fn direct_browser_label_tap_rejects_ambiguous_matches_without_tapping() {
                 r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"关注","rawIdentifier":"author-a","rect":{"x":300,"y":200,"width":60,"height":44}},{"type":"XCUIElementTypeButton","label":"关注","rawIdentifier":"author-b","rect":{"x":300,"y":400,"width":60,"height":44}}]}}"#.to_string(),
             ))
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let response = app
             .oneshot(
@@ -1286,7 +1286,7 @@ fn direct_browser_label_tap_rejects_ambiguous_matches_without_tapping() {
 #[test]
 fn direct_browser_label_tap_rejects_missing_match_without_tapping() {
     block(async {
-        let (base, server) = mock_wda(1, move |request, _| {
+        let (base, server) = mock_runner(1, move |request, _| {
             assert!(
                 request.contains("/source?format=json"),
                 "missing label resolution must stop before an action: {request}"
@@ -1296,7 +1296,7 @@ fn direct_browser_label_tap_rejects_missing_match_without_tapping() {
                 r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"取消","rect":{"x":20,"y":700,"width":60,"height":44}}]}}"#.to_string(),
             ))
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let response = app
             .oneshot(
@@ -1324,7 +1324,7 @@ fn direct_browser_label_tap_rejects_missing_match_without_tapping() {
 #[test]
 fn indexed_browser_tap_requires_an_element_snapshot() {
     block(async {
-        let app = http::router(build_state_with_wda("http://127.0.0.1:9"));
+        let app = http::router(build_state_with_runner("http://127.0.0.1:9"));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1354,7 +1354,7 @@ fn indexed_browser_tap_applies_only_when_the_snapshot_still_matches() {
         let observed = action_count.clone();
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"更多","rect":{"x":20,"y":40,"width":80,"height":44},"children":[]},{"type":"XCUIElementTypeButton","label":"更多","rect":{"x":20,"y":100,"width":80,"height":44},"children":[]}]}}"#;
         let source = source.replacen("\"label\":\"更多\"", "\"label\":\"菜单\"", 1);
-        let (base, server) = mock_wda(7, move |request, _| {
+        let (base, server) = mock_runner(7, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1390,13 +1390,13 @@ fn indexed_browser_tap_applies_only_when_the_snapshot_still_matches() {
             } else {
                 assert!(
                     request.contains("/element/MORE/click"),
-                    "unexpected WDA request: {request}"
+                    "unexpected runner request: {request}"
                 );
                 observed.fetch_add(1, Ordering::SeqCst);
                 Some((std::time::Duration::ZERO, r#"{"value":null}"#.to_string()))
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let elements_response = app
             .clone()
@@ -1460,7 +1460,7 @@ fn indexed_browser_tap_rejects_a_stale_snapshot_without_tapping() {
         let observed_sources = source_count.clone();
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed_actions = action_count.clone();
-        let (base, server) = mock_wda(6, move |request, _| {
+        let (base, server) = mock_runner(6, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1499,10 +1499,10 @@ fn indexed_browser_tap_rejects_a_stale_snapshot_without_tapping() {
                 ))
             } else {
                 observed_actions.fetch_add(1, Ordering::SeqCst);
-                panic!("stale snapshot must not send a WDA action: {request}");
+                panic!("stale snapshot must not send a runner action: {request}");
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
 
         let elements_response = app
             .clone()
@@ -1687,7 +1687,7 @@ fn agent_input_rejects_garbage_body() {
 }
 
 #[test]
-fn agent_actions_validates_the_entire_batch_before_touching_wda() {
+fn agent_actions_validates_the_entire_batch_before_touching_runner() {
     block(async {
         let app = http::router(build_state(None));
         let response = app
@@ -1725,7 +1725,7 @@ fn agent_actions_executes_a_guarded_sequence_under_one_request() {
     block(async {
         // session, Home, source (reads go straight to the lite tree; no
         // front-app lookup after Home any more).
-        let (base, server) = mock_wda(3, |request, _| {
+        let (base, server) = mock_runner(3, |request, _| {
             let body = if request.starts_with("POST /session ") {
                 r#"{"value":{"sessionId":"SESSION"}}"#
             } else if request.contains("/wda/pressButton") {
@@ -1735,7 +1735,7 @@ fn agent_actions_executes_a_guarded_sequence_under_one_request() {
             } else {
                 assert!(
                     request.contains("/source?format=json"),
-                    "unexpected WDA request: {request}"
+                    "unexpected runner request: {request}"
                 );
                 r#"{"value":{
                     "type":"XCUIElementTypeApplication",
@@ -1751,7 +1751,7 @@ fn agent_actions_executes_a_guarded_sequence_under_one_request() {
             };
             Some((std::time::Duration::ZERO, body.to_string()))
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1791,7 +1791,7 @@ fn agent_actions_taps_one_strict_semantic_locator() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed_actions = action_count.clone();
-        let (base, server) = mock_wda(4, move |request, _| {
+        let (base, server) = mock_runner(4, move |request, _| {
             let body = if request.starts_with("POST /session ") {
                 r#"{"value":{"sessionId":"SESSION"}}"#.to_string()
             } else if request.contains("/source?format=json") {
@@ -1812,20 +1812,20 @@ fn agent_actions_taps_one_strict_semantic_locator() {
             } else if request.contains("/elements") {
                 assert!(
                     request.contains("enabled == 1 AND visible == 1"),
-                    "strict locator state must reach the native WDA query: {request}"
+                    "strict locator state must reach the native runner query: {request}"
                 );
                 r#"{"value":[{"ELEMENT":"SEARCH"}]}"#.to_string()
             } else {
                 assert!(
                     request.contains("/element/SEARCH/click"),
-                    "unexpected WDA request: {request}"
+                    "unexpected runner request: {request}"
                 );
                 observed_actions.fetch_add(1, Ordering::SeqCst);
                 r#"{"value":null}"#.to_string()
             };
             Some((std::time::Duration::ZERO, body))
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1867,7 +1867,7 @@ fn agent_actions_wait_for_retries_one_stale_source_read() {
     block(async {
         let source_count = Arc::new(AtomicUsize::new(0));
         let observed_sources = source_count.clone();
-        let (base, server) = mock_wda(2, move |request, _| {
+        let (base, server) = mock_runner(2, move |request, _| {
             assert!(
                 request.contains("/source?format=json"),
                 "wait_for retries only its read-only source observation: {request}"
@@ -1884,7 +1884,7 @@ fn agent_actions_wait_for_retries_one_stale_source_read() {
             };
             Some((std::time::Duration::ZERO, body))
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1920,7 +1920,7 @@ fn agent_actions_stops_before_later_steps_when_an_element_is_missing() {
     block(async {
         // session, Home, source (reads go straight to the lite tree; no
         // front-app lookup after Home any more).
-        let (base, server) = mock_wda(3, |request, _| {
+        let (base, server) = mock_runner(3, |request, _| {
             let body = if request.starts_with("POST /session ") {
                 r#"{"value":{"sessionId":"SESSION"}}"#
             } else if request.contains("/wda/pressButton") {
@@ -1930,7 +1930,7 @@ fn agent_actions_stops_before_later_steps_when_an_element_is_missing() {
             } else {
                 assert!(
                     request.contains("/source?format=json"),
-                    "unexpected WDA request: {request}"
+                    "unexpected runner request: {request}"
                 );
                 r#"{"value":{
                     "type":"XCUIElementTypeApplication",
@@ -1940,7 +1940,7 @@ fn agent_actions_stops_before_later_steps_when_an_element_is_missing() {
             };
             Some((std::time::Duration::ZERO, body.to_string()))
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1981,7 +1981,7 @@ fn direct_agent_input_does_not_replay_after_response_loss() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed = action_count.clone();
-        let (base, server) = mock_wda(2, move |request, _| {
+        let (base, server) = mock_runner(2, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1992,7 +1992,7 @@ fn direct_agent_input_does_not_replay_after_response_loss() {
                 None
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(
                 Request::builder()
@@ -2017,11 +2017,11 @@ fn direct_agent_input_does_not_replay_after_response_loss() {
 }
 
 #[test]
-fn delayed_cold_wda_session_eventually_becomes_actionable() {
+fn delayed_cold_runner_session_eventually_becomes_actionable() {
     block(async {
         // /status, the session-less /wda/locked read, POST /session,
         // session /wda/locked, /wda/apps/list.
-        let (base, server) = mock_wda(5, |request, _| {
+        let (base, server) = mock_runner(5, |request, _| {
             let (delay, body) = if request.starts_with("POST /session ") {
                 (
                     std::time::Duration::from_millis(1_800),
@@ -2039,7 +2039,7 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
             };
             Some((delay, body.to_string()))
         });
-        let state = build_state_with_wda(&base);
+        let state = build_state_with_runner(&base);
         let app = http::router(state.clone());
 
         let first = app
@@ -2053,7 +2053,7 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !state.wda_health.lock().unwrap().actionable {
+            while !state.runner_health.lock().unwrap().actionable {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
@@ -2061,7 +2061,7 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
         .expect("background health probe completed");
         server.join().unwrap();
 
-        let health = *state.wda_health.lock().unwrap();
+        let health = *state.runner_health.lock().unwrap();
         assert!(health.up);
         assert!(health.actionable);
         assert_eq!(health.locked, Some(false));
@@ -2069,7 +2069,7 @@ fn delayed_cold_wda_session_eventually_becomes_actionable() {
 }
 
 #[test]
-fn human_handoff_is_refused_when_wda_is_not_daemon_managed() {
+fn human_handoff_is_refused_when_runner_is_not_daemon_managed() {
     block(async {
         let app = http::router(build_state(None));
         let resp = app
@@ -2087,7 +2087,7 @@ fn human_handoff_is_refused_when_wda_is_not_daemon_managed() {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("wda_is_externally_managed"), "{text}");
+        assert!(text.contains("runner_is_externally_managed"), "{text}");
         assert!(text.contains("hand-off"), "{text}");
     });
 }
@@ -2123,7 +2123,7 @@ fn status_reports_a_human_handoff_only_while_released() {
 }
 
 #[test]
-fn externally_managed_released_wda_is_not_bootstrapped_locally() {
+fn externally_managed_released_runner_is_not_bootstrapped_locally() {
     block(async {
         let state = build_state(None);
         state
@@ -2144,9 +2144,9 @@ fn externally_managed_released_wda_is_not_bootstrapped_locally() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("wda_is_externally_managed"));
+        assert!(String::from_utf8_lossy(&body).contains("runner_is_externally_managed"));
         assert!(observed.released.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!observed.wda_lifecycle.is_reconnecting());
+        assert!(!observed.runner_lifecycle.is_reconnecting());
     });
 }
 
@@ -2187,7 +2187,7 @@ fn input_and_actions_refuse_a_released_phone_with_the_same_json() {
             );
             let body = resp.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(json["error"], "wda_is_externally_managed", "{uri}: {json}");
+            assert_eq!(json["error"], "runner_is_externally_managed", "{uri}: {json}");
             assert_eq!(json["outcome"], "not_sent", "{uri}: {json}");
             assert_eq!(json["retry_safe"], true, "{uri}: {json}");
             if uri == "/agent/actions" {
@@ -2214,15 +2214,21 @@ fn agent_elements_reports_unavailable_instead_of_an_empty_success() {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["elements"], serde_json::json!([]));
-        assert_eq!(json["error"], "wda_not_configured");
+        assert_eq!(json["error"], "runner_not_configured");
     });
 }
 
 #[test]
 fn failed_element_read_revokes_cached_actionability() {
     block(async {
-        let (base, server) = mock_wda(4, |request, _| {
-            if request.starts_with("POST /session ") {
+        let (base, server) = mock_runner(4, |request, _| {
+            if request.starts_with("GET /status ") {
+                // Idle: the read failed on its own, not behind a slow one.
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"ready":true,"busy":false}}"#.to_string(),
+                ))
+            } else if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
                     r#"{"value":{"sessionId":"SESSION"}}"#.to_string(),
@@ -2237,7 +2243,7 @@ fn failed_element_read_revokes_cached_actionability() {
             } else {
                 assert!(
                     request.contains("/source?format=json"),
-                    "unexpected WDA request: {request}"
+                    "unexpected runner request: {request}"
                 );
                 Some((
                     std::time::Duration::ZERO,
@@ -2246,9 +2252,9 @@ fn failed_element_read_revokes_cached_actionability() {
                 ))
             }
         });
-        let state = build_state_with_wda(&base);
-        state.wda_actionable.store(true, Ordering::Release);
-        *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+        let state = build_state_with_runner(&base);
+        state.runner_actionable.store(true, Ordering::Release);
+        *state.runner_health.lock().unwrap() = server::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -2281,13 +2287,13 @@ fn failed_element_read_revokes_cached_actionability() {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let expected_error = if status == StatusCode::GATEWAY_TIMEOUT {
-            "wda_source_timeout"
+            "runner_source_timeout"
         } else {
-            "wda_source_failed"
+            "runner_source_failed"
         };
         assert_eq!(json["error"], expected_error);
-        assert!(!observed.wda_actionable.load(Ordering::Acquire));
-        let health = *observed.wda_health.lock().unwrap();
+        assert!(!observed.runner_actionable.load(Ordering::Acquire));
+        let health = *observed.runner_health.lock().unwrap();
         assert!(health.up);
         assert!(!health.actionable);
         assert_eq!(health.locked, Some(false));
@@ -2295,12 +2301,93 @@ fn failed_element_read_revokes_cached_actionability() {
 }
 
 #[test]
+fn heavy_screen_read_waits_for_the_runner_and_answers_a_partial_tree() {
+    // The field failure (iOS 27 Photos search results, 345 photos): the full
+    // read fails while the runner is still serializing it. The daemon must
+    // not pile more reads or a `POST /session` onto the runner's main thread,
+    // must not mark the runner degraded, and should answer a bounded tree.
+    block(async {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let statuses = status_calls.clone();
+        let (base, server) = mock_runner(6, move |request, _| {
+            let line = request.lines().next().unwrap_or_default().to_string();
+            log.lock().unwrap().push(line.clone());
+            let body = if line.starts_with("GET /status ") {
+                if statuses.fetch_add(1, Ordering::SeqCst) == 0 {
+                    r#"{"value":{"ready":true,"busy":true,"busyMs":5000}}"#
+                } else {
+                    r#"{"value":{"ready":true,"busy":false}}"#
+                }
+                .to_string()
+            } else if line.starts_with("GET /source") && line.contains("max_depth=12") {
+                r#"{"value":{"type":"XCUIElementTypeApplication","label":"Photos","rect":{"x":0,"y":0,"width":440,"height":956},"children":[{"type":"XCUIElementTypeCell","label":"Food","rect":{"x":0,"y":200,"width":146,"height":146},"children":[]}]}}"#.to_string()
+            } else if line.starts_with("GET /source") {
+                r#"{"value":{"error":"unknown error","message":"source unavailable"}}"#.to_string()
+            } else if line.starts_with("POST /session ") {
+                r#"{"value":{"sessionId":"SESSION"}}"#.to_string()
+            } else if line.contains("/alert/text") {
+                r#"{"value":{"error":"no such alert","message":"An attempt was made to operate on a modal dialog when one was not open"}}"#.to_string()
+            } else {
+                panic!("unexpected runner request: {line}");
+            };
+            Some((std::time::Duration::ZERO, body))
+        });
+        let state = build_state_with_runner(&base);
+        state.runner_actionable.store(true, Ordering::Release);
+        let observed = state.clone();
+        let app = http::router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/elements")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["partial"], true, "{json}");
+        assert!(
+            json["elements"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["label"] == "Food")),
+            "{json}"
+        );
+        assert!(observed.runner_actionable.load(Ordering::Acquire));
+        assert!(!observed.runner_read_degraded.load(Ordering::Acquire));
+        let seen = seen.lock().unwrap().clone();
+        let idle_at = seen
+            .iter()
+            .rposition(|line| line.starts_with("GET /status "))
+            .expect("asked whether the runner was busy");
+        assert!(
+            seen[..idle_at]
+                .iter()
+                .all(|line| !line.starts_with("POST /session ") && !line.contains("/alert/")),
+            "nothing may queue behind the busy read: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter().filter(|line| line.starts_with("GET /source")).count(),
+            2,
+            "one failed full read, one bounded read: {seen:?}"
+        );
+    });
+}
+
+#[test]
 fn failed_screenshot_read_revokes_cached_actionability() {
     block(async {
-        let (base, server) = mock_wda(1, |request, _| {
+        let (base, server) = mock_runner(1, |request, _| {
             assert!(
                 request.starts_with("GET /screenshot "),
-                "unexpected WDA request: {request}"
+                "unexpected runner request: {request}"
             );
             Some((
                 std::time::Duration::ZERO,
@@ -2308,9 +2395,9 @@ fn failed_screenshot_read_revokes_cached_actionability() {
                     .to_string(),
             ))
         });
-        let state = build_state_with_wda(&base);
-        state.wda_actionable.store(true, Ordering::Release);
-        *state.wda_health.lock().unwrap() = server::wda::WdaHealth {
+        let state = build_state_with_runner(&base);
+        state.runner_actionable.store(true, Ordering::Release);
+        *state.runner_health.lock().unwrap() = server::runner::RunnerHealth {
             updated_at: std::time::Instant::now(),
             up: true,
             actionable: true,
@@ -2331,8 +2418,8 @@ fn failed_screenshot_read_revokes_cached_actionability() {
         server.join().unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(!observed.wda_actionable.load(Ordering::Acquire));
-        let health = *observed.wda_health.lock().unwrap();
+        assert!(!observed.runner_actionable.load(Ordering::Acquire));
+        let health = *observed.runner_health.lock().unwrap();
         assert!(health.up);
         assert!(!health.actionable);
         assert_eq!(health.locked, Some(false));
@@ -2377,12 +2464,12 @@ fn agent_elements_accepts_the_logged_in_browser_session() {
             .await
             .unwrap();
 
-        // Auth passed. The test state has no WDA, so the honest result is 503
+        // Auth passed. The test state has no runner, so the honest result is 503
         // rather than a misleading empty tree or an authentication failure.
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "wda_not_configured");
+        assert_eq!(json["error"], "runner_not_configured");
     });
 }
 
@@ -2970,7 +3057,7 @@ fn inbox_peek_does_not_drain() {
     });
 }
 
-// auto-update.sh decides "in use" from real activity, not from WDA being up:
+// auto-update.sh decides "in use" from real activity, not from runner being up:
 // status reports how long since the last agent request, and a status poll
 // itself must not reset that clock.
 #[test]
@@ -3109,7 +3196,7 @@ fn a_second_session_is_refused_while_the_first_owns_the_phone() {
 #[test]
 fn element_labels_with_control_characters_serialize_as_valid_json() {
     let label = format!("Line one\nLine two\tcol{}", '\u{0001}');
-    let row = server::wda::ElementRow {
+    let row = server::runner::ElementRow {
         kind: "StaticText".to_string(),
         label: label.clone(),
         rect: [0.0, 0.0, 10.0, 10.0],
@@ -3651,12 +3738,12 @@ fn loopback_only_daemon_refuses_to_pair() {
 }
 
 #[test]
-fn agent_answers_carry_wda_timing_in_body_and_server_timing() {
+fn agent_answers_carry_runner_timing_in_body_and_server_timing() {
     block(async {
-        // Answer whatever /agent/elements asks WDA; the source read is slow on
+        // Answer whatever /agent/elements asks runner; the source read is slow on
         // purpose so it stands out in the breakdown. The server thread is left
         // waiting for requests that never come and ends with the process.
-        let (base, _server) = mock_wda(16, move |request, _| {
+        let (base, _server) = mock_runner(16, move |request, _| {
             if request.contains("/source") {
                 Some((
                     std::time::Duration::from_millis(50),
@@ -3677,7 +3764,7 @@ fn agent_answers_carry_wda_timing_in_body_and_server_timing() {
                 Some((std::time::Duration::ZERO, r#"{"value":null}"#.to_string()))
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(
                 Request::builder()
@@ -3696,13 +3783,13 @@ fn agent_answers_carry_wda_timing_in_body_and_server_timing() {
             .to_string();
         assert!(server_timing.starts_with("total;dur="), "{server_timing}");
         assert!(
-            server_timing.contains("wda-get-source;dur="),
+            server_timing.contains("runner-get-source;dur="),
             "{server_timing}"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let timing = &json["timing"];
-        let source = timing["wda"]
+        let source = timing["runner"]
             .as_array()
             .unwrap()
             .iter()
@@ -3710,7 +3797,7 @@ fn agent_answers_carry_wda_timing_in_body_and_server_timing() {
             .unwrap_or_else(|| panic!("no source call in {timing}"));
         assert!(source["ms"].as_u64().unwrap() >= 50, "{timing}");
         assert!(source["bytes"].as_u64().unwrap() > 0, "{timing}");
-        assert!(timing["total_ms"].as_u64().unwrap() >= timing["wda_ms"].as_u64().unwrap());
+        assert!(timing["total_ms"].as_u64().unwrap() >= timing["runner_ms"].as_u64().unwrap());
     });
 }
 
@@ -3718,8 +3805,8 @@ fn agent_answers_carry_wda_timing_in_body_and_server_timing() {
 // Snapshot-bound taps when several live elements share the row's locator
 // ---------------------------------------------------------------------------
 
-/// Two `关闭` buttons; WDA's label lookup returns `ids`. `rects` answers
-/// `element/:id/rect` (None = WDA fails that read). Taps snapshot row
+/// Two `关闭` buttons; runner's label lookup returns `ids`. `rects` answers
+/// `element/:id/rect` (None = runner fails that read). Taps snapshot row
 /// `element` and returns (status, json, clicked element ids).
 fn tap_with_duplicate_labels(
     ids: &'static [&'static str],
@@ -3730,7 +3817,7 @@ fn tap_with_duplicate_labels(
         let clicked = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = clicked.clone();
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"关闭","rect":{"x":24,"y":66,"width":36,"height":36},"children":[]},{"type":"XCUIElementTypeButton","label":"关闭","rect":{"x":300,"y":700,"width":60,"height":44},"children":[]}]}}"#;
-        let (base, _server) = mock_wda(32, move |request, _| {
+        let (base, _server) = mock_runner(32, move |request, _| {
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
             if request.starts_with("POST /session ") {
                 ok(r#"{"value":{"sessionId":"SESSION"}}"#.to_string())
@@ -3768,7 +3855,7 @@ fn tap_with_duplicate_labels(
                 ok(r#"{"value":null}"#.to_string())
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let elements = app
             .clone()
             .oneshot(
@@ -3858,7 +3945,7 @@ fn snapshot_tap_ignores_a_frame_match_when_another_frame_is_unreadable() {
 
 #[test]
 fn snapshot_tap_still_refuses_when_nothing_decides() {
-    // WDA sees three matches, the snapshot two, and no frame can be read.
+    // runner sees three matches, the snapshot two, and no frame can be read.
     let (status, json, clicked) = tap_with_duplicate_labels(&["A", "B", "C"], |_| None, 1);
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
     assert_eq!(json["error"], "ambiguous_element_label");
@@ -3870,7 +3957,7 @@ fn snapshot_tap_still_refuses_when_nothing_decides() {
 // Screens the app hides from capture
 // ---------------------------------------------------------------------------
 
-/// GET /agent/screenshot against a WDA whose capture is a flat white screen
+/// GET /agent/screenshot against a runner whose capture is a flat white screen
 /// and whose tree is `source`. Returns (status, redacted header, png bytes).
 fn screenshot_of_blank_capture(
     source: &'static str,
@@ -3885,7 +3972,7 @@ fn screenshot_of_blank_capture(
     .unwrap();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&blank);
     block(async move {
-        let (base, _server) = mock_wda(16, move |request, _| {
+        let (base, _server) = mock_runner(16, move |request, _| {
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
             if request.starts_with("POST /session ") {
                 ok(r#"{"value":{"sessionId":"SESSION"}}"#.to_string())
@@ -3899,7 +3986,7 @@ fn screenshot_of_blank_capture(
                 ok(r#"{"value":{"error":"no such alert","message":"no alert"}}"#.to_string())
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
@@ -3972,7 +4059,7 @@ fn max_side_shrinks_the_capture_and_the_wireframe() {
     let image = server::redaction::decode_png(&png).unwrap();
     assert_eq!(image.height, 422);
 
-    // `raw` is WDA's capture untouched, size included.
+    // `raw` is runner's capture untouched, size included.
     let (_, _, png) = screenshot_of_blank_capture(empty, "/agent/screenshot?raw=1&max_side=422");
     let image = server::redaction::decode_png(&png).unwrap();
     assert_eq!((image.width, image.height), (390, 844));
@@ -3987,8 +4074,8 @@ fn max_side_shrinks_the_capture_and_the_wireframe() {
 // Label taps narrowed by kind, occlusion refusal, set_value read-back
 // ---------------------------------------------------------------------------
 
-/// POST `body` to /control against a WDA whose tree is `source`; `value_now`
-/// answers element value reads. Returns (status, json, WDA request lines).
+/// POST `body` to /control against a runner whose tree is `source`; `value_now`
+/// answers element value reads. Returns (status, json, runner request lines).
 fn control_against(
     source: &'static str,
     value_now: &'static str,
@@ -3998,7 +4085,7 @@ fn control_against(
     block(async move {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let log = seen.clone();
-        let (base, _server) = mock_wda(64, move |request, _| {
+        let (base, _server) = mock_runner(64, move |request, _| {
             let line = request.lines().next().unwrap_or("").to_string();
             log.lock().unwrap().push(line.clone());
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
@@ -4018,7 +4105,7 @@ fn control_against(
                 ok(r#"{"value":null}"#.to_string())
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let mut body = body;
         if with_snapshot {
             let elements = app
@@ -4177,7 +4264,7 @@ fn tap_after_read_with(
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = log.clone();
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","label":"Chat","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeButton","label":"发送","rect":{"x":300,"y":700,"width":60,"height":44}}]}}"#;
-        let (base, _server) = mock_wda(64, move |request, _| {
+        let (base, _server) = mock_runner(64, move |request, _| {
             let line = request.lines().next().unwrap_or("").to_string();
             seen.lock().unwrap().push(line.clone());
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
@@ -4197,7 +4284,7 @@ fn tap_after_read_with(
                 ok(r#"{"value":null}"#.to_string())
             }
         });
-        let app = http::router(build_state_with_wda(&base));
+        let app = http::router(build_state_with_runner(&base));
         let post = |body: serde_json::Value| {
             // The browser's /control has no locator taps; agents send them.
             let uri = if body["type"] == "tap_locator" {
@@ -4313,7 +4400,7 @@ fn a_label_or_locator_target_that_moved_since_the_read_is_read_again_not_refused
 }
 
 // ---------------------------------------------------------------------------
-// Rows WDA reports as not drawn (Chrome's tab grid behind the page)
+// Rows runner reports as not drawn (Chrome's tab grid behind the page)
 // ---------------------------------------------------------------------------
 
 const PAGE_OVER_HIDDEN_GRID: &str = r#"{"value":{"type":"XCUIElementTypeApplication","label":"Chrome","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeButton","label":"Close","rawIdentifier":"GridCellCloseButtonIdentifier","isVisible":false,"rect":{"x":179,"y":214,"width":33,"height":32}},{"type":"XCUIElementTypeButton","label":"Close","rect":{"x":20,"y":600,"width":80,"height":44}},{"type":"XCUIElementTypeButton","label":"Tab title","rawIdentifier":"GridCellIdentifierPrefix0","isVisible":false,"rect":{"x":17,"y":400,"width":195,"height":100}}]}}"#;
@@ -4331,7 +4418,7 @@ fn a_label_tap_prefers_the_drawn_match_over_a_hidden_tab_grid_row() {
 }
 
 #[test]
-fn a_tap_on_a_row_wda_reports_not_visible_is_refused_unless_allowed() {
+fn a_tap_on_a_row_runner_reports_not_visible_is_refused_unless_allowed() {
     let (status, json, lines) = control_against(
         PAGE_OVER_HIDDEN_GRID,
         "",
