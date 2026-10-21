@@ -6,8 +6,10 @@
   <LaunchAgents>/<前缀>.phone-gateway.plist        phone-gateway serve（局域网 + WSS 入口）
   <LaunchAgents>/<前缀>.cloudflared-phone.plist    cloudflared 隧道常驻
   <LaunchAgents>/<前缀>.selfrunner-autoresign.plist 每 30 分钟检查签名并自动重签
+  <LaunchAgents>/<前缀>.selfrunner-watchdog.plist   定时检查能否远程控制，需要人处理时通知
   <cloudflared>/phone-gateway.yml                  隧道 ingress：<域名> → WSS 入口
   <autoresign 路径>                                 scripts/selfrunner-autoresign 的副本
+  <watchdog 路径>                                   scripts/selfrunner-watchdog 的副本
   daemon plist 的环境变量                           外部托管模式（§14）：runner/MJPEG 指向转发端口
 
 用法：
@@ -53,6 +55,9 @@ DEFAULTS = {
     "SR_LOG_DIR": "~/Library/Logs",
     "SR_AUTORESIGN_BIN": "~/.local/bin/selfrunner-autoresign",
     "SR_AUTORESIGN_STATE": "~/.iphone-use/selfrunner-autoresign",
+    "SR_WATCHDOG_BIN": "~/.local/bin/selfrunner-watchdog",
+    "SR_WATCHDOG_STATE": "~/.iphone-use/selfrunner-watchdog",
+    "SR_WATCHDOG_INTERVAL": "1800",
     "SR_SRC": "~/.iphone-use/selfrunner-src",
     "SR_DAEMON_PLIST": "~/Library/LaunchAgents/com.leeguoo.iphone-use.plist",
 }
@@ -118,6 +123,8 @@ def validate(v):
             die(f"{key} 应为 IP:端口")
         if key != "SR_GW_BIND" and not ip.is_loopback:
             die(f"{key} 必须是回环地址")
+    if not v["SR_WATCHDOG_INTERVAL"].isdigit() or int(v["SR_WATCHDOG_INTERVAL"]) < 300:
+        die("SR_WATCHDOG_INTERVAL 应为不少于 300 的秒数")
 
 
 def launch_agent(v, name):
@@ -178,6 +185,18 @@ def autoresign_plist(v):
     }
 
 
+def watchdog_plist(v):
+    state = v["SR_WATCHDOG_STATE"]
+    return {
+        "Label": f"{v['SR_LABEL_PREFIX']}.selfrunner-watchdog",
+        "ProgramArguments": [v["SR_WATCHDOG_BIN"]],
+        "RunAtLoad": True,
+        "StartInterval": int(v["SR_WATCHDOG_INTERVAL"]),
+        "StandardOutPath": f"{state}/launchd.out",
+        "StandardErrorPath": f"{state}/launchd.err",
+    }
+
+
 def cloudflared_yml(v):
     tunnel = v["SR_TUNNEL_ID"]
     return (
@@ -209,8 +228,10 @@ def targets(v):
         (launch_agent(v, "phone-gateway"), "plist", gateway_plist(v)),
         (launch_agent(v, "cloudflared-phone"), "plist", cloudflared_plist(v)),
         (launch_agent(v, "selfrunner-autoresign"), "plist", autoresign_plist(v)),
+        (launch_agent(v, "selfrunner-watchdog"), "plist", watchdog_plist(v)),
         (cloudflared_yml_path(v), "text", cloudflared_yml(v)),
         (pathlib.Path(v["SR_AUTORESIGN_BIN"]), "script", (REPO / "scripts/selfrunner-autoresign").read_text()),
+        (pathlib.Path(v["SR_WATCHDOG_BIN"]), "script", (REPO / "scripts/selfrunner-watchdog").read_text()),
     ]
     daemon = pathlib.Path(v["SR_DAEMON_PLIST"])
     if daemon.is_file():
@@ -344,11 +365,11 @@ def cmd_apply(v, dry_run, load):
             handle.write(serialize(kind, wanted))
         os.chmod(tmp, mode)
         os.replace(tmp, path)
-    state = pathlib.Path(v["SR_AUTORESIGN_STATE"])
-    if not state.is_dir():
-        print(f"{'将建' if dry_run else '建立'}  {state}/（launchd 日志目录）")
-        if not dry_run:
-            state.mkdir(parents=True)
+    for state in (pathlib.Path(v["SR_AUTORESIGN_STATE"]), pathlib.Path(v["SR_WATCHDOG_STATE"])):
+        if not state.is_dir():
+            print(f"{'将建' if dry_run else '建立'}  {state}/（launchd 日志目录）")
+            if not dry_run:
+                state.mkdir(parents=True)
     src = pathlib.Path(v["SR_SRC"])
     if not src.exists():
         print(f"{'将建' if dry_run else '建立'}  {src}（自动重签用的固定 worktree，detached HEAD）")

@@ -2,6 +2,7 @@
 # 用途：免费 Apple ID 签名到期前，自动重签、安装并启动 Self Runner。
 # 运行：LaunchAgent 每 30 分钟调用；手动：selfrunner-autoresign [--force] [--dry-run]
 # 依赖：Xcode（已登录 Apple ID）、xcodegen、python3、phone-gateway、osascript。
+# 通知：Mac 本机通知，另交给 SR_NOTIFY_CMD（若设置），用法同 selfrunner-watchdog。
 # 参数：本机配置文件 ${SELFRUNNER_REMOTE_CONFIG:-~/.config/iphone-use/selfrunner-remote.env}
 #（只读 SR_ 开头的 KEY=VALUE 行，不执行），同名环境变量优先。字段见
 # docs/selfrunner-remote-setup.md；安装见 scripts/selfrunner-remote-setup.py。
@@ -133,6 +134,13 @@ on run argv
   display notification (item 1 of argv) with title "Self Runner 签名"
 end run
 APPLESCRIPT
+  # 同 selfrunner-watchdog：SR_NOTIFY_CMD 收到「标题 正文」，可转发到手机。
+  [ -n "${SR_NOTIFY_CMD:-}" ] || return 0
+  local key
+  for key in ${!SR_NOTIFY_@}; do export "${key?}"; done
+  SR_NOTIFY_EVENT=autoresign perl -e 'alarm shift; exec @ARGV or exit 127' 30 \
+    "$SR_NOTIFY_CMD" "Self Runner 签名" "$1" </dev/null >> "$LOG" 2>&1 \
+    || log "通知命令失败：$SR_NOTIFY_CMD"
 }
 
 # 只输出所需的枚举/布尔值；响应全文、owner 内容、token 和密码均不写日志。

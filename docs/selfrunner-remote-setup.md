@@ -4,7 +4,7 @@
 
 | 层 | 放哪里 | 内容 |
 |---|---|---|
-| 通用 | 本仓库 | `scripts/selfrunner-remote-setup.py`（生成 plist 与 cloudflared 配置）、`scripts/selfrunner-autoresign`（自动重签）、本清单 |
+| 通用 | 本仓库 | `scripts/selfrunner-remote-setup.py`（生成 plist 与 cloudflared 配置）、`scripts/selfrunner-autoresign`（自动重签）、`scripts/selfrunner-watchdog`（掉线通知）、本清单 |
 | 参数 | `~/.config/iphone-use/selfrunner-remote.env`（权限 600，自己另存一份私有备份） | 设备 UDID、Team ID、域名、隧道 UUID、launchd label 前缀等 |
 | 机密 | 只在本机文件或钥匙串，另在密码管理器里备份 | 隧道凭据 json、手机锁屏密码 |
 
@@ -36,6 +36,10 @@ SR_LAN_HOST=192.168.1.10                    # Mac 在家里局域网的地址，
 | `SR_CLOUDFLARED_BIN` | `PATH` 里的 `cloudflared`，否则 `/opt/homebrew/bin/cloudflared` |
 | `SR_CLOUDFLARED_DIR` | `~/.cloudflared` |
 | `SR_AUTORESIGN_BIN` / `SR_AUTORESIGN_STATE` | `~/.local/bin/selfrunner-autoresign` / `~/.iphone-use/selfrunner-autoresign` |
+| `SR_WATCHDOG_BIN` / `SR_WATCHDOG_STATE` | `~/.local/bin/selfrunner-watchdog` / `~/.iphone-use/selfrunner-watchdog` |
+| `SR_WATCHDOG_INTERVAL` | `1800`（秒，至少 300） |
+| `SR_WATCHDOG_CONFIRM_SECS` / `SR_WATCHDOG_REMIND_HOURS` | `60` / `6`（见「掉线通知」） |
+| `SR_NOTIFY_CMD` | 空：只发 Mac 本机通知（见「掉线通知」） |
 | `SR_SRC` | `~/.iphone-use/selfrunner-src`（自动重签用的固定 worktree） |
 | `SR_DAEMON_PLIST` / `SR_DAEMON_URL` | `~/Library/LaunchAgents/com.leeguoo.iphone-use.plist` / `http://127.0.0.1:8787` |
 
@@ -52,8 +56,10 @@ SR_LAN_HOST=192.168.1.10                    # Mac 在家里局域网的地址，
 | `<前缀>.phone-gateway.plist` | `phone-gateway serve --bind … --http … --runner-forward … --mjpeg-forward … --ws-bind …`，常驻，日志 `~/Library/Logs/phone-gateway.log` |
 | `<前缀>.cloudflared-phone.plist` | `cloudflared tunnel --no-autoupdate --config <cloudflared 目录>/phone-gateway.yml run`，常驻，日志 `~/Library/Logs/cloudflared-phone.log` |
 | `<前缀>.selfrunner-autoresign.plist` | 每 30 分钟运行一次 `selfrunner-autoresign` |
+| `<前缀>.selfrunner-watchdog.plist` | 每 `SR_WATCHDOG_INTERVAL` 秒（默认 30 分钟）运行一次 `selfrunner-watchdog` |
 | `phone-gateway.yml` | 隧道 UUID、凭据路径，ingress `<SR_WS_HOSTNAME>` → `http://<SR_WS_BIND>`，其余 404 |
 | `selfrunner-autoresign` | `scripts/selfrunner-autoresign` 的副本，运行时读同一份参数文件 |
+| `selfrunner-watchdog` | `scripts/selfrunner-watchdog` 的副本，运行时读同一份参数文件 |
 | daemon plist 的环境变量 | `IPHONE_USE_UDID`、`IPHONE_USE_RUNNER_MANAGED=false`、`IPHONE_USE_RUNNER_URL` / `IPHONE_USE_RUNNER_MJPEG_URL` 指向两个转发端口、`IPHONE_USE_SELFRUNNER_GATEWAY` 指向 gateway HTTP（§14）；其余键原样保留 |
 
 另外：缺少 `SR_SRC` 时用当前仓库的 HEAD 建一个 detached worktree；缺少隧道凭据时只提示，不创建。`~/.cloudflared/config.yml` 和账号里的其他隧道不会被碰。
@@ -127,19 +133,40 @@ SR_LAN_HOST=192.168.1.10                    # Mac 在家里局域网的地址，
    ```
 
    App 导入后存进钥匙串并删除文件；没有合法新文件时点「重新配对」不会清掉现有配对。
-7. 设置 → 显示与亮度 → 自动锁定，设为「永不」；如需后台保活，定位权限设为「始终」。
+7. 设置 → 显示与亮度 → 自动锁定，设为「永不」；如需后台保活，定位权限设为「始终」。自动锁定 2 分钟时出现过：自动重签重装 App 后自动化会话没起来，要人到手机上点 Start。
 8. 让自动重签接手：`selfrunner-autoresign --force`。它用 `--remote-on --runner-core-on` 等预设参数启动 App，等自动化会话就绪；首次会通知你在手机上输入一次密码。之后签名剩余不到 48 小时、手机在家里局域网且 LocalDevVPN 开着时自动重签重装。
 9. 直接调试手机上的 runner API 时，用 `scripts/selfrunner-runner-token.py` 从 gateway 的 PSK 算出请求签名 token。
+
+## 掉线通知
+
+`selfrunner-watchdog` 定时检查手机还能不能被远程控制，只读：不解锁、不重启、不改手机状态。锁屏不算故障，agent 需要时 `phone_reconnect` 会远程解锁。下面这些情况要人处理，会发通知：
+
+| 事件代码 | 情况 | 通知里让人做的事 |
+|---|---|---|
+| `gateway_down` / `daemon_down` | Mac 上的 phone-gateway 或 iphone-use daemon 没响应 | 检查 Mac 上对应的服务 |
+| `offline` | 手机没连上 gateway | 打开 Self Runner，确认 LocalDevVPN 已开 |
+| `unresponsive` | 连着但不回应状态查询 | 打开 Self Runner；不行就上滑关掉再打开 |
+| `needs_start` | 自动化会话停了（例如重装后要密码） | 打开 Self Runner 点 Start，按提示输一次密码 |
+| `needs_relaunch` | 进程要彻底重启 | 上滑关掉 Self Runner，重新打开后点 Start |
+| `runner_api_off` | Runner API 没开 | 在 Self Runner 里打开「Runner API 8100/9100」 |
+
+规则：第一次查到问题后隔 `SR_WATCHDOG_CONFIRM_SECS` 秒再查一次，两次都有问题才通知；同一个问题每 `SR_WATCHDOG_REMIND_HOURS` 小时最多提醒一次（0 表示不重复提醒），问题变了马上通知；恢复时发一次「已恢复」（事件代码 `recovered`）。自动重签正在重装时这一轮跳过，结果由自动重签自己通知。状态在 `SR_WATCHDOG_STATE/state`，日志在同目录的 `watchdog.log`。
+
+通知默认只弹 Mac 本机通知。要推到手机，把 `SR_NOTIFY_CMD` 设成一个可执行文件的路径（不带参数；需要参数就写个包装脚本）。它会收到两个参数：标题和正文；环境变量 `SR_NOTIFY_EVENT` 是上表的事件代码（自动重签的通知为 `autoresign`），参数文件里其他 `SR_NOTIFY_` 开头的键也原样传给它，可放推送服务的地址、收件人等。退出码非 0 表示没送到，下次检查重发；超过 30 秒会被结束。自动重签的通知也走同一个命令。推送服务的 token 不要写进参数文件，让通知命令自己从权限 600 的文件或钥匙串里读。
+
+手动检查：`selfrunner-watchdog --dry-run` 打印事件代码和将要发的通知，不发、不记录；`--test-notify` 经同一条路径发一条测试通知，送不到时退出码非 0。改了脚本后跑 `bash scripts/test-selfrunner-watchdog.sh`（假 gateway，不碰真手机）。
 
 ## 验收
 
 1. `~/.iphone-use/bin/phone-gateway cmd status`：`transport` 为 `online`，在家 Wi‑Fi 下 `link` 为 `lan`；
 2. 手机关掉 Wi‑Fi 只用蜂窝（LocalDevVPN 保持开）：`link` 变为 `wss`，`cmd read` 正常；
 3. daemon 的 `phone_status` 为 `drivable:true`，`phone_run_steps` 能执行；
-4. `python3 scripts/selfrunner-remote-setup.py check` 全部一致；`selfrunner-autoresign --dry-run --force` 只打印计划、不动描述文件。
+4. `python3 scripts/selfrunner-remote-setup.py check` 全部一致；`selfrunner-autoresign --dry-run --force` 只打印计划、不动描述文件；
+5. `selfrunner-watchdog --dry-run` 打印 `ok`；`selfrunner-watchdog --test-notify` 发一条测试通知（事件代码 `test`），确认手机收得到。
 
 ## 已知限制
 
 - 重签重装要用 devicectl，只能在家里局域网或插线时做；在外只能控制、不能重装，48 小时窗口内回家一次即可。
 - 手机重启后要人解锁、开 VPN、点开 App。
+- 自动重签重装 App 后，自动化会话有时要人在手机上点 Start 并输一次密码，远程做不到；`selfrunner-watchdog` 会通知。
 - 在外（`link=wss`）时所有字节走 Cloudflare 免费套餐，不要长时间开 MJPEG 或录屏（§15.9）。

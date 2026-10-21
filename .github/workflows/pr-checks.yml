@@ -221,6 +221,7 @@ jobs:
           bash scripts/test-install-adhoc-signing.sh
           bash scripts/test-uninstall-safety.sh
           bash scripts/test-setup-runner-shim.sh
+          bash scripts/test-selfrunner-watchdog.sh
           python3 scripts/test-auto-update.py
           python3 scripts/test-instance-context.py
           # The nightly re-verification canary decides whether an installed

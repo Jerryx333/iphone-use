@@ -1,0 +1,209 @@
+#!/bin/bash
+# 用途：定时检查 Self Runner 还能不能被远程控制；需要有人到手机上处理时发通知。
+# 运行：LaunchAgent 每 30 分钟调用；手动：selfrunner-watchdog [--dry-run | --test-notify]
+# 只读：不解锁、不重启、不改手机状态。锁屏不算故障（agent 需要时 phone_reconnect 会远程解锁）。
+# 通知：Mac 本机通知；参数 SR_NOTIFY_CMD 指向的可执行文件另外收到「标题 正文」两个参数，
+#   可转发到手机（Bark、ntfy、自建服务等），退出码非 0 视为没送到，下次检查重发。
+#   环境变量 SR_NOTIFY_EVENT 是事件代码（见 problem_text），其余 SR_NOTIFY_ 开头的参数原样传过去。
+# 参数：本机配置文件 ${SELFRUNNER_REMOTE_CONFIG:-~/.config/iphone-use/selfrunner-remote.env}
+#（只读 SR_ 开头的 KEY=VALUE 行，不执行），同名环境变量优先。字段见
+# docs/selfrunner-remote-setup.md；安装见 scripts/selfrunner-remote-setup.py。
+set -uo pipefail
+
+CONFIG="${SELFRUNNER_REMOTE_CONFIG:-$HOME/.config/iphone-use/selfrunner-remote.env}"
+if [ -f "$CONFIG" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*(SR_[A-Z0-9_]+)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then value="${BASH_REMATCH[1]}"; fi
+    # shellcheck disable=SC2088 # 匹配字面的 "~/"，再换成 $HOME。
+    case "$value" in "~/"*) value="$HOME/${value#\~/}" ;; esac
+    # 环境变量已设置时不覆盖。
+    [ -n "${!key+x}" ] || printf -v "$key" '%s' "$value"
+  done < "$CONFIG"
+fi
+
+GATEWAY_HTTP="${SR_GW_HTTP:-127.0.0.1:7382}"
+GATEWAY_HOME="${PHONE_GATEWAY_HOME:-$HOME/.config/phone-gateway}"
+DAEMON_URL="${SR_DAEMON_URL:-http://127.0.0.1:8787}"
+STATE="${SR_WATCHDOG_STATE:-$HOME/.iphone-use/selfrunner-watchdog}"
+AUTORESIGN_STATE="${SR_AUTORESIGN_STATE:-$HOME/.iphone-use/selfrunner-autoresign}"
+NOTIFY_CMD="${SR_NOTIFY_CMD:-}"
+# 第一次查到问题后隔这么久再查一次，两次都有问题才通知，滤掉切网等瞬时抖动。
+CONFIRM_SECS="${SR_WATCHDOG_CONFIRM_SECS:-60}"
+# 问题一直没解决时，隔这么久再提醒一次；0 表示只在问题出现或变化时通知。
+REMIND_HOURS="${SR_WATCHDOG_REMIND_HOURS:-6}"
+LOG="$STATE/watchdog.log"
+
+DRY_RUN=0; TEST_NOTIFY=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --test-notify) TEST_NOTIFY=1 ;;
+    *) printf '未知参数：%s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+for number in "$CONFIRM_SECS" "$REMIND_HOURS"; do
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    printf 'SR_WATCHDOG_CONFIRM_SECS 和 SR_WATCHDOG_REMIND_HOURS 必须是非负整数\n' >&2; exit 2
+  fi
+done
+CONFIRM_SECS=$((10#$CONFIRM_SECS)); REMIND_HOURS=$((10#$REMIND_HOURS))
+# 试运行只把结论打到标准输出，不写日志和状态。
+(( DRY_RUN == 0 )) || LOG=/dev/null
+
+mkdir -p "$STATE" || exit 1
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+
+# 防并发；超过 1 小时的锁目录视为残留。
+if ! mkdir "$STATE/lock.d" 2>/dev/null; then
+  if [ -n "$(find "$STATE/lock.d" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+    rmdir "$STATE/lock.d" 2>/dev/null && mkdir "$STATE/lock.d" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+trap 'rmdir "$STATE/lock.d" 2>/dev/null' EXIT
+
+# 自动重签正在重装 App 时状态本来就不对，它会自己报告结果。
+autoresign_busy() {
+  [ -d "$AUTORESIGN_STATE/lock.d" ] && [ -z "$(find "$AUTORESIGN_STATE/lock.d" -maxdepth 0 -mmin +60 2>/dev/null)" ]
+}
+
+GATEWAY_TOKEN=""
+gateway() {
+  local endpoint="$1" body="$2"
+  curl -fsS -m 15 -X POST \
+    -H "Authorization: Bearer $GATEWAY_TOKEN" \
+    -H 'Content-Type: application/json' --data "$body" \
+    "http://$GATEWAY_HTTP/v1/$endpoint" 2>/dev/null
+}
+
+# 输出一个事件代码：ok 或 problem_text 里的某个问题。只读 /v1/status 和 status 命令。
+probe() {
+  local status_json command_json code
+  GATEWAY_TOKEN=$(cat "$GATEWAY_HOME/client-token" 2>/dev/null) || GATEWAY_TOKEN=""
+  if [ -z "$GATEWAY_TOKEN" ] || ! status_json=$(gateway status '{}'); then
+    echo gateway_down; return
+  fi
+  # daemon 只看是否在听：任何 HTTP 响应（包括 401）都算活着，不需要它的密码。
+  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$DAEMON_URL/agent/status" 2>/dev/null)
+  if [ "${code:-000}" = 000 ]; then echo daemon_down; return; fi
+  command_json=$(gateway command '{"action":"status","deadline_ms":4000}') || command_json=""
+  GATEWAY_TOKEN=""
+  python3 -I -c '
+import json, sys
+try:
+    status = json.loads(sys.argv[1])
+except Exception:
+    status = {}
+if status.get("transport") != "online":
+    print("offline"); sys.exit()
+try:
+    command = json.loads(sys.argv[2])
+except Exception:
+    command = {}
+result = command.get("result") if command.get("ok") is True else None
+if not isinstance(result, dict):
+    print("unresponsive")
+elif result.get("needs_relaunch") is True:
+    print("needs_relaunch")
+elif result.get("needs_passcode") is True or result.get("xctest_ready") is not True:
+    print("needs_start")
+elif (result.get("runner_core") or {}).get("running") is not True:
+    print("runner_api_off")
+else:
+    print("ok")
+' "$status_json" "$command_json" 2>/dev/null || echo unresponsive
+}
+
+problem_text() {
+  case "$1" in
+    gateway_down) echo "Mac 上的 phone-gateway 没响应，手机暂时控制不了。请检查 Mac 上的 phone-gateway 服务。" ;;
+    daemon_down) echo "Mac 上的 iphone-use daemon 没响应，手机暂时控制不了。请检查 Mac 上的 iphone-use 服务。" ;;
+    offline) echo "手机没连上 Mac：请在手机上打开 Self Runner，并确认 LocalDevVPN 已开。" ;;
+    unresponsive) echo "Self Runner 在线但不回应：请在手机上打开 Self Runner 看看；不行就从多任务界面上滑关掉再打开。" ;;
+    needs_relaunch) echo "自动化会话要重启：在手机上把 Self Runner 从多任务界面上滑关掉，重新打开后点 Start，按提示输一次密码。" ;;
+    needs_start) echo "自动化会话停了：请在手机上打开 Self Runner 点 Start，按提示输一次密码（远程做不到）。" ;;
+    runner_api_off) echo "Self Runner 的 Runner API 没开：请在 Self Runner 里打开「Runner API 8100/9100」。" ;;
+    *) echo "Self Runner 状态异常（$1）。" ;;
+  esac
+}
+
+# 标题 正文 事件代码；返回非 0 表示 SR_NOTIFY_CMD 没送到。
+notify() {
+  if (( DRY_RUN )); then echo "将会通知：$1｜$2"; return 0; fi
+  # 消息作为 argv 传入，避免消息中的引号成为 AppleScript 代码。
+  osascript - "$1" "$2" >/dev/null 2>&1 <<'APPLESCRIPT'
+on run argv
+  display notification (item 2 of argv) with title (item 1 of argv)
+end run
+APPLESCRIPT
+  [ -n "$NOTIFY_CMD" ] || return 0
+  local key
+  for key in ${!SR_NOTIFY_@}; do export "${key?}"; done
+  # macOS 没有 timeout 命令；perl 的 alarm 让卡住的通知命令 30 秒后退出。
+  if SR_NOTIFY_EVENT="$3" perl -e 'alarm shift; exec @ARGV or exit 127' 30 \
+    "$NOTIFY_CMD" "$1" "$2" </dev/null >> "$LOG" 2>&1; then
+    return 0
+  fi
+  log "通知命令失败：$NOTIFY_CMD"
+  return 1
+}
+
+if (( TEST_NOTIFY )); then
+  # 走真实通知路径发一条，确认能送到手机；不检查手机、不记录状态。
+  notify "Self Runner 通知测试" "收到这条，说明掉线通知能送到。" test
+  exit
+fi
+if autoresign_busy; then
+  (( DRY_RUN )) && echo "跳过：自动重签正在进行"
+  exit 0
+fi
+problem=$(probe)
+if [ "$problem" != ok ] && (( CONFIRM_SECS > 0 )); then
+  sleep "$CONFIRM_SECS"
+  autoresign_busy && exit 0
+  problem=$(probe)
+fi
+if (( DRY_RUN )); then echo "$problem"; fi
+
+# 状态文件一行：事件代码 首次发现时间 上次通知时间（epoch 秒，0 表示没有）。
+prev=ok; since=0; alerted=0
+[ ! -f "$STATE/state" ] || read -r prev since alerted < "$STATE/state"
+[[ "$since" =~ ^[0-9]+$ ]] || since=0
+[[ "$alerted" =~ ^[0-9]+$ ]] || alerted=0
+now=$(date +%s)
+
+if [ "$problem" = ok ]; then
+  if [ "$prev" != ok ]; then
+    log "恢复（之前：${prev}）"
+    if (( alerted > 0 )); then
+      minutes=$(( (now - since) / 60 ))
+      notify "Self Runner 已恢复" "手机又能远程控制了（中断约 ${minutes} 分钟）。" recovered || true
+    fi
+  fi
+  (( DRY_RUN )) || printf 'ok 0 0\n' > "$STATE/state"
+  exit 0
+fi
+
+if [ "$prev" = ok ] || (( since == 0 )); then since=$now; fi
+due=0
+if [ "$problem" != "$prev" ] || (( alerted == 0 )); then
+  due=1
+elif (( REMIND_HOURS > 0 && now - alerted >= REMIND_HOURS * 3600 )); then
+  due=1
+fi
+[ "$problem" = "$prev" ] || log "问题：$problem"
+if (( due )); then
+  if notify "Self Runner 需要处理" "$(problem_text "$problem")" "$problem"; then
+    alerted=$now
+    log "已通知：$problem"
+  else
+    # 没送到就不记通知时间，下次检查重发。
+    alerted=0
+  fi
+fi
+(( DRY_RUN )) || printf '%s %s %s\n' "$problem" "$since" "$alerted" > "$STATE/state"
+exit 0
