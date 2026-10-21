@@ -5877,6 +5877,7 @@ async fn agent_mode_inner(
             if !state.managed_runner {
                 if let Some(gateway) = &state.selfrunner_gateway {
                     let mut unlock_error = None;
+                    let mut lock_unknown = false;
                     if let Some(runner) = &state.runner {
                         let _priority = state.begin_runner_control();
                         let Ok(mut client) =
@@ -5888,11 +5889,17 @@ async fn agent_mode_inner(
                                 serde_json::json!({"ok": false, "error": "client_busy"}),
                             );
                         };
-                        let locked = tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            client.locked_unattached(),
-                        )
-                        .await;
+                        // Over the Cloudflare link (wss) one runner round trip
+                        // took 0.4–1.8 s and once 4.5 s (2026-10-21): a 1 s read
+                        // gave up first, the unlock was never sent and the call
+                        // still answered ok.
+                        const LOCK_READ: std::time::Duration = std::time::Duration::from_secs(6);
+                        let locked =
+                            tokio::time::timeout(LOCK_READ, client.locked_unattached()).await;
+                        // Unlock only a phone the runner reads as locked: Self
+                        // Runner takes any on-screen 0–9 keypad (a bank's PIN pad)
+                        // for its lock screen and would press Home on an open phone.
+                        lock_unknown = !matches!(locked, Ok(Ok(_)));
                         if matches!(locked, Ok(Ok(true))) {
                             unlock_error = gateway.unlock().await.err();
                             // Self Runner judges the lock by what is on screen and
@@ -5901,11 +5908,8 @@ async fn agent_mode_inner(
                             // lock state has the last word.
                             if unlock_error.is_none()
                                 && matches!(
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(1),
-                                        client.locked_unattached(),
-                                    )
-                                    .await,
+                                    tokio::time::timeout(LOCK_READ, client.locked_unattached())
+                                        .await,
                                     Ok(Ok(true))
                                 )
                             {
@@ -5927,6 +5931,9 @@ async fn agent_mode_inner(
                         }
                     }
                     let health = *recover(state.runner_health.lock());
+                    if lock_unknown && !health.actionable {
+                        unlock_error = Some("lock_state_unknown".into());
+                    }
                     let mut result = serde_json::json!({"ok": unlock_error.is_none(), "recovery_owner":"external", "runner": health.up, "runner_actionable":health.actionable, "runner_locked":health.locked, "drivable":health.actionable});
                     if let Some(error) = &unlock_error {
                         result["error"] = serde_json::json!(error);
@@ -5937,11 +5944,16 @@ async fn agent_mode_inner(
                         // caller back to it.
                         let locked = health.locked == Some(true) && unlock_error.is_none();
                         let guidance = crate::selfrunner::guidance(&diagnostics, locked).or(
-                            unlock_error.as_ref().map(|_| {
-                                (
+                            unlock_error.as_deref().map(|error| match error {
+                                // Nothing was sent, so one more call is safe.
+                                "lock_state_unknown" => (
+                                    "runner 没及时回答手机是否锁屏，这次没有发解锁；可以再调用一次 phone_reconnect，还不行就请有人在手机上解锁",
+                                    "The runner did not say in time whether the phone is locked, so no unlock was sent; call phone_reconnect once more, and if that fails someone has to unlock the phone in hand",
+                                ),
+                                _ => (
                                     "远程解锁失败，请有人在手机上解锁",
                                     "The remote unlock failed; someone has to unlock the phone in hand",
-                                )
+                                ),
                             }),
                         );
                         if let Some((zh, en)) = guidance {
@@ -25715,7 +25727,21 @@ mod selfrunner_p2_tests {
         Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
-        use axum::{routing::get, Json};
+        runner_lock_reads(reads, std::time::Duration::ZERO, false).await
+    }
+
+    /// [`runner_locked_for`] answering each lock read after `delay`, or with
+    /// HTTP 500 when `fail` is set.
+    async fn runner_lock_reads(
+        reads: usize,
+        delay: std::time::Duration,
+        fail: bool,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{response::IntoResponse, routing::get, Json};
         let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = mutations.clone();
         let lock_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -25724,7 +25750,13 @@ mod selfrunner_p2_tests {
                 "/wda/locked",
                 get(move || {
                     let n = lock_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    async move { Json(serde_json::json!({"value": n < reads})) }
+                    async move {
+                        tokio::time::sleep(delay).await;
+                        if fail {
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        Json(serde_json::json!({"value": n < reads})).into_response()
+                    }
                 }),
             )
             .route(
@@ -25832,6 +25864,64 @@ mod selfrunner_p2_tests {
             }
         });
     }
+
+    /// Over the Cloudflare link a lock read took up to 4.5 s, and a 1 s read
+    /// never sent the unlock. A slow read still unlocks. A failed one sends
+    /// nothing and says so: Self Runner can take an app's 0–9 keypad for its
+    /// lock screen, so only a phone the runner reads as locked is unlocked.
+    #[test]
+    fn reconnect_waits_for_a_slow_lock_read_but_never_unlocks_blind() {
+        block(async {
+            // (lock reads answering locked, delay per read, reads fail, unlocks sent, error)
+            for (locked_reads, delay_ms, fail, unlocks, error) in [
+                (1, 1200, false, 1, None),
+                (0, 0, true, 0, Some("lock_state_unknown")),
+                (0, 0, false, 0, None),
+            ] {
+                let (gateway, _file, calls, gateway_task) = mock_gateway(
+                    serde_json::json!({"transport":"online","tunnels":{"idle":2}}),
+                    serde_json::json!({"ok":true,"result":{"unlocked":true}}),
+                )
+                .await;
+                let (base, _mutations, runner_task) = runner_lock_reads(
+                    locked_reads,
+                    std::time::Duration::from_millis(delay_ms),
+                    fail,
+                )
+                .await;
+                let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
+                state.selfrunner_gateway = Some(gateway);
+                state.runner = Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::runner::RunnerClient::new(&base).unwrap(),
+                )));
+                let mut headers = HeaderMap::new();
+                headers.insert("x-phone-control", HeaderValue::from_static("1"));
+                let body = response_json(
+                    agent_mode(
+                        State(Arc::new(state)),
+                        headers,
+                        r#"{"mode":"agent"}"#.into(),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    unlocks,
+                    "{body}"
+                );
+                assert_eq!(body["ok"], error.is_none(), "{body}");
+                if let Some(error) = error {
+                    assert_eq!(body["error"], error, "{body}");
+                    let zh = body["next_step"]["zh"].as_str().unwrap();
+                    assert!(zh.contains("没有发解锁"), "{body}");
+                }
+                gateway_task.abort();
+                runner_task.abort();
+            }
+        });
+    }
+
     #[test]
     fn stale_cache_waits_for_existing_probe_but_fresh_cache_does_not() {
         block(async {
