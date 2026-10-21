@@ -25677,7 +25677,7 @@ mod selfrunner_p2_tests {
                 let expected = [
                     "not running",
                     "LocalDevVPN",
-                    "passcode on the phone once",
+                    "tap Start",
                     "Runner API",
                     "phone_reconnect",
                 ][case];

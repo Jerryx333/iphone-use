@@ -160,8 +160,18 @@ pub fn guidance(value: &Value, locked: bool) -> Option<(&'static str, &'static s
             "请在手机上打开 Self Runner App，并确认 LocalDevVPN 已开",
             "Self Runner is disconnected; open Self Runner on the phone and enable LocalDevVPN",
         ))
-    } else if value["needs_passcode"] == true || value["needs_relaunch"] == true {
-        Some(("重启自动化会话需要有人在手机上输一次密码，远程做不到", "Restarting the Self Runner automation session requires someone to enter the passcode on the phone once; this cannot be done remotely"))
+    } else if value["needs_relaunch"] == true {
+        // Unlocking the screen is not enough: the automation session itself
+        // has to be started again by someone holding the phone.
+        Some((
+            "在手机上把 Self Runner 从多任务界面上滑关掉，重新打开后点 Start，按提示输一次密码；远程做不到",
+            "On the phone, swipe Self Runner away in the app switcher, reopen it, tap Start and enter the passcode if asked; this cannot be done remotely",
+        ))
+    } else if value["needs_passcode"] == true {
+        Some((
+            "在手机上打开 Self Runner 点 Start，按提示输一次密码；远程做不到",
+            "Open Self Runner on the phone, tap Start and enter the passcode if asked; this cannot be done remotely",
+        ))
     } else if value["runner_core_running"] == false
         // Every tunnel busy is a working runner, not a missing one.
         || (value["tunnels_idle"] == 0 && value["tunnels_active"] == 0)
@@ -180,6 +190,23 @@ pub fn guidance(value: &Value, locked: bool) -> Option<(&'static str, &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_stopped_session_names_the_start_button() {
+        let up = |field: &str| json!({"gateway": "up", "transport": "online", field: true});
+        let (zh, en) = guidance(&up("needs_passcode"), true).unwrap();
+        assert!(
+            zh.contains("点 Start") && en.contains("tap Start"),
+            "{zh} / {en}"
+        );
+        assert!(
+            !zh.contains("上滑"),
+            "a plain restart needs no relaunch: {zh}"
+        );
+        let (zh, en) = guidance(&up("needs_relaunch"), false).unwrap();
+        assert!(zh.contains("上滑关掉") && zh.contains("点 Start"), "{zh}");
+        assert!(en.contains("swipe Self Runner away"), "{en}");
+    }
+
     #[test]
     fn accepts_only_loopback() {
         for base in [

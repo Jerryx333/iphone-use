@@ -281,7 +281,7 @@ runner 不可驱动时，status 可增加 `self_runner`：
 
 1. gateway 不可达：启动本机 phone-gateway。
 2. transport=offline：在手机打开 Self Runner App，确认 LocalDevVPN 已开。
-3. needs_passcode 或 needs_relaunch：有人在手机上输一次密码以重启自动化会话，不能远程完成。
+3. needs_relaunch：在手机上把 Self Runner 从多任务界面上滑关掉，重新打开后点 Start，按提示输一次密码；needs_passcode：打开 Self Runner 点 Start，按提示输一次密码。两者都不能远程完成；只解锁屏幕不会重启自动化会话。Mac 上的 `scripts/selfrunner-watchdog` 定时检查这些状态并通知（见 `docs/selfrunner-remote-setup.md`「掉线通知」）。
 4. runner_core 未运行，或空闲和使用中的通道都为 0：打开「Runner API 8100/9100」，或等待通道建立。
 5. runner 可达但锁屏：调用一次 phone_reconnect，通过 gateway 使用 Mac 钥匙串密码远程解锁。
 
