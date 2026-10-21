@@ -105,6 +105,12 @@ pub struct AppsParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementsParams {
+    /// Show off-screen/not-drawn rows individually in the text, with their
+    /// original indexes and hidden state, instead of a five-label summary.
+    /// The 200-row / 32 KiB text budget still applies. Scroll them into view
+    /// before acting. Default false.
+    #[serde(default)]
+    pub include_hidden: bool,
     /// Keep only rows whose label, identifier, value or placeholder contains
     /// this text (case-insensitive). Rows keep their original index.
     #[serde(default)]
@@ -1339,6 +1345,8 @@ impl PhoneHandler {
         and `limit` caps the rows — both keep each row's index and the snapshot, so taps still \
         work. Screen text shows at most 200 rows and 32 KiB of row text; an omission notice \
         means a partial view, not absence or list completion. Narrow with query when needed. \
+        include_hidden=true expands off-screen/not-drawn rows instead of summarizing five labels; \
+        these rows are marked hidden and must be scrolled into view before acting. \
         On the first read in a newly entered app a `registry` block lists saved flows for \
         it: if one does the task, phone_flow_run it instead of tapping step by step. An `alert` \
         block means a system alert is up: answer it with an `alert` step, taps on alerts do not act. \
@@ -1348,7 +1356,12 @@ impl PhoneHandler {
     )]
     async fn phone_elements(
         &self,
-        Parameters(ElementsParams { query, limit, ocr }): Parameters<ElementsParams>,
+        Parameters(ElementsParams {
+            query,
+            limit,
+            ocr,
+            include_hidden,
+        }): Parameters<ElementsParams>,
     ) -> CallToolResult {
         let ocr = match crate::device::ocr_param(ocr.as_deref()) {
             Ok(ocr) => ocr,
@@ -1381,7 +1394,13 @@ impl PhoneHandler {
                     .and_then(|b64| b64.as_str().map(str::to_string));
                 let mut text = parsed
                     .as_ref()
-                    .and_then(crate::compact::elements)
+                    .and_then(|json| {
+                        if include_hidden {
+                            crate::compact::elements_with_hidden(json, true)
+                        } else {
+                            crate::compact::elements(json)
+                        }
+                    })
                     .unwrap_or_else(|| body.clone());
                 // OCR rows ride under the tree, never mixed into its indexes.
                 if let Some(ocr) = parsed.as_ref().and_then(crate::device::ocr_block) {
@@ -4411,6 +4430,8 @@ mod tests {
             .unwrap();
         let properties = tool.input_schema["properties"].as_object().unwrap();
         assert!(properties.contains_key("query") && properties.contains_key("limit"));
+        assert_eq!(properties["include_hidden"]["type"], "boolean");
+        assert!(!serde_json::from_value::<ElementsParams>(serde_json::json!({})).unwrap().include_hidden);
         assert!(tool
             .input_schema
             .get("required")
@@ -5041,6 +5062,31 @@ mod tests {
         let text = text_of(&result);
         assert!(text.contains("Nothing was sent") || text.contains("nothing was sent"), "{text}");
         text
+    }
+
+    #[test]
+    fn requested_hidden_elements_reach_all_structured_modes_without_an_extra_read() {
+        let body = serde_json::json!({"snapshot":"S", "elements":[
+            {"index":17,"kind":"Button","label":"Hidden target","identifier":"target-id","visible":false}
+        ], "filter":{"query":"target","matched":1,"returned":1,"omitted":0,"of":30}});
+        let (result, line, _, _) = device_call("200 OK", &body.to_string(), |h| async move {
+            h.phone_elements(Parameters(ElementsParams {
+                query: Some("target".into()), include_hidden: true, ..Default::default()
+            })).await
+        });
+        assert_eq!(line, "GET /agent/elements?image=auto&query=target HTTP/1.1");
+        assert_ne!(result.is_error, Some(true));
+        for mode in [StructuredMode::Slim, StructuredMode::Full, StructuredMode::Off] {
+            let shaped = shape_structured(result.clone(), mode);
+            let text = text_of(&shaped);
+            assert!(text.contains("#17 [Button] \"Hidden target\" id=target-id hidden"), "{text}");
+            assert!(text.contains("\"omitted\":0"), "{text}");
+            if mode == StructuredMode::Slim {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["summary"], text);
+            } else if mode == StructuredMode::Full {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["elements"], body["elements"]);
+            }
+        }
     }
 
     #[test]

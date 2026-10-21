@@ -147,6 +147,10 @@ MCP screen text includes at most 200 rows and 32 KiB of row text. When it
 reports omitted rows, narrow `phone_elements` with `query`/`limit`; an omitted
 target is not proven absent and a truncated list is not proven complete.
 Use the displayed `#N` with its snapshot: it is the original full-tree index.
+To inspect off-screen/not-drawn rows beyond the five-label summary, call
+`phone_elements` with `include_hidden: true` (combine with `query`/`limit`
+to stay within the text budget). These rows are marked `hidden`; scroll them
+into view and read again before acting.
 → reference: *Task metrics, runs and advice*
 
 ## A flow is just these steps saved

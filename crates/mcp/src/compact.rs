@@ -69,13 +69,17 @@ fn clip(label: &str) -> String {
 /// printed only when the label cannot tell the row apart (empty, or shared
 /// with another row): it is in the structured content either way.
 fn row_line(index: u64, row: &Value, show_id: bool) -> String {
+    row_line_with_ids(index, row, show_id, false)
+}
+
+fn row_line_with_ids(index: u64, row: &Value, show_id: bool, full_id: bool) -> String {
     let kind = text(row, "kind").unwrap_or_default();
     let label = text(row, "label").unwrap_or_default();
     let mut line = format!("#{index} [{kind}] \"{}\"", clip(&label));
     if let Some(id) = text(row, "identifier")
-        .filter(|id| (show_id || label.is_empty()) && *id != label && !generated_id(id))
+        .filter(|id| full_id || ((show_id || label.is_empty()) && *id != label && !generated_id(id)))
     {
-        line.push_str(&format!(" id={}", clip(&id)));
+        line.push_str(&format!(" id={}", if full_id { id } else { clip(&id) }));
     }
     if let Some(value) = text(row, "value").filter(|value| *value != label) {
         line.push_str(&format!(" value={}", clip(&value)));
@@ -207,6 +211,10 @@ fn is_hidden(row: &Value) -> bool {
 /// decoration (repeated text, icons, wrapper cells) left out. Indexes stay
 /// the daemon's, so `#N` is still the element to tap.
 fn rows_block(rows: &[Value], out: &mut Vec<String>) {
+    rows_block_with_hidden(rows, out, false);
+}
+
+fn rows_block_with_hidden(rows: &[Value], out: &mut Vec<String>, include_hidden: bool) {
     let mut budget = RowBudget::default();
     let mut hidden = Vec::new();
     let mut omitted = 0;
@@ -231,7 +239,17 @@ fn rows_block(rows: &[Value], out: &mut Vec<String>) {
             ancestors.push((depth, label));
         }
         if is_hidden(row) {
-            hidden.push(text(row, "label").unwrap_or_default());
+            if include_hidden {
+                // Explicit expansion keeps even generated/long identifiers.
+                // Escape physical line breaks before charging the budget.
+                let mut line = row_line_with_ids(row_index(row, index), row, true, true)
+                    .replace('\r', "\\r")
+                    .replace('\n', "\\n");
+                line.push_str(" hidden");
+                budget.push(line, out);
+            } else {
+                hidden.push(text(row, "label").unwrap_or_default());
+            }
             continue;
         }
         if noise || repeated_text(row, &printed) {
@@ -325,6 +343,11 @@ fn extra_blocks(json: &Value, out: &mut Vec<String>) {
 /// `GET /agent/elements` as text, or `None` when the body is not a tree (an
 /// error answer keeps its JSON so every field a caller branches on survives).
 pub fn elements(json: &Value) -> Option<String> {
+    elements_with_hidden(json, false)
+}
+
+/// Expand hidden rows on request, within the same row and byte budgets.
+pub fn elements_with_hidden(json: &Value, include_hidden: bool) -> Option<String> {
     let rows = json.get("elements")?.as_array()?;
     let snapshot = text(json, "snapshot")?;
     if json.get("error").is_some() {
@@ -334,7 +357,10 @@ pub fn elements(json: &Value) -> Option<String> {
         "snapshot {snapshot} · {} rows (tap: element=#N + snapshot)",
         rows.len()
     )];
-    rows_block(rows, &mut out);
+    if include_hidden && rows.iter().any(is_hidden) {
+        out.push("hidden = off-screen or not drawn; scroll into view before acting".into());
+    }
+    rows_block_with_hidden(rows, &mut out, include_hidden);
     extra_blocks(json, &mut out);
     Some(out.join("\n"))
 }
@@ -957,6 +983,79 @@ mod tests {
              #2 [Switch] \"飞行模式\" value=0\n\
              (1 rows off-screen or not drawn: \"隐私\")"
         );
+    }
+
+    #[test]
+    fn hidden_rows_expand_with_original_indexes_and_state_only_on_request() {
+        let body = json!({"snapshot":"S", "elements":[
+            {"index":3,"kind":"Button","label":"Visible"},
+            {"index":17,"kind":"Button","label":"Hidden","identifier":"hidden-id","value":"42","visible":false},
+            {"index":21,"kind":"StaticText","label":"Visible","visible":false},
+            {"index":25,"kind":"Cell","label":"","visible":false}
+        ]});
+        let compact = elements(&body).unwrap();
+        assert!(compact.contains("3 rows off-screen or not drawn"), "{compact}");
+        assert!(!compact.contains("#17"), "{compact}");
+        let expanded = elements_with_hidden(&body, true).unwrap();
+        for expected in [
+            "#3 [Button] \"Visible\"",
+            "#17 [Button] \"Hidden\" id=hidden-id value=42 hidden",
+            "#21 [StaticText] \"Visible\" hidden",
+            "#25 [Cell] \"\" hidden",
+            "scroll into view before acting",
+        ] {
+            assert!(expanded.contains(expected), "{expanded}");
+        }
+        assert!(!expanded.contains("rows off-screen or not drawn:"), "{expanded}");
+        assert_eq!(body["elements"][1]["visible"], false);
+    }
+
+    #[test]
+    fn hidden_rows_keep_full_generated_identifiers_and_escape_line_breaks() {
+        let uuid = "12345678-1234-1234-1234-123456789012";
+        let long = "identifier-".repeat(20);
+        let body = json!({"snapshot":"S", "elements":[
+            {"index":10,"kind":"Button","label":"A\nB","identifier":uuid,"value":"one\r\ntwo","visible":false},
+            {"index":15,"kind":"Button","label":"Long","identifier":long,"visible":false},
+            {"index":18,"kind":"Cell","label":"Same","identifier":"Same","visible":false},
+            {"index":19,"kind":"TextField","label":"","placeholder":"first\nsecond","identifier":"id\r\nnext","visible":false}
+        ]});
+        let expanded = elements_with_hidden(&body, true).unwrap();
+        let lines: Vec<_> = expanded.lines().filter(|line| line.starts_with('#')).collect();
+        assert_eq!(lines.len(), 4, "{expanded}");
+        assert!(lines[0].contains("A\\nB") && lines[0].contains("value=one\\r\\ntwo"), "{expanded}");
+        assert!(lines[0].contains(uuid), "{expanded}");
+        assert!(lines[1].contains(&long), "{expanded}");
+        assert!(lines[2].contains("id=Same"), "{expanded}");
+        assert!(lines[3].contains("id=id\\r\\nnext") && lines[3].contains("placeholder=first\\nsecond"), "{expanded}");
+        assert!(lines.iter().all(|line| line.ends_with(" hidden")), "{expanded}");
+        // One header and one hidden-state notice plus exactly four row lines.
+        assert_eq!(expanded.lines().count(), 6, "{expanded}");
+        // The serialized source remains untouched for programmatic consumers.
+        assert_eq!(body["elements"][0]["value"], "one\r\ntwo");
+    }
+
+    #[test]
+    fn expanded_hidden_rows_still_obey_text_budgets() {
+        for count in [201, 1000] {
+            let rows: Vec<Value> = (0..count).map(|i| json!({
+                "index":i + 10,"kind":"Button","label":format!("Hidden {i}"),"visible":false
+            })).collect();
+            let body = json!({"snapshot":"S","elements":rows});
+            let expanded = elements_with_hidden(&body, true).unwrap();
+            assert_eq!(expanded.lines().filter(|line| line.starts_with('#')).count(), SCREEN_ROW_LIMIT);
+            assert!(expanded.contains(&format!("{} rows omitted by text budget", count - SCREEN_ROW_LIMIT)), "{expanded}");
+            assert!(expanded.contains("partial view, not evidence of absence"));
+        }
+        let rows: Vec<Value> = (0..200).map(|i| json!({
+            "index":i,"kind":"Button","label":"界".repeat(80),
+            "identifier":format!("{i}{}", "号".repeat(79)),"visible":false
+        })).collect();
+        let expanded = elements_with_hidden(&json!({"snapshot":"S","elements":rows}), true).unwrap();
+        let lines: Vec<_> = expanded.lines().filter(|line| line.starts_with('#')).collect();
+        assert!(lines.len() < SCREEN_ROW_LIMIT);
+        assert!(lines.iter().map(|line| line.len() + 1).sum::<usize>() <= SCREEN_ROW_BYTES);
+        assert!(expanded.contains("rows omitted by text budget"));
     }
 
     #[test]

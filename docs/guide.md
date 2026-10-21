@@ -495,6 +495,12 @@ its daemon requests automatically.
 | Flows | `phone_flow_list`, `phone_flow_info`, `phone_flow_run`, `phone_flow_draft`, `phone_flow_update`, `phone_flow_publish`, `phone_flow_report` |
 | Metrics | `phone_run_start`, `phone_run_end` (count one task's calls exactly) |
 
+`phone_elements` normally summarizes off-screen/not-drawn rows with up to five
+labels. Set `include_hidden: true` to see those rows individually, with their
+original indexes, identifiers, values and a `hidden` marker. The 200-row / 32 KiB
+text budget still applies; use `query`/`limit` to narrow a large list. Scroll a
+hidden target into view and read again before acting.
+
 Each of these 26 tools answers in two parts.
 
 * **The text block** is compact and written for the model. It holds the settled

@@ -247,6 +247,11 @@ verb 定义在 `~/.iphone-use/intents-registry.json`（从 [`deploy/intents-regi
 | Flow | `phone_flow_list`、`phone_flow_info`、`phone_flow_run`、`phone_flow_draft`、`phone_flow_update`、`phone_flow_publish`、`phone_flow_report` |
 | 统计 | `phone_run_start`、`phone_run_end`（精确统计一次任务的调用） |
 
+`phone_elements` 默认把屏外或未绘制的元素合并成摘要，最多列出 5 个标签。传
+`include_hidden: true` 可逐行查看它们，保留原始索引、标识和值，并标注 `hidden`。
+文本仍受 200 行和 32 KiB 预算限制，长列表可配合 `query`、`limit` 缩小范围。
+操作前先滚动到目标，再读取一次屏幕。
+
 这 26 个工具的返回都分两部分：
 
 * **文本块**是写给模型看的精简内容：动作工具执行后稳定下来的变化，`phone_elements` 每个元素一行，批次的结论和结束时的屏幕。批次失败时，文本给出失败的那一步、它的错误、`retry_safe` 和结束时的屏幕。
