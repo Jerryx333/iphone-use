@@ -969,5 +969,23 @@ do {
   }
 }
 
+// Strict locators use the real identifier, never name's label fallback.
+do {
+  let controls = UINode(raw: node("Application", children: [
+    node("Button", label: "Open", id: "target-row"),
+    node("Button", label: "Open", id: "other-row"),
+    node("Button", label: "Open"),
+  ]), parent: nil, pid: 1)
+  let query = "type == 'XCUIElementTypeButton' AND (label == 'Open' OR name == 'Open') AND identifier == 'target-row'"
+  let found = try Locator.find(using: "predicate string", value: query, root: controls, screen: screen)
+  check(found.count == 1 && found.first?.identifier == "target-row", "compound locator preserves strict identity")
+  check(try Locator.find(using: "predicate string", value: "identifier == 'Open'", root: controls, screen: screen).isEmpty,
+        "identifier-only locator does not match a name supplied by the label")
+  check(try Locator.find(using: "predicate string", value: "name == 'Open'", root: controls, screen: screen).count == 1,
+        "name fallback exists but is not an identifier")
+} catch {
+  check(false, "strict identifier predicate: \(error)")
+}
+
 print(failures == 0 ? "unit check: \(checks) checks passed" : "unit check: \(failures) of \(checks) checks FAILED")
 exit(failures == 0 ? 0 : 1)
