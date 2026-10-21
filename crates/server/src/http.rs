@@ -11786,10 +11786,18 @@ async fn agent_actions_inner(
                 timeout_ms,
                 poll_ms,
             } => {
+                let wait_started = tokio::time::Instant::now();
                 let wait_deadline = std::cmp::min(
                     batch_deadline,
-                    tokio::time::Instant::now() + std::time::Duration::from_millis(*timeout_ms),
+                    wait_started + std::time::Duration::from_millis(*timeout_ms),
                 );
+                // Narrow probes are an optimization, not evidence. Reserve
+                // at least half the actual remaining window for full reads:
+                // a source read can take seconds, far longer than poll_ms.
+                // The probe timeout AND sleeps share this earlier deadline,
+                // so a slow/missing probe cannot starve the authoritative read.
+                let probe_deadline = wait_started
+                    + wait_deadline.saturating_duration_since(wait_started) / 2;
                 let mut attempts = 0_u64;
                 let mut last_observation = serde_json::Value::Null;
                 let mut last_read_error = None;
@@ -11803,22 +11811,17 @@ async fn agent_actions_inner(
                     attempts += 1;
                     // While the targets are not there yet, ask runner for just
                     // them (~0.3 s) instead of the whole tree (~0.9–3 s). A
-                    // hit, and the last poll of the window, still read the
-                    // whole tree, so the verdict and its observation are
-                    // exactly what they always were.
+                    // hit, or exhausting the probe budget, reads the whole
+                    // tree. Only that read decides whether the wait passed.
                     if let Some(probes) = &probes {
                         let poll = std::time::Duration::from_millis(*poll_ms);
-                        if tokio::time::Instant::now() + poll < wait_deadline
-                            && wait_probe_missed(&mut w, probes, wait_deadline).await
+                        if tokio::time::Instant::now() + poll < probe_deadline
+                            && wait_probe_missed(&mut w, probes, probe_deadline).await
                         {
                             probe_misses += 1;
-                            // Never sleep through the window: with less than a
-                            // poll left, go straight to the final full read.
-                            let remaining = wait_deadline
+                            let remaining = probe_deadline
                                 .saturating_duration_since(tokio::time::Instant::now());
-                            if remaining > poll {
-                                tokio::time::sleep(poll).await;
-                            }
+                            tokio::time::sleep(std::cmp::min(poll, remaining)).await;
                             continue;
                         }
                     }

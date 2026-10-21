@@ -381,3 +381,97 @@ fn a_present_wait_polls_the_target_not_the_whole_tree() {
         );
     });
 }
+
+
+/// A narrow query can miss something the full source reports (for example a
+/// system sheet or a normalized label). The final read takes longer than a
+/// poll interval, so leaving it until that interval guarantees a false timeout.
+#[test]
+fn probe_misses_leave_time_for_a_slow_full_read() {
+    block(async {
+        let runner = mock_runner(move |request, _| {
+            if request.starts_with("POST /session ") {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if request.contains("/elements") {
+                return Some((Duration::ZERO, r#"{"value":[]}"#.to_string()));
+            }
+            if request.contains("/source?format=json") {
+                return Some((Duration::from_millis(500), PRESENT_SCREEN.to_string()));
+            }
+            None
+        });
+        let (status, json) = run_actions(
+            runner.url(),
+            r#"{"steps":[{"kind":"wait_for",
+                "expect":{"present":[{"kind":"Button","label":"搜索"}]},
+                "timeout_ms":2000,"poll_ms":50}]}"#,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "the full read must get a usable budget: {json}");
+        assert_eq!(json["applied_actions"], 0);
+        assert!(json["steps"][0]["probe_misses"].as_u64().unwrap() > 0);
+        assert_eq!(json["steps"][0]["observation"]["read"], true);
+        assert_eq!(json["steps"][0]["observation"]["missing_present"], serde_json::json!([]));
+    });
+}
+
+/// A slow probe is only an optimization; it must time out before the wait
+/// itself does. The mock serves requests sequentially like the runner, so the
+/// full read also has to wait for the abandoned probe to finish on the phone.
+#[test]
+fn a_slow_probe_cannot_consume_the_full_wait_window() {
+    block(async {
+        let runner = mock_runner(move |request, _| {
+            if request.starts_with("POST /session ") {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if request.contains("/elements") {
+                return Some((Duration::from_millis(1800), r#"{"value":[]}"#.to_string()));
+            }
+            if request.contains("/source?format=json") {
+                return Some((Duration::from_millis(300), PRESENT_SCREEN.to_string()));
+            }
+            None
+        });
+        let (status, json) = run_actions(
+            runner.url(),
+            r#"{"steps":[{"kind":"wait_for",
+                "expect":{"present":[{"kind":"Button","label":"搜索"}]},
+                "timeout_ms":3000,"poll_ms":50}]}"#,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "a probe timeout must fall through to the full read: {json}");
+        assert_eq!(json["applied_actions"], 0);
+        assert_eq!(json["steps"][0]["observation"]["read"], true);
+    });
+}
+
+
+/// A fast-path hit is only a reason to read the screen, never a verdict.
+#[test]
+fn a_probe_hit_cannot_satisfy_a_wait_the_full_tree_does_not_confirm() {
+    block(async {
+        let runner = mock_runner(move |request, _| {
+            if request.starts_with("POST /session ") {
+                return Some((Duration::ZERO, SESSION.to_string()));
+            }
+            if request.contains("/elements") {
+                return Some((Duration::ZERO, r#"{"value":[{"ELEMENT":"E1"}]}"#.to_string()));
+            }
+            if request.contains("/source?format=json") {
+                return Some((Duration::ZERO, OTHER_SCREEN.to_string()));
+            }
+            None
+        });
+        let (status, json) = run_actions(
+            runner.url(),
+            r#"{"steps":[{"kind":"wait_for",
+                "expect":{"present":[{"kind":"Button","label":"搜索"}]},
+                "timeout_ms":1000,"poll_ms":50}]}"#,
+        ).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(json["error"], "expectation_timeout");
+        assert_eq!(json["applied_actions"], 0);
+        assert_eq!(json["observation"]["read"], true);
+        assert_eq!(json["observation"]["missing_present"], serde_json::json!([0]));
+    });
+}
