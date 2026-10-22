@@ -433,8 +433,8 @@ static void SaveSnapshot(NSData *lines, NSString *rootLabel, int pid, NSMutableD
     } @catch (NSException *e) { result[@"snapshotFileError"] = Exception(e); }
 }
 // The runner comparison preserves IPURBridge's mapped-attribute filtering and root fallback.
-+ (NSDictionary *)readScreenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters log:(void (^)(NSString *))log {
-    return [self screenWithMaxDepth:maxDepth runnerParameters:runnerParameters remote:NO system:NO log:log];
++ (NSDictionary *)readScreenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters persist:(BOOL)persist log:(void (^)(NSString *))log {
+    return [self screenWithMaxDepth:maxDepth runnerParameters:runnerParameters remote:NO system:NO input:NO persist:persist log:log];
 }
 + (NSDictionary *)remoteReadWithMaxDepth:(NSInteger)maxDepth {
     return [self screenWithMaxDepth:maxDepth runnerParameters:NO remote:YES system:NO log:^(__unused NSString *message) {}];
@@ -444,12 +444,12 @@ static void SaveSnapshot(NSData *lines, NSString *rootLabel, int pid, NSMutableD
 }
 // Input-only snapshot keeps the existing read response unchanged.
 + (NSDictionary *)remoteInputReadWithMaxDepth:(NSInteger)maxDepth {
-    return [self screenWithMaxDepth:maxDepth runnerParameters:NO remote:YES system:NO input:YES log:^(__unused NSString *message) {}];
+    return [self screenWithMaxDepth:maxDepth runnerParameters:NO remote:YES system:NO input:YES persist:NO log:^(__unused NSString *message) {}];
 }
 + (NSDictionary *)screenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters remote:(BOOL)remote system:(BOOL)systemTarget log:(void (^)(NSString *))log {
-    return [self screenWithMaxDepth:maxDepth runnerParameters:runnerParameters remote:remote system:systemTarget input:NO log:log];
+    return [self screenWithMaxDepth:maxDepth runnerParameters:runnerParameters remote:remote system:systemTarget input:NO persist:YES log:log];
 }
-+ (NSDictionary *)screenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters remote:(BOOL)remote system:(BOOL)systemTarget input:(BOOL)input log:(void (^)(NSString *))log {
++ (NSDictionary *)screenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters remote:(BOOL)remote system:(BOOL)systemTarget input:(BOOL)input persist:(BOOL)persist log:(void (^)(NSString *))log {
     NSString *prefix = runnerParameters ? @"ax-runner" : @"ax-default";
     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
     NSMutableDictionary *result = [@{@"mode": prefix, @"maxDepth": @(MAX(1, maxDepth)), @"alerts": @[], @"alertCount": @0} mutableCopy];
@@ -599,7 +599,7 @@ static void SaveSnapshot(NSData *lines, NSString *rootLabel, int pid, NSMutableD
                      @"truncated": @(pending.count > 0 || depthTruncated), @"snapshot_id": NSUUID.UUID.UUIDString};
         }
         if (serializationError) result[@"snapshotFileError"] = serializationError;
-        else SaveSnapshot(lines, SnapshotString(rootLabel), pid, result);
+        else if (persist) SaveSnapshot(lines, SnapshotString(rootLabel), pid, result);
         return result;
     } @catch (NSException *e) { result[@"error"] = Exception(e); return result; }
     @finally {

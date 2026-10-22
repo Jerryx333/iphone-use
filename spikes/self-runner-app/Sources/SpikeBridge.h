@@ -9,7 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSDictionary *)loadAccessibilityWithLog:(void (^)(NSString *))log;
 + (NSDictionary *)loadAccessibilityVariant:(NSString *)variant log:(void (^)(NSString *))log;
 + (NSArray<NSString *> *)installQuiescenceBypass;
-+ (NSDictionary *)readScreenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters log:(void (^)(NSString *))log NS_SWIFT_NAME(readScreen(maxDepth:runnerParameters:log:));
++ (NSDictionary *)readScreenWithMaxDepth:(NSInteger)maxDepth runnerParameters:(BOOL)runnerParameters persist:(BOOL)persist log:(void (^)(NSString *))log NS_SWIFT_NAME(readScreen(maxDepth:runnerParameters:persist:log:));
 + (nullable NSData *)screenshotWithLog:(void (^)(NSString *))log error:(NSString *_Nullable *_Nullable)error NS_SWIFT_NAME(screenshot(log:error:));
 // Captures the live button center on main; refuses background, covered, detached or disabled targets.
 + (void)tapTarget:(UIButton *)target worker:(dispatch_queue_t)worker log:(void (^)(NSString *))log completion:(void (^)(NSString *_Nullable))completion;

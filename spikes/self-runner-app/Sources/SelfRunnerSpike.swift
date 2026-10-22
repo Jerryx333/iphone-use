@@ -380,7 +380,8 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         autoChecking = true
         let epoch = autoEpoch, token = generation
         let takeScreenshot = autoChecks % 5 == 0
-        readScreen { result in
+        // Documents is visible in Files; background checks must not persist screen content.
+        readScreen(persist: false) { result in
             guard self.autoSession, epoch == self.autoEpoch else { return }
             self.lastAutoCheck = ["at": at, "result": String(result.prefix(300))]
             self.writeAutoStatus()
@@ -389,7 +390,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
                 self.log("auto screenshot: skipped (busy / AX in flight)")
                 self.autoChecking = false; return
             }
-            self.screenshot { result in
+            self.screenshot(persist: false) { result in
                 guard self.autoSession, epoch == self.autoEpoch else { return }
                 self.lastAutoScreenshot = ["at": ISO8601DateFormatter().string(from: Date()), "result": result]
                 self.autoChecking = false
@@ -899,7 +900,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
         }
     }
-    func readScreen(delayed: Bool = false, runnerParameters: Bool = false, holdGate: Bool = false, completion: ((String) -> Void)? = nil) {
+    func readScreen(delayed: Bool = false, runnerParameters: Bool = false, holdGate: Bool = false, persist: Bool = true, completion: ((String) -> Void)? = nil) {
         guard !axInFlight else {
             log("AX call still running; read screen refused")
             completion?("refused: AX in flight")
@@ -924,7 +925,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
             let logger = self.operationLog(op)
             self.axWorker.async {
-                let result = SpikeBridge.readScreen(maxDepth: depth, runnerParameters: runnerParameters, log: logger)
+                let result = SpikeBridge.readScreen(maxDepth: depth, runnerParameters: runnerParameters, persist: persist, log: logger)
                 DispatchQueue.main.async {
                     self.axInFlight = false
                     if !holdGate { self.finishOperation(op, result: "\(result)") }
@@ -985,7 +986,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
         return " file=screenshots/\(filename)"
     }
-    func screenshot(completion: ((String) -> Void)? = nil) {
+    func screenshot(persist: Bool = true, completion: ((String) -> Void)? = nil) {
         guard let op = beginOperation("screenshot") else {
             completion?("refused: operation gate")
             return
@@ -994,7 +995,7 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         screenshotWorker.async {
             var error: NSString?
             let data = SpikeBridge.screenshot(log: logger, error: &error)
-            let fileResult = self.saveScreenshot(data, kind: "shot", error: error as String?)
+            let fileResult = persist ? self.saveScreenshot(data, kind: "shot", error: error as String?) : ""
             DispatchQueue.main.async {
                 if op.generation == self.generation { self.image = data.flatMap { UIImage(data: $0) } }
                 let result = "bytes=\(data?.count ?? 0), \(error as String? ?? "OK")\(fileResult)"
