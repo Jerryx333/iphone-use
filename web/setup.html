@@ -326,29 +326,21 @@
         'Keep it on USB, unlocked and with the screen on; check again once developer services finish mounting.',
       '保持 USB、解锁和亮屏；开发者服务就绪后会自动继续。':
         'Keep it on USB, unlocked and with the screen on; it continues on its own once developer services are ready.',
-      'iPhone 未开启 UI 自动化': 'UI Automation is off on the iPhone',
-      '解锁 iPhone，打开“设置 › 开发者 › 启用 UI 自动化”，并在手机上确认密码或“允许自动化”提示，再重新运行设置命令。':
-        'Unlock the iPhone, turn on Settings › Developer › Enable UI Automation, confirm the passcode or “Allow automation” prompt on the phone, then run the setup command again.',
-      '解锁 iPhone，打开“设置 › 开发者 › 启用 UI 自动化”，并确认手机上的密码或“允许自动化”提示；服务会自动重试。':
-        'Unlock the iPhone, turn on Settings › Developer › Enable UI Automation and confirm the passcode or “Allow automation” prompt on the phone; the service retries on its own.',
+      '自动化模式未就绪': 'Automation mode is not ready',
+      '请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查 CoreDevice 连接和日志。检查后再重新运行设置。': 'Check Settings › Developer › Enable UI Automation and handle a prompt if one appears; if already enabled and authorized, inspect the CoreDevice connection and runner log. Run setup again after checking.',
+      '请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查 CoreDevice 连接和日志。服务会按退避策略重试。': 'Check Settings › Developer › Enable UI Automation and handle a prompt if one appears; if already enabled and authorized, inspect the CoreDevice connection and runner log. The service retries with backoff.',
       'iPhone 重启后还没解锁': 'The iPhone has not been unlocked since it restarted',
       '这台 iPhone 重启后还没解锁过：需要有人在手机上输入一次密码，之后会自动连上。':
         'This iPhone restarted and has not been unlocked since: someone needs to enter the passcode on the phone once, then it connects on its own.',
-      '需要有人在手机上输入密码': 'Someone needs to enter the passcode on the phone',
-      '手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。请站在手机旁重新运行设置命令，手机要求时输入密码。':
-        'The phone has a passcode: this start needs someone at the phone to enter it and allow UI Automation. It won’t ask again while it stays connected. Stand next to the phone, run the setup command again and enter the passcode when asked.',
-      '手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。':
-        'The phone has a passcode: this start needs someone at the phone to enter it and allow UI Automation. It won’t ask again while it stays connected.',
-      'iPhone 没有授权 UI 自动化': 'The iPhone has not allowed UI Automation',
-      'runner 启动时手机上会弹出密码或“允许”提示，约 30 秒不处理就会失败。解锁 iPhone，确认“设置 › 开发者 › 启用 UI 自动化”已打开，重新运行设置命令时盯着手机完成这个提示。':
-        'When the runner starts, the phone shows a passcode or “Allow” prompt that fails after about 30 seconds. Unlock the iPhone, make sure Settings › Developer › Enable UI Automation is on, and watch the phone to answer the prompt when you run the setup command again.',
-      'runner 启动时手机上会弹出密码或“允许”提示，约 30 秒不处理就会失败；解锁 iPhone、确认已打开“启用 UI 自动化”，下次重试时完成这个提示；服务会自动安静重试。':
-        'When the runner starts, the phone shows a passcode or “Allow” prompt that fails after about 30 seconds; unlock the iPhone, make sure Enable UI Automation is on, and answer the prompt on the next retry. The service retries quietly on its own.',
-      'Wi-Fi 下无法授权 UI 自动化': 'UI Automation can’t be allowed over Wi-Fi',
-      '通过 Wi-Fi 时手机弹不出输密码的提示（有些 iOS 版本干脆拒绝）。请用 USB 连接这台 iPhone，在它要求时输入密码，再重新运行设置命令；如果之后走 Wi-Fi 仍然失败，就让这台手机一直用 USB。':
-        'Over Wi-Fi the phone can’t show the passcode prompt (some iOS versions refuse outright). Connect this iPhone over USB, enter the passcode when asked, then run the setup command again; if Wi-Fi still fails afterwards, keep this phone on USB.',
-      '通过 Wi-Fi 重试解决不了：请用 USB 连接这台 iPhone，插上后服务会立刻重试，并在手机要求时输入密码。':
-        'Retrying over Wi-Fi won’t fix this: connect this iPhone over USB. The service retries as soon as it is plugged in; enter the passcode when the phone asks.',
+      '检查手机授权提示': 'Check on-phone authorization',
+      '连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。保持解锁，检查后再重新运行设置。': 'Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log. Keep the phone unlocked and run setup again after checking.',
+      '连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。': 'Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log.',
+      '自动化会话启动失败': 'Automation session did not start',
+      '自动化会话未建立（错误码 74），原因尚未确认。请检查 设置 › 开发者 › 启用 UI 自动化；若有密码或允许提示，请处理；若已授权，检查 CoreDevice 连接和 runner 日志。保持解锁，检查后再重新运行设置。': 'The automation session was not established (exit code 74); its cause is unconfirmed. Check Settings › Developer › Enable UI Automation and handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log. Keep the phone unlocked and run setup again after checking.',
+      '自动化会话未建立（错误码 74），原因尚未确认。请检查 设置 › 开发者 › 启用 UI 自动化；若有密码或允许提示，请处理；若已授权，检查 CoreDevice 连接和 runner 日志。服务会按退避策略重试。': 'The automation session was not established (exit code 74); its cause is unconfirmed. Check Settings › Developer › Enable UI Automation and handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log. The service retries with backoff.',
+      'Wi-Fi 自动化会话启动失败': 'Wi-Fi automation session did not start',
+      'Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时插线启动，拔掉后用新的屏幕读取验证。保持解锁，检查后再重新运行设置。': 'The Wi-Fi automation session was not established. Exit code 74 does not prove a permanent Wi-Fi restriction. Inspect the CoreDevice tunnel; if needed, start over USB and verify fresh reads after unplugging. Keep the phone unlocked and run setup again after checking.',
+      'Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时插线启动，拔掉后用新的屏幕读取验证。服务会按退避策略重试。': 'The Wi-Fi automation session was not established. Exit code 74 does not prove a permanent Wi-Fi restriction. Inspect the CoreDevice tunnel; if needed, start over USB and verify fresh reads after unplugging. The service retries with backoff.',
       'Xcode 版本太旧，不支持这台 iPhone 的 iOS': 'Xcode is too old for this iPhone’s iOS',
       '安装支持这台 iPhone 系统版本的 Xcode（测试版 iOS 需要测试版 Xcode），运行 iphone-use setup --xcode <那个 Xcode.app> 让这台手机用它，再重新运行设置命令。':
         'Install an Xcode that supports this iPhone’s iOS version (beta iOS needs beta Xcode), run iphone-use setup --xcode <that Xcode.app> so this phone uses it, then run the setup command again.',
@@ -492,9 +484,9 @@
         retry: t('保持 USB、解锁和亮屏；开发者服务就绪后会自动继续。'),
       },
       automation_mode_disabled: {
-        title: t('iPhone 未开启 UI 自动化'),
-        setup: t('解锁 iPhone，打开“设置 › 开发者 › 启用 UI 自动化”，并在手机上确认密码或“允许自动化”提示，再重新运行设置命令。'),
-        retry: t('解锁 iPhone，打开“设置 › 开发者 › 启用 UI 自动化”，并确认手机上的密码或“允许自动化”提示；服务会自动重试。'),
+        title: t('自动化模式未就绪'),
+        setup: t('请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查 CoreDevice 连接和日志。检查后再重新运行设置。'),
+        retry: t('请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查 CoreDevice 连接和日志。服务会按退避策略重试。'),
       },
       locked_after_restart: {
         title: t('iPhone 重启后还没解锁'),
@@ -502,19 +494,19 @@
         retry: t('这台 iPhone 重启后还没解锁过：需要有人在手机上输入一次密码，之后会自动连上。'),
       },
       needs_passcode_on_phone: {
-        title: t('需要有人在手机上输入密码'),
-        setup: t('手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。请站在手机旁重新运行设置命令，手机要求时输入密码。'),
-        retry: t('手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。'),
+        title: t('检查手机授权提示'),
+        setup: t('连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。保持解锁，检查后再重新运行设置。'),
+        retry: t('连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。'),
       },
       automation_not_allowed: {
-        title: t('iPhone 没有授权 UI 自动化'),
-        setup: t('runner 启动时手机上会弹出密码或“允许”提示，约 30 秒不处理就会失败。解锁 iPhone，确认“设置 › 开发者 › 启用 UI 自动化”已打开，重新运行设置命令时盯着手机完成这个提示。'),
-        retry: t('runner 启动时手机上会弹出密码或“允许”提示，约 30 秒不处理就会失败；解锁 iPhone、确认已打开“启用 UI 自动化”，下次重试时完成这个提示；服务会自动安静重试。'),
+        title: t('自动化会话启动失败'),
+        setup: t('自动化会话未建立（错误码 74），原因尚未确认。请检查 设置 › 开发者 › 启用 UI 自动化；若有密码或允许提示，请处理；若已授权，检查 CoreDevice 连接和 runner 日志。保持解锁，检查后再重新运行设置。'),
+        retry: t('自动化会话未建立（错误码 74），原因尚未确认。请检查 设置 › 开发者 › 启用 UI 自动化；若有密码或允许提示，请处理；若已授权，检查 CoreDevice 连接和 runner 日志。服务会按退避策略重试。'),
       },
       wifi_automation_refused: {
-        title: t('Wi-Fi 下无法授权 UI 自动化'),
-        setup: t('通过 Wi-Fi 时手机弹不出输密码的提示（有些 iOS 版本干脆拒绝）。请用 USB 连接这台 iPhone，在它要求时输入密码，再重新运行设置命令；如果之后走 Wi-Fi 仍然失败，就让这台手机一直用 USB。'),
-        retry: t('通过 Wi-Fi 重试解决不了：请用 USB 连接这台 iPhone，插上后服务会立刻重试，并在手机要求时输入密码。'),
+        title: t('Wi-Fi 自动化会话启动失败'),
+        setup: t('Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时插线启动，拔掉后用新的屏幕读取验证。保持解锁，检查后再重新运行设置。'),
+        retry: t('Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时插线启动，拔掉后用新的屏幕读取验证。服务会按退避策略重试。'),
       },
       xcode_too_old: {
         title: t('Xcode 版本太旧，不支持这台 iPhone 的 iOS'),

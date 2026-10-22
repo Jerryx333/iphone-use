@@ -2761,9 +2761,7 @@ async fn agent_status(
         None
     };
     let setup_blocked_on = if state.managed_runner {
-        // An automation refusal on a phone known to have a passcode is the
-        // passcode prompt nobody answered: name it (setup does too when it
-        // knows; this covers a passcode the daemon learned first).
+        // Passcode presence is not evidence of an unanswered prompt.
         crate::keep_runner::person_blocker(
             &read_setup_blocked_on(),
             crate::lock_readiness::passcode(),
@@ -3465,12 +3463,12 @@ fn human_next_step(
                 "This iPhone restarted and has not been unlocked since: someone needs to enter the passcode on the phone once, then it connects on its own.",
             ),
             "needs_passcode_on_phone" => (
-                "手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。",
-                "This iPhone has a passcode: this start needs someone at the phone to enter it and allow UI Automation. After that, staying connected means it will not ask again.",
+                "连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。",
+                "Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log.",
             ),
             "automation_mode_disabled" => (
-                "在 iPhone 的 设置 › 开发者 里打开「启用 UI 自动化」，并允许弹出的提示",
-                "On the iPhone, turn on Settings › Developer › Enable UI Automation and allow the prompt",
+                "自动化模式未就绪。请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查连接和日志。",
+                "Automation mode is not ready. On the unlocked iPhone, check Settings › Developer › Enable UI Automation and handle a prompt if one appears; if already enabled and authorized, inspect the connection and runner log.",
             ),
             "locked" => (
                 "请解锁 iPhone 并保持亮屏，解锁后会自动接着连接",
@@ -3493,12 +3491,12 @@ fn human_next_step(
                 "This iOS 15/16 iPhone is neither plugged in nor reachable over Wi-Fi from this Mac: plug it in once and keep it unlocked — it connects in about 20 s, and after that it can be unplugged and used over Wi-Fi (on the same network as this Mac)",
             ),
             "automation_not_allowed" => (
-                "iPhone 没有授权这次 UI 自动化：runner 启动时手机上会弹出密码或「允许」提示，约 30 秒不处理就会失败；请解锁手机、确认 设置 › 开发者 › 启用 UI 自动化 已打开，下次重试时完成这个提示；会自动重试",
-                "The iPhone did not authorize UI automation: a passcode or Allow prompt appears on the iPhone while the runner starts and times out after about 30 s — unlock it, check Settings › Developer › Enable UI Automation, and answer that prompt on the next attempt; it retries on its own",
+                "自动化会话未建立（错误码 74），原因尚未确认。请保持解锁并检查 设置 › 开发者 › 启用 UI 自动化；若手机出现密码或允许提示，请处理。若已授权，检查 CoreDevice 连接和 runner 日志；会按退避策略重试。",
+                "The automation session was not established (exit code 74); its cause is unconfirmed. Keep the phone unlocked, check Settings › Developer › Enable UI Automation, and handle a passcode or Allow prompt if one appears. If already authorized, inspect the CoreDevice connection and runner log; retries use backoff.",
             ),
             "wifi_automation_refused" => (
-                "这台 iPhone 的 iOS 不允许通过 Wi-Fi 启动设备服务（和锁屏密码、设置开关都无关，手机上没有可点的选项，重试也没用）：插一次线启动（保持解锁，约 20 秒连上），之后拔掉可以一直用 Wi-Fi，直到设备服务重启（比如手机重启）时再插一次",
-                "This iPhone's iOS will not start the device service over Wi-Fi (not a passcode or a setting, nothing to tap on the phone, and retrying will not help): plug it in by USB once to start it (unlocked, about 20 s), then unplug it and keep using Wi-Fi until the device service restarts (for example after the phone restarts), when it needs the cable once more",
+                "这次 Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时可插一次线启动，拔掉后用新的屏幕读取验证连接。",
+                "This Wi-Fi automation session was not established. Exit code 74 does not prove a permanent Wi-Fi restriction. Inspect the CoreDevice tunnel; starting by USB once is a recovery option. Verify fresh screen reads after you unplug.",
             ),
             "runner" => (
                 "设备 runner 启动失败：在这台 Mac 上运行 iphone-use doctor 查看原因",
@@ -3643,10 +3641,10 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the configured iPhone is on USB but usbmuxd does not list it: it restarted and has not been unlocked since (Before First Unlock), and iOS keeps it off usbmuxd until its passcode is entered once — this is not an Xcode problem; have a person enter the passcode on the phone, and the managed service connects on its own after that, so do not send another reconnect request",
         ),
         "needs_passcode_on_phone" => Some(
-            "the iPhone has a passcode, and iOS asks for it on the phone every time the device runner starts before it enables UI automation; nobody entered it, so the start timed out — have a person at the phone unlock it and enter the passcode when the runner starts (if no prompt appears, check Settings › Developer › Enable UI Automation). Nothing remote can enter a passcode. After one successful start the daemon keeps the runner up while idle (keep_runner_alive) so it does not ask again; the managed service retries on its own backoff, so do not send another reconnect request",
+            "Setup recorded a possible on-phone authorization requirement. If a passcode or Allow prompt appears, handle it on the unlocked phone. If already authorized, inspect the CoreDevice connection and runner log; this historical blocker does not prove that a prompt was ignored. keep_runner_alive avoids unnecessary relaunches; do not send another reconnect request",
         ),
         "automation_mode_disabled" => Some(
-            "iOS has not enabled UI automation for the device runner — on the unlocked iPhone turn on Settings › Developer › Enable UI Automation and accept any passcode or Allow automation prompt; the managed service retries on its own backoff, so do not send another reconnect request",
+            "The device runner did not become ready for UI automation. On the unlocked iPhone, check Settings › Developer › Enable UI Automation and handle a passcode or Allow automation prompt if one appears; if already enabled and authorized, inspect the CoreDevice connection and runner log; the managed service retries on its own backoff, so do not send another reconnect request",
         ),
         "locked" => Some(
             "the iPhone is locked — unlock it and keep it awake; connecting continues on its own as soon as it is unlocked, so do not send another reconnect request",
@@ -3664,10 +3662,10 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the phone runs iOS 15/16 and is neither on USB nor reachable over Wi-Fi (its lockdownd does not answer on its LAN address, or that address is not known yet) — have a person plug it into this Mac once, unlocked; after that the runner starts over Wi-Fi and survives the unplug; the managed service starts it as soon as usbmuxd lists the phone on USB, so do not send another reconnect request",
         ),
         "automation_not_allowed" => Some(
-            "the iPhone did not authorize the device runner's UI-automation session although this Xcode supports its iOS (the runner exited with code 74, testmanagerd refused the IDE channel) — a passcode or Allow prompt appears on the iPhone while the runner starts and times out after about 30 s; unlock the iPhone, check Settings › Developer › Enable UI Automation, and have a person answer that prompt on the next attempt; the managed service retries quietly every 5 s to 1 min, so do not send another reconnect request",
+            "The runner's IDE channel was not established (exit code 74) although this Xcode supports its iOS. This does not prove an unanswered passcode or Allow prompt. Keep the phone unlocked, check Settings › Developer › Enable UI Automation, and handle a prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log. The managed service retries with backoff; do not send another reconnect request",
         ),
         "wifi_automation_refused" => Some(
-            "over Wi-Fi the iPhone would not start the device runner's UI-automation session (code 74: testmanagerd took the test session but never gave the runner its IDE channel; setup_message has the wait) — this iPhone's iOS refuses to start UI automation over the network, and no passcode, setting or Wi-Fi retry changes that; have a person plug the iPhone in by USB once, unlocked: the runner starts in about 20 s and keeps working over Wi-Fi after the unplug, until the phone restarts or the runner has to start again; the managed service waits 15 minutes between Wi-Fi attempts and retries at once when the phone is plugged in, so do not send another reconnect request",
+            "The runner failed to establish its IDE channel over Wi-Fi (exit code 74; setup_message has the wait). This does not prove a permanent Wi-Fi restriction or an unanswered prompt. Inspect the CoreDevice tunnel and runner log. Starting by USB once is a recovery option; verify fresh reads after you unplug. The managed service retries with backoff; do not send another reconnect request",
         ),
         "runner" => Some(
             "the device runner failed to start — inspect ~/.iphone-use/runner-agent.log and run iphone-use doctor before retrying",
@@ -4811,10 +4809,10 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     kept_runner = Some(because);
                     match because {
                         crate::keep_runner::Because::WifiStartRefused => tracing::info!(
-                            "idle, but keeping the runner: it is up over Wi-Fi and this iPhone refused to start one over Wi-Fi (wifi_automation_refused), so a release would need the cable to undo"
+                            "idle, but keeping the runner: it is up over Wi-Fi and an earlier Wi-Fi start failed (wifi_automation_refused); restarting may require USB recovery"
                         ),
                         crate::keep_runner::Because::Passcode => tracing::info!(
-                            "idle, but keeping the runner: this iPhone has a passcode and every runner start asks for it on the phone, so a release would need a person to undo (IPHONE_USE_IDLE_RELEASE=force releases anyway)"
+                            "idle, but keeping the runner: this iPhone has a passcode and restarting may require on-phone authorization (IPHONE_USE_IDLE_RELEASE=force releases anyway)"
                         ),
                     }
                 }
@@ -22125,7 +22123,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_mode_blocker_names_the_phone_setting_not_a_log() {
+    fn automation_mode_failure_checks_the_setting_without_claiming_it_is_off() {
         // setup-runner publishes this when the runner log says "The test runner
         // failed to initialize for UI testing. (Underlying Error: Timed out
         // while enabling automation mode.)" on an unlocked phone.
@@ -22139,6 +22137,8 @@ mod tests {
         );
         assert!(hint.contains("Allow automation"), "{hint}");
         assert!(hint.contains("unlocked"), "{hint}");
+        assert!(hint.contains("if already enabled and authorized"), "{hint}");
+        assert!(!hint.contains("nobody entered"), "{hint}");
         assert!(!hint.contains("runner-agent.log"), "{hint}");
         // The hint is spliced into the status JSON unescaped.
         assert!(!hint.contains('"') && !hint.contains('{') && !hint.contains('}'));
@@ -22163,9 +22163,8 @@ mod tests {
 
     #[test]
     fn automation_not_allowed_names_the_phone_switch_and_the_quiet_retry() {
-        // A code-74 refusal with an Xcode that supports the phone's iOS
-        // (hardware: iOS 27.2 beta with Xcode 27.2 beta): the phone has not
-        // allowed UI automation, which is not an Xcode problem.
+        // A supported SDK does not explain a code-74 failure. Preserve
+        // useful authorization checks without claiming that they caused it.
         let payload = r#"{"phase":"building-fail","blocked_on":"automation_not_allowed","message":"the iPhone refused the UI-automation session","ts":1000}"#;
         let status = parse_setup_status(payload, 1100).expect("fresh status");
         assert_eq!(status.blocked_on, "automation_not_allowed");
@@ -22251,9 +22250,12 @@ mod tests {
         let (zh, en) = human_next_step("blocker", "needs_passcode_on_phone", "").unwrap();
         assert_eq!(
             zh,
-            "手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。"
+            "连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。"
         );
-        assert!(en.contains("enter it") && en.contains("will not ask again"), "{en}");
+        assert!(
+            en.contains("if one appears") && en.contains("if already authorized"),
+            "{en}"
+        );
         let hint = setup_blocker_hint("needs_passcode_on_phone").unwrap();
         assert!(hint.contains("keep_runner_alive"), "{hint}");
         assert!(
@@ -22272,10 +22274,10 @@ mod tests {
         // The web panel shows it as a blocking card, not a spinner.
         assert!(INDEX_HTML.contains("case 'needs_passcode_on_phone':"));
         assert!(INDEX_HTML.contains("['locked', 'needs_passcode_on_phone',"));
-        // The daemon names it too when only it knows about the passcode.
+        // A saved passcode fact does not establish an unanswered prompt.
         assert_eq!(
             crate::keep_runner::person_blocker("automation_mode_disabled", Some(true)),
-            "needs_passcode_on_phone"
+            "automation_mode_disabled"
         );
     }
 
@@ -22322,7 +22324,7 @@ mod tests {
         );
         let hint = setup_blocker_hint("wifi_automation_refused").unwrap();
         assert!(hint.contains("by USB once"), "{hint}");
-        assert!(hint.contains("after the unplug"), "{hint}");
+        assert!(hint.contains("after you unplug"), "{hint}");
         assert!(hint.contains("Wi-Fi"), "{hint}");
         assert!(
             hint.contains("do not send another reconnect request"),
@@ -22334,9 +22336,12 @@ mod tests {
         assert!(zh.contains("插一次线") && zh.contains("拔掉"), "{zh}");
         assert!(en.contains("by USB once") && en.contains("unplug"), "{en}");
         assert!(!en.contains("enter the passcode"), "{en}");
-        // The USB reading now says the prompt is time-limited.
+        // Both transports preserve uncertainty instead of blaming authorization.
         let usb = setup_blocker_hint("automation_not_allowed").unwrap();
-        assert!(usb.contains("about 30 s"), "{usb}");
+        assert!(usb.contains("does not prove"), "{usb}");
+        assert!(hint.contains("does not prove"), "{hint}");
+        assert!(!usb.contains("nobody entered"));
+        assert!(!hint.contains("about 20 s"));
     }
 
     #[test]

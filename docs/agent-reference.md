@@ -165,15 +165,17 @@ KeepAlive keeps the last concrete blocker while it re-checks).
 - **`proxy`**: an enabled macOS HTTP/HTTPS/SOCKS entry is malformed or points at
   a loopback port with no listener; start that proxy app or disable the stale entry.
 - **`trust`**: a one-time "trust the Apple Development certificate" tap on the phone.
-- **`automation_mode_disabled`**: the phone is unlocked but iOS has not enabled UI
-  automation (runner log: "Timed out while enabling automation mode"). Ask the
-  operator to turn on **Settings › Developer › Enable UI Automation** and accept
-  any passcode / "Allow automation" prompt. KeepAlive retries; do not loop reconnect.
-- **`needs_passcode_on_phone`**: the phone has a passcode, and iOS asks for it on
-  the phone every time the runner starts; nobody entered it, so the start timed
-  out. Nothing remote can type a passcode: tell the owner `next_step` ("someone
-  at the phone enters the passcode for this start") and do not reconnect. After
-  one good start idle release keeps the runner up (`keep_runner_alive`).
+- **`automation_mode_disabled`**: the runner did not become ready for UI
+  automation (for example, "Timed out while enabling automation mode"). Check
+  **Settings › Developer › Enable UI Automation** and handle a prompt if one
+  appears. If already enabled and authorized, inspect the CoreDevice connection
+  and runner log. KeepAlive retries; do not loop reconnect.
+- **`needs_passcode_on_phone`**: setup recorded a possible requirement for
+  on-phone authorization. Handle a passcode or Allow prompt only if one appears.
+  If the operator already authorized it, inspect the CoreDevice connection and
+  runner log; an old blocker is not proof that a prompt was ignored. Cached
+  passcode presence no longer converts generic automation failures into this
+  blocker. Idle policy remains conservative (`keep_runner_alive`).
 - **`locked_after_restart`**: a phone this Mac knows is on USB but usbmuxd does
   not list it — it restarted and nobody has unlocked it since. A person enters
   the passcode once; it connects on its own. Not an Xcode problem.
@@ -198,26 +200,23 @@ KeepAlive keeps the last concrete blocker while it re-checks).
 - **`legacy_needs_usb`** (iOS 15/16): the runner of such a phone runs over USB
   only (see the legacy path below); ask a person to plug it in, unlocked. The
   managed service starts it as soon as usbmuxd lists the phone on USB.
-- **`automation_not_allowed`**: the same code-74 refusal, but this Xcode supports
-  the phone's iOS (over USB): the phone did not authorize the UI-automation
-  session. A passcode / "Allow" prompt appears on the phone while the runner
-  starts and times out after about 30 s; ask the operator to unlock it, check
-  **Settings › Developer › Enable UI Automation**, and answer that prompt on the
-  next attempt. KeepAlive retries quietly every 5 s to 1 min; do not loop reconnect.
-- **`wifi_automation_refused`**: that refusal over Wi-Fi. The phone's iOS will
-  not start the runner's UI-automation session over the network (seen on an
-  iOS 27.2 beta with Enable UI Automation on and no prompt; any Xcode). Nothing
-  on the phone fixes it. Ask the operator to plug the phone in by USB once,
-  unlocked: the runner starts in about 20 s, and after the unplug it keeps
-  working over Wi-Fi until it has to start again (phone restart, runner crash).
-  While `wifi_start_refused` is true and `transport` is `wifi-tunnel`, idle
-  release keeps the runner up instead of stopping it, since it could not be
-  started again without the cable. KeepAlive waits 15 minutes between Wi-Fi
-  attempts and retries at once on USB; do not reconnect.
+- **`automation_not_allowed`**: the runner's IDE channel was not established
+  (exit code 74), although the selected Xcode supports the phone's iOS. The
+  cause is unconfirmed. Keep the phone unlocked, check **Settings › Developer ›
+  Enable UI Automation**, and handle a prompt if one appears. If already
+  authorized, inspect the CoreDevice connection and runner log. KeepAlive retries
+  with backoff; do not loop reconnect.
+- **`wifi_automation_refused`**: the same session failure observed over Wi-Fi.
+  This does not establish a permanent Wi-Fi restriction or an unanswered prompt.
+  Inspect the CoreDevice tunnel. Starting over USB is a recovery option; verify
+  fresh screen reads after unplugging before relying on Wi-Fi. Existing retry
+  and idle policies are retained: a previously failed Wi-Fi start keeps a working
+  runner alive, retries use a 15-minute backoff, and USB arrival prompts a retry.
+  Proxy or VPN settings are never changed automatically.
 
 **`keep_runner_alive`** (in `/agent/status`): `null`, or
 `{"reason":"relaunch_needs_person","because":"passcode"|"wifi_start_refused","hint":{zh,en}}`
-when idle release keeps a runner that is up because starting it again would need a
+when idle release keeps a runner that is up because starting it again may need a
 person (a passcode phone, or the Wi-Fi case above). The screen still auto-locks; only
 the runner process stays. `IPHONE_USE_IDLE_RELEASE=force` on the daemon turns it off.
 - **`usb`**: the configured iPhone is neither on USB nor on its encrypted
