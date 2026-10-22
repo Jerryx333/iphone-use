@@ -82,6 +82,13 @@ pub struct TypeParams {
     pub observe: Option<bool>,
 }
 
+/// Select one zero-based home page, or omit to read every page and folder.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HomeLayoutParams {
+    pub page: Option<usize>,
+}
+
 /// Parameters for [`phone_apps`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -917,6 +924,22 @@ impl PhoneHandler {
             Ok(response) => daemon_read_result(&response),
             Err(e) => CallToolResult::error(vec![Content::text(format!(
                 "capabilities failed: {e:#}"
+            ))]),
+        }
+    }
+
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = true),
+        description = "Read all home-screen pages, Dock, folder pages and widget stacks from the paired iPhone without opening folders, swiping, or taking screenshots. Optional page selects one zero-based page to reduce output. Requires a configured physical target reachable through usbmuxd. Page indexes refer to persisted icon state, including hidden/Focus-filtered pages; they are not the visible page-control indexes. Zero-based row/col positions are derived from icon-state order and grid metrics; null positions or positions_complete=false mean unknown, never safe drag coordinates. Contains no pixel coordinates and does not restore or modify a layout. An unreadable device returns an error rather than an empty home screen."
+    )]
+    async fn phone_home_layout(
+        &self,
+        Parameters(params): Parameters<HomeLayoutParams>,
+    ) -> CallToolResult {
+        match self.daemon.home_layout(params.page).await {
+            Ok(response) => daemon_read_result(&response),
+            Err(error) => CallToolResult::error(vec![Content::text(format!(
+                "home layout failed: {error:#}"
             ))]),
         }
     }
@@ -4149,6 +4172,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn home_layout_preserves_failures_and_page_index_space() {
+        assert!(
+            serde_json::from_value::<HomeLayoutParams>(serde_json::json!({"pages":0})).is_err()
+        );
+        for (status, body, fails) in [
+            ("503 Service Unavailable", br#"{"ok":false,"error":"home_layout_unavailable"}"#.to_vec(), true),
+            ("200 OK", b"<html>proxy error</html>".to_vec(), true),
+            ("200 OK", br#"{"ok":true,"page_index_space":"persisted_icon_state","pages":[{"page":0,"positions_complete":false}]}"#.to_vec(), false),
+        ] {
+            let (url, task)=scripted_daemon(status,body);
+            let result=block(handler_for(&url).phone_home_layout(Parameters(HomeLayoutParams{page:Some(0)})));
+            task.join().unwrap();
+            assert_eq!(result.is_error==Some(true),fails,"{}",text_of(&result));
+            if !fails { assert_eq!(result.structured_content.unwrap()["page_index_space"],"persisted_icon_state"); }
+        }
+    }
+
     /// A read that could not be parsed is not data, and must not be handed
     /// back as though it were.
     #[test]
@@ -4188,7 +4229,7 @@ mod tests {
 
         assert_eq!(
             names.len(),
-            37,
+            38,
             "tool count changed; update README, the skill, and the CI assertion: {names:?}"
         );
         for required in [
@@ -4270,7 +4311,7 @@ mod tests {
 
     /// The tools that only read: no phone input, no outward-facing writes.
     /// `IPHONE_USE_MCP_TOOLS=readonly` exposes exactly these.
-    const READ_ONLY_TOOLS: [&str; 11] = [
+    const READ_ONLY_TOOLS: [&str; 12] = [
         "phone_apps",
         "phone_capabilities",
         "phone_crashes",
@@ -4278,6 +4319,7 @@ mod tests {
         "phone_flow_draft",
         "phone_flow_info",
         "phone_flow_list",
+        "phone_home_layout",
         "phone_screen",
         "phone_screen_frame",
         "phone_screenshot",
@@ -4966,7 +5008,7 @@ mod tests {
                 assert!(tool.get("_meta").is_none(), "{name} has no _meta: {tool}");
             }
         }
-        assert_eq!(tools.len(), 37, "the whole documented surface");
+        assert_eq!(tools.len(), 38, "the whole documented surface");
     }
 
     #[test]

@@ -1229,3 +1229,21 @@ gh issue create -R leeguooooo/iphone-use -t "agent feedback: <one-line symptom>"
 EOF
 )"
 ```
+
+## Home-screen layout
+
+`GET /agent/home-layout` / MCP `phone_home_layout` reads the configured physical
+phone through its paired usbmuxd connection, without XCTest UI input. It returns
+Dock, every home page, folder pages, widget sizes and stack members. It requires
+an explicit target UDID and obeys private holds. `?page=0` selects one zero-based
+home page and retains its original index, Dock and total page count.
+
+Page indexes refer to persisted icon state, including pages hidden by Focus or
+Home Screen settings; their indexes are not the visible page-control numbers.
+The service does not report page visibility. Rows and columns are derived from serialized icon order, known widget spans and
+the phone's reported grid metrics. `positions_complete:false` and null positions
+mean the geometry is unknown; unknown items remain in the inventory. These are
+not pixel coordinates or a restore format. Read again after moving an icon and
+resolve live UI elements before sending a gesture. An unavailable service returns
+`503 home_layout_unavailable`, never a successful empty layout. Simulator targets
+are explicitly unsupported. No endpoint changes the saved layout.

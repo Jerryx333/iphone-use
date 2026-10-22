@@ -1042,6 +1042,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         // existing `/agent/inbox`; the registry file — not the phone — is the
         // capability list.
         .route("/agent/apps", get(agent_apps))
+        .route("/agent/home-layout", get(agent_home_layout))
         .route("/agent/intents", get(agent_intents))
         .route("/agent/intent", post(agent_intent))
         .route("/agent/hold", post(agent_hold))
@@ -5568,6 +5569,8 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
             // device: an unlisted name is refused without reaching the phone.
             "perform_actions": perform,
             "element_tree": true,
+            "home_layout": {"source":"springboardservices","read_only":true,
+                "physical_only":true,"target_required":true,"positions":"derived_from_icon_state_order"},
             "drag_path": {
                 "requires_runner_capability": "ipu:timedDragPath",
                 "min_segment_ms": 80,
@@ -15240,8 +15243,13 @@ fn try_take_hold(
 /// Seconds left on a private hold (0 when none or expired).
 fn private_secs_left(private_until: &Mutex<Option<Instant>>) -> u64 {
     recover(private_until.lock())
-        .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
-        .filter(|secs| *secs > 0)
+        .map(|until| {
+            let remaining = until.saturating_duration_since(Instant::now());
+            // A private hold protects its last fractional second too.
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+        })
         .unwrap_or(0)
 }
 
@@ -17532,6 +17540,69 @@ fn agent_apps_json(status: StatusCode, body: serde_json::Value) -> Response {
             .body(Body::from(body.to_string()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeLayoutQuery {
+    page: Option<usize>,
+}
+
+async fn agent_home_layout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HomeLayoutQuery>,
+) -> Response {
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    if state.simulator.is_some() {
+        return agent_apps_json(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({
+            "ok":false,"error":"home_layout_unavailable","hint":"Home layout requires a paired physical iPhone; simulator layouts are not supported"}),
+        );
+    }
+    let Some(udid) = state.device_udid.as_deref().filter(|s| !s.is_empty()) else {
+        return agent_apps_json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+            "ok":false,"error":"target_required","hint":"Configure IPHONE_USE_UDID; no device was queried"}),
+        );
+    };
+    let result = crate::home_layout::read(udid).await;
+    // A private handoff may have begun while the device service was reading.
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    match result {
+        Ok(body) => match crate::home_layout::select_page(body, query.page) {
+            Ok(body) => agent_apps_json(StatusCode::OK, body),
+            Err(error) => agent_apps_json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok":false,"error":"invalid_page","reason":error.to_string()}),
+            ),
+        },
+        Err(error) => agent_apps_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+            "ok":false,"error":"home_layout_unavailable","reason":format!("{error:#}"),
+            "hint":"Connect the configured iPhone through its paired USB or usbmuxd network connection; no UI input or layout change was sent"}),
+        ),
+    }
 }
 
 /// `GET /agent/apps` (issue #76) — installed apps and their versions, so

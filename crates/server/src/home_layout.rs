@@ -1,0 +1,168 @@
+//! A fresh read of SpringBoard's persisted layout, bound to one paired device.
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
+
+pub async fn read(udid: &str) -> Result<Value> {
+    if udid.is_empty() || !udid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        bail!("an explicit device UDID is required");
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut stream =
+            crate::lockdown::open_service(udid, "com.apple.springboardservices").await?;
+        let mut body = read_stream(&mut stream).await?;
+        body["udid"] = json!(udid);
+        body["transport"] = json!("paired_usbmuxd");
+        body["ok"] = json!(true);
+        Ok(body)
+    })
+    .await
+    .context("home layout read timed out")?
+}
+
+async fn read_stream<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<Value> {
+    let state = exchange(stream, "getIconState", true).await?;
+    let metrics = exchange(stream, "getHomeScreenIconMetrics", false).await?;
+    core::home_layout::decode(&state, &metrics).map_err(anyhow::Error::msg)
+}
+
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    command: &str,
+    version: bool,
+) -> Result<Value> {
+    let mut request = plist::Dictionary::new();
+    request.insert("command".into(), command.into());
+    if version {
+        request.insert("formatVersion".into(), "2".into());
+    }
+    let mut bytes = Vec::new();
+    plist::to_writer_xml(&mut bytes, &request)?;
+    stream.write_u32(bytes.len() as u32).await?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    let size = stream.read_u32().await? as usize;
+    if !(1..=MAX_PLIST_BYTES).contains(&size) {
+        bail!("{command} response size is invalid");
+    }
+    let mut response = vec![0; size];
+    stream.read_exact(&mut response).await?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(response))
+        .context("invalid SpringBoard plist")?;
+    let json = serde_json::to_value(value)?;
+    if json.get("error").is_some() || json.get("Error").is_some() {
+        bail!("SpringBoard refused {command}");
+    }
+    Ok(json)
+}
+
+/// Filtering changes only the response, never the phone or the original page indexes.
+pub fn select_page(mut body: Value, page: Option<usize>) -> Result<Value> {
+    if let Some(page) = page {
+        let pages = body["pages"].as_array().context("layout has no pages")?;
+        let selected = pages
+            .get(page)
+            .cloned()
+            .context("page is outside the returned home layout")?;
+        let total = pages.len();
+        body["pages"] = json!([selected]);
+        body["selection"] = json!({"page":page,"total_pages":total});
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn block<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+    #[test]
+    fn protocol_sends_only_two_read_commands_and_decodes_binary_replies() {
+        block(async {
+            let (mut peer, mut client) = tokio::io::duplex(8192);
+            let server = tokio::spawn(async move {
+                let replies = [
+                    json!([[],[{"displayName":"App","bundleIdentifier":"example.app"}]]),
+                    json!({"homeScreenIconRows":6,"homeScreenIconColumns":4,
+                "homeScreenIconFolderRows":3,"homeScreenIconFolderColumns":3,"homeScreenIconDockMaxCount":4}),
+                ];
+                for (expected, reply) in ["getIconState", "getHomeScreenIconMetrics"]
+                    .into_iter()
+                    .zip(replies)
+                {
+                    let size = peer.read_u32().await.unwrap() as usize;
+                    let mut data = vec![0; size];
+                    peer.read_exact(&mut data).await.unwrap();
+                    let request: plist::Value = plist::from_bytes(&data).unwrap();
+                    assert_eq!(
+                        request.as_dictionary().unwrap()["command"].as_string(),
+                        Some(expected)
+                    );
+                    if expected == "getIconState" {
+                        assert_eq!(
+                            request.as_dictionary().unwrap()["formatVersion"].as_string(),
+                            Some("2")
+                        );
+                    }
+                    let mut bytes = Vec::new();
+                    plist::to_writer_binary(&mut bytes, &reply).unwrap();
+                    peer.write_u32(bytes.len() as u32).await.unwrap();
+                    peer.write_all(&bytes).await.unwrap();
+                }
+            });
+            let out = read_stream(&mut client).await.unwrap();
+            assert_eq!(out["pages"][0]["entries"][0]["bundle_id"], "example.app");
+            server.await.unwrap();
+        });
+    }
+    #[test]
+    fn oversized_or_error_replies_never_become_empty_layouts() {
+        block(async {
+            for error in [true, false] {
+                let (mut peer, mut client) = tokio::io::duplex(2048);
+                let server = tokio::spawn(async move {
+                    let size = peer.read_u32().await.unwrap() as usize;
+                    let mut data = vec![0; size];
+                    peer.read_exact(&mut data).await.unwrap();
+                    if error {
+                        let mut bytes = Vec::new();
+                        plist::to_writer_xml(
+                            &mut bytes,
+                            &plist::Value::Dictionary(
+                                [("Error".to_string(), plist::Value::String("Denied".into()))]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        )
+                        .unwrap();
+                        peer.write_u32(bytes.len() as u32).await.unwrap();
+                        peer.write_all(&bytes).await.unwrap();
+                    } else {
+                        peer.write_u32((MAX_PLIST_BYTES + 1) as u32).await.unwrap();
+                    }
+                });
+                assert!(read_stream(&mut client).await.is_err());
+                server.await.unwrap();
+            }
+        });
+    }
+    #[test]
+    fn page_selection_retains_its_original_index_and_total() {
+        let out = select_page(
+            json!({"pages":[{"page":0},{"page":1}],"dock":{"entries":[]}}),
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(out["pages"], json!([{"page":1}]));
+        assert_eq!(out["selection"]["total_pages"], 2);
+        assert!(select_page(out, Some(10)).is_err());
+    }
+}

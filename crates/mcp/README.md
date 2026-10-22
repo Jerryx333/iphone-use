@@ -325,6 +325,7 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 | `phone_release_owner` | — | Release this session's owner lease when the task is done |
 | `phone_login` | `item?`, `user?`, `submit?`, `code_via?`, `code_from?` | Sign the app on screen in from the user's own vault entry (bitwarden-use), inside the daemon; the password never reaches the model |
 | `phone_screenshot` | `max_side?`, `overlay?` | Capture current screen → PNG image content; `overlay=true` draws each interactive element's frame and `phone_elements` index on it |
+| `phone_home_layout` | `page?` | Read all home pages, Dock, folder pages and widget stacks without UI input. `page` selects one zero-based page. Page indexes include hidden/Focus-filtered pages and differ from visible page-control numbers. Grid positions are derived from reported icon order and widget spans; `positions_complete=false` / null positions mean unknown. No pixel coordinates or layout restore. Requires a paired physical target reachable through usbmuxd; obeys private holds. |
 | `phone_elements` | `query?`, `limit?`, `ocr?`, `include_hidden?` | The UI as a flattened element list — prefer over screenshots for reasoning. `query` keeps rows whose label/identifier/value/placeholder contain the text; `limit` caps the rows. Kept rows keep their index and the snapshot, so taps still work. `include_hidden=true` expands off-screen/not-drawn rows with original indexes and a `hidden` marker instead of the five-label summary; scroll them into view and read again before acting. The 200-row / 32 KiB text budget still applies. `ocr=auto` adds text read from pixels (Vision) when the tree has no interactive rows, `ocr=force` always; those rows are listed under the tree with `phone_tap` coordinates |
 | `phone_tap` | `x`, `y` (0–1), `observe?` | Single tap at normalized position |
 | `phone_tap_element` | `element`, `snapshot`, `observe?` | Snapshot-bound indexed tap; stale trees are rejected without tapping |
@@ -357,7 +358,7 @@ Every tool carries MCP `annotations`: `readOnlyHint`, `openWorldHint`, and for
 tools that act, `destructiveHint` and `idempotentHint`. Clients that honour
 them can auto-approve the read-only ones and confirm the rest. The read-only
 set is `phone_status`, `phone_capabilities`, `phone_apps`, `phone_screen`,
-`phone_screen_frame`, `phone_screenshot`, `phone_elements`, `phone_crashes`,
+`phone_screen_frame`, `phone_screenshot`, `phone_elements`, `phone_home_layout`, `phone_crashes`,
 `phone_flow_list`, `phone_flow_info` and `phone_flow_draft` (its `save_as` writes a new local
 file and is refused under `IPHONE_USE_MCP_TOOLS=readonly`; the phone is never
 touched).

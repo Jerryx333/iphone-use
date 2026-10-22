@@ -589,6 +589,17 @@ impl DaemonClient {
         read_response(req.send().await?).await
     }
 
+    /// A complete home-screen inventory, without changing the foreground app.
+    pub async fn home_layout(&self, page: Option<usize>) -> anyhow::Result<DaemonResponse> {
+        let mut request = self
+            .auth(self.http().get(self.url("/agent/home-layout")))
+            .timeout(Duration::from_secs(20));
+        if let Some(page) = page {
+            request = request.query(&[("page", page)]);
+        }
+        read_response(request.send().await?).await
+    }
+
     /// `POST /agent/input` with the daemon's structured result kept.
     ///
     /// `observe` asks the daemon for a post-action observation

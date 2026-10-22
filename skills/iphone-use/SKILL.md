@@ -86,6 +86,7 @@ it off again.
 |---|---|---|---|
 | Find an app's bundle id | `GET /agent/apps?query=微信` | `phone_apps` | — |
 | Open an app | `launch_app` `bundle` (or `name` for built-ins, or `app`: any app's exact name — refused with candidates if ambiguous) | `phone_run_steps` step | `launch_app` (`bundle` or `app`) |
+| Read home pages, Dock and folders | `GET /agent/home-layout?page=0` (omit page for all) | `phone_home_layout` (`page?`) | — |
 | Read the screen | `GET /agent/elements` | `phone_elements` | `wait_for` (`application`, `present`, `absent`) |
 | Tap an element | `tap` + `element` + `snapshot` | `phone_tap_element` | `tap_locator` (durable) |
 | Tap a unique label | `tap` + `label` | `phone_tap_label` | `tap_label` |
@@ -158,6 +159,14 @@ To inspect off-screen/not-drawn rows beyond the five-label summary, call
 to stay within the text budget). These rows are marked `hidden`; scroll them
 into view and read again before acting.
 → reference: *Task metrics, runs and advice*
+
+Home-screen organization: use `phone_home_layout` before opening folders or
+swiping through pages. It reads persisted pages, Dock, folder contents and widget
+stacks without moving any icon. Page/row/col indexes are zero-based. Pages include hidden/Focus-filtered pages,
+so page indexes are not the visible page-control numbers. Positions
+are derived from icon order and grid metrics; unknown sizes make positions null
+and `positions_complete:false`. They are not pixel coordinates or permission to
+restore a layout. Re-read after a drop, then use live elements for gestures.
 
 ## A flow is just these steps saved
 

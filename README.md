@@ -236,6 +236,12 @@ See the [MCP tools](crates/mcp/README.md) and the [Agent API reference](docs/age
 - **Local by default.** The daemon listens on `127.0.0.1:44321` behind a password, and the runner on the phone accepts only requests signed with a per-launch token. The iOS 15/16 LAN path is unencrypted ([security](docs/guide.md#security)).
 - **No telemetry.** This build sends no usage data ([telemetry](docs/telemetry.md) · [privacy policy](docs/privacy.md)).
 
+`phone_home_layout` reads the paired phone's persisted home pages, Dock,
+folders and widget stacks without opening folders or taking screenshots.
+Use `page` to limit the response. Its page indexes include hidden/Focus-filtered
+pages; use fresh UI elements before dragging, rather than treating grid slots
+as screen coordinates.
+
 ## Flows: do a task once, replay it with no model
 
 Tasks you repeat are kept as **flows**: reviewed per-app scripts that replay without a model, so they cost no tokens. The official registry is **[leeguooooo/iphone-use-flows](https://github.com/leeguooooo/iphone-use-flows)**. Record a flow in the browser's Flow panel and publish it there with a PR.
