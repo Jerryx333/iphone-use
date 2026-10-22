@@ -200,6 +200,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/test-drag-simulator-verdict.py
           # Same gate as release-binaries.yml: the installer ships SKILL.md
           # alone, so the skill directory must hold exactly that one file
           # (agent reference lives in docs/agent-reference.md).

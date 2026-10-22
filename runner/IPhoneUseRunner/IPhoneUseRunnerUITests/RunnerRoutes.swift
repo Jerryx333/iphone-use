@@ -132,6 +132,7 @@ extension RunnerTests {
     [
       "device": UIDevice.current.userInterfaceIdiom == .pad ? "ipad" : "iphone",
       "sdkVersion": Self.systemVersion,
+      "ipu:timedDragPath": true,
       "browserName": NSNull(),
       "CFBundleIdentifier": NSNull(),
     ]

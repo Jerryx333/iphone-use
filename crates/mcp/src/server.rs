@@ -224,6 +224,16 @@ pub struct RunStepsParams {
     pub observe: Option<bool>,
 }
 
+/// One stop in a continuous drag. Dwell keeps the same finger down.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneDragPoint {
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub dwell_ms: u64,
+}
+
 /// One step in a bounded multi-step sequence.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -256,12 +266,16 @@ pub enum PhoneStep {
         #[serde(default)]
         after_ms: u64,
     },
-    /// Hold, then drag once between two normalized screen points.
+    /// Hold, then drag continuously. Use either x1/y1/x2/y2 or 2–16
+    /// normalized points with optional dwell_ms at each stop. For points,
+    /// duration_ms is travel time per segment; total hold/travel/dwell <= 10s.
     Drag {
-        x1: f64,
-        y1: f64,
-        x2: f64,
-        y2: f64,
+        x1: Option<f64>,
+        y1: Option<f64>,
+        x2: Option<f64>,
+        y2: Option<f64>,
+        #[serde(default)]
+        points: Option<Vec<PhoneDragPoint>>,
         #[serde(default = "default_phone_drag_hold_ms")]
         hold_ms: u64,
         #[serde(default = "default_phone_swipe_ms")]
@@ -1153,7 +1167,7 @@ impl PhoneHandler {
         segment is understood; keep single-action tools for exploring an unknown screen. Step kinds: \
         launch_app, open_url, tap_locator, tap_label, tap, type, key, shortcut, scroll, swipe, drag, \
         longpress, back, alert (system alerts; taps on them do not act), picker, perform (toggle a \
-        switch, adjust a slider: element+snapshot from phone_elements), wait_for, pause. Guard every \
+        switch, adjust a slider: element+snapshot from phone_elements), wait_for, pause. Drag points can dwell at an edge while keeping one finger down. Guard every \
         screen change with wait_for; never batch an irreversible step you have not verified. These \
         step objects are exactly a saved flow's `steps` — when the response carries \
         `flow_suggestion`, ask the user whether to keep the task as a flow (phone_flow_draft). \
@@ -3033,35 +3047,40 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
                 y1,
                 x2,
                 y2,
+                points,
                 hold_ms,
                 duration_ms,
                 after_ms,
             } => {
                 validate_after(after_ms)?;
-                if ![x1, y1, x2, y2].into_iter().all(f64::is_finite)
-                    || ![x1, y1, x2, y2]
+                if let Some(points) = points {
+                    if [x1, y1, x2, y2].iter().any(Option::is_some) {
+                        return Err(format!("steps[{index}] drag needs either points or x1/y1/x2/y2, not both; no action was sent"));
+                    }
+                    let action = serde_json::json!({"type":"drag","points":points,"hold_ms":hold_ms,"duration_ms":duration_ms});
+                    iu_core::drag::Path::parse(&action)
+                        .map_err(|error| format!("steps[{index}] {error}; no action was sent"))?;
+                    action_step(action, after_ms)
+                } else {
+                    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) else {
+                        return Err(format!("steps[{index}] drag needs points or all four x1/y1/x2/y2 coordinates; no action was sent"));
+                    };
+                    if ![x1, y1, x2, y2]
                         .into_iter()
-                        .all(|value| (0.0..=1.0).contains(&value))
-                    || hold_ms > 10_000
-                    || !(1..=10_000).contains(&duration_ms)
-                    || (x1 == x2 && y1 == y2)
-                {
-                    return Err(format!(
-                        "steps[{index}] drag needs distinct coordinates from 0 to 1, hold_ms at most 10000, and duration_ms from 1 to 10000; no action was sent"
-                    ));
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(&v))
+                        || hold_ms > 10_000
+                        || !(1..=10_000).contains(&duration_ms)
+                        || (x1 == x2 && y1 == y2)
+                    {
+                        return Err(format!(
+                            "steps[{index}] drag geometry or timing is invalid; no action was sent"
+                        ));
+                    }
+                    action_step(
+                        serde_json::json!({"type":"drag","x1":x1,"y1":y1,"x2":x2,"y2":y2,"hold_ms":hold_ms,"duration_ms":duration_ms}),
+                        after_ms,
+                    )
                 }
-                action_step(
-                    serde_json::json!({
-                        "type":"drag",
-                        "x1":x1,
-                        "y1":y1,
-                        "x2":x2,
-                        "y2":y2,
-                        "hold_ms":hold_ms,
-                        "duration_ms":duration_ms
-                    }),
-                    after_ms,
-                )
             }
             PhoneStep::TapLabel { label, after_ms } => {
                 validate_after(after_ms)?;
@@ -4527,6 +4546,46 @@ mod tests {
     }
 
     #[test]
+    fn drag_waypoints_validate_before_any_batch_is_sent() {
+        let valid = serde_json::json!({"kind":"drag","points":[
+            {"x":0.3,"y":0.4},{"x":0.13,"y":0.5,"dwell_ms":900},{"x":0.5,"y":0.4}
+        ],"hold_ms":400,"duration_ms":300});
+        let request =
+            phone_steps_request(vec![serde_json::from_value(valid.clone()).unwrap()]).unwrap();
+        let expected = valid["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let mut p = p.clone();
+                if p.get("dwell_ms").is_none() {
+                    p["dwell_ms"] = serde_json::json!(0);
+                }
+                p
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request["steps"][0]["action"]["points"].as_array().unwrap(),
+            &expected
+        );
+        for change in [
+            serde_json::json!({"x1":0.1}),
+            serde_json::json!({"points":[]}),
+            serde_json::json!({"hold_ms":10000}),
+        ] {
+            let mut step = valid.clone();
+            for (key, value) in change.as_object().unwrap() {
+                step[key] = value.clone();
+            }
+            let step = serde_json::from_value(step).unwrap();
+            assert!(phone_steps_request(vec![step]).is_err());
+        }
+        let mut unknown = valid;
+        unknown["points"][0]["wait_ms"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<PhoneStep>(unknown).is_err());
+    }
+
+    #[test]
     fn multi_step_request_encodes_recordable_gestures() {
         let request = phone_steps_request(vec![
             PhoneStep::Longpress {
@@ -4544,10 +4603,11 @@ mod tests {
                 after_ms: 0,
             },
             PhoneStep::Drag {
-                x1: 0.2,
-                y1: 0.5,
-                x2: 0.8,
-                y2: 0.5,
+                x1: Some(0.2),
+                y1: Some(0.5),
+                x2: Some(0.8),
+                y2: Some(0.5),
+                points: None,
                 hold_ms: 500,
                 duration_ms: 400,
                 after_ms: 0,

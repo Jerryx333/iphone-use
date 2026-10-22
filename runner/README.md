@@ -136,7 +136,7 @@ has one fixed session id per launch.
   `viewport`, `pointer` or an element reference, which is relative to the element's centre),
   `pointerDown`, `pause`, `pointerUp` and `pointerCancel`.
 - **Down-to-up paths.** Each `pointerDown…pointerUp` becomes one touch path. Moves while the
-  pointer is down are sampled every ~16 ms over their duration. A down/up with no time between them
+  pointer is down keep timed endpoints for XCTest interpolation; pauses pin the finger until their end. A down/up with no time between them
   is held for 50 ms, so iOS sees a tap.
 - **Multiple sources** become concurrent fingers in one event record.
 - **Key sources:** the `keyDown` values are typed. WebDriver private-use keys map to

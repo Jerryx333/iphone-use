@@ -501,6 +501,16 @@ original indexes, identifiers, values and a `hidden` marker. The 200-row / 32 Ki
 text budget still applies; use `query`/`limit` to narrow a large list. Scroll a
 hidden target into view and read again before acting.
 
+For a continuous drag that pauses at an edge, `phone_run_steps` accepts a
+`drag` step with `points: [{x, y, dwell_ms}, …]`. Use 2–16 normalized points;
+`duration_ms` is travel time per segment, `hold_ms` the initial hold, and total
+hold/travel/dwell must fit in 10 seconds. The finger stays down through every
+stop. Flow drafts keep the path for replay. The four-coordinate form also works.
+
+Send paths through `/agent/input`, `/agent/actions`, or MCP/Flow; the browser `/control` deadline does not accept paths.
+Waypoint paths require 80–2000 ms travel per segment and at most 2000 ms initial hold. The four-coordinate form accepts 1–10000 ms travel and up to 10000 ms hold; the Runner clamps these to 80–2000 ms travel and at most 2000 ms hold. Rebuild the Runner before using paths; older runners return `runner_upgrade_required` without sending a gesture. A failed capability read returns `runner_capability_unavailable` instead; check connectivity before trying again. Flows containing `points` require an updated client and must stay out of the public Flow registry until that release is broadly available.
+
+
 Each of these 26 tools answers in two parts.
 
 * **The text block** is compact and written for the model. It holds the settled

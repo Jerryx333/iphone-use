@@ -326,11 +326,22 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 {"type":"scroll","element":7,"snapshot":"…","dy":120}   // inside that element only
 {"type":"scroll","page":true,"dy":300}                  // the page scroller (long web forms); 422 no_page_scroller if none
 {"type":"swipe","x1":0.5,"y1":0.8,"x2":0.5,"y2":0.2}    // also drag (+hold_ms), longpress (+duration_ms)
+{"type":"drag","points":[{"x":0.3,"y":0.4},{"x":0.13,"y":0.5,"dwell_ms":900},{"x":0.5,"y":0.4}],"hold_ms":400,"duration_ms":300}
 {"type":"back"}                                         // left-edge swipe, not a Back button
 {"type":"alert","button":"允许"}                        // or "action":"accept"|"dismiss"
 {"type":"picker","column":0,"value":"2026"}
 {"type":"perform","element":9,"snapshot":"…","action":"toggle"}  // increment|decrement|adjust(+value)|toggle|menu|double_tap|two_finger_tap|scroll_to_visible|pinch|rotate
 ```
+
+**Continuous drag.** `drag` accepts either the existing `x1/y1/x2/y2` form or
+`points` (2–16 normalized stops), never both. Each point's `dwell_ms` (default 0)
+keeps the same finger down there. For `points`, `duration_ms` is travel time
+**per segment** (default 300), and `hold_ms` is the initial hold (default 500);
+the first point's dwell is additional to that hold. Total hold, travel and dwell
+must be at most 10000 ms. Only one finger press/release is sent, including when
+hovering at an edge to flip a folder page. Use coordinates observed on the
+current screen, then verify the end screen. Flow drafts preserve all points and
+dwells. `supported.drag_path` in `/agent/capabilities` advertises this format.
 
 **Long text.** Text over 200 characters is typed in chunks of about 200 (never
 splitting an emoji, flag, or combining mark), roughly 60 characters a second;

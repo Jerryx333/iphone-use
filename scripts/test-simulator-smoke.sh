@@ -88,22 +88,19 @@ bytes="$(printf '%s' "$body" | json 'd["summary"]["bytes"]')" || bad "record sto
 [ "$bytes" -gt 0 ] || bad "empty recording: $body"
 ok_t "recording via simctl recordVideo saved $bytes bytes"
 
+# Verify UIKit-observed input, including timed hover and a no-hover control.
+python3 "$ROOT/scripts/test-drag-simulator.py" --base "$B" --udid "$SIM" \
+    --owner smoke --mcp "$BIN/iphone-use-mcp" --runner-record "$STATE/simulator.json" \
+    --out "$STATE/gesture-acceptance" --settings-suite "$STATE/gesture-acceptance/settings-suite.json" || bad "OS-delivered drag/hover checks failed"
+ok_t "single, batch, Flow and native input satisfy the fixture's UIKit postconditions"
+
 # Give the owner lease back, so the MCP client (another owner) may drive.
 curl -fsS -m 30 "${H[@]}" -X POST "$B/agent/owner" -d '{"release":true}' >/dev/null || bad "release the owner lease"
 
-suite="$(mktemp -d)/settings.yaml"
-cat >"$suite" <<'YAML'
-suite: Simulator smoke
-app: com.apple.Preferences
-cases:
-  - name: Settings opens
-    steps:
-      - {kind: pause, ms: 1500}
-    assert:
-      - application: Settings
-        timeout_ms: 15000
-YAML
-IPHONE_USE_URL= IPHONE_USE_INSTANCE="$INSTANCE" "$BIN/iphone-use-mcp" test "$suite" --junit "$(dirname "$suite")/report.xml" \
+# The fixture verified bundle ID and source PID before recording the
+# localized Application label: Settings / 设置 / etc. Keep the exact assertion.
+suite="$STATE/gesture-acceptance/settings-suite.json"
+IPHONE_USE_URL= IPHONE_USE_INSTANCE="$INSTANCE" "$BIN/iphone-use-mcp" test "$suite" --junit "$(dirname "$suite")/report.xml" --artifacts-dir "$STATE/gesture-acceptance/suite-artifacts" \
     || bad "the MCP suite failed (IPHONE_USE_INSTANCE=$INSTANCE)"
 ok_t "an MCP test suite reaches the daemon through IPHONE_USE_INSTANCE=$INSTANCE"
 

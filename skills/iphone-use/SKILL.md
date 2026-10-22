@@ -99,6 +99,12 @@ it off again.
 | App asks you to log in | `POST /agent/login` (`iphone-use auth login --bwu`) | `phone_login` | — |
 | Switch / slider | `perform` `toggle` / `adjust` | `phone_run_steps` `perform` step (element + snapshot) | — |
 
+For a drag that needs an edge hover, a `drag` step can use
+`points: [{x, y, dwell_ms}, …]` instead of `x1/y1/x2/y2`. Use 2–16 points from
+the current screen. The same finger stays down through each dwell;
+`duration_ms` is travel time per segment and total hold/travel/dwell <= 10s.
+Flow drafts retain the full path. Verify the end screen before the next action.
+
 All actions, including swipe, drag, picker, set_value and the scroll variants,
 are listed in the reference: *Actions catalogue*.
 
