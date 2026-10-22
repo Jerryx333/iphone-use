@@ -5903,17 +5903,25 @@ async fn agent_mode_inner(
                         if matches!(locked, Ok(Ok(true))) {
                             unlock_error = gateway.unlock().await.err();
                             // Self Runner judges the lock by what is on screen and
-                            // can miss one (hardware, 14 Pro: the Sleep Focus lock
-                            // screen answered already_unlocked); the runner's
-                            // lock state has the last word.
-                            if unlock_error.is_none()
-                                && matches!(
-                                    tokio::time::timeout(LOCK_READ, client.locked_unattached())
-                                        .await,
-                                    Ok(Ok(true))
-                                )
+                            // misreads it both ways (hardware, 14 Pro: the Sleep
+                            // Focus lock screen answered already_unlocked; Face ID
+                            // opening the phone in hand mid-unlock answered
+                            // keypad_not_found); the runner's lock state has the
+                            // last word.
+                            match tokio::time::timeout(LOCK_READ, client.locked_unattached()).await
                             {
-                                unlock_error = Some("unlock_unconfirmed".into());
+                                Ok(Ok(true)) if unlock_error.is_none() => {
+                                    unlock_error = Some("unlock_unconfirmed".into());
+                                }
+                                Ok(Ok(false)) => {
+                                    if let Some(code) = unlock_error.take() {
+                                        tracing::info!(
+                                            code = %code,
+                                            "Self Runner reported a failed unlock, but the runner reads the phone open"
+                                        );
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         if let Ok(health) = tokio::time::timeout(
@@ -25819,15 +25827,33 @@ mod selfrunner_p2_tests {
     #[test]
     fn reconnect_unlocks_and_preserves_gateway_error_code() {
         block(async {
-            // (gateway ok, lock reads before the phone opens, expected error)
-            for (success, locked_reads, expected) in [
-                (true, 1, None),
+            // (gateway ok, its error code, lock reads before the phone opens, expected error)
+            for (success, code, locked_reads, expected) in [
+                (true, "", 1, None),
                 // Self Runner answered already_unlocked on the Sleep Focus
                 // lock screen; the runner still read locked.
-                (true, usize::MAX, Some("unlock_unconfirmed")),
-                (false, usize::MAX, Some("passcode_unavailable")),
+                (true, "", usize::MAX, Some("unlock_unconfirmed")),
+                (
+                    false,
+                    "passcode_unavailable",
+                    usize::MAX,
+                    Some("passcode_unavailable"),
+                ),
+                // Face ID opened the phone in hand mid-unlock: no keypad came
+                // up, yet the runner reads the phone open.
+                (false, "keypad_not_found", 1, None),
             ] {
-                let (gateway,_file,calls,gateway_task) = mock_gateway(serde_json::json!({"transport":"online","tunnels":{"idle":2}}),serde_json::json!({"ok":success,"error":"passcode_unavailable","result":{"unlocked":true}})).await;
+                // The gateway's own response shapes (phone-gateway unlock_response).
+                let response = if success {
+                    serde_json::json!({"ok":true,"result":{"unlocked":true}})
+                } else {
+                    serde_json::json!({"ok":false,"error":{"code":code},"result":{"retry_allowed":false}})
+                };
+                let (gateway, _file, calls, gateway_task) = mock_gateway(
+                    serde_json::json!({"transport":"online","tunnels":{"idle":2}}),
+                    response,
+                )
+                .await;
                 let (base, mutations, runner_task) = runner_locked_for(locked_reads).await;
                 let mut state = Arc::try_unwrap(fixture_app_state(None)).ok().unwrap();
                 state.selfrunner_gateway = Some(gateway);
@@ -25854,7 +25880,10 @@ mod selfrunner_p2_tests {
                         assert!(!hint.contains("phone_reconnect"), "{body}");
                     }
                     // The open phone's health probe opens a session (POSTs).
-                    None => assert_ne!(body["runner_locked"], true, "{body}"),
+                    None => {
+                        assert_ne!(body["runner_locked"], true, "{body}");
+                        assert!(body.get("error").is_none(), "{body}");
+                    }
                 }
                 if expected.is_some() {
                     assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);

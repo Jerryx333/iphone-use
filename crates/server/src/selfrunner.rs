@@ -140,7 +140,8 @@ impl Gateway {
         *self.cache.lock().await = None;
         match response {
             Ok(Ok(value)) if value["ok"] == true => Ok(()),
-            Ok(Ok(value)) => Err(value["error"]
+            // The gateway answers {"ok":false,"error":{"code":…}}.
+            Ok(Ok(value)) => Err(value["error"]["code"]
                 .as_str()
                 .unwrap_or("gateway_unlock_failed")
                 .to_owned()),

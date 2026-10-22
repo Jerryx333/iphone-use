@@ -285,7 +285,7 @@ runner 不可驱动时，status 可增加 `self_runner`：
 4. runner_core 未运行，或空闲和使用中的通道都为 0：打开「Runner API 8100/9100」，或等待通道建立。
 5. runner 可达但锁屏：调用一次 phone_reconnect，通过 gateway 使用 Mac 钥匙串密码远程解锁。
 
-此模式下 phone_reconnect 只读取无会话锁屏状态、必要时调用 gateway unlock，然后重新探测 health；不运行本地 setup 或 launchctl。unlock 的失败错误码原样返回；仍不可驱动时附诊断建议，但不会再建议调用 phone_reconnect。未配置 gateway 时 reconnect 行为不变。
+此模式下 phone_reconnect 先读取无会话锁屏状态（最多等 6 秒：外网 wss 一次往返实测 0.4–4.5 秒），只有 runner 明确答「锁着」才调用 gateway unlock，然后重新探测 health；不运行本地 setup 或 launchctl。没读到锁屏状态时不发解锁（Self Runner 会把 App 里任意 0–9 数字键盘当成锁屏），仍不可驱动时返回 `lock_state_unknown`，并提示可以再调用一次。解锁后再读一次锁屏状态，以 runner 为准：gateway 报成功但仍锁着为 `unlock_unconfirmed`；gateway 报失败但 runner 读到已解锁时按成功返回（例如人拿着手机，面容 ID 在解锁途中先打开了手机，Self Runner 报 `keypad_not_found`）。其余失败原样返回 gateway 的 `error.code`；仍不可驱动时附诊断建议，除 `lock_state_unknown` 外不会再建议调用 phone_reconnect。未配置 gateway 时 reconnect 行为不变。
 
 health 缓存超过 5 秒时，status 最多等待后台探测 2.5 秒；动作前另用最多 1 秒查询无会话锁屏状态。发现锁屏会在发送动作前拒绝（not_sent、retry_safe=true）。
 
