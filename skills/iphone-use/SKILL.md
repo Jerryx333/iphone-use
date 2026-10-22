@@ -25,8 +25,11 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure st
 
 ## The loop
 
-1. **Probe.** `GET /agent/status` / `phone_status`. Act only when
-   `drivable:true`. Otherwise report `hint` and stop. Reconnect once
+1. **Probe.** `GET /agent/status` / `phone_status`. Screen reads and UI input
+   require `drivable:true`; otherwise report `hint` and stop those operations.
+   Paired metadata reads (`phone_home_layout`, `phone_apps`) and cached capability
+   discovery do not require a running Runner. Use them without reconnecting or
+   opening Home, and respect any private-hold refusal. Reconnect once
    (`phone_reconnect` / `POST /agent/mode {"mode":"agent"}`) only when the
    user's current task needs the phone, never for a health check: each runner
    launch can make the operator type the passcode. If `owner` is another

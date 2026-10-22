@@ -1233,7 +1233,9 @@ EOF
 ## Home-screen layout
 
 `GET /agent/home-layout` / MCP `phone_home_layout` reads the configured physical
-phone through its paired usbmuxd connection, without XCTest UI input. It returns
+phone through its paired usbmuxd connection, without XCTest UI input. It works
+while the Runner is stopped and `drivable:false`; do not reconnect or navigate
+Home just for this metadata read. It returns
 Dock, every home page, folder pages, widget sizes and stack members. It requires
 an explicit target UDID and obeys private holds. `?page=0` selects one zero-based
 home page and retains its original index, Dock and total page count.

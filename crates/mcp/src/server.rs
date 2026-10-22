@@ -930,7 +930,7 @@ impl PhoneHandler {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = true),
-        description = "Read all home-screen pages, Dock, folder pages and widget stacks from the paired iPhone without opening folders, swiping, or taking screenshots. Optional page selects one zero-based page to reduce output. Requires a configured physical target reachable through usbmuxd. Page indexes refer to persisted icon state, including hidden/Focus-filtered pages; they are not the visible page-control indexes. Zero-based row/col positions are derived from icon-state order and grid metrics; null positions or positions_complete=false mean unknown, never safe drag coordinates. Contains no pixel coordinates and does not restore or modify a layout. An unreadable device returns an error rather than an empty home screen."
+        description = "Read all home-screen pages, Dock, folder pages and widget stacks from the paired iPhone without opening folders, swiping, or taking screenshots. Optional page selects one zero-based page to reduce output. Requires a configured physical target reachable through usbmuxd. This metadata read does not require drivable=true or a running XCTest Runner; never reconnect or open Home solely for this read. Page indexes refer to persisted icon state, including hidden/Focus-filtered pages; they are not the visible page-control indexes. Zero-based row/col positions are derived from icon-state order and grid metrics; null positions or positions_complete=false mean unknown, never safe drag coordinates. Contains no pixel coordinates and does not restore or modify a layout. An unreadable device returns an error rather than an empty home screen."
     )]
     async fn phone_home_layout(
         &self,
