@@ -94,7 +94,7 @@ Self Runner 的 `UIApplication.applicationState == active` 时，主线程打开
 
 真机输入事实由本单提供：iPhone 14 Pro、中文系统，锁屏前台为 SpringBoard（当次 pid 37，不在代码中硬编码）；press home 后等待 800ms，上滑 `{196,840}→{196,300}`（300ms）可调出数字键盘。标志为「已锁定」「向上轻扫以解锁」「密码栏」，兼容 `Locked`、`Swipe up to unlock`、`Passcode field`；键 label 为 `0`…`9`。本次新增 unlock 的完整真机效果**未核实**。
 
-`unlock` 沿用执行闸、deadline、最近 64 个响应去重；判定已解锁时不输入。亮屏后若无完整键盘只上滑一次，每 300ms 轮询最多 3s，找不到为 `keypad_not_found`。按数字 label 的唯一可见 frame 中心逐位点击，PID 来自该次前台快照；位间等待 120ms，不走通用 tap 遮挡等待。输入后每 300ms 核对前台及 SpringBoard：键盘和锁屏标志均消失才返回 unlocked；到 timeout 键盘仍在为 `unlock_failed`，其余不确定状态为 `unlock_unconfirmed`。失败响应含 `retry_allowed:false`；输入绝不自动重试。
+`unlock` 沿用执行闸、deadline、最近 64 个响应去重；判定已解锁时不输入。是否锁屏以系统状态为准（SpringBoardServices `SBGetScreenLockStatus`，与 runner `/wda/locked` 同源），取不到时才看屏幕上的锁屏标志和数字键盘：手机已解锁时，屏幕上的 0–9 键盘是 App 自己的（例如银行密码键盘），不是锁屏。亮屏后若无完整键盘只上滑一次，每 300ms 轮询最多 3s，找不到为 `keypad_not_found`。等键盘期间和每点一位之前都复查系统状态，一旦已解锁就返回 unlocked、不再输入：人拿着手机时，按 Home 亮屏后面容 ID 可能先把手机解开，上滑会进主屏幕或某个 App。按数字 label 的唯一可见 frame 中心逐位点击，PID 来自该次前台快照；位间等待 120ms，不走通用 tap 遮挡等待。输入后每 300ms 核对：系统状态读到已解锁即返回 unlocked（解锁后回到的 App 可能自带数字键盘）；取不到系统状态时，前台及 SpringBoard 里键盘和锁屏标志均消失才返回 unlocked；到 timeout 键盘仍在为 `unlock_failed`，其余不确定状态为 `unlock_unconfirmed`。失败响应含 `retry_allowed:false`；输入绝不自动重试。
 
 密码的持久副本只放 **Mac 登录钥匙串** generic password，service 为 `phone-gateway.passcode`，account 为配置文件中的完整 `device_id`。用户自行在终端执行以下命令（把占位符换成 device_id；`-w` 不带值，交互输入，不把密码写在命令行）：
 

@@ -394,6 +394,10 @@ final class RemoteActions {
     private func unlock(_ args: [String: Any], portrait: Bool, expired: () -> Bool) -> RemoteActionResult {
         let noRetry: [String: Any] = ["retry_allowed": false]
         func fail(_ code: String) -> RemoteActionResult { RemoteActionResult(code: code, details: noRetry) }
+        // SBGetScreenLockStatus, the source of /wda/locked. Face ID can open a phone in
+        // hand after the wake press; a 0–9 pad on an open phone is an app's own (a bank
+        // PIN) and must never get the passcode.
+        func opened() -> Bool { SpikeBridge.remoteScreenLocked()?.boolValue == false }
         guard args.keys.allSatisfy({ ["passcode", "timeout_ms"].contains($0) }),
               let passcode = args["passcode"] as? String,
               (4...6).contains(passcode.utf8.count), passcode.utf8.allSatisfy({ (48...57).contains($0) }),
@@ -410,7 +414,8 @@ final class RemoteActions {
         let springPID = SpikeBridge.remoteSystemPID()
         guard springPID > 0, let _ = (initial["pid"] as? NSNumber)?.int32Value else { return fail("target_unknown") }
         // Sleep Focus uses a separate SleepLockScreen process; foreground PID cannot imply unlock.
-        let initialLocked = systemLocked == true || lockMarked(initial) || keypad(initial, screen: screen) != nil
+        // The system lock state decides; screen marks count only when it is unavailable.
+        let initialLocked = systemLocked ?? (lockMarked(initial) || keypad(initial, screen: screen) != nil)
         if !initialLocked {
             if systemLocked == false { return RemoteActionResult(["already_unlocked": true]) }
             guard let system = unlockSnapshot(system: true) else { return fail("read_failed") }
@@ -433,6 +438,7 @@ final class RemoteActions {
         }
         let keypadEnd = ProcessInfo.processInfo.systemUptime + 3
         while keypad(snapshot, screen: screen) == nil {
+            if opened() { return RemoteActionResult(["unlocked": true]) }
             if expired() { return fail("expired") }
             if ProcessInfo.processInfo.systemUptime >= keypadEnd { return fail("keypad_not_found") }
             if !pause(0.3, until: keypadEnd, expired: expired) { return fail("expired") }
@@ -443,6 +449,7 @@ final class RemoteActions {
             if expired() { return fail("expired") }
             guard let keys = keypad(snapshot, screen: screen), let point = keys[String(Int(digits[i]) - 48)],
                   let target = (snapshot["pid"] as? NSNumber)?.int32Value else { return fail("unlock_unconfirmed") }
+            if opened() { return RemoteActionResult(["unlocked": true]) }
             // Deliberately bypass general tap occlusion logic. Never return bridge text.
             if SpikeBridge.tapScreen(point: point, pid: target, log: { _ in }) != nil { return fail("tap_failed") }
             if i < digits.count - 1 {
@@ -453,6 +460,7 @@ final class RemoteActions {
         let end = ProcessInfo.processInfo.systemUptime + ms / 1000
         while true {
             if expired() { return fail("expired") }
+            if opened() { return RemoteActionResult(["unlocked": true]) }
             guard let fresh = unlockSnapshot(), let system = unlockSnapshot(system: true) else { return fail("unlock_unconfirmed") }
             if expired() { return fail("expired") }
             let keyboard = keypad(fresh, screen: screen) != nil || keypad(system, screen: screen) != nil
