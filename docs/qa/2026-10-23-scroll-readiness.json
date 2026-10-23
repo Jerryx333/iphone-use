@@ -1,0 +1,138 @@
+{
+  "scope": "UIKit controls on iOS Simulator 26.2; Xcode 27.0 on Mac 190",
+  "build": {
+    "source_base": "78abf4b252bc7d1edf3c34e3a8dc3f89c852d51f",
+    "working_tree_sha256": {
+      "crates/server/src/http.rs": "7921175baea772c8aa66be5ba65a0126edf0312ed821102228c9b92476155ea9",
+      "crates/server/src/runner.rs": "64673cd3564317231ee795df0a932197a4f04d939272c0dc247b83d104733c17",
+      "runner/gesture-fixture/main.swift": "21dac4a6b59d7fce965a25fc68316da4dbc33ce8639a1f95acf2b2f428d24f85",
+      "scripts/test-drag-simulator.py": "f6b52ab0411c03211fefe24badeec0f6dedfcfb62a5a9b5c59e63c88df5c5df4",
+      "scripts/test-drag-simulator-verdict.py": "11a5ecec223f6ac4dfd8783b487ad4a7c0b85416eb7e302864f328f8640fcd88"
+    },
+    "candidate_cli_sha256": "9b13f0ac30e19e63690ddf3dd3fd4deaf3e3410692fec7715990e36e2db60a03",
+    "baseline_cli_sha256": "58ce36641afdf7f156be46f85f49e31e55948e858ab8c1b63c381e67a1a473f3",
+    "live_daemon_binary_path_matches_candidate": true,
+    "build_host": "m4",
+    "xcode": "27.0",
+    "simulator_runtime": "26.2"
+  },
+  "baseline_scroll_then_tap": [
+    {
+      "http": 200,
+      "acknowledged": true,
+      "selected_rows": [],
+      "offset_y": 700,
+      "passed": false
+    },
+    {
+      "http": 200,
+      "acknowledged": true,
+      "selected_rows": [],
+      "offset_y": 700,
+      "passed": false
+    },
+    {
+      "http": 200,
+      "acknowledged": true,
+      "selected_rows": [],
+      "offset_y": 700,
+      "passed": false
+    }
+  ],
+  "candidate_cases": [
+    {
+      "case": "longpress-regression",
+      "passed": true
+    },
+    {
+      "case": "native-swipe-regression",
+      "passed": true
+    },
+    {
+      "case": "single-hover",
+      "passed": true
+    },
+    {
+      "case": "batch-hover",
+      "passed": true
+    },
+    {
+      "case": "flow-hover",
+      "passed": true
+    },
+    {
+      "case": "slow-drift-control",
+      "passed": true
+    },
+    {
+      "case": "settled-row-control",
+      "passed": true,
+      "selections": [
+        3
+      ],
+      "text": "",
+      "began_editing": 0,
+      "offset_y": 0
+    },
+    {
+      "case": "scroll-then-tap-0",
+      "passed": true,
+      "selections": [
+        8
+      ],
+      "text": "",
+      "began_editing": 0,
+      "offset_y": 440
+    },
+    {
+      "case": "scroll-then-tap-1",
+      "passed": true,
+      "selections": [
+        8
+      ],
+      "text": "",
+      "began_editing": 0,
+      "offset_y": 440
+    },
+    {
+      "case": "scroll-then-tap-2",
+      "passed": true,
+      "selections": [
+        8
+      ],
+      "text": "",
+      "began_editing": 0,
+      "offset_y": 440
+    },
+    {
+      "case": "first-focus-typing-0",
+      "passed": true,
+      "selections": [],
+      "text": "\u7167\u7247",
+      "began_editing": 1,
+      "offset_y": 0
+    },
+    {
+      "case": "first-focus-typing-1",
+      "passed": true,
+      "selections": [],
+      "text": "\u7167\u7247",
+      "began_editing": 1,
+      "offset_y": 0
+    },
+    {
+      "case": "first-focus-typing-2",
+      "passed": true,
+      "selections": [],
+      "text": "\u7167\u7247",
+      "began_editing": 1,
+      "offset_y": 0
+    }
+  ],
+  "server_unit_tests": {
+    "passed": 874,
+    "ignored": 1
+  },
+  "acceptance_verdict_tests": 14,
+  "candidate_physical_settings_acceptance": "pending"
+}

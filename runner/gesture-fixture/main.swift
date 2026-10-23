@@ -114,13 +114,93 @@ final class PadController: UIViewController {
   override var prefersStatusBarHidden: Bool { true }
   override var prefersHomeIndicatorAutoHidden: Bool { true }
 }
+
+// Standard UIKit controls provide an independent receiver for input timing:
+// action acknowledgements alone cannot prove a row selected or text arrived.
+final class InputController: UIViewController, UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating, UISearchBarDelegate {
+  private let result = UILabel()
+  private let table = UITableView(frame: .zero, style: .plain)
+  private let search = UISearchController(searchResultsController: nil)
+  private let runID = ProcessInfo.processInfo.environment["GESTURE_RUN_ID"] ?? "missing"
+  private var selections: [Int] = []
+  private var edits: [String] = []
+  private var beganEditing = 0
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .systemBackground
+    title = "Input readiness"
+    result.numberOfLines = 0
+    result.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    result.accessibilityIdentifier = "input-result"
+    result.translatesAutoresizingMaskIntoConstraints = false
+    table.translatesAutoresizingMaskIntoConstraints = false
+    table.accessibilityIdentifier = "input-table"
+    table.dataSource = self
+    table.delegate = self
+    table.rowHeight = 60
+    view.addSubview(result)
+    view.addSubview(table)
+    NSLayoutConstraint.activate([
+      result.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      result.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+      result.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+      result.heightAnchor.constraint(equalToConstant: 130),
+      table.topAnchor.constraint(equalTo: result.bottomAnchor),
+      table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      table.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+    ])
+    search.obscuresBackgroundDuringPresentation = false
+    search.searchResultsUpdater = self
+    search.searchBar.delegate = self
+    search.searchBar.placeholder = "Fixture search"
+    navigationItem.searchController = search
+    navigationItem.hidesSearchBarWhenScrolling = false
+    definesPresentationContext = true
+    publish()
+  }
+  func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { 80 }
+  func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let cell = tableView.dequeueReusableCell(withIdentifier: "row") ?? UITableViewCell(style: .default, reuseIdentifier: "row")
+    cell.textLabel?.text = "Fixture row \(indexPath.row)"
+    cell.accessibilityIdentifier = "input-row-\(indexPath.row)"
+    return cell
+  }
+  func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    selections.append(indexPath.row)
+    tableView.deselectRow(at: indexPath, animated: false)
+    publish()
+  }
+  func scrollViewDidScroll(_ scrollView: UIScrollView) { publish() }
+  func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { publish() }
+  func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) { beganEditing += 1; publish() }
+  func updateSearchResults(for searchController: UISearchController) {
+    edits.append(searchController.searchBar.text ?? "")
+    publish()
+  }
+  private func publish() {
+    let record: [String: Any] = [
+      "run_id": runID, "selections": selections, "text": search.searchBar.text ?? "",
+      "edits": edits, "began_editing": beganEditing,
+      "offset_y": Double(table.contentOffset.y),
+      "decelerating": table.isDecelerating, "dragging": table.isDragging,
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]),
+       let text = String(data: data, encoding: .utf8) {
+      result.text = text
+      result.accessibilityLabel = text
+    }
+  }
+}
 @objc(GestureFixtureSceneDelegate)
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   var window: UIWindow?
   func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
     guard let scene = scene as? UIWindowScene else { return }
     let window = UIWindow(windowScene: scene)
-    window.rootViewController = PadController()
+    window.rootViewController = ProcessInfo.processInfo.environment["GESTURE_FIXTURE_MODE"] == "input"
+      ? UINavigationController(rootViewController: InputController()) : PadController()
     window.makeKeyAndVisible()
     self.window = window
   }

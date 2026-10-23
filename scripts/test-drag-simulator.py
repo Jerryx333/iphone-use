@@ -124,11 +124,11 @@ class Daemon:
             raise RuntimeError("simulator belongs to another owner")
         return status
 
-    def metrics(self, nonce):
+    def metrics(self, nonce, identifier="gesture-result"):
         tree = self.call("/agent/elements")
         matches = []
         for row in tree.get("elements", []):
-            if row.get("identifier") == "gesture-result":
+            if row.get("identifier") == identifier:
                 try:
                     record = json.loads(row["label"])
                     if record.get("run_id") == nonce:
@@ -139,11 +139,11 @@ class Daemon:
             return matches[0]
         return None
 
-    def wait_metrics(self, nonce, ended=False):
+    def wait_metrics(self, nonce, ended=False, identifier="gesture-result"):
         until = time.monotonic() + 15
         last = None
         while time.monotonic() < until:
-            last = self.metrics(nonce)
+            last = self.metrics(nonce, identifier)
             if last is not None and (not ended or last.get("up_count", 0) > 0):
                 return last
             time.sleep(0.2)
@@ -264,6 +264,73 @@ def case(daemon, args, label, carrier, hover):
     return report
 
 
+def judge_input(record, nonce, kind, row):
+    if not isinstance(record, dict) or record.get("run_id") != nonce:
+        return ["no independent input receipt for this launch"]
+    errors = []
+    if kind == "typing":
+        if (record.get("text") != "照片" or type(record.get("began_editing")) is not int
+                or record["began_editing"] != 1 or record.get("selections") != []):
+            errors.append("the fresh search field did not receive exactly the requested text")
+    elif record.get("selections") != [row]:
+        errors.append("the requested row was not selected exactly once")
+    offset = record.get("offset_y")
+    if kind == "scroll" and (type(offset) not in (int, float) or not math.isfinite(offset) or offset <= 20):
+        errors.append("the UIKit table did not scroll")
+    return errors
+
+
+def input_case(daemon, args, label, kind):
+    out = args.out / label
+    out.mkdir()
+    nonce = uuid.uuid4().hex
+    daemon.require_simulator(args.udid)
+    command(["xcrun", "simctl", "terminate", args.udid, BUNDLE], check=False, timeout=30)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SIMCTL_CHILD_")}
+    env.update(SIMCTL_CHILD_GESTURE_RUN_ID=nonce, SIMCTL_CHILD_GESTURE_FIXTURE_MODE="input")
+    command(["xcrun", "simctl", "launch", args.udid, BUNDLE], env=env, timeout=60)
+    before = daemon.wait_metrics(nonce, identifier="input-result")
+    if not before or before.get("selections") != [] or before.get("text") != "":
+        raise RuntimeError("input fixture is not fresh; no input sent")
+    row = 8 if kind == "scroll" else 3
+    steps = []
+    if kind == "scroll":
+        steps.extend([
+            {"kind": "action", "action": {"type": "scroll", "x": 0.5, "y": 0.65, "dx": 0, "dy": 300}},
+            {"kind": "wait_for", "expect": {"present": [{"identifier": f"input-row-{row}", "kind": "Cell"}]}, "timeout_ms": 4000},
+        ])
+    if kind == "typing":
+        steps.extend([
+            {"kind": "action", "action": {"type": "tap_locator", "locator": {"kind": "SearchField"}}},
+            {"kind": "action", "action": {"type": "text", "text": "照片"}},
+        ])
+    else:
+        steps.append({"kind": "action", "action": {"type": "tap_locator", "locator": {"identifier": f"input-row-{row}", "kind": "Cell"}}})
+    daemon.require_simulator(args.udid)
+    reply, reply_error = None, None
+    try:
+        # Exactly one send. Wait only for the receiver's postcondition below;
+        # a missing acknowledgement or selection must never replay the batch.
+        reply = daemon.call("/agent/actions", {"steps": steps, "observe": True})
+    except (OSError, ValueError) as error:
+        reply_error = str(error)
+    after = None
+    until = time.monotonic() + 4
+    while time.monotonic() < until:
+        after = daemon.metrics(nonce, "input-result")
+        if after and (after.get("text") == "照片" if kind == "typing" else after.get("selections")):
+            break
+        time.sleep(0.1)
+    errors = judge_input(after, nonce, kind, row)
+    if reply_error or not isinstance(reply, dict) or reply.get("ok") is not True:
+        errors.append("input acknowledgement failed: " + str(reply_error or reply))
+    report = {"case": label, "carrier": "batch", "passed": not errors, "errors": errors,
+              "before": before, "after": after, "steps": steps, "reply": reply, "reply_error": reply_error}
+    (out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps({"case": label, "passed": not errors, "after": after, "errors": errors}), flush=True)
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
@@ -271,6 +338,7 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--owner", default="gesture-fixture")
     parser.add_argument("--settings-suite", type=Path)
+    parser.add_argument("--input-readiness", action="store_true", help="also verify scroll/tap and first-focus typing against UIKit controls")
     parser.add_argument("--runner-record", required=True, type=Path)
     parser.add_argument("--mcp", type=Path, default=ROOT / "target/release/iphone-use-mcp")
     args = parser.parse_args()
@@ -298,7 +366,15 @@ def main():
             reports.append(case(daemon, args, label, carrier, hover))
             if not reports[-1]["passed"]:
                 break
-        if len(reports) == 6 and all(r["passed"] for r in reports) and args.settings_suite:
+        if len(reports) == 6 and all(r["passed"] for r in reports) and args.input_readiness:
+            for label, kind in [("settled-row-control", "tap"),
+                                *[(f"scroll-then-tap-{i}", "scroll") for i in range(3)],
+                                *[(f"first-focus-typing-{i}", "typing") for i in range(3)]]:
+                reports.append(input_case(daemon, args, label, kind))
+                if not reports[-1]["passed"]:
+                    break
+        expected_cases = 13 if args.input_readiness else 6
+        if len(reports) == expected_cases and all(r["passed"] for r in reports) and args.settings_suite:
             settings_binding = localized_settings_suite(daemon, args)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         harness_error = str(error)
@@ -316,12 +392,13 @@ def main():
         return value.hexdigest()
     source_files = ["scripts/test-drag-simulator.py", "runner/gesture-fixture/main.swift", "runner/gesture-fixture/Info.plist", "runner/gesture-fixture/LaunchScreen.storyboard", "runner/gesture-fixture/GestureFixture.xcodeproj/project.pbxproj",
                     "runner/IPhoneUseRunner/IPhoneUseRunnerUITests/RunnerActions.swift",
-                    "runner/IPhoneUseRunner/IPhoneUseRunnerUITests/IPURBridge.m"]
+                    "runner/IPhoneUseRunner/IPhoneUseRunnerUITests/IPURBridge.m",
+                    "crates/server/src/runner.rs", "crates/server/src/http.rs"]
     provenance = {"source_commit": command(["git", "-C", ROOT, "rev-parse", "HEAD"], check=False).stdout.strip() if (ROOT/".git").exists() else None,
                   "source_sha256": {name:digest(ROOT/name) for name in source_files},
                   "mcp_sha256":digest(args.mcp), "device":status.get("device"),
                   "scope":"iOS Simulator touch delivery; not physical iPhone or SpringBoard folder acceptance"}
-    result = {"provenance":provenance, "passed": len(reports) == 6 and all(r["passed"] for r in reports) and not harness_error and not cleanup_error,
+    result = {"provenance":provenance, "passed": len(reports) == (13 if args.input_readiness else 6) and all(r["passed"] for r in reports) and not harness_error and not cleanup_error,
               "udid": args.udid, "cases": reports, "settings_binding": settings_binding, "harness_error": harness_error, "cleanup_error": cleanup_error}
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: result[key] for key in ["passed", "harness_error", "cleanup_error", "settings_binding"]}), flush=True)

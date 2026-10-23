@@ -15,6 +15,22 @@ spec.loader.exec_module(check)
 
 
 class VerdictTests(unittest.TestCase):
+    def test_scroll_ack_without_the_right_selection_is_not_a_pass(self):
+        record = {"run_id": "fresh", "selections": [8], "offset_y": 439}
+        self.assertEqual(check.judge_input(record, "fresh", "scroll", 8), [])
+        for value in [None, {"ok": True}, dict(record, run_id="old"),
+                      dict(record, selections=[]), dict(record, selections=[7]),
+                      dict(record, selections=[8, 8]), dict(record, offset_y=0),
+                      dict(record, offset_y=float("nan"))]:
+            self.assertTrue(check.judge_input(value, "fresh", "scroll", 8), value)
+
+    def test_first_focus_typing_requires_the_actual_text_receiver(self):
+        record = {"run_id": "fresh", "text": "照片", "began_editing": 1, "selections": []}
+        self.assertEqual(check.judge_input(record, "fresh", "typing", 3), [])
+        for key, value in [("text", ""), ("text", "照"), ("text", "照片照片"), ("began_editing", 0),
+                           ("began_editing", True), ("selections", [3]), ("run_id", "old")]:
+            self.assertTrue(check.judge_input(dict(record, **{key: value}), "fresh", "typing", 3))
+
     def record(self):
         return {"run_id": "fresh", "down_count": 1, "up_count": 1, "cancel_count": 0,
                 "max_fingers": 1, "hover_ms": 900, "duration_ms": 1900, "initial_hold_ms": 400,

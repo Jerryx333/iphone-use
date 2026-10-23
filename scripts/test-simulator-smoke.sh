@@ -90,6 +90,7 @@ ok_t "recording via simctl recordVideo saved $bytes bytes"
 
 # Verify UIKit-observed input, including timed hover and a no-hover control.
 python3 "$ROOT/scripts/test-drag-simulator.py" --base "$B" --udid "$SIM" \
+    --input-readiness \
     --owner smoke --mcp "$BIN/iphone-use-mcp" --runner-record "$STATE/simulator.json" \
     --out "$STATE/gesture-acceptance" --settings-suite "$STATE/gesture-acceptance/settings-suite.json" || bad "OS-delivered drag/hover checks failed"
 ok_t "single, batch, Flow and native input satisfy the fixture's UIKit postconditions"

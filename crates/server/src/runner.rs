@@ -1418,6 +1418,50 @@ impl RunnerClient {
         Ok(())
     }
 
+    /// Scroll without a fling: the last <=30 points travel at <=120 pt/s.
+    /// A constant-speed swipe keeps decelerating after lift; the next tap can
+    /// then only stop the list instead of selecting its target. Keep the finger
+    /// moving slowly at the end rather than pausing (UIKit retains velocity
+    /// across a stationary hold). Explicit swipes retain their flick semantics.
+    pub async fn scroll(
+        &mut self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        duration_ms: u64,
+    ) -> Result<()> {
+        let distance = (x2 - x1).hypot(y2 - y1);
+        let tail = if distance > 0.0 {
+            0.15_f64.min(30.0 / distance)
+        } else {
+            0.0
+        };
+        let fast_ms = bounded_move_duration_ms(duration_ms)
+            .saturating_sub(250)
+            .max(80);
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .post_req(format!("{}/session/{}/actions", self.base, sid))
+            .json(&serde_json::json!({"actions": [{
+                "type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"},
+                "actions": [
+                    {"type": "pointerMove", "duration": 0, "x": x1, "y": y1},
+                    {"type": "pointerDown", "button": 0},
+                    {"type": "pause", "duration": 80},
+                    {"type": "pointerMove", "duration": fast_ms,
+                     "x": x2 - (x2 - x1) * tail, "y": y2 - (y2 - y1) * tail},
+                    {"type": "pointerMove", "duration": 250, "x": x2, "y": y2},
+                    {"type": "pointerUp", "button": 0}
+                ]
+            }]}))
+            .send_signed(&self.auth)
+            .await
+            .context("POST /actions (scroll)")?;
+        ensure_runner_success(response, "POST /actions (scroll)").await?;
+        Ok(())
+    }
+
     /// Press the Home button on-device (`POST /wda/pressButton` `{name:home}`).
     /// The reliable "go home".
     pub async fn press_home(&mut self) -> Result<()> {

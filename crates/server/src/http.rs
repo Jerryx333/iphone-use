@@ -6178,7 +6178,7 @@ fn coordinate_swipe_endpoints(
     Ok((x1, y1, x2, y2))
 }
 
-pub(crate) async fn runner_swipe(
+pub(crate) async fn runner_scroll(
     w: &mut crate::runner::RunnerClient,
     nx: f64,
     ny: f64,
@@ -6189,7 +6189,7 @@ pub(crate) async fn runner_swipe(
     let (x1, y1, x2, y2) = coordinate_swipe_endpoints(nx, ny, dx, dy, sw, sh)?;
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let dur = (dist * 1.2).clamp(120.0, 600.0) as u64;
-    w.swipe(x1, y1, x2, y2, dur).await
+    w.scroll(x1, y1, x2, y2, dur).await
 }
 
 /// Resolve the CoreDevice identifier of the currently-connected iPhone by
@@ -8054,7 +8054,7 @@ async fn scroll_snapshot_element(
             SCROLL_ALERT_HINT,
         ));
     }
-    w.swipe(x1, y1, x2, y2, duration)
+    w.scroll(x1, y1, x2, y2, duration)
         .await
         .map_err(SnapshotElementTapError::AfterDispatch)
 }
@@ -9096,12 +9096,12 @@ async fn runner_control_with_client(
                         }
                         let duration = (((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt() * 1.2)
                             .clamp(120.0, 600.0) as u64;
-                        w.swipe(x1, y1, x2, y2, duration).await
+                        w.scroll(x1, y1, x2, y2, duration).await
                     }
                     Err(error) => Err(error),
                 }
             } else {
-                runner_swipe(w, nx, ny, dx, dy).await
+                runner_scroll(w, nx, ny, dx, dy).await
             }
         }
         "text" => match v.get("text").and_then(|t| t.as_str()) {
@@ -12173,7 +12173,7 @@ async fn agent_actions_inner(
 // ---------------------------------------------------------------------------
 
 /// The runner as a [`crate::collect::Pager`]: a page is the element tree, a
-/// swipe is the coordinate scroll `/agent/input` sends (`runner_swipe`).
+/// swipe is the coordinate scroll `/agent/input` sends (`runner_scroll`).
 struct RunnerPager<'a> {
     w: &'a mut crate::runner::RunnerClient,
     screen: Option<(f64, f64)>,
@@ -12215,7 +12215,7 @@ impl crate::collect::Pager for RunnerPager<'_> {
         let region = region.unwrap_or(crate::collect::Region::FULL);
         let (x, y) = region.center();
         let dy = crate::collect::page_dy(region.h * height, direction);
-        runner_swipe(self.w, x, y, 0.0, dy).await?;
+        runner_scroll(self.w, x, y, 0.0, dy).await?;
         tokio::time::sleep(crate::collect::SWIPE_SETTLE).await;
         Ok(())
     }
@@ -24915,7 +24915,7 @@ mod tests {
             assert_eq!(error["status"], 400);
             assert_eq!(error["code"], "invalid argument");
             assert_eq!(error["message"], OFF_SCREEN_REFUSAL);
-            assert_eq!(error["call"], "POST /actions (swipe)");
+            assert_eq!(error["call"], "POST /actions (scroll)");
 
             let body = runner_rejected_body(detail.as_ref());
             assert_eq!(body["error"], "runner_rejected");
