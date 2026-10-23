@@ -2133,7 +2133,7 @@ pub mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.mp4");
         // Stands in for recordVideo: writes the file when interrupted.
-        let script = "echo 'Recording started' >&2; trap 'printf movie > \"$0\"; exit 0' INT; while :; do sleep 0.05; done";
+        let script = "trap 'printf movie > \"$0\"; exit 0' INT; echo 'Recording started' >&2; while :; do sleep 0.05; done";
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let started = recorder
@@ -2150,12 +2150,12 @@ pub mod tests {
             assert!(summary.get("ended").is_none());
             assert!(recorder.stop().await.unwrap().is_none());
             // Nothing written: no file, and an error that says so.
-            recorder.start_with("sh", &["-c".into(), "echo 'Recording started' >&2; trap 'exit 0' INT; while :; do sleep 0.05; done".into()], dir.join("c.mp4"), RECORD_MAX).await.unwrap();
+            recorder.start_with("sh", &["-c".into(), "trap 'exit 0' INT; echo 'Recording started' >&2; while :; do sleep 0.05; done".into()], dir.join("c.mp4"), RECORD_MAX).await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(format!("{:#}", recorder.stop().await.unwrap_err()).contains("no video frames"));
             // `start` returns only once the recorder says it is recording.
             let e = dir.join("e.mp4");
-            let slow = "sleep 0.5; echo 'Recording started' >&2; trap 'printf movie > \"$0\"; exit 0' INT; while :; do sleep 0.05; done";
+            let slow = "sleep 0.5; trap 'printf movie > \"$0\"; exit 0' INT; echo 'Recording started' >&2; while :; do sleep 0.05; done";
             let began = std::time::Instant::now();
             recorder.start_with("sh", &["-c".into(), slow.into(), e.display().to_string()], e.clone(), RECORD_MAX).await.unwrap();
             assert!(began.elapsed() >= Duration::from_millis(400), "{:?}", began.elapsed());

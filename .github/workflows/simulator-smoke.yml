@@ -13,6 +13,8 @@ on:
       - crates/mcp/src/client.rs
       - runner/**
       - scripts/test-simulator-smoke.sh
+      - scripts/test-drag-simulator.py
+      - scripts/test-drag-simulator-verdict.py
       - .github/workflows/simulator-smoke.yml
   workflow_dispatch:
 
@@ -65,3 +67,18 @@ jobs:
             [ -f "$f" ] && { echo "== $f"; tail -120 "$f"; }
           done
           ls -1 ~/.iphone-use/instances/ci-sim/ 2>/dev/null || true
+
+      - name: Preserve independent gesture evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: simulator-gesture-evidence
+          include-hidden-files: true
+          if-no-files-found: ignore
+          path: |
+            ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/result.json
+            ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/*.png
+            ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/flow.log
+            ~/.iphone-use/instances/ci-sim/gesture-acceptance/fixture-build.log
+            ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/*.xml
+            ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/trace.ndjson

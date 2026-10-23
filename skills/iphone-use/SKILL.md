@@ -25,8 +25,11 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure st
 
 ## The loop
 
-1. **Probe.** `GET /agent/status` / `phone_status`. Act only when
-   `drivable:true`. Otherwise report `hint` and stop. Reconnect once
+1. **Probe.** `GET /agent/status` / `phone_status`. Screen reads and UI input
+   require `drivable:true`; otherwise report `hint` and stop those operations.
+   Paired metadata reads (`phone_home_layout`, `phone_apps`) and cached capability
+   discovery do not require a running Runner. Use them without reconnecting or
+   opening Home, and respect any private-hold refusal. Reconnect once
    (`phone_reconnect` / `POST /agent/mode {"mode":"agent"}`) only when the
    user's current task needs the phone, never for a health check: each runner
    launch can make the operator type the passcode. If `owner` is another
@@ -86,6 +89,7 @@ it off again.
 |---|---|---|---|
 | Find an app's bundle id | `GET /agent/apps?query=微信` | `phone_apps` | — |
 | Open an app | `launch_app` `bundle` (or `name` for built-ins, or `app`: any app's exact name — refused with candidates if ambiguous) | `phone_run_steps` step | `launch_app` (`bundle` or `app`) |
+| Read home pages, Dock and folders | `GET /agent/home-layout?page=0` (omit page for all) | `phone_home_layout` (`page?`) | — |
 | Read the screen | `GET /agent/elements` | `phone_elements` | `wait_for` (`application`, `present`, `absent`) |
 | Tap an element | `tap` + `element` + `snapshot` | `phone_tap_element` | `tap_locator` (durable) |
 | Tap a unique label | `tap` + `label` | `phone_tap_label` | `tap_label` |
@@ -98,6 +102,12 @@ it off again.
 | System alert | `alert` `button` / `action` | `phone_run_steps` step | `alert` |
 | App asks you to log in | `POST /agent/login` (`iphone-use auth login --bwu`) | `phone_login` | — |
 | Switch / slider | `perform` `toggle` / `adjust` | `phone_run_steps` `perform` step (element + snapshot) | — |
+
+For a drag that needs an edge hover, a `drag` step can use
+`points: [{x, y, dwell_ms}, …]` instead of `x1/y1/x2/y2`. Use 2–16 points from
+the current screen. The same finger stays down through each dwell;
+`duration_ms` is travel time per segment and total hold/travel/dwell <= 10s.
+Flow drafts retain the full path. Verify the end screen before the next action.
 
 All actions, including swipe, drag, picker, set_value and the scroll variants,
 are listed in the reference: *Actions catalogue*.
@@ -147,7 +157,19 @@ MCP screen text includes at most 200 rows and 32 KiB of row text. When it
 reports omitted rows, narrow `phone_elements` with `query`/`limit`; an omitted
 target is not proven absent and a truncated list is not proven complete.
 Use the displayed `#N` with its snapshot: it is the original full-tree index.
+To inspect off-screen/not-drawn rows beyond the five-label summary, call
+`phone_elements` with `include_hidden: true` (combine with `query`/`limit`
+to stay within the text budget). These rows are marked `hidden`; scroll them
+into view and read again before acting.
 → reference: *Task metrics, runs and advice*
+
+Home-screen organization: use `phone_home_layout` before opening folders or
+swiping through pages. It reads persisted pages, Dock, folder contents and widget
+stacks without moving any icon. Page/row/col indexes are zero-based. Pages include hidden/Focus-filtered pages,
+so page indexes are not the visible page-control numbers. Positions
+are derived from icon order and grid metrics; unknown sizes make positions null
+and `positions_complete:false`. They are not pixel coordinates or permission to
+restore a layout. Re-read after a drop, then use live elements for gestures.
 
 ## A flow is just these steps saved
 

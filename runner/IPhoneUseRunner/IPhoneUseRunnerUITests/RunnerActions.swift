@@ -17,7 +17,7 @@ enum W3CActions {
   static let minimumHold = 0.01
 
   /// Turns one W3C pointer source's `actions` into touch paths (one per down…up). Moves while the
-  /// pointer is down are sampled every ~16 ms; a down…up with no time between them is held for
+  /// pointer is down keep their timed endpoints for XCTest to interpolate; a down…up with no time between them is held for
   /// `tapHold` so iOS sees a tap, and one with time between them for at least `minimumHold`.
   /// Each step is `{"type": "down"|"move"|"up", "x", "y", "t" (s)}`.
   /// `elementCenter` resolves an element-origin pointerMove.
@@ -37,6 +37,11 @@ enum W3CActions {
       switch action["type"] as? String {
       case "pause":
         t += duration
+        // A time gap alone would interpolate the next move across the pause.
+        // Pin the finger here until the pause ends (long-press / edge hover).
+        if downAt != nil, duration > 0 {
+          current.append(step("move", position, t))
+        }
       case "pointerMove":
         let dx = CGFloat(number(action, "x") ?? 0)
         let dy = CGFloat(number(action, "y") ?? 0)
@@ -48,14 +53,9 @@ enum W3CActions {
           target = CGPoint(x: center.x + dx, y: center.y + dy)
         }
         if downAt != nil {
-          let samples = max(1, min(120, Int((duration / 0.016).rounded(.up))))
-          for index in 1...samples {
-            let fraction = Double(index) / Double(samples)
-            let point = CGPoint(
-              x: position.x + (target.x - position.x) * CGFloat(fraction),
-              y: position.y + (target.y - position.y) * CGFloat(fraction))
-            current.append(step("move", point, t + duration * fraction))
-          }
+          // XCTest interpolates a segment to its timed endpoint. Dense
+          // sub-frame samples can be compressed during simulator playback.
+          current.append(step("move", target, t + duration))
         }
         t += duration
         position = target

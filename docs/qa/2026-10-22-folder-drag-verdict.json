@@ -1,0 +1,42 @@
+{
+  "passed": true,
+  "device": "iPhone 17 Pro Max",
+  "ios": "27.2",
+  "transport": "Wi-Fi",
+  "screen": {
+    "height": 956.0,
+    "width": 440.0
+  },
+  "artifact_run": 39711777067,
+  "candidate_source": "c2b160305a1cff05b722ec138db7a42b36fbc396",
+  "internal_version": "0.21.0",
+  "daemon_sha256": "b117ed2b04f8c9adbef93a54c8c77afe72259269d74cd10e429d0525a0487f2f",
+  "runner_xcode": "27.2 beta 2",
+  "source_main": "642f5255959e6050e288167ee15791efb87ace68",
+  "runner_source_digest_prefix": "81f982ef7a66",
+  "test_folder_apps": 2,
+  "app_state": "offloaded",
+  "edge_dwell_ms": 1200,
+  "hold_ms": 400,
+  "per_segment_ms": 300,
+  "forward": {
+    "from_page": 1,
+    "to_page": 2,
+    "visible_apps": 1
+  },
+  "back": {
+    "from_page": 2,
+    "to_page": 1,
+    "visible_apps": 2
+  },
+  "restored": {
+    "pages": 1,
+    "max_rect_delta_points": 5.684341886080801e-13,
+    "same_app_order": true,
+    "editing": false
+  },
+  "scope": "two offloaded icons; right flip to initially empty page and left flip to populated page; no original iPhone 15 Pro or 10-app regression claim",
+  "timing_note": "UIKit touch timing measured separately; physical folder acceptance uses page and icon postconditions.",
+  "foreground_restore_request": "outcome_unknown",
+  "foreground_observed_after": null
+}

@@ -82,6 +82,13 @@ pub struct TypeParams {
     pub observe: Option<bool>,
 }
 
+/// Select one zero-based home page, or omit to read every page and folder.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HomeLayoutParams {
+    pub page: Option<usize>,
+}
+
 /// Parameters for [`phone_apps`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +112,12 @@ pub struct AppsParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementsParams {
+    /// Show off-screen/not-drawn rows individually in the text, with their
+    /// original indexes and hidden state, instead of a five-label summary.
+    /// The 200-row / 32 KiB text budget still applies. Scroll them into view
+    /// before acting. Default false.
+    #[serde(default)]
+    pub include_hidden: bool,
     /// Keep only rows whose label, identifier, value or placeholder contains
     /// this text (case-insensitive). Rows keep their original index.
     #[serde(default)]
@@ -218,6 +231,16 @@ pub struct RunStepsParams {
     pub observe: Option<bool>,
 }
 
+/// One stop in a continuous drag. Dwell keeps the same finger down.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneDragPoint {
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub dwell_ms: u64,
+}
+
 /// One step in a bounded multi-step sequence.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -250,12 +273,16 @@ pub enum PhoneStep {
         #[serde(default)]
         after_ms: u64,
     },
-    /// Hold, then drag once between two normalized screen points.
+    /// Hold, then drag continuously. Use either x1/y1/x2/y2 or 2–16
+    /// normalized points with optional dwell_ms at each stop. For points,
+    /// duration_ms is travel time per segment; total hold/travel/dwell <= 10s.
     Drag {
-        x1: f64,
-        y1: f64,
-        x2: f64,
-        y2: f64,
+        x1: Option<f64>,
+        y1: Option<f64>,
+        x2: Option<f64>,
+        y2: Option<f64>,
+        #[serde(default)]
+        points: Option<Vec<PhoneDragPoint>>,
         #[serde(default = "default_phone_drag_hold_ms")]
         hold_ms: u64,
         #[serde(default = "default_phone_swipe_ms")]
@@ -901,6 +928,22 @@ impl PhoneHandler {
         }
     }
 
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = true),
+        description = "Read all home-screen pages, Dock, folder pages and widget stacks from the paired iPhone without opening folders, swiping, or taking screenshots. Optional page selects one zero-based page to reduce output. Requires a configured physical target reachable through usbmuxd. This metadata read does not require drivable=true or a running XCTest Runner; never reconnect or open Home solely for this read. Page indexes refer to persisted icon state, including hidden/Focus-filtered pages; they are not the visible page-control indexes. Zero-based row/col positions are derived from icon-state order and grid metrics; null positions or positions_complete=false mean unknown, never safe drag coordinates. Contains no pixel coordinates and does not restore or modify a layout. An unreadable device returns an error rather than an empty home screen."
+    )]
+    async fn phone_home_layout(
+        &self,
+        Parameters(params): Parameters<HomeLayoutParams>,
+    ) -> CallToolResult {
+        match self.daemon.home_layout(params.page).await {
+            Ok(response) => daemon_read_result(&response),
+            Err(error) => CallToolResult::error(vec![Content::text(format!(
+                "home layout failed: {error:#}"
+            ))]),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // phone_apps
     // -----------------------------------------------------------------------
@@ -1147,7 +1190,7 @@ impl PhoneHandler {
         segment is understood; keep single-action tools for exploring an unknown screen. Step kinds: \
         launch_app, open_url, tap_locator, tap_label, tap, type, key, shortcut, scroll, swipe, drag, \
         longpress, back, alert (system alerts; taps on them do not act), picker, perform (toggle a \
-        switch, adjust a slider: element+snapshot from phone_elements), wait_for, pause. Guard every \
+        switch, adjust a slider: element+snapshot from phone_elements), wait_for, pause. Drag points can dwell at an edge while keeping one finger down. Guard every \
         screen change with wait_for; never batch an irreversible step you have not verified. These \
         step objects are exactly a saved flow's `steps` — when the response carries \
         `flow_suggestion`, ask the user whether to keep the task as a flow (phone_flow_draft). \
@@ -1340,6 +1383,8 @@ impl PhoneHandler {
         and `limit` caps the rows — both keep each row's index and the snapshot, so taps still \
         work. Screen text shows at most 200 rows and 32 KiB of row text; an omission notice \
         means a partial view, not absence or list completion. Narrow with query when needed. \
+        include_hidden=true expands off-screen/not-drawn rows instead of summarizing five labels; \
+        these rows are marked hidden and must be scrolled into view before acting. \
         On the first read in a newly entered app a `registry` block lists saved flows for \
         it: if one does the task, phone_flow_run it instead of tapping step by step. An `alert` \
         block means a system alert is up: answer it with an `alert` step, taps on alerts do not act. \
@@ -1349,7 +1394,12 @@ impl PhoneHandler {
     )]
     async fn phone_elements(
         &self,
-        Parameters(ElementsParams { query, limit, ocr }): Parameters<ElementsParams>,
+        Parameters(ElementsParams {
+            query,
+            limit,
+            ocr,
+            include_hidden,
+        }): Parameters<ElementsParams>,
     ) -> CallToolResult {
         let ocr = match crate::device::ocr_param(ocr.as_deref()) {
             Ok(ocr) => ocr,
@@ -1382,7 +1432,13 @@ impl PhoneHandler {
                     .and_then(|b64| b64.as_str().map(str::to_string));
                 let mut text = parsed
                     .as_ref()
-                    .and_then(crate::compact::elements)
+                    .and_then(|json| {
+                        if include_hidden {
+                            crate::compact::elements_with_hidden(json, true)
+                        } else {
+                            crate::compact::elements(json)
+                        }
+                    })
                     .unwrap_or_else(|| body.clone());
                 // OCR rows ride under the tree, never mixed into its indexes.
                 if let Some(ocr) = parsed.as_ref().and_then(crate::device::ocr_block) {
@@ -3016,35 +3072,40 @@ pub(crate) fn phone_steps_request(steps: Vec<PhoneStep>) -> Result<serde_json::V
                 y1,
                 x2,
                 y2,
+                points,
                 hold_ms,
                 duration_ms,
                 after_ms,
             } => {
                 validate_after(after_ms)?;
-                if ![x1, y1, x2, y2].into_iter().all(f64::is_finite)
-                    || ![x1, y1, x2, y2]
+                if let Some(points) = points {
+                    if [x1, y1, x2, y2].iter().any(Option::is_some) {
+                        return Err(format!("steps[{index}] drag needs either points or x1/y1/x2/y2, not both; no action was sent"));
+                    }
+                    let action = serde_json::json!({"type":"drag","points":points,"hold_ms":hold_ms,"duration_ms":duration_ms});
+                    iu_core::drag::Path::parse(&action)
+                        .map_err(|error| format!("steps[{index}] {error}; no action was sent"))?;
+                    action_step(action, after_ms)
+                } else {
+                    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) else {
+                        return Err(format!("steps[{index}] drag needs points or all four x1/y1/x2/y2 coordinates; no action was sent"));
+                    };
+                    if ![x1, y1, x2, y2]
                         .into_iter()
-                        .all(|value| (0.0..=1.0).contains(&value))
-                    || hold_ms > 10_000
-                    || !(1..=10_000).contains(&duration_ms)
-                    || (x1 == x2 && y1 == y2)
-                {
-                    return Err(format!(
-                        "steps[{index}] drag needs distinct coordinates from 0 to 1, hold_ms at most 10000, and duration_ms from 1 to 10000; no action was sent"
-                    ));
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(&v))
+                        || hold_ms > 10_000
+                        || !(1..=10_000).contains(&duration_ms)
+                        || (x1 == x2 && y1 == y2)
+                    {
+                        return Err(format!(
+                            "steps[{index}] drag geometry or timing is invalid; no action was sent"
+                        ));
+                    }
+                    action_step(
+                        serde_json::json!({"type":"drag","x1":x1,"y1":y1,"x2":x2,"y2":y2,"hold_ms":hold_ms,"duration_ms":duration_ms}),
+                        after_ms,
+                    )
                 }
-                action_step(
-                    serde_json::json!({
-                        "type":"drag",
-                        "x1":x1,
-                        "y1":y1,
-                        "x2":x2,
-                        "y2":y2,
-                        "hold_ms":hold_ms,
-                        "duration_ms":duration_ms
-                    }),
-                    after_ms,
-                )
             }
             PhoneStep::TapLabel { label, after_ms } => {
                 validate_after(after_ms)?;
@@ -4113,6 +4174,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn home_layout_preserves_failures_and_page_index_space() {
+        assert!(
+            serde_json::from_value::<HomeLayoutParams>(serde_json::json!({"pages":0})).is_err()
+        );
+        for (status, body, fails) in [
+            ("503 Service Unavailable", br#"{"ok":false,"error":"home_layout_unavailable"}"#.to_vec(), true),
+            ("200 OK", b"<html>proxy error</html>".to_vec(), true),
+            ("200 OK", br#"{"ok":true,"page_index_space":"persisted_icon_state","pages":[{"page":0,"positions_complete":false}]}"#.to_vec(), false),
+        ] {
+            let (url, task)=scripted_daemon(status,body);
+            let result=block(handler_for(&url).phone_home_layout(Parameters(HomeLayoutParams{page:Some(0)})));
+            task.join().unwrap();
+            assert_eq!(result.is_error==Some(true),fails,"{}",text_of(&result));
+            if !fails { assert_eq!(result.structured_content.unwrap()["page_index_space"],"persisted_icon_state"); }
+        }
+    }
+
     /// A read that could not be parsed is not data, and must not be handed
     /// back as though it were.
     #[test]
@@ -4152,7 +4231,7 @@ mod tests {
 
         assert_eq!(
             names.len(),
-            37,
+            38,
             "tool count changed; update README, the skill, and the CI assertion: {names:?}"
         );
         for required in [
@@ -4234,7 +4313,7 @@ mod tests {
 
     /// The tools that only read: no phone input, no outward-facing writes.
     /// `IPHONE_USE_MCP_TOOLS=readonly` exposes exactly these.
-    const READ_ONLY_TOOLS: [&str; 11] = [
+    const READ_ONLY_TOOLS: [&str; 12] = [
         "phone_apps",
         "phone_capabilities",
         "phone_crashes",
@@ -4242,6 +4321,7 @@ mod tests {
         "phone_flow_draft",
         "phone_flow_info",
         "phone_flow_list",
+        "phone_home_layout",
         "phone_screen",
         "phone_screen_frame",
         "phone_screenshot",
@@ -4413,6 +4493,8 @@ mod tests {
             .unwrap();
         let properties = tool.input_schema["properties"].as_object().unwrap();
         assert!(properties.contains_key("query") && properties.contains_key("limit"));
+        assert_eq!(properties["include_hidden"]["type"], "boolean");
+        assert!(!serde_json::from_value::<ElementsParams>(serde_json::json!({})).unwrap().include_hidden);
         assert!(tool
             .input_schema
             .get("required")
@@ -4508,6 +4590,46 @@ mod tests {
     }
 
     #[test]
+    fn drag_waypoints_validate_before_any_batch_is_sent() {
+        let valid = serde_json::json!({"kind":"drag","points":[
+            {"x":0.3,"y":0.4},{"x":0.13,"y":0.5,"dwell_ms":900},{"x":0.5,"y":0.4}
+        ],"hold_ms":400,"duration_ms":300});
+        let request =
+            phone_steps_request(vec![serde_json::from_value(valid.clone()).unwrap()]).unwrap();
+        let expected = valid["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let mut p = p.clone();
+                if p.get("dwell_ms").is_none() {
+                    p["dwell_ms"] = serde_json::json!(0);
+                }
+                p
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request["steps"][0]["action"]["points"].as_array().unwrap(),
+            &expected
+        );
+        for change in [
+            serde_json::json!({"x1":0.1}),
+            serde_json::json!({"points":[]}),
+            serde_json::json!({"hold_ms":10000}),
+        ] {
+            let mut step = valid.clone();
+            for (key, value) in change.as_object().unwrap() {
+                step[key] = value.clone();
+            }
+            let step = serde_json::from_value(step).unwrap();
+            assert!(phone_steps_request(vec![step]).is_err());
+        }
+        let mut unknown = valid;
+        unknown["points"][0]["wait_ms"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<PhoneStep>(unknown).is_err());
+    }
+
+    #[test]
     fn multi_step_request_encodes_recordable_gestures() {
         let request = phone_steps_request(vec![
             PhoneStep::Longpress {
@@ -4525,10 +4647,11 @@ mod tests {
                 after_ms: 0,
             },
             PhoneStep::Drag {
-                x1: 0.2,
-                y1: 0.5,
-                x2: 0.8,
-                y2: 0.5,
+                x1: Some(0.2),
+                y1: Some(0.5),
+                x2: Some(0.8),
+                y2: Some(0.5),
+                points: None,
                 hold_ms: 500,
                 duration_ms: 400,
                 after_ms: 0,
@@ -4887,7 +5010,7 @@ mod tests {
                 assert!(tool.get("_meta").is_none(), "{name} has no _meta: {tool}");
             }
         }
-        assert_eq!(tools.len(), 37, "the whole documented surface");
+        assert_eq!(tools.len(), 38, "the whole documented surface");
     }
 
     #[test]
@@ -5043,6 +5166,31 @@ mod tests {
         let text = text_of(&result);
         assert!(text.contains("Nothing was sent") || text.contains("nothing was sent"), "{text}");
         text
+    }
+
+    #[test]
+    fn requested_hidden_elements_reach_all_structured_modes_without_an_extra_read() {
+        let body = serde_json::json!({"snapshot":"S", "elements":[
+            {"index":17,"kind":"Button","label":"Hidden target","identifier":"target-id","visible":false}
+        ], "filter":{"query":"target","matched":1,"returned":1,"omitted":0,"of":30}});
+        let (result, line, _, _) = device_call("200 OK", &body.to_string(), |h| async move {
+            h.phone_elements(Parameters(ElementsParams {
+                query: Some("target".into()), include_hidden: true, ..Default::default()
+            })).await
+        });
+        assert_eq!(line, "GET /agent/elements?image=auto&query=target HTTP/1.1");
+        assert_ne!(result.is_error, Some(true));
+        for mode in [StructuredMode::Slim, StructuredMode::Full, StructuredMode::Off] {
+            let shaped = shape_structured(result.clone(), mode);
+            let text = text_of(&shaped);
+            assert!(text.contains("#17 [Button] \"Hidden target\" id=target-id hidden"), "{text}");
+            assert!(text.contains("\"omitted\":0"), "{text}");
+            if mode == StructuredMode::Slim {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["summary"], text);
+            } else if mode == StructuredMode::Full {
+                assert_eq!(shaped.structured_content.as_ref().unwrap()["elements"], body["elements"]);
+            }
+        }
     }
 
     #[test]

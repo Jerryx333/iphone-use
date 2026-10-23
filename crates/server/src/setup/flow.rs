@@ -33,10 +33,7 @@ const PORT_IN_USE_WINDOW: Duration = Duration::from_secs(60);
 const PORT_IN_USE_RETRY: Duration = Duration::from_secs(3);
 /// Published as `not_connected`; the daemon's hint says the same.
 const NOT_CONNECTED_MESSAGE: &str = "the iPhone isn't connected to this Mac — plug it in over USB (or join the same Wi-Fi) and unlock it";
-/// Published as `needs_passcode_on_phone`: a start on a phone with a passcode
-/// that nobody unlocked for.
-const NEEDS_PASSCODE_MESSAGE: &str = "the iPhone has a passcode and iOS asks for it on the phone every time the device runner starts; nobody entered it, so UI automation was not enabled — have a person at the phone enter the passcode during the next start (if no prompt appears, check Settings › Developer › Enable UI Automation). After one successful start the daemon keeps the runner up while idle, so it does not ask again";
-const AUTOMATION_MODE_HINT: &str = "enable UI automation on the iPhone: Settings › Developer › Enable UI Automation, then accept any passcode or Allow automation prompt while the phone is unlocked";
+const AUTOMATION_MODE_HINT: &str = "check Settings › Developer › Enable UI Automation on the unlocked iPhone and handle any passcode or Allow prompt if it appears; if already authorized, inspect the CoreDevice connection and runner log";
 
 /// How often [`Setup::wait_for_developer_services`] re-checks the mount.
 const DDI_POLL: Duration = Duration::from_secs(1);
@@ -1740,33 +1737,23 @@ impl Setup {
         }
     }
 
-    /// A runner start on a passcode phone ended without UI automation:
-    /// nobody entered the passcode. Publish `needs_passcode_on_phone` and
-    /// leave the marker that keeps the next runner up while idle.
-    fn report_needs_passcode<T>(&self, cause: &str) -> Step<T> {
-        crate::keep_runner::write_passcode_marker(self.ctx.state_dir());
-        self.phase(
-            "building-fail",
-            crate::keep_runner::NEEDS_PASSCODE_BLOCKER,
-            NEEDS_PASSCODE_MESSAGE,
-        );
-        die(format!(
-            "{NEEDS_PASSCODE_MESSAGE} ({cause}). KeepAlive retries on its own. Log: {}",
-            self.ctx.run_log.display()
-        ))
+    /// Keep the conservative idle policy without inferring a failure cause
+    /// from the independent fact that the phone has a passcode.
+    fn remember_passcode_phone(&self) {
+        if self.passcode_phone() {
+            crate::keep_runner::write_passcode_marker(self.ctx.state_dir());
+        }
     }
 
     fn report_automation_disabled<T>(&self) -> Step<T> {
-        if self.passcode_phone() {
-            return self.report_needs_passcode("iOS did not enable UI automation");
-        }
+        self.remember_passcode_phone();
         self.phase(
             "building-fail",
             "automation_mode_disabled",
             AUTOMATION_MODE_HINT,
         );
         die(format!(
-            "iOS did not enable UI automation for the device runner — {AUTOMATION_MODE_HINT}, then rerun setup (KeepAlive retries on its own). Log: {}",
+            "the device runner did not become ready for UI automation — {AUTOMATION_MODE_HINT}, then rerun setup (KeepAlive retries on its own). Log: {}",
             self.ctx.run_log.display()
         ))
     }
@@ -1783,14 +1770,13 @@ impl Setup {
         )
     }
 
-    /// testmanagerd refused the IDE channel with an Xcode that supports this
-    /// iOS. Over USB the phone wants a passcode or Allow prompt answered;
-    /// over Wi-Fi iOS cannot show that prompt at all, so it is its own
-    /// blocker with a long backoff instead of a minute-by-minute relaunch.
+    /// The IDE channel was not established. Transport determines retry policy,
+    /// but exit code 74 does not establish an authentication or network cause.
     fn report_ide_refusal<T>(&mut self) -> Step<T> {
         let wait = runner::ide_refusal_wait_secs(&self.ctx.run_log);
         let transport = checks::transport(&self.ctx.udid);
         let log = self.ctx.run_log.display().to_string();
+        self.remember_passcode_phone();
         match ide_refusal_blocker(transport) {
             "wifi_automation_refused" => {
                 let message = wifi_automation_message(wait);
@@ -1804,17 +1790,11 @@ impl Setup {
                 self.phase("building-fail", "wifi_automation_refused", &message);
                 self.failure_kind = Kind::WifiAutomation;
                 die(format!(
-                    "{message}. Retrying over Wi-Fi cannot fix this; KeepAlive waits 15 minutes between attempts and starts again as soon as the iPhone is plugged in over USB. Log: {log}"
+                    "{message}. KeepAlive waits 15 minutes between Wi-Fi attempts and retries when the iPhone is plugged in over USB. Log: {log}"
                 ))
             }
             _ => {
                 self.failure_kind = Kind::Automation;
-                if self.passcode_phone() {
-                    return self.report_needs_passcode(&format!(
-                        "runner exit code 74, IDE channel refused{}",
-                        waited(wait)
-                    ));
-                }
                 let message = automation_message(wait);
                 self.phase("building-fail", "automation_not_allowed", &message);
                 die(format!(
@@ -3418,14 +3398,9 @@ impl UnlockWait {
 
 /// #126: only when the SDK's major.minor is older than the phone's does a
 /// code-74 refusal mean the Xcode is too old.
-/// Which blocker an IDE-channel refusal (code 74, supported iOS) is: over
-/// Wi-Fi some iOS versions never finish the test session (hardware: iPhone 14
-/// on iOS 27.2 beta, Enable UI Automation on, no prompt, Xcode 27.0 and 27.2
-/// alike), so it is not something a person can allow on the phone. A runner
-/// started over USB keeps working after the unplug. An unknown transport
-/// keeps the USB reading.
-/// State-dir marker: this phone refused to start the device runner over
-/// Wi-Fi (`wifi_automation_refused`). Cleared when a runner next starts over
+/// State-dir marker: an IDE-channel session failed over Wi-Fi. This records
+/// the observed transport, not a permanent restriction or authentication cause.
+/// Cleared when a runner next starts over
 /// Wi-Fi. While it exists the daemon does not idle-release a runner that is
 /// up over the Wi-Fi tunnel.
 pub const WIFI_START_REFUSED_FILE: &str = "wifi-start-refused";
@@ -3458,14 +3433,14 @@ pub fn not_reachable_message(udid: &str, tunnel_allowed: bool) -> String {
 
 pub fn wifi_automation_message(wait: Option<u64>) -> String {
     format!(
-        "over Wi-Fi the iPhone would not start the device runner's UI-automation session (runner exit code 74: testmanagerd took the Mac's test session but never gave the runner its IDE channel{}). This iPhone's iOS refuses to start UI automation over the network; it is not a passcode prompt or a setting, so nothing on the phone and no Wi-Fi retry fixes it. Plug the iPhone in by USB once, unlocked: the runner starts in about 20 s, and after you unplug it keeps working over Wi-Fi until it has to start again (phone restart, runner crash), which needs the cable once more",
+        "the runner's IDE channel was not established over Wi-Fi (exit code 74{}). This does not prove a missing passcode or a permanent Wi-Fi restriction. Keep the phone unlocked and handle a prompt if one appears; if already authorized, inspect the CoreDevice tunnel and runner log. Starting by USB once is a recovery option; verify fresh reads after you unplug before relying on Wi-Fi",
         waited(wait)
     )
 }
 
 pub fn automation_message(wait: Option<u64>) -> String {
     format!(
-        "the iPhone did not authorize the device runner's UI-automation session (runner exit code 74, IDE channel refused{}) although this Xcode supports its iOS — a passcode or Allow prompt appears on the iPhone while the runner starts and times out after about 30 s; unlock the iPhone, check Settings › Developer › Enable UI Automation, and answer that prompt during the next attempt",
+        "the runner's IDE channel was not established (exit code 74{}) although this Xcode supports its iOS. This does not prove an unanswered passcode or Allow prompt. Keep the phone unlocked, check Settings › Developer › Enable UI Automation, and handle a prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log",
         waited(wait)
     )
 }
@@ -3810,7 +3785,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wifi_refusal_is_its_own_blocker_and_names_usb() {
+    fn ide_channel_failure_records_transport_without_inventing_a_cause() {
         assert_eq!(
             ide_refusal_blocker(checks::Transport::Network),
             "wifi_automation_refused"
@@ -3822,22 +3797,23 @@ mod tests {
         assert_eq!(
             ide_refusal_blocker(checks::Transport::Unknown),
             "automation_not_allowed",
-            "without evidence of Wi-Fi, keep the on-phone reading"
+            "without evidence of Wi-Fi, preserve the generic failure"
         );
         let wifi = wifi_automation_message(Some(30));
         assert!(wifi.contains("over Wi-Fi"), "{wifi}");
         assert!(wifi.contains("by USB once"), "{wifi}");
         assert!(wifi.contains("after you unplug"), "{wifi}");
-        assert!(
-            !wifi.contains("passcode when"),
-            "no prompt to answer: {wifi}"
-        );
+        assert!(wifi.contains("does not prove"), "{wifi}");
         assert!(wifi.contains("after waiting 30 s"), "{wifi}");
         let usb = automation_message(None);
-        assert!(usb.contains("about 30 s"), "{usb}");
+        assert!(usb.contains("does not prove"), "{usb}");
         assert!(!usb.contains("after waiting"), "{usb}");
         for text in [wifi, usb, automation_message(Some(2))] {
             assert!(!text.contains("--"), "never a bypass flag: {text}");
+            assert!(text.contains("if already authorized"), "{text}");
+            assert!(text.contains("CoreDevice"), "{text}");
+            assert!(!text.contains("nobody entered"), "{text}");
+            assert!(!text.contains("about 20 s"), "{text}");
         }
     }
 
@@ -5319,14 +5295,7 @@ impl Setup {
                             continue 'attempts;
                         }
                         let reason = legacy_ios::last_error(&log);
-                        // On a passcode phone the launch waits for the
-                        // passcode on the phone; with nobody there it never
-                        // starts (hardware: iPhone X, iOS 16).
-                        if self.passcode_phone() {
-                            return self.report_needs_passcode(&format!(
-                                "the iOS 15/16 runner did not start: {reason}"
-                            ));
-                        }
+                        self.remember_passcode_phone();
                         self.phase(
                             "building-fail",
                             "runner",

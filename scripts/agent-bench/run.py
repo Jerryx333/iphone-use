@@ -5,13 +5,13 @@ Each task is a Markdown file in tasks/ with a small header:
 
     ---
     name: settings-ios-version
-    expect: "iOS \\d+"          # regex the final answer must match (optional)
+    expect: "iOS \\d+"          # answer format only (optional)
     max_tool_calls: 8            # budget the run is judged against (optional)
     ---
     Open Settings on my iPhone and tell me which iOS version it runs.
 
 The driver gives Claude only the iphone-use MCP server (the installed one by
-default), records Claude's stream JSONL, and reports per task: pass/fail, tool
+default), records Claude's stream JSONL, and reports per task: checks, verification, tool
 calls by name, failed tool calls, turns, wall time, tokens and cost. This tells
 whether the tool descriptions lead a model to the short path, the way
 XcodeBuildMCP's and mobile-mcp's agent benchmarks do.
@@ -20,12 +20,13 @@ It drives a real phone and spends model tokens, so it is manual, not CI:
 
     scripts/agent-bench/run.py                 # every task
     scripts/agent-bench/run.py --task settings-ios-version --model claude-sonnet-5-5
-    scripts/agent-bench/run.py --from-jsonl out/…/settings.jsonl   # re-audit a run
+    scripts/agent-bench/run.py --from-jsonl out/…/settings-ios-version.jsonl   # re-audit a run
 
 Artifacts go to scripts/agent-bench/out/<timestamp>/ (git-ignored).
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -61,8 +62,8 @@ def parse_task(path):
 
 def audit(lines, returncode=0):
     """Summarize one stream-json run (an iterable of JSONL lines). A run
-    without a final `result` event, or whose `claude` exited non-zero, is an
-    error."""
+    without a final `result` event, or whose known exit code is non-zero, is
+    an error. None means the original exit code was not supplied."""
     calls, failed, names = [], [], {}
     pending = {}
     result = {}
@@ -102,12 +103,13 @@ def audit(lines, returncode=0):
         "input_tokens": usage.get("input_tokens"),
         "output_tokens": usage.get("output_tokens"),
         "answer": result.get("result", ""),
-        "is_error": bool(result.get("is_error")) or not result or returncode != 0,
+        "is_error": bool(result.get("is_error")) or not result or returncode not in (None, 0),
+        "process_returncode": returncode,
     }
 
 
 def judge(header, summary):
-    """Pass/fail and the reasons, from the task header and the audit."""
+    """Check execution, answer format and call budget, not physical completion."""
     reasons = []
     if summary["is_error"]:
         reasons.append("claude reported an error, exited non-zero or gave no result")
@@ -118,6 +120,56 @@ def judge(header, summary):
     if isinstance(budget, int) and summary["tool_calls"] > budget:
         reasons.append(f"{summary['tool_calls']} tool calls > budget {budget}")
     return not reasons, reasons
+
+
+def assess(header, trace, returncode=None, verification=None):
+    """Only an independent, trace-bound receipt can verify task postconditions.
+
+    The model's answer, regex match and tool acknowledgements are not receipts.
+    Receipt loading never executes code or takes instructions from the trace.
+    """
+    digest = hashlib.sha256()
+    with open(trace, "rb") as source:
+        def captured_lines():
+            for line in source:
+                digest.update(line)
+                yield line.decode("utf-8")
+        summary = audit(captured_lines(), returncode)
+    fingerprint = digest.hexdigest()
+    checks_passed, reasons = judge(header, summary)
+    proof = {"state": "unverified"}
+    if verification:
+        with open(verification, encoding="utf-8") as source:
+            receipt = json.load(source)
+        if not isinstance(receipt, dict):
+            raise ValueError("verification receipt must be an object")
+        if receipt.get("task") != header["name"]:
+            raise ValueError("verification receipt belongs to another task")
+        if receipt.get("trace_sha256") != fingerprint:
+            raise ValueError("verification receipt does not match this trace")
+        if type(receipt.get("verified")) is not bool:
+            raise ValueError("receipt verified must be a boolean")
+        for field in ("verifier", "evidence"):
+            if not isinstance(receipt.get(field), str) or not receipt[field].strip():
+                raise ValueError(f"receipt {field} must name the independent check")
+        proof = {key: receipt[key] for key in
+                 ("task", "trace_sha256", "verifier", "evidence")}
+        proof["state"] = "passed" if receipt["verified"] else "failed"
+    if not checks_passed or proof["state"] == "failed":
+        passed = False
+        if proof["state"] == "failed":
+            reasons.append("independent task verification failed")
+    elif proof["state"] == "passed" and returncode == 0:
+        passed = True
+    else:
+        passed = None
+        if proof["state"] != "passed":
+            reasons.append("task postconditions have not been independently verified")
+        if returncode is None:
+            reasons.append("the original process exit status was not supplied")
+    return {"schema_version": 2, "task": header["name"], **summary, "passed": passed,
+            "trace_sha256": fingerprint,
+            "checks_passed": checks_passed, "verification": proof, "reasons": reasons}
 
 
 def run_task(path, out_dir, mcp, model):
@@ -136,20 +188,21 @@ def run_task(path, out_dir, mcp, model):
     started = time.monotonic()
     with open(jsonl, "w", encoding="utf-8") as sink:
         proc = subprocess.run(command, stdout=sink, stderr=subprocess.STDOUT, cwd=out_dir, check=False)
-    with open(jsonl, encoding="utf-8") as source:
-        summary = audit(source, proc.returncode)
-    summary["wall_ms"] = int((time.monotonic() - started) * 1000)
-    passed, reasons = judge(header, summary)
-    return {"task": header["name"], "passed": passed, "reasons": reasons, **summary}
+    result = assess(header, jsonl, proc.returncode)
+    result["wall_ms"] = int((time.monotonic() - started) * 1000)
+    return result
 
 
 def print_report(rows):
     for row in rows:
-        mark = "PASS" if row["passed"] else "FAIL"
-        secs = (row.get("duration_ms") or row.get("wall_ms") or 0) / 1000
+        mark = "UNVERIFIED" if row["passed"] is None else "PASS" if row["passed"] else "FAIL"
+        elapsed = row.get("duration_ms")
+        if elapsed is None:
+            elapsed = row.get("wall_ms")
+        timing = f"{elapsed / 1000:.1f} s" if elapsed is not None else "duration unknown"
         cost = row.get("cost_usd")
         print(f"{mark} {row['task']}: {row['tool_calls']} tool calls, "
-              f"{len(row['failed_calls'])} failed, {row.get('turns')} turns, {secs:.1f} s"
+              f"{len(row['failed_calls'])} failed, {row.get('turns')} turns, {timing}"
               + (f", ${cost:.4f}" if isinstance(cost, (int, float)) else ""))
         print(f"     sequence: {' → '.join(row['sequence']) or '(none)'}")
         for reason in row["reasons"]:
@@ -162,18 +215,38 @@ def main(argv=None):
     parser.add_argument("--model", help="exact Claude model id for a controlled comparison")
     parser.add_argument("--mcp", default=os.environ.get("IPHONE_USE_MCP", str(DEFAULT_MCP)))
     parser.add_argument("--from-jsonl", help="re-audit a saved run instead of running Claude")
+    parser.add_argument("--verification", help="independent JSON receipt bound to --from-jsonl")
+    parser.add_argument("--returncode", type=int, help="original process exit code for --from-jsonl")
     parser.add_argument("--json", action="store_true", help="print machine-readable results")
     args = parser.parse_args(argv)
+    replay = args.from_jsonl is not None
+    if replay and not args.from_jsonl.strip():
+        parser.error("--from-jsonl must name a trace file")
+    if args.verification is not None and not args.verification.strip():
+        parser.error("--verification must name a receipt file")
+    if args.verification is not None and not replay:
+        parser.error("--verification requires --from-jsonl")
+    if args.returncode is not None and not replay:
+        parser.error("--returncode requires --from-jsonl")
 
-    if args.from_jsonl:
-        with open(args.from_jsonl, encoding="utf-8") as source:
-            summary = audit(source)
-        rows = [{"task": pathlib.Path(args.from_jsonl).stem, "passed": not summary["is_error"],
-                 "reasons": [], **summary}]
+    if replay:
+        if args.task and len(args.task) != 1:
+            parser.error("re-auditing needs exactly one --task")
+        name = args.task[0] if args.task else pathlib.Path(args.from_jsonl).stem
+        task = HERE / "tasks" / f"{name}.md"
+        if not task.is_file():
+            parser.error("no matching task header; provide --task NAME")
+        header, _ = parse_task(task)
+        try:
+            rows = [assess(header, args.from_jsonl, args.returncode, args.verification)]
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     else:
         tasks = sorted((HERE / "tasks").glob("*.md"))
         if args.task:
             tasks = [HERE / "tasks" / f"{name}.md" for name in args.task]
+        if not tasks:
+            parser.error("no benchmark tasks were selected")
         out_dir = HERE / "out" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir.mkdir(parents=True, exist_ok=True)
         rows = [run_task(task, out_dir, args.mcp, args.model) for task in tasks]
@@ -182,7 +255,9 @@ def main(argv=None):
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     else:
         print_report(rows)
-    return 0 if all(row["passed"] for row in rows) else 1
+    if any(row["passed"] is False for row in rows):
+        return 1
+    return 0 if all(row["passed"] is True for row in rows) else 3
 
 
 if __name__ == "__main__":

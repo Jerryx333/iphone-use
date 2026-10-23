@@ -153,9 +153,10 @@ jobs:
           tools = listing["result"]["tools"]
           names = sorted(tool["name"] for tool in tools)
 
-          assert len(names) == 37, names
+          assert len(names) == 38, names
           for required in (
               "phone_capabilities",
+              "phone_home_layout",
               "phone_status",
               "phone_run_steps",
               "phone_hold",
@@ -200,6 +201,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/test-drag-simulator-verdict.py
           # Same gate as release-binaries.yml: the installer ships SKILL.md
           # alone, so the skill directory must hold exactly that one file
           # (agent reference lives in docs/agent-reference.md).

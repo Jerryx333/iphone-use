@@ -1024,12 +1024,9 @@ static NSString *IPURSynthesize(id record, id path)
     id path = IPURNewTouchPath(start, 0.0);
     if (path == nil) return @"private XCTest event synthesis failed: could not create pointer path";
     duration = MAX(0.05, duration);
-    NSInteger steps = MIN(60, MAX(2, (NSInteger)ceil(duration / 0.016)));
-    for (NSInteger step = 1; step <= steps; step++) {
-      double t = (double)step / (double)steps;
-      CGPoint point = CGPointMake(start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t);
-      IPURMove(path, point, duration * t);
-    }
+    // XCTest interpolates the segment. Sub-frame samples can shorten its
+    // playback time (covered by the simulator touch-receiver fixture).
+    IPURMove(path, end, duration);
     IPURLift(path, duration);
     return IPURSynthesize(record, path);
   } @catch (NSException *exception) {

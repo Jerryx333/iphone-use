@@ -1043,6 +1043,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         // existing `/agent/inbox`; the registry file — not the phone — is the
         // capability list.
         .route("/agent/apps", get(agent_apps))
+        .route("/agent/home-layout", get(agent_home_layout))
         .route("/agent/intents", get(agent_intents))
         .route("/agent/intent", post(agent_intent))
         .route("/agent/hold", post(agent_hold))
@@ -2785,9 +2786,7 @@ async fn agent_status(
         None
     };
     let setup_blocked_on = if state.managed_runner {
-        // An automation refusal on a phone known to have a passcode is the
-        // passcode prompt nobody answered: name it (setup does too when it
-        // knows; this covers a passcode the daemon learned first).
+        // Passcode presence is not evidence of an unanswered prompt.
         crate::keep_runner::person_blocker(
             &read_setup_blocked_on(),
             crate::lock_readiness::passcode(),
@@ -3506,12 +3505,12 @@ fn human_next_step(
                 "This iPhone restarted and has not been unlocked since: someone needs to enter the passcode on the phone once, then it connects on its own.",
             ),
             "needs_passcode_on_phone" => (
-                "手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。",
-                "This iPhone has a passcode: this start needs someone at the phone to enter it and allow UI Automation. After that, staying connected means it will not ask again.",
+                "连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。",
+                "Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log.",
             ),
             "automation_mode_disabled" => (
-                "在 iPhone 的 设置 › 开发者 里打开「启用 UI 自动化」，并允许弹出的提示",
-                "On the iPhone, turn on Settings › Developer › Enable UI Automation and allow the prompt",
+                "自动化模式未就绪。请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查连接和日志。",
+                "Automation mode is not ready. On the unlocked iPhone, check Settings › Developer › Enable UI Automation and handle a prompt if one appears; if already enabled and authorized, inspect the connection and runner log.",
             ),
             "locked" => (
                 "请解锁 iPhone 并保持亮屏，解锁后会自动接着连接",
@@ -3534,12 +3533,12 @@ fn human_next_step(
                 "This iOS 15/16 iPhone is neither plugged in nor reachable over Wi-Fi from this Mac: plug it in once and keep it unlocked — it connects in about 20 s, and after that it can be unplugged and used over Wi-Fi (on the same network as this Mac)",
             ),
             "automation_not_allowed" => (
-                "iPhone 没有授权这次 UI 自动化：runner 启动时手机上会弹出密码或「允许」提示，约 30 秒不处理就会失败；请解锁手机、确认 设置 › 开发者 › 启用 UI 自动化 已打开，下次重试时完成这个提示；会自动重试",
-                "The iPhone did not authorize UI automation: a passcode or Allow prompt appears on the iPhone while the runner starts and times out after about 30 s — unlock it, check Settings › Developer › Enable UI Automation, and answer that prompt on the next attempt; it retries on its own",
+                "自动化会话未建立（错误码 74），原因尚未确认。请保持解锁并检查 设置 › 开发者 › 启用 UI 自动化；若手机出现密码或允许提示，请处理。若已授权，检查 CoreDevice 连接和 runner 日志；会按退避策略重试。",
+                "The automation session was not established (exit code 74); its cause is unconfirmed. Keep the phone unlocked, check Settings › Developer › Enable UI Automation, and handle a passcode or Allow prompt if one appears. If already authorized, inspect the CoreDevice connection and runner log; retries use backoff.",
             ),
             "wifi_automation_refused" => (
-                "这台 iPhone 的 iOS 不允许通过 Wi-Fi 启动设备服务（和锁屏密码、设置开关都无关，手机上没有可点的选项，重试也没用）：插一次线启动（保持解锁，约 20 秒连上），之后拔掉可以一直用 Wi-Fi，直到设备服务重启（比如手机重启）时再插一次",
-                "This iPhone's iOS will not start the device service over Wi-Fi (not a passcode or a setting, nothing to tap on the phone, and retrying will not help): plug it in by USB once to start it (unlocked, about 20 s), then unplug it and keep using Wi-Fi until the device service restarts (for example after the phone restarts), when it needs the cable once more",
+                "这次 Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时可插一次线启动，拔掉后用新的屏幕读取验证连接。",
+                "This Wi-Fi automation session was not established. Exit code 74 does not prove a permanent Wi-Fi restriction. Inspect the CoreDevice tunnel; starting by USB once is a recovery option. Verify fresh screen reads after you unplug.",
             ),
             "runner" => (
                 "设备 runner 启动失败：在这台 Mac 上运行 iphone-use doctor 查看原因",
@@ -3684,10 +3683,10 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the configured iPhone is on USB but usbmuxd does not list it: it restarted and has not been unlocked since (Before First Unlock), and iOS keeps it off usbmuxd until its passcode is entered once — this is not an Xcode problem; have a person enter the passcode on the phone, and the managed service connects on its own after that, so do not send another reconnect request",
         ),
         "needs_passcode_on_phone" => Some(
-            "the iPhone has a passcode, and iOS asks for it on the phone every time the device runner starts before it enables UI automation; nobody entered it, so the start timed out — have a person at the phone unlock it and enter the passcode when the runner starts (if no prompt appears, check Settings › Developer › Enable UI Automation). Nothing remote can enter a passcode. After one successful start the daemon keeps the runner up while idle (keep_runner_alive) so it does not ask again; the managed service retries on its own backoff, so do not send another reconnect request",
+            "Setup recorded a possible on-phone authorization requirement. If a passcode or Allow prompt appears, handle it on the unlocked phone. If already authorized, inspect the CoreDevice connection and runner log; this historical blocker does not prove that a prompt was ignored. keep_runner_alive avoids unnecessary relaunches; do not send another reconnect request",
         ),
         "automation_mode_disabled" => Some(
-            "iOS has not enabled UI automation for the device runner — on the unlocked iPhone turn on Settings › Developer › Enable UI Automation and accept any passcode or Allow automation prompt; the managed service retries on its own backoff, so do not send another reconnect request",
+            "The device runner did not become ready for UI automation. On the unlocked iPhone, check Settings › Developer › Enable UI Automation and handle a passcode or Allow automation prompt if one appears; if already enabled and authorized, inspect the CoreDevice connection and runner log; the managed service retries on its own backoff, so do not send another reconnect request",
         ),
         "locked" => Some(
             "the iPhone is locked — unlock it and keep it awake; connecting continues on its own as soon as it is unlocked, so do not send another reconnect request",
@@ -3705,10 +3704,10 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the phone runs iOS 15/16 and is neither on USB nor reachable over Wi-Fi (its lockdownd does not answer on its LAN address, or that address is not known yet) — have a person plug it into this Mac once, unlocked; after that the runner starts over Wi-Fi and survives the unplug; the managed service starts it as soon as usbmuxd lists the phone on USB, so do not send another reconnect request",
         ),
         "automation_not_allowed" => Some(
-            "the iPhone did not authorize the device runner's UI-automation session although this Xcode supports its iOS (the runner exited with code 74, testmanagerd refused the IDE channel) — a passcode or Allow prompt appears on the iPhone while the runner starts and times out after about 30 s; unlock the iPhone, check Settings › Developer › Enable UI Automation, and have a person answer that prompt on the next attempt; the managed service retries quietly every 5 s to 1 min, so do not send another reconnect request",
+            "The runner's IDE channel was not established (exit code 74) although this Xcode supports its iOS. This does not prove an unanswered passcode or Allow prompt. Keep the phone unlocked, check Settings › Developer › Enable UI Automation, and handle a prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log. The managed service retries with backoff; do not send another reconnect request",
         ),
         "wifi_automation_refused" => Some(
-            "over Wi-Fi the iPhone would not start the device runner's UI-automation session (code 74: testmanagerd took the test session but never gave the runner its IDE channel; setup_message has the wait) — this iPhone's iOS refuses to start UI automation over the network, and no passcode, setting or Wi-Fi retry changes that; have a person plug the iPhone in by USB once, unlocked: the runner starts in about 20 s and keeps working over Wi-Fi after the unplug, until the phone restarts or the runner has to start again; the managed service waits 15 minutes between Wi-Fi attempts and retries at once when the phone is plugged in, so do not send another reconnect request",
+            "The runner failed to establish its IDE channel over Wi-Fi (exit code 74; setup_message has the wait). This does not prove a permanent Wi-Fi restriction or an unanswered prompt. Inspect the CoreDevice tunnel and runner log. Starting by USB once is a recovery option; verify fresh reads after you unplug. The managed service retries with backoff; do not send another reconnect request",
         ),
         "runner" => Some(
             "the device runner failed to start — inspect ~/.iphone-use/runner-agent.log and run iphone-use doctor before retrying",
@@ -4852,10 +4851,10 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     kept_runner = Some(because);
                     match because {
                         crate::keep_runner::Because::WifiStartRefused => tracing::info!(
-                            "idle, but keeping the runner: it is up over Wi-Fi and this iPhone refused to start one over Wi-Fi (wifi_automation_refused), so a release would need the cable to undo"
+                            "idle, but keeping the runner: it is up over Wi-Fi and an earlier Wi-Fi start failed (wifi_automation_refused); restarting may require USB recovery"
                         ),
                         crate::keep_runner::Because::Passcode => tracing::info!(
-                            "idle, but keeping the runner: this iPhone has a passcode and every runner start asks for it on the phone, so a release would need a person to undo (IPHONE_USE_IDLE_RELEASE=force releases anyway)"
+                            "idle, but keeping the runner: this iPhone has a passcode and restarting may require on-phone authorization (IPHONE_USE_IDLE_RELEASE=force releases anyway)"
                         ),
                     }
                 }
@@ -5610,6 +5609,17 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
             // device: an unlisted name is refused without reaching the phone.
             "perform_actions": perform,
             "element_tree": true,
+            "home_layout": {"source":"springboardservices","read_only":true,
+                "physical_only":true,"target_required":true,"positions":"derived_from_icon_state_order"},
+            "drag_path": {
+                "requires_runner_capability": "ipu:timedDragPath",
+                "min_segment_ms": 80,
+                "max_segment_ms": 2000,
+                "max_hold_ms": 2000,
+                "max_points": core::drag::MAX_POINTS,
+                "max_total_ms": core::drag::MAX_DURATION_MS,
+                "duration_ms": "per_segment",
+            },
             "observation": {
                 "return_delta": true,
                 "settle_ms_max": AGENT_INPUT_SETTLE_MAX_MS,
@@ -8919,11 +8929,10 @@ fn runner_predicate_literal(value: &str) -> String {
 
 /// Build a fresh runner element lookup for a strict agent locator.
 ///
-/// runner's predicate attributes do not expose the source tree's
-/// `rawIdentifier`. When an identifier is the only condition, accessibility-id
-/// is the closest native lookup and the caller still requires exactly one
-/// result. When other fields exist, the source-tree precheck above enforces the
-/// identifier while the predicate re-resolves every runner-queryable condition.
+/// The native runner exposes `identifier` separately from `name` (which can
+/// fall back to the label). Match the actual identifier, even when it is the
+/// only condition: a namesake without that identifier must not replace a
+/// target that disappeared after the source precheck.
 fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, String)> {
     let mut clauses = Vec::new();
     if let Some(kind) = &locator.kind {
@@ -8935,6 +8944,9 @@ fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, 
     if let Some(label) = &locator.label {
         let label = runner_predicate_literal(label);
         clauses.push(format!("(label == {label} OR name == {label})"));
+    }
+    if let Some(identifier) = &locator.identifier {
+        clauses.push(format!("identifier == {}", runner_predicate_literal(identifier)));
     }
     if let Some(value) = &locator.value {
         clauses.push(format!("value == {}", runner_predicate_literal(value)));
@@ -8948,14 +8960,7 @@ fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, 
     if let Some(visible) = locator.visible {
         clauses.push(format!("visible == {}", u8::from(visible)));
     }
-    if clauses.is_empty() {
-        locator
-            .identifier
-            .as_ref()
-            .map(|identifier| ("accessibility id", identifier.clone()))
-    } else {
-        Some(("predicate string", clauses.join(" AND ")))
-    }
+    (!clauses.is_empty()).then(|| ("predicate string", clauses.join(" AND ")))
 }
 
 async fn runner_control_with_client(
@@ -9213,6 +9218,30 @@ async fn runner_control_with_client(
         // scroll deltas (runner has no scroll-wheel; a delta stream turned into a
         // storm of discrete swipes that kept scrolling after release — issue: the
         // screen "kept moving" after the finger stopped).
+        "drag" if v.get("points").is_some() => {
+            let path = match core::drag::Path::parse(v) {
+                Ok(path) => path,
+                Err(hint) => return RunnerControlOutcome::InvalidValue(hint),
+            };
+            if refuse_scroll_alert(w, guard_alert, detail).await {
+                return RunnerControlOutcome::Refused("alert_present", SCROLL_ALERT_HINT);
+            }
+            match w.supports_timed_drag_path().await {
+                Ok(true) => {}
+                Ok(false) => return RunnerControlOutcome::Refused(
+                    "runner_upgrade_required",
+                    "Timed drag paths require a rebuilt runner with ipu:timedDragPath; no gesture was sent",
+                ),
+                Err(error) => {
+                    tracing::warn!("drag path capability probe failed: {error:#}");
+                    return RunnerControlOutcome::Refused(
+                        "runner_capability_unavailable",
+                        "Could not read Runner capabilities; no gesture was sent. Check Runner connectivity and try again",
+                    );
+                }
+            }
+            w.drag_path(&path).await
+        }
         "swipe" | "drag" => {
             let g = |k: &str| v.get(k).and_then(|x| x.as_f64());
             match (g("x1"), g("y1"), g("x2"), g("y2")) {
@@ -10111,6 +10140,18 @@ async fn direct_control(
             );
         }
     };
+    // Browser controls have a short freshness/acknowledgement deadline. Timed
+    // paths belong to the agent endpoints, which budget for the whole gesture.
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("drag")
+        && value.get("points").is_some()
+    {
+        return hinted_control_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "drag_path_requires_agent_endpoint",
+            "not_sent",
+            "Use /agent/input or /agent/actions for timed drag paths; /control has a short browser deadline",
+        );
+    }
     if let Some(refusal) = stale_action_lock_refusal(&state).await {
         return refusal.into_response();
     }
@@ -10874,6 +10915,11 @@ fn validate_agent_action_value(
                 .is_some_and(|name| matches!(name, "home" | "spotlight"))
             {
                 return invalid("shortcut must be home or spotlight");
+            }
+        }
+        "drag" if action.contains_key("points") => {
+            if let Err(hint) = core::drag::Path::parse(&serde_json::Value::Object(action.clone())) {
+                return invalid(hint);
             }
         }
         "swipe" | "drag" => {
@@ -12060,10 +12106,18 @@ async fn agent_actions_inner(
                 timeout_ms,
                 poll_ms,
             } => {
+                let wait_started = tokio::time::Instant::now();
                 let wait_deadline = std::cmp::min(
                     batch_deadline,
-                    tokio::time::Instant::now() + std::time::Duration::from_millis(*timeout_ms),
+                    wait_started + std::time::Duration::from_millis(*timeout_ms),
                 );
+                // Narrow probes are an optimization, not evidence. Reserve
+                // at least half the actual remaining window for full reads:
+                // a source read can take seconds, far longer than poll_ms.
+                // The probe timeout AND sleeps share this earlier deadline,
+                // so a slow/missing probe cannot starve the authoritative read.
+                let probe_deadline = wait_started
+                    + wait_deadline.saturating_duration_since(wait_started) / 2;
                 let mut attempts = 0_u64;
                 let mut last_observation = serde_json::Value::Null;
                 let mut last_read_error = None;
@@ -12074,19 +12128,16 @@ async fn agent_actions_inner(
                 let probes = wait_probe_predicates(expect);
                 let mut probe_misses = 0_u64;
                 let mut probes_answered = 0_u64;
-                let reserve = std::time::Duration::from_millis((*timeout_ms / 3).min(2500));
                 loop {
                     attempts += 1;
                     // While the targets are not there yet, ask runner for just
                     // them (~0.3 s) instead of the whole tree (~0.9–3 s). A
-                    // hit, and the last poll of the window, still read the
-                    // whole tree, so the verdict and its observation are
-                    // exactly what they always were.
+                    // hit, or exhausting the probe budget, reads the whole
+                    // tree. Only that read decides whether the wait passed.
                     if let Some(probes) = &probes {
                         let poll = std::time::Duration::from_millis(*poll_ms);
-                        let miss = if tokio::time::Instant::now() + poll + reserve < wait_deadline {
-                            let answer =
-                                wait_probe_missed(&mut w, probes, wait_deadline - reserve).await;
+                        let miss = if tokio::time::Instant::now() + poll < probe_deadline {
+                            let answer = wait_probe_missed(&mut w, probes, probe_deadline).await;
                             if answer.is_some() {
                                 probes_answered += 1;
                             }
@@ -12096,13 +12147,9 @@ async fn agent_actions_inner(
                         };
                         if miss {
                             probe_misses += 1;
-                            // Never sleep through the window: with less than a
-                            // poll left, go straight to the final full read.
-                            let remaining = wait_deadline
+                            let remaining = probe_deadline
                                 .saturating_duration_since(tokio::time::Instant::now());
-                            if remaining > poll {
-                                tokio::time::sleep(poll).await;
-                            }
+                            tokio::time::sleep(std::cmp::min(poll, remaining)).await;
                             continue;
                         }
                     }
@@ -15495,8 +15542,13 @@ fn try_take_hold(
 /// Seconds left on a private hold (0 when none or expired).
 fn private_secs_left(private_until: &Mutex<Option<Instant>>) -> u64 {
     recover(private_until.lock())
-        .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
-        .filter(|secs| *secs > 0)
+        .map(|until| {
+            let remaining = until.saturating_duration_since(Instant::now());
+            // A private hold protects its last fractional second too.
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+        })
         .unwrap_or(0)
 }
 
@@ -17793,6 +17845,69 @@ fn agent_apps_json(status: StatusCode, body: serde_json::Value) -> Response {
     )
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeLayoutQuery {
+    page: Option<usize>,
+}
+
+async fn agent_home_layout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HomeLayoutQuery>,
+) -> Response {
+    match browser_or_agent_auth(&state, &headers) {
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Ok => {}
+    }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    if state.simulator.is_some() {
+        return agent_apps_json(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({
+            "ok":false,"error":"home_layout_unavailable","hint":"Home layout requires a paired physical iPhone; simulator layouts are not supported"}),
+        );
+    }
+    let Some(udid) = state.device_udid.as_deref().filter(|s| !s.is_empty()) else {
+        return agent_apps_json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+            "ok":false,"error":"target_required","hint":"Configure IPHONE_USE_UDID; no device was queried"}),
+        );
+    };
+    let result = crate::home_layout::read(udid).await;
+    // A private handoff may have begun while the device service was reading.
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    match result {
+        Ok(body) => match crate::home_layout::select_page(body, query.page) {
+            Ok(body) => agent_apps_json(StatusCode::OK, body),
+            Err(error) => agent_apps_json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"ok":false,"error":"invalid_page","reason":error.to_string()}),
+            ),
+        },
+        Err(error) => agent_apps_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+            "ok":false,"error":"home_layout_unavailable","reason":format!("{error:#}"),
+            "hint":"Connect the configured iPhone through its paired USB or usbmuxd network connection; no UI input or layout change was sent"}),
+        ),
+    }
+}
+
 /// `GET /agent/apps` (issue #76) — installed apps and their versions, so
 /// registry flows can be matched to what is on the phone. Read-only: bearer
 /// auth, no `X-Phone-Control`, no lease. Answered by CoreDevice on this Mac for
@@ -19657,13 +19772,13 @@ mod tests {
             .next()
             .unwrap();
         assert!(shared.contains("scroll_snapshot_element(w, v, guard_alert, detail)"));
-        // Page, coordinate and swipe/drag dispatch each have a gate; element has its own.
+        // Page, coordinate, two-point and path gestures each have a gate; element has its own.
         assert_eq!(
             shared
                 .split("refuse_scroll_alert(w, guard_alert, detail).await")
                 .count()
                 - 1,
-            3
+            4
         );
         for typ in ["scroll", "swipe", "drag"] {
             let block =
@@ -21745,7 +21860,7 @@ mod tests {
         assert_eq!(using, "predicate string");
         assert_eq!(
             value,
-            "type == 'XCUIElementTypeCell' AND (label == '保存到“文件”' OR name == '保存到“文件”') AND focused == 0 AND enabled == 1 AND visible == 1"
+            "type == 'XCUIElementTypeCell' AND (label == '保存到“文件”' OR name == '保存到“文件”') AND identifier == 'actionGroupCell' AND focused == 0 AND enabled == 1 AND visible == 1"
         );
     }
 
@@ -21766,7 +21881,7 @@ mod tests {
     }
 
     #[test]
-    fn locator_runner_query_falls_back_to_identifier_and_escapes_predicates() {
+    fn locator_runner_query_matches_the_identifier_and_escapes_predicates() {
         let locator = AgentElementLocator {
             label: None,
             identifier: Some("unique-control".to_string()),
@@ -21778,7 +21893,7 @@ mod tests {
         };
         assert_eq!(
             locator_runner_query(&locator),
-            Some(("accessibility id", "unique-control".to_string()))
+            Some(("predicate string", "identifier == 'unique-control'".to_string()))
         );
         assert_eq!(
             runner_predicate_literal("O'Reilly\\Files"),
@@ -22313,7 +22428,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_mode_blocker_names_the_phone_setting_not_a_log() {
+    fn automation_mode_failure_checks_the_setting_without_claiming_it_is_off() {
         // setup-runner publishes this when the runner log says "The test runner
         // failed to initialize for UI testing. (Underlying Error: Timed out
         // while enabling automation mode.)" on an unlocked phone.
@@ -22327,6 +22442,8 @@ mod tests {
         );
         assert!(hint.contains("Allow automation"), "{hint}");
         assert!(hint.contains("unlocked"), "{hint}");
+        assert!(hint.contains("if already enabled and authorized"), "{hint}");
+        assert!(!hint.contains("nobody entered"), "{hint}");
         assert!(!hint.contains("runner-agent.log"), "{hint}");
         // The hint is spliced into the status JSON unescaped.
         assert!(!hint.contains('"') && !hint.contains('{') && !hint.contains('}'));
@@ -22351,9 +22468,8 @@ mod tests {
 
     #[test]
     fn automation_not_allowed_names_the_phone_switch_and_the_quiet_retry() {
-        // A code-74 refusal with an Xcode that supports the phone's iOS
-        // (hardware: iOS 27.2 beta with Xcode 27.2 beta): the phone has not
-        // allowed UI automation, which is not an Xcode problem.
+        // A supported SDK does not explain a code-74 failure. Preserve
+        // useful authorization checks without claiming that they caused it.
         let payload = r#"{"phase":"building-fail","blocked_on":"automation_not_allowed","message":"the iPhone refused the UI-automation session","ts":1000}"#;
         let status = parse_setup_status(payload, 1100).expect("fresh status");
         assert_eq!(status.blocked_on, "automation_not_allowed");
@@ -22439,9 +22555,12 @@ mod tests {
         let (zh, en) = human_next_step("blocker", "needs_passcode_on_phone", "").unwrap();
         assert_eq!(
             zh,
-            "手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。"
+            "连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。"
         );
-        assert!(en.contains("enter it") && en.contains("will not ask again"), "{en}");
+        assert!(
+            en.contains("if one appears") && en.contains("if already authorized"),
+            "{en}"
+        );
         let hint = setup_blocker_hint("needs_passcode_on_phone").unwrap();
         assert!(hint.contains("keep_runner_alive"), "{hint}");
         assert!(
@@ -22460,10 +22579,10 @@ mod tests {
         // The web panel shows it as a blocking card, not a spinner.
         assert!(INDEX_HTML.contains("case 'needs_passcode_on_phone':"));
         assert!(INDEX_HTML.contains("['locked', 'needs_passcode_on_phone',"));
-        // The daemon names it too when only it knows about the passcode.
+        // A saved passcode fact does not establish an unanswered prompt.
         assert_eq!(
             crate::keep_runner::person_blocker("automation_mode_disabled", Some(true)),
-            "needs_passcode_on_phone"
+            "automation_mode_disabled"
         );
     }
 
@@ -22510,7 +22629,7 @@ mod tests {
         );
         let hint = setup_blocker_hint("wifi_automation_refused").unwrap();
         assert!(hint.contains("by USB once"), "{hint}");
-        assert!(hint.contains("after the unplug"), "{hint}");
+        assert!(hint.contains("after you unplug"), "{hint}");
         assert!(hint.contains("Wi-Fi"), "{hint}");
         assert!(
             hint.contains("do not send another reconnect request"),
@@ -22522,9 +22641,12 @@ mod tests {
         assert!(zh.contains("插一次线") && zh.contains("拔掉"), "{zh}");
         assert!(en.contains("by USB once") && en.contains("unplug"), "{en}");
         assert!(!en.contains("enter the passcode"), "{en}");
-        // The USB reading now says the prompt is time-limited.
+        // Both transports preserve uncertainty instead of blaming authorization.
         let usb = setup_blocker_hint("automation_not_allowed").unwrap();
-        assert!(usb.contains("about 30 s"), "{usb}");
+        assert!(usb.contains("does not prove"), "{usb}");
+        assert!(hint.contains("does not prove"), "{hint}");
+        assert!(!usb.contains("nobody entered"));
+        assert!(!hint.contains("about 20 s"));
     }
 
     #[test]

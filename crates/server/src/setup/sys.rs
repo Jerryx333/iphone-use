@@ -5,6 +5,8 @@
 //! shell in between.
 
 use std::io::{Read as _, Write as _};
+use std::os::fd::AsRawFd as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -68,7 +70,7 @@ pub fn stdout_of(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// Run with a deadline; the child is killed when it outlives it. Returns its
+/// Run with a deadline; the command's process group is killed on timeout. Returns its
 /// stdout (whatever it printed before the kill) and whether it exited 0.
 ///
 /// devicectl can hang forever on a device whose tunnel is stuck connecting
@@ -79,36 +81,116 @@ pub fn run_bounded(program: &str, args: &[&str], limit: Duration) -> (String, bo
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
     else {
         return (String::new(), false);
     };
-    let mut stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        if let Some(stdout) = stdout.as_mut() {
-            let _ = stdout.read_to_end(&mut text);
-        }
-        text
-    });
+    let mut stdout = child.stdout.take().expect("piped command stdout");
+    let fd = stdout.as_raw_fd();
+    // SAFETY: stdout owns this live descriptor; preserve its existing flags.
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if !nonblocking {
+        kill_command_group(&mut child);
+        return (String::new(), false);
+    }
+    // A wrapper's descendant may inherit stdout after the wrapper exits or
+    // is killed. Never wait for pipe EOF (or join a reader waiting for it).
+    let mut text = Vec::new();
+    let mut buffer = [0; 8192];
     let deadline = Instant::now() + limit;
-    let mut success = false;
+    let mut exited = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                success = status.success();
-                break;
+        if !exited {
+            match command_exit_pending(&child) {
+                Ok(status) => exited = status,
+                Err(_) => {
+                    kill_command_group(&mut child);
+                    return (String::from_utf8_lossy(&text).into_owned(), false);
+                }
             }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
+        }
+        // Limit each drain so a continuously writing command cannot starve
+        // the deadline check. If the parent exited, drain buffered bytes only.
+        let mut drained = false;
+        for _ in 0..8 {
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    drained = true;
+                    break;
+                }
+                Ok(n) => text.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    drained = true;
+                    break;
+                }
+                Err(_) => {
+                    kill_command_group(&mut child);
+                    return (String::from_utf8_lossy(&text).into_owned(), false);
+                }
             }
+        }
+        if exited && drained {
+            let success = child.wait().is_ok_and(|status| status.success());
+            return (String::from_utf8_lossy(&text).into_owned(), success);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            kill_command_group(&mut child);
+            return (String::from_utf8_lossy(&text).into_owned(), false);
+        }
+        if drained {
+            std::thread::sleep(left.min(Duration::from_millis(10)));
         }
     }
-    let text = reader.join().unwrap_or_default();
-    (String::from_utf8_lossy(&text).into_owned(), success)
+}
+
+/// Check for exit without reaping. The leader's PID must remain reserved
+/// until group cleanup or the successful buffered-output drain is complete.
+fn command_exit_pending(child: &std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: a zeroed siginfo_t is valid storage for waitid. With WNOHANG,
+    // a zero PID also represents no available exit event.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: P_PID restricts this to our child; WNOWAIT leaves the exit
+        // status waitable and prevents this check from releasing its PID.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: waitid initialized the exit event, or left our zero PID.
+            return Ok(unsafe { info.si_pid() } == child.id() as libc::pid_t);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn kill_command_group(child: &mut std::process::Child) {
+    // A successful non-reaping check confirms the leader is still our child,
+    // even if it exited. process_group(0) isolates it from the caller's group.
+    // Never signal a numeric group after ownership has been lost (ECHILD).
+    if command_exit_pending(child).is_ok() {
+        if let Ok(group) = i32::try_from(child.id()) {
+            // SAFETY: this is the dedicated process group of our live child.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// `xcrun devicectl <args>` bounded to `secs`.
@@ -531,6 +613,105 @@ mod tests {
         let (out, ok) = run_bounded("/bin/echo", &["hi"], Duration::from_secs(5));
         assert!(ok);
         assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn timeout_kills_wrapper_descendants_that_hold_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("escaped-timeout");
+        let descendant_started = dir.path().join("descendant-started");
+        let started = Instant::now();
+        let (out, ok) = run_bounded(
+            "/bin/sh",
+            &[
+                "-c",
+                "(printf started > \"$2\"; sleep 2; printf escaped > \"$1\") & printf started; wait",
+                "fixture",
+                marker.to_str().unwrap(),
+                descendant_started.to_str().unwrap(),
+            ],
+            Duration::from_millis(200),
+        );
+        assert!(!ok);
+        assert_eq!(out, "started");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(descendant_started.exists(), "the descendant did not start");
+        // The descendant must be stopped too, not just detached from a
+        // leaked reader thread. Its delayed write would otherwise escape.
+        std::thread::sleep(Duration::from_millis(2200));
+        assert!(!marker.exists(), "a timed-out descendant kept running");
+    }
+
+    #[test]
+    fn successful_wrapper_does_not_wait_for_descendant_pipe_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("background-finished");
+        let started = Instant::now();
+        let (out, ok) = run_bounded(
+            "/bin/sh",
+            &[
+                "-c",
+                "(sleep 2; printf finished > \"$1\") & printf ready",
+                "fixture",
+                marker.to_str().unwrap(),
+            ],
+            Duration::from_millis(300),
+        );
+        assert!(ok);
+        assert_eq!(out, "ready");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A successful command's background helper is not ours to kill.
+        // Let this fixture finish before its temporary directory is removed.
+        std::thread::sleep(Duration::from_millis(2200));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "finished");
+    }
+
+    #[test]
+    fn cleanup_keeps_the_exited_group_leader_waitable_until_descendants_stop() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("escaped-cleanup");
+        let ready = dir.path().join("descendant-started");
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "(printf ready > \"$2\"; sleep 2; printf escaped > \"$1\") & while [ ! -f \"$2\" ]; do sleep 0.01; done",
+                "fixture",
+                marker.to_str().unwrap(),
+                ready.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !command_exit_pending(&child).unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the descendant must hold stdout open");
+        assert!(command_exit_pending(&child).unwrap());
+        assert!(
+            command_exit_pending(&child).unwrap(),
+            "checking again must not have reaped the leader"
+        );
+        kill_command_group(&mut child);
+        assert!(child.wait().unwrap().success(), "the leader had exited normally");
+        std::thread::sleep(Duration::from_millis(2200));
+        assert!(!marker.exists(), "cleanup must stop the descendant");
+    }
+
+    #[test]
+    fn bounded_command_drains_output_larger_than_the_pipe() {
+        let (out, ok) = run_bounded(
+            "/bin/dd",
+            &["if=/dev/zero", "bs=1024", "count=256"],
+            Duration::from_secs(5),
+        );
+        assert!(ok);
+        assert_eq!(out.len(), 256 * 1024);
+        assert!(out.bytes().all(|byte| byte == 0));
     }
 
     /// The runner handoff is a POST the daemon accepts: bearer, the control

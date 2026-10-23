@@ -1303,6 +1303,43 @@ impl RunnerClient {
         Ok(())
     }
 
+    /// Read the current runner, without caching across a runner replacement.
+    /// Old runners accept W3C pauses but interpolate through them.
+    pub async fn supports_timed_drag_path(&mut self) -> Result<bool> {
+        let sid = self.ensure_session().await?.to_string();
+        let value: serde_json::Value = self
+            .http
+            .get(format!("{}/session/{}", self.base, sid))
+            .timeout(Duration::from_secs(3))
+            .send_signed(&self.auth)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(value
+            .pointer("/value/capabilities/ipu:timedDragPath")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+    }
+
+    /// A continuous drag, including pauses at intermediate points. All timing
+    /// is explicit and validated before any mutation; this sends exactly once.
+    pub async fn drag_path(&mut self, path: &core::drag::Path) -> Result<()> {
+        path.validate().map_err(|error| anyhow!(error))?;
+        let (width, height) = self.window_size().await?;
+        let actions = path
+            .actions(width, height)
+            .map_err(|error| anyhow!(error))?;
+        let sid = self.ensure_session().await?.to_string();
+        let response = self.post_req(format!("{}/session/{}/actions", self.base, sid))
+            .json(&serde_json::json!({"actions":[{
+                "type":"pointer", "id":"finger1", "parameters":{"pointerType":"touch"}, "actions":actions
+            }]}))
+            .send_signed(&self.auth).await.context("POST /actions (drag path)")?;
+        ensure_runner_success(response, "POST /actions (drag path)").await?;
+        Ok(())
+    }
+
     /// Press, hold, drag, and release one on-device touch.
     pub async fn drag(
         &mut self,

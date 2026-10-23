@@ -1715,6 +1715,21 @@ mod tests {
     }
 
     #[test]
+    fn validates_and_materializes_a_saved_drag_waypoint_path() {
+        let mut document: serde_json::Value = serde_json::from_str(valid_flow()).unwrap();
+        document["steps"] = serde_json::json!([{"kind":"drag", "hold_ms":400, "duration_ms":300,
+            "points":[{"x":0.3,"y":0.4},{"x":0.13,"y":0.5,"dwell_ms":900},{"x":0.5,"y":0.4}]
+        }]);
+        let flow = parse_flow(&serde_json::to_vec(&document).unwrap(), "drag-path.json").unwrap();
+        let steps = ran_steps(&flow, &BTreeMap::new());
+        assert_eq!(steps[0]["action"]["type"], "drag");
+        assert_eq!(steps[0]["action"]["points"][1]["dwell_ms"], 900);
+        assert_eq!(steps[0]["action"]["points"].as_array().unwrap().len(), 3);
+        document["steps"][0]["points"][1]["dwell_ms"] = serde_json::json!(10000);
+        assert!(parse_flow(&serde_json::to_vec(&document).unwrap(), "drag-path.json").is_err());
+    }
+
+    #[test]
     fn validates_parameterized_text_without_persisting_a_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parameterized.json");

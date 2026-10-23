@@ -1347,18 +1347,18 @@ const I18N_EN = {
   '请在 iPhone 上信任开发者证书；完成后会自动继续': 'Trust the developer certificate on the iPhone; it continues automatically when done',
   '开发者服务未就绪': 'Developer services are not ready',
   '请保持 USB、解锁和亮屏；设备准备完成后会自动继续': 'Keep the phone on USB, unlocked and with the screen on; it continues automatically when the device is ready',
-  '请开启 UI 自动化': 'Turn on UI Automation',
-  '解锁 iPhone，打开 设置 › 开发者 › 启用 UI 自动化，并确认手机上的密码或“允许自动化”提示；稍候会自动重试': 'Unlock the iPhone, turn on Settings › Developer › Enable UI Automation, and confirm the passcode or “Allow automation” prompt on the phone; it retries automatically shortly',
+  '自动化模式未就绪': 'Automation mode is not ready',
+  '请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查 CoreDevice 连接和日志。服务会按退避策略重试。': 'Check Settings › Developer › Enable UI Automation and handle a prompt if one appears; if already enabled and authorized, inspect the CoreDevice connection and runner log. The service retries with backoff.',
   '请解锁 iPhone': 'Unlock the iPhone',
   '手机锁着屏，设备服务启动不了；解锁并保持亮屏后会自动接着连接': 'The phone is locked, so the device service cannot start; unlock it and keep the screen on and it connects automatically',
   'iPhone 重启后还没解锁': 'The iPhone has not been unlocked since it restarted',
   '这台 iPhone 重启后还没解锁过：需要有人在手机上输入一次密码，之后会自动连上。': 'This iPhone has not been unlocked since it restarted: someone needs to enter the passcode on the phone once, then it connects automatically.',
-  '需要有人在手机上输入密码': 'Someone needs to enter the passcode on the phone',
-  '手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。': 'The phone has a passcode: this start needs someone to enter it on the phone to allow UI Automation. It won’t ask again while the connection stays up.',
-  'iPhone 没有授权 UI 自动化': 'The iPhone did not allow UI Automation',
-  'runner 启动时手机上会弹出密码或“允许”提示，约 30 秒不处理就会失败；请解锁 iPhone、确认 设置 › 开发者 › 启用 UI 自动化 已打开，下次重试时完成这个提示；稍候会自动重试': 'When the runner starts, the phone shows a passcode or “Allow” prompt that fails after about 30 seconds; unlock the iPhone, make sure Settings › Developer › Enable UI Automation is on, and answer the prompt on the next try; it retries automatically shortly',
-  'Wi-Fi 下无法授权 UI 自动化': 'UI Automation cannot be allowed over Wi-Fi',
-  '通过 Wi-Fi 时手机弹不出输密码的提示（有些 iOS 版本干脆拒绝）；请用 USB 连接这台 iPhone，并在它要求时输入密码。插上 USB 后会立刻重试；如果之后走 Wi-Fi 仍然失败，就让这台手机一直用 USB': 'Over Wi-Fi the phone cannot show the passcode prompt (some iOS versions refuse outright); connect this iPhone over USB and enter the passcode when asked. It retries as soon as USB is plugged in; if Wi-Fi still fails afterwards, keep this phone on USB',
+  '检查手机授权提示': 'Check on-phone authorization',
+  '连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。': 'Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log.',
+  '自动化会话启动失败': 'Automation session did not start',
+  '自动化会话未建立（错误码 74），原因尚未确认。请检查 设置 › 开发者 › 启用 UI 自动化；若有密码或允许提示，请处理；若已授权，检查 CoreDevice 连接和 runner 日志。服务会按退避策略重试。': 'The automation session was not established (exit code 74); its cause is unconfirmed. Check Settings › Developer › Enable UI Automation and handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log. The service retries with backoff.',
+  'Wi-Fi 自动化会话启动失败': 'Wi-Fi automation session did not start',
+  'Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时插线启动，拔掉后用新的屏幕读取验证。服务会按退避策略重试。': 'The Wi-Fi automation session was not established. Exit code 74 does not prove a permanent Wi-Fi restriction. Inspect the CoreDevice tunnel; if needed, start over USB and verify fresh reads after unplugging. The service retries with backoff.',
   '这台 Mac 还驱动不了这台 iPhone 的系统': 'This Mac cannot drive this iPhone’s iOS version yet',
   'iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了': 'iOS 15 and 16 need no update, but they need an App Store Connect API key from a paid developer account (IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID); set it and run iphone-use setup again. iOS 14 and earlier can only be fixed by updating the phone. A new cable, retrying or reconnecting won’t help',
   '请重启一次 iPhone': 'Restart the iPhone once',
@@ -1965,17 +1965,17 @@ function setupBlockerCopy(blockedOn) {
     case 'ddi':
       return [t('开发者服务未就绪'), t('请保持 USB、解锁和亮屏；设备准备完成后会自动继续')];
     case 'automation_mode_disabled':
-      return [t('请开启 UI 自动化'), t('解锁 iPhone，打开 设置 › 开发者 › 启用 UI 自动化，并确认手机上的密码或“允许自动化”提示；稍候会自动重试')];
+      return [t('自动化模式未就绪'), t('请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查 CoreDevice 连接和日志。服务会按退避策略重试。')];
     case 'locked':
       return [t('请解锁 iPhone'), t('手机锁着屏，设备服务启动不了；解锁并保持亮屏后会自动接着连接')];
     case 'locked_after_restart':
       return [t('iPhone 重启后还没解锁'), t('这台 iPhone 重启后还没解锁过：需要有人在手机上输入一次密码，之后会自动连上。')];
     case 'needs_passcode_on_phone':
-      return [t('需要有人在手机上输入密码'), t('手机设了锁屏密码：这次启动需要有人在手机上输入密码，允许 UI 自动化。之后保持连接就不会再问。')];
+      return [t('检查手机授权提示'), t('连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。')];
     case 'automation_not_allowed':
-      return [t('iPhone 没有授权 UI 自动化'), t('runner 启动时手机上会弹出密码或“允许”提示，约 30 秒不处理就会失败；请解锁 iPhone、确认 设置 › 开发者 › 启用 UI 自动化 已打开，下次重试时完成这个提示；稍候会自动重试')];
+      return [t('自动化会话启动失败'), t('自动化会话未建立（错误码 74），原因尚未确认。请检查 设置 › 开发者 › 启用 UI 自动化；若有密码或允许提示，请处理；若已授权，检查 CoreDevice 连接和 runner 日志。服务会按退避策略重试。')];
     case 'wifi_automation_refused':
-      return [t('Wi-Fi 下无法授权 UI 自动化'), t('通过 Wi-Fi 时手机弹不出输密码的提示（有些 iOS 版本干脆拒绝）；请用 USB 连接这台 iPhone，并在它要求时输入密码。插上 USB 后会立刻重试；如果之后走 Wi-Fi 仍然失败，就让这台手机一直用 USB')];
+      return [t('Wi-Fi 自动化会话启动失败'), t('Wi-Fi 自动化会话未建立，不能仅凭错误码 74 判断手机永久不支持 Wi-Fi。检查 CoreDevice 隧道；必要时插线启动，拔掉后用新的屏幕读取验证。服务会按退避策略重试。')];
     case 'ios_too_old':
       return [t('这台 Mac 还驱动不了这台 iPhone 的系统'), t('iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了')];
     case 'ddi_needs_reboot':
@@ -1998,7 +1998,7 @@ function setupBlockerCopy(blockedOn) {
    installing an Xcode or updating the iPhone, and a reconnect spinner over
    them would promise a retry that cannot succeed. They are not in
    managedSetupWillRetry for the same reason, and neither is
-   `wifi_automation_refused`: retrying over Wi-Fi cannot fix it, only USB. */
+   `wifi_automation_refused`: inspect the tunnel or try USB recovery; its backoff is long. */
 const ACTIONABLE_SETUP_BLOCKERS = new Set(
   ['locked', 'needs_passcode_on_phone', 'locked_after_restart', 'trust', 'automation_mode_disabled', 'automation_not_allowed', 'wifi_automation_refused', 'not_connected', 'usb', 'ddi', 'warp', 'proxy', 'xcode_too_old', 'ios_too_old', 'ddi_needs_reboot', 'legacy_needs_usb'],
 );

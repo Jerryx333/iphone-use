@@ -139,7 +139,7 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 
 + (nullable NSString *)synthesizeTapAt:(CGPoint)point pid:(int)pid;
 + (nullable NSString *)synthesizeLongPressAt:(CGPoint)point duration:(NSTimeInterval)duration pid:(int)pid;
-/// Linear drag sampled every ~16 ms, finger lifts at `duration`.
+/// Linear drag interpolated by XCTest; finger lifts at `duration`.
 + (nullable NSString *)synthesizeDragFrom:(CGPoint)start
                                        to:(CGPoint)end
                                  duration:(NSTimeInterval)duration

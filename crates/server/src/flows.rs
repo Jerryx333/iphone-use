@@ -477,7 +477,7 @@ pub fn convert_action(action: &Value, rows: Option<&[crate::runner::ElementRow]>
         "launch_app" if action.get("bundle").is_some() => copy("launch_app", &["bundle", "fresh"]),
         "scroll" if action.get("element").is_none() => copy("scroll", &["x", "y", "dx", "dy"]),
         "swipe" => copy("swipe", &["x1", "y1", "x2", "y2", "duration_ms"]),
-        "drag" => copy("drag", &["x1", "y1", "x2", "y2", "hold_ms", "duration_ms"]),
+        "drag" => copy("drag", &["x1", "y1", "x2", "y2", "points", "hold_ms", "duration_ms"]),
         "longpress" => copy("longpress", &["x", "y", "duration_ms"]),
         "alert" => copy("alert", &["button", "action"]),
         "picker" => copy("picker", &["column", "value"]),
@@ -1250,4 +1250,21 @@ pub fn locator_at(rows: &[crate::runner::ElementRow], x: f64, y: f64) -> Option<
         .filter_map(|row| locator_for_row(row).map(|locator| (row.rect[2] * row.rect[3], locator)))
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, locator)| locator)
+}
+
+#[cfg(test)]
+mod drag_path_tests {
+    use super::*;
+    #[test]
+    fn drag_recording_preserves_waypoints_and_dwell_for_replay() {
+        let action = json!({"type":"drag","points":[{"x":0.3,"y":0.4},{"x":0.13,"y":0.5,"dwell_ms":900},{"x":0.5,"y":0.4}],"hold_ms":400,"duration_ms":300});
+        let Converted::Step(step) = convert_action(&action, None) else {
+            panic!("drag must be recordable")
+        };
+        assert_eq!(step["kind"], "drag");
+        for key in ["points", "hold_ms", "duration_ms"] {
+            assert_eq!(step[key], action[key]);
+        }
+        assert!(step.get("x1").is_none());
+    }
 }

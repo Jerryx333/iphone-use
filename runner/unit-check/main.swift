@@ -246,7 +246,7 @@ do {
       ["type": "pause", "duration": pauseMs],
       ["type": "pointerUp", "button": 0],
     ])
-    return t(path[0][1]) - t(path[0][0])
+    return t(path[0].last!) - t(path[0][0])
   }
   check(abs(try held(20) - 0.02) < 1e-9, "an explicit 20 ms pause holds 20 ms")
   check(abs(try held(3) - W3CActions.minimumHold) < 1e-9, "an explicit pause holds at least minimumHold")
@@ -257,7 +257,7 @@ do {
     ["type": "pause", "duration": 800],
     ["type": "pointerUp", "button": 0],
   ])
-  check(abs(t(hold[0][1]) - 0.8) < 1e-9, "long press lifts after the pause")
+  check(abs(t(hold[0].last!) - 0.8) < 1e-9, "long press lifts after the pause")
 
   let swipe = try pointer([
     ["type": "pointerMove", "duration": 0, "x": 10, "y": 500],
@@ -266,10 +266,30 @@ do {
     ["type": "pointerMove", "duration": 250, "x": 10, "y": 100],
     ["type": "pointerUp", "button": 0],
   ])
-  let moves = swipe[0].filter { $0["type"] as? String == "move" }
-  check(moves.count == 16, "250 ms move sampled every ~16 ms (got \(moves.count))")
+  check(swipe[0].contains { $0["type"] as? String == "move" && $0["y"] as? Double == 500 && abs(t($0) - 0.08) < 1e-9 },
+        "the initial hold pins the finger before any motion")
+  let moves = swipe[0].filter { $0["type"] as? String == "move" && t($0) > 0.08 }
+  check(moves.count == 1, "a move keeps one timed endpoint for XCTest interpolation")
   check(moves.last?["y"] as? Double == 100 && abs(t(moves.last!) - 0.33) < 1e-9, "move ends at target and time")
-  check(abs(t(moves.first!) - (0.08 + 0.25 / 16)) < 1e-9, "move starts after the pause")
+  check(abs(t(moves.first!) - 0.33) < 1e-9, "endpoint preserves the full move duration after the pause")
+
+  let edgeDrag = try pointer([
+    ["type":"pointerMove", "duration":0, "x":117, "y":337.6],
+    ["type":"pointerDown", "button":0],
+    ["type":"pause", "duration":400],
+    ["type":"pointerMove", "duration":300, "x":50.7, "y":422],
+    ["type":"pause", "duration":900],
+    ["type":"pointerMove", "duration":300, "x":195, "y":337.6],
+    ["type":"pointerUp", "button":0],
+  ])
+  check(edgeDrag.count == 1, "multi-point drag is a single uninterrupted touch path")
+  let edge = edgeDrag[0]
+  check(edge.filter { $0["type"] as? String == "down" }.count == 1 && edge.filter { $0["type"] as? String == "up" }.count == 1,
+        "no finger lift or second press between waypoints")
+  check(edge.contains { $0["x"] as? Double == 50.7 && $0["y"] as? Double == 422 && abs(t($0) - 1.6) < 1e-9 },
+        "edge dwell pins the finger at the edge through its end, not a slow interpolation toward the next point")
+  check(abs(t(edge.last!) - 1.9) < 1e-9 && edge.last?["x"] as? Double == 195,
+        "path lifts at the final point after hold, moves and dwell")
 
   let relative = try pointer([
     ["type": "pointerMove", "duration": 0, "x": 5, "y": 5, "origin": ["element-6066-11e4-a52e-4f735466cecf": "E1"]],
@@ -967,6 +987,24 @@ do {
       }
     }
   }
+}
+
+// Strict locators use the real identifier, never name's label fallback.
+do {
+  let controls = UINode(raw: node("Application", children: [
+    node("Button", label: "Open", id: "target-row"),
+    node("Button", label: "Open", id: "other-row"),
+    node("Button", label: "Open"),
+  ]), parent: nil, pid: 1)
+  let query = "type == 'XCUIElementTypeButton' AND (label == 'Open' OR name == 'Open') AND identifier == 'target-row'"
+  let found = try Locator.find(using: "predicate string", value: query, root: controls, screen: screen)
+  check(found.count == 1 && found.first?.identifier == "target-row", "compound locator preserves strict identity")
+  check(try Locator.find(using: "predicate string", value: "identifier == 'Open'", root: controls, screen: screen).isEmpty,
+        "identifier-only locator does not match a name supplied by the label")
+  check(try Locator.find(using: "predicate string", value: "name == 'Open'", root: controls, screen: screen).count == 1,
+        "name fallback exists but is not an identifier")
+} catch {
+  check(false, "strict identifier predicate: \(error)")
 }
 
 print(failures == 0 ? "unit check: \(checks) checks passed" : "unit check: \(failures) of \(checks) checks FAILED")

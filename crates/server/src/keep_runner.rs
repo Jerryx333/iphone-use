@@ -30,8 +30,8 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-/// State-dir marker written by setup when a runner start failed because
-/// nobody entered the passcode on the phone (`needs_passcode_on_phone`). It
+/// State-dir marker written after a failed start on a phone known to have a
+/// passcode. It records a possible need for a person, not the failure cause. It
 /// stands in for the passcode fact until the daemon has read one (a phone
 /// whose lockdown answer never came back).
 pub const RELAUNCH_NEEDS_PERSON_FILE: &str = "relaunch-needs-person";
@@ -45,10 +45,10 @@ pub const REASON: &str = "relaunch_needs_person";
 /// Why a start of the runner needs a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Because {
-    /// The phone has a passcode: iOS asks for it on every runner launch.
+    /// The phone has a passcode: restarting may require on-phone authorization.
     Passcode,
-    /// The phone refuses to start the runner over Wi-Fi and the runner is up
-    /// over Wi-Fi: starting it again needs the cable.
+    /// An earlier Wi-Fi start failed and the runner is now up over Wi-Fi:
+    /// keeping it may avoid needing USB recovery.
     WifiStartRefused,
 }
 
@@ -73,12 +73,12 @@ impl Because {
     pub fn hint(self) -> (&'static str, &'static str) {
         match self {
             Self::Passcode => (
-                "这台手机设了锁屏密码，每次启动设备服务都要有人在手机上输入密码，所以空闲时不停掉设备服务：手机会一直处在自动化模式，屏幕照常自动锁定。想让它空闲时照常释放，设置 IPHONE_USE_IDLE_RELEASE=force。",
-                "This phone has a passcode and every start of the device service asks for it on the phone, so the service is kept running while idle: the phone stays in automation mode, and the screen still locks as usual. Set IPHONE_USE_IDLE_RELEASE=force to release it when idle anyway.",
+                "这台手机设了锁屏密码，重新启动设备服务可能需要有人处理手机上的提示，因此空闲时保持服务运行；屏幕仍会照常自动锁定。想让它空闲时照常释放，设置 IPHONE_USE_IDLE_RELEASE=force。",
+                "This phone has a passcode, and restarting the device service may need someone to handle a prompt on the phone, so the service is kept running while idle. The screen still locks as usual. Set IPHONE_USE_IDLE_RELEASE=force to release it when idle anyway.",
             ),
             Self::WifiStartRefused => (
-                "这台手机不允许通过 Wi‑Fi 启动设备服务，空闲时停掉的话要插线才能再启动，所以设备服务一直保持运行。想让它空闲时照常释放，设置 IPHONE_USE_IDLE_RELEASE=force。",
-                "This phone will not start the device service over Wi-Fi, so stopping it while idle would need the cable to undo; it is kept running. Set IPHONE_USE_IDLE_RELEASE=force to release it when idle anyway.",
+                "这台手机曾通过 Wi-Fi 启动失败，空闲时停掉服务可能需要插线恢复，因此保持服务运行。想让它空闲时照常释放，设置 IPHONE_USE_IDLE_RELEASE=force。",
+                "A previous Wi-Fi start failed on this phone. Restarting may need a USB connection, so the service is kept running while idle. Set IPHONE_USE_IDLE_RELEASE=force to release it when idle anyway.",
             ),
         }
     }
@@ -166,18 +166,10 @@ pub fn status_json(because: Option<Because>) -> Value {
     }
 }
 
-/// The blocker to publish for a failed runner start. A refusal to enable UI
-/// automation on a phone known to have a passcode is the passcode prompt
-/// nobody answered, so say that; anything else passes through.
-pub fn person_blocker(raw: &str, passcode_protected: Option<bool>) -> &str {
-    match raw {
-        "automation_mode_disabled" | "automation_not_allowed"
-            if passcode_protected == Some(true) =>
-        {
-            NEEDS_PASSCODE_BLOCKER
-        }
-        other => other,
-    }
+/// Passcode presence does not explain why a particular runner start failed.
+/// Preserve the setup evidence, including an explicit passcode blocker.
+pub fn person_blocker(raw: &str, _passcode_protected: Option<bool>) -> &str {
+    raw
 }
 
 #[cfg(test)]
@@ -294,9 +286,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswered_automation_prompt_on_a_passcode_phone_is_named() {
+    fn passcode_presence_does_not_infer_an_unanswered_prompt() {
         for raw in ["automation_mode_disabled", "automation_not_allowed"] {
-            assert_eq!(person_blocker(raw, Some(true)), "needs_passcode_on_phone");
+            assert_eq!(person_blocker(raw, Some(true)), raw);
             assert_eq!(
                 person_blocker(raw, None),
                 raw,
@@ -306,5 +298,10 @@ mod tests {
         }
         assert_eq!(person_blocker("trust", Some(true)), "trust");
         assert_eq!(person_blocker("", Some(true)), "");
+        assert_eq!(
+            person_blocker(NEEDS_PASSCODE_BLOCKER, Some(true)),
+            NEEDS_PASSCODE_BLOCKER,
+            "explicit setup evidence is preserved"
+        );
     }
 }

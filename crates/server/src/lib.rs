@@ -12,6 +12,7 @@ pub mod flows;
 pub mod focus;
 pub mod guard;
 pub mod h264sps;
+pub mod home_layout;
 pub mod http;
 pub mod instance;
 pub mod keep_awake;
