@@ -314,13 +314,27 @@ fn metrics_runs_advice_and_cli_through_the_real_daemon() {
 
     let log = state_path.join("agent-runs.jsonl");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !log.exists() && Instant::now() < deadline {
+    // Earlier inferred runs may already have created the file. Wait for this
+    // run's complete JSON record, not merely the asynchronous writer's file.
+    let persisted = loop {
+        let summary = std::fs::read_to_string(&log).ok().and_then(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|record| record["key"]["run_id"] == "task-1")
+        });
+        if let Some(summary) = summary {
+            break summary;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task-1 was not persisted within 5 seconds"
+        );
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
     use std::os::unix::fs::PermissionsExt as _;
     let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    assert!(std::fs::read_to_string(&log).unwrap().contains("task-1"));
+    assert_eq!(persisted["key"]["owner"], "e2e-agent");
 
     // The CLI reads the same metrics from the same daemon.
     let output = Command::new(env!("CARGO_BIN_EXE_iphone-use"))

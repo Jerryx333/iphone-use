@@ -41,6 +41,8 @@ const STICKY_ON_BEGIN: &[&str] = &[
 #[derive(Debug, Clone)]
 pub enum Op {
     Begin,
+    BeginForSupervisor(String),
+    ProductKey(String),
     Phase {
         phase: String,
         blocked: String,
@@ -134,7 +136,7 @@ pub fn apply(
 ) -> Option<Map<String, Value>> {
     let mut out = data.clone();
     match op {
-        Op::Begin => {
+        Op::Begin | Op::BeginForSupervisor(_) => {
             let blocker = data.get("blocked_on").and_then(Value::as_str).unwrap_or("");
             let kept = if STICKY_ON_BEGIN.contains(&blocker) {
                 blocker
@@ -156,6 +158,9 @@ pub fn apply(
             .as_object()
             .cloned()
             .unwrap_or_default();
+            if let Op::BeginForSupervisor(generation) = op {
+                out.insert("supervisor_generation".into(), json!(generation));
+            }
         }
         _ if data.get("run_id").and_then(Value::as_str) != Some(owner.run_id.as_str()) => {
             return None
@@ -184,6 +189,9 @@ pub fn apply(
             if !active || terminal {
                 return None;
             }
+        }
+        Op::ProductKey(key) => {
+            out.insert("product_key".into(), json!(key));
         }
         Op::Finish(_) | Op::Abandoned => {
             let terminal = data
@@ -270,7 +278,13 @@ pub struct Run {
 
 impl Run {
     /// Become the owner: write `begin`, then start the heartbeat watcher.
-    pub fn begin(path: &Path) -> std::io::Result<Run> {
+    pub fn begin_for_supervisor(path: &Path, generation: Option<&str>) -> std::io::Result<Run> {
+        if generation.is_some_and(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid IPU_RUNNER_SUPERVISOR_GENERATION (expected 64 hexadecimal characters)",
+            ));
+        }
         let pid = std::process::id();
         let start = sys::ps_lstart(pid);
         if start.is_empty() {
@@ -286,7 +300,10 @@ impl Run {
             pid,
             start,
         };
-        publish(&owner, &Op::Begin)?;
+        let begin = generation
+            .map(|s| Op::BeginForSupervisor(s.into()))
+            .unwrap_or(Op::Begin);
+        publish(&owner, &begin)?;
         let watcher = std::env::current_exe().ok().and_then(|exe| {
             std::process::Command::new(exe)
                 .args(["setup-native", "status-watch"])
@@ -311,6 +328,10 @@ impl Run {
                 message: message.into(),
             },
         );
+    }
+
+    pub fn product_key(&self, key: &str) {
+        let _ = publish(&self.owner, &Op::ProductKey(key.into()));
     }
 
     pub fn finish(mut self, code: i32) {
@@ -536,6 +557,23 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn invalid_generation_never_starts_a_status_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        for generation in ["".to_string(), "a".repeat(63), "g".repeat(64)] {
+            let error = Run::begin_for_supervisor(&path, Some(&generation))
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error
+                .to_string()
+                .contains("IPU_RUNNER_SUPERVISOR_GENERATION"));
+            assert!(!path.exists());
+            assert!(!dir.path().join("s.json.lock").exists());
+        }
     }
 
     #[test]
