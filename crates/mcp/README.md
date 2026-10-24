@@ -359,16 +359,18 @@ tools that act, `destructiveHint` and `idempotentHint`. Clients that honour
 them can auto-approve the read-only ones and confirm the rest. The read-only
 set is `phone_status`, `phone_capabilities`, `phone_apps`, `phone_screen`,
 `phone_screen_frame`, `phone_screenshot`, `phone_elements`, `phone_home_layout`, `phone_crashes`,
-`phone_flow_list`, `phone_flow_info` and `phone_flow_draft` (its `save_as` writes a new local
-file and is refused under `IPHONE_USE_MCP_TOOLS=readonly`; the phone is never
-touched).
+`phone_flow_list` and `phone_flow_info`. `phone_flow_draft` is non-read-only in
+normal discovery because its optional `save_as` writes a new local file. The
+`readonly` profile retains its read-only draft mode: discovery marks it read-only
+and omits `save_as`; attempts to supply that argument are still refused by the
+handler. Neither mode sends phone input.
 
 `IPHONE_USE_MCP_TOOLS` in the server's `env` narrows the surface:
 
 | Value | Listed and callable |
 |---|---|
 | `all` (default) | every tool |
-| `readonly` | only the read-only set above: an observer that can never act on the phone |
+| `readonly` | the read-only set above plus `phone_flow_draft` without `save_as`: observation and draft reads, with no phone actions or file writes |
 | `phone_status,phone_elements,phone_tap` | exactly the named tools (`phone_screen` brings `phone_screen_frame` along for the panel); unknown names are reported on stderr and ignored |
 
 A hidden tool is left out of `tools/list`, and a call to it anyway is refused
