@@ -14,6 +14,7 @@ pub mod app;
 pub mod asc;
 pub mod checks;
 pub mod commands;
+pub mod coordination;
 pub mod ctx;
 pub mod doctor;
 pub mod embed;

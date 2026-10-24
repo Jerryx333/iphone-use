@@ -376,3 +376,72 @@ fn a_verified_handoff_reaches_each_relaunch_and_names_why_it_cannot() {
         wait_drivable(&daemon, Duration::from_secs(10)).await;
     });
 }
+
+#[test]
+fn interactive_setup_blocks_both_reconnect_entrypoints_through_ready_and_cleanup() {
+    let _serial = serial();
+    state_dir();
+    runtime().block_on(async {
+        let runner = start_runner().await;
+        runner.relaunch();
+        let state = daemon_state(&runner);
+        state
+            .released
+            .store(true, std::sync::atomic::Ordering::Release);
+        let daemon = serve(server::http::router(state.clone())).await;
+        let client = reqwest::Client::new();
+        let guard = server::setup::coordination::try_acquire(state_dir())
+            .unwrap()
+            .unwrap();
+        // A child may replace the status file, reach ready, or be rolled back.
+        // None of those observations ends the foreground parent's ownership.
+        for phase in ["starting", "ready", "building-fail"] {
+            std::fs::write(
+                state_dir().join("runner-setup-status.json"),
+                serde_json::json!({"phase": phase, "terminal": phase != "starting", "ts": 1})
+                    .to_string(),
+            )
+            .unwrap();
+            for (route, body) in [
+                ("mode", serde_json::json!({"mode":"agent"})),
+                ("input", serde_json::json!({"type":"tap","x":0.5,"y":0.5})),
+            ] {
+                let response = client
+                    .post(format!("{daemon}/agent/{route}"))
+                    .header("x-phone-control", "1")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 503, "{phase}: {route}");
+                let value: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(
+                    value["error"], "setup_in_progress",
+                    "{phase}: {route}: {value}"
+                );
+                assert_eq!(value["reconnecting"], false, "no reconnect was admitted");
+                assert!(!state.runner_lifecycle.is_transitioning());
+                assert_eq!(
+                    runner.launch.lock().unwrap().number,
+                    1,
+                    "bootstrap must not run"
+                );
+            }
+        }
+        drop(guard); // The foreground commit/rollback has fully completed.
+        let response = client
+            .post(format!("{daemon}/agent/mode"))
+            .header("x-phone-control", "1")
+            .json(&serde_json::json!({"mode":"agent"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        wait_drivable(&daemon, Duration::from_secs(20)).await;
+        assert_eq!(
+            runner.launch.lock().unwrap().number,
+            2,
+            "normal recovery resumes after cleanup"
+        );
+    });
+}

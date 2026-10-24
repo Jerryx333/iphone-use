@@ -1,7 +1,8 @@
 [package]
 name = "iphone-use-mcp"
-version = "0.22.1"
+version = "0.22.4"
 edition = "2021"
+license-file = "../../LICENSE"
 description = "MCP stdio server that wraps the iphone-use daemon's agent HTTP API"
 
 [lib]

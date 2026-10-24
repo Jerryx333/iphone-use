@@ -26,6 +26,10 @@ use super::usbdiag;
 
 const RUNNER_DEVICE_PORT: u16 = 8100;
 const MJPEG_DEVICE_PORT: u16 = 9100;
+/// The foreground has already built the product. Allow the supervisor's
+/// first device launch and relay/product checks, including a cold Wi-Fi start.
+const SUPERVISOR_START_WINDOW: Duration = Duration::from_secs(15 * 60);
+pub(crate) const SUPERVISOR_GENERATION_ENV: &str = "IPU_RUNNER_SUPERVISOR_GENERATION";
 /// How long a launch keeps retrying, in place, while a previous runner still
 /// holds the runner port on the phone (#265) …
 const PORT_IN_USE_WINDOW: Duration = Duration::from_secs(60);
@@ -93,6 +97,9 @@ pub struct Setup {
     /// The control relay reaches the phone through CoreDevice's Wi-Fi
     /// tunnel, not usbmuxd (only for what the log calls it).
     relay_over_tunnel: bool,
+    supervisor_generation: Option<String>,
+    // Held through commit/rollback cleanup; children do not inherit it.
+    _interactive_guard: Option<super::coordination::Guard>,
 }
 
 /// A phone on the legacy (iOS 15/16) path: see `legacy_ios`.
@@ -169,6 +176,8 @@ impl Setup {
             prebuild_only: false,
             upgrade_rebuild: false,
             relay_over_tunnel: false,
+            supervisor_generation: None,
+            _interactive_guard: None,
         }
     }
 
@@ -211,13 +220,20 @@ impl Setup {
                 std::fs::Permissions::from_mode(0o700),
             );
         }
-        match status::Run::begin(&self.ctx.status_file) {
+        let generation = self
+            .ctx
+            .keepalive
+            .then(|| std::env::var(SUPERVISOR_GENERATION_ENV).ok())
+            .flatten();
+        match status::Run::begin_for_supervisor(&self.ctx.status_file, generation.as_deref()) {
             Ok(run) => {
                 self.run = Some(run);
                 Ok(())
             }
-            Err(_) => {
-                super::term::die_line("could not initialize the setup status owner");
+            Err(error) => {
+                super::term::die_line(&format!(
+                    "could not initialize the setup status owner: {error}"
+                ));
                 Err(1)
             }
         }
@@ -554,6 +570,29 @@ impl Setup {
             &deployment_override,
         );
         let (products, xctestrun, from_cache) = self.product(&xcodebuild, &key)?;
+        if !self.ctx.keepalive {
+            // The foreground prepares the exact product; only launchd starts
+            // it on the phone. A successful setup must not need a second
+            // automation session just to establish supervision.
+            let target_url = format!("http://127.0.0.1:{}", self.ctx.runner_port);
+            // Install the selected target/settings before configuring the
+            // daemon: recovery may start this label as soon as it is loaded.
+            if !self.stage_supervisor() {
+                return die("could not stage the runner supervisor for the prebuilt product");
+            }
+            retry::reset(&self.ctx.retry_state).map_err(|error| {
+                super::term::die_line(&error);
+                Exit(1)
+            })?;
+            let daemon = self.configure_daemon(&target_url)?;
+            self.handoff(&target_url, &key)?;
+            self.verify_product(&daemon)?;
+            self.commit_setup();
+            let address = runner::server_url(&self.ctx.run_log)
+                .unwrap_or_else(|| format!("device port {RUNNER_DEVICE_PORT}"));
+            self.summary(&address, &target_url, &daemon, &source_hash);
+            return Ok(());
+        }
         let url = if self.legacy_ios.is_some() {
             self.legacy_launch(&products, &key)?
         } else {
@@ -565,28 +604,29 @@ impl Setup {
             target_url = self.legacy_wifi(&url, &target_url)?;
         }
         let daemon = self.configure_daemon(&target_url)?;
-        if self.ctx.keepalive {
-            self.verify_supervision(&target_url)?;
-        } else {
-            self.handoff(&target_url)?;
-        }
+        self.verify_supervision(&target_url)?;
         self.verify_product(&daemon)?;
-        self.handoff_complete = true;
-        if self.ctx.keepalive {
-            if let Err(error) = retry::reset(&self.ctx.retry_state) {
-                warn(&error);
-                warn("could not clear KeepAlive retry state after a verified recovery");
-            }
+        if let Err(error) = retry::reset(&self.ctx.retry_state) {
+            warn(&error);
+            warn("could not clear KeepAlive retry state after a verified recovery");
         }
+        self.commit_setup();
+        if let Some(run) = &self.run {
+            run.product_key(&key);
+        }
+        self.phase("ready", "", &self.ready_message());
+        self.summary(&url, &target_url, &daemon, &source_hash);
+        Ok(())
+    }
+
+    fn commit_setup(&mut self) {
+        self.handoff_complete = true;
         let _ = std::fs::remove_file(&self.daemon.rollback);
         let _ = std::fs::remove_file(&self.sup.rollback);
         let _ = std::fs::remove_file(&self.self_install.rollback);
         self.daemon.active = false;
         self.sup.active = false;
         self.self_install.replaced = false;
-        self.phase("ready", "", &self.ready_message());
-        self.summary(&url, &target_url, &daemon, &source_hash);
-        Ok(())
     }
 
     fn prerequisites(&mut self) -> Step {
@@ -2524,8 +2564,8 @@ impl Setup {
 
     // ── the daemon ──────────────────────────────────────────────────────────
 
-    /// Point the daemon at the verified endpoints. It restarts only for the
-    /// settings it reads at startup: a restart drops every in-flight request,
+    /// Configure daemon endpoints; readiness is verified after startup.
+    /// Restart only for settings it reads at startup: a restart drops every in-flight request,
     /// hold and owner lease.
     fn configure_daemon(&mut self, target_url: &str) -> Step<DaemonEndpoint> {
         let ctx = self.ctx.clone();
@@ -2648,7 +2688,7 @@ impl Setup {
             }
             launchd::enable(&ctx, &label);
             if !launchd::bootstrap(&ctx, &ctx.daemon_plist) {
-                return die("the device runner is reachable, but the daemon LaunchAgent could not be bootstrapped");
+                return die("the configured daemon LaunchAgent could not be bootstrapped");
             }
         }
         let loaded = launchd::loaded(&ctx, &label);
@@ -3729,6 +3769,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn already_started_supervisor_is_not_bootstrapped_again() {
+        let enabled = std::cell::Cell::new(0);
+        assert!(ensure_supervisor_started(
+            || {
+                enabled.set(enabled.get() + 1);
+                true
+            },
+            || true,
+            || panic!("recovery already started the staged label"),
+        ));
+        assert_eq!(enabled.get(), 1);
+    }
+
+    #[test]
+    fn supervisor_start_accepts_a_bootstrap_race_only_after_readback() {
+        let loaded = std::cell::Cell::new(false);
+        let attempts = std::cell::Cell::new(0);
+        assert!(ensure_supervisor_started(
+            || true,
+            || loaded.get(),
+            || {
+                attempts.set(attempts.get() + 1);
+                loaded.set(true);
+                false
+            },
+        ));
+        assert_eq!(attempts.get(), 1);
+        assert!(!ensure_supervisor_started(|| true, || false, || true));
+        assert!(!ensure_supervisor_started(
+            || false,
+            || panic!("enable failed"),
+            || panic!("enable failed"),
+        ));
+    }
+
+    #[test]
+    fn readiness_is_bound_to_the_supervisors_generation_and_product() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let owner = |id: &str| status::Owner {
+            path: path.clone(),
+            run_id: id.into(),
+            pid: 123,
+            start: "fixture".into(),
+        };
+        let old = owner("old");
+        let new = owner("new");
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let ready = status::Op::Phase {
+            phase: "ready".into(),
+            blocked: "".into(),
+            message: "ready".into(),
+        };
+        status::publish(&old, &status::Op::BeginForSupervisor(a.clone())).unwrap();
+        status::publish(&old, &status::Op::ProductKey("product".into())).unwrap();
+        status::publish(&old, &ready).unwrap();
+        assert_eq!(supervisor_ready(&path, &b, "product"), Ok(false));
+        status::publish(&new, &status::Op::BeginForSupervisor(b.clone())).unwrap();
+        assert_eq!(supervisor_ready(&path, &b, "product"), Ok(false));
+        status::publish(&new, &ready).unwrap();
+        assert!(
+            supervisor_ready(&path, &b, "product")
+                .unwrap_err()
+                .contains("without product verification"),
+            "old product proof must not survive Begin, and missing proof must fail immediately"
+        );
+        status::publish(&new, &status::Op::ProductKey("wrong".into())).unwrap();
+        assert!(supervisor_ready(&path, &b, "product")
+            .unwrap_err()
+            .contains("different product"));
+        status::publish(&new, &status::Op::ProductKey("product".into())).unwrap();
+        assert_eq!(supervisor_ready(&path, &b, "product"), Ok(true));
+        assert!(!status::publish(&old, &status::Op::ProductKey("wrong".into())).unwrap());
+        assert_eq!(supervisor_ready(&path, &b, "product"), Ok(true));
+        status::publish(&owner("generic"), &status::Op::Begin).unwrap();
+        status::publish(&owner("generic"), &ready).unwrap();
+        assert_eq!(supervisor_ready(&path, &b, "product"), Ok(false));
+        std::fs::write(path.clone(), b"not JSON").unwrap();
+        assert_eq!(supervisor_ready(&path, &b, "product"), Ok(false));
+    }
+
+    #[test]
     fn an_unreachable_target_names_the_tunnel_and_never_offers_the_lan_relay_as_the_fix() {
         let auto = not_reachable_message("00008110-001C18203AD2401E", true);
         assert!(auto.contains("no CoreDevice Wi-Fi tunnel"), "{auto}");
@@ -4205,13 +4328,9 @@ impl Setup {
         }
     }
 
-    /// An interactive setup: build and prove the runner, then hand it to the
-    /// dedicated launchd supervisor and verify the hand-off.
+    /// Prepare the product, start it under launchd, and verify supervision.
     pub fn run_interactive(mut self) -> i32 {
         proc::install_signal_handlers();
-        if let Err(code) = self.install_self() {
-            return code;
-        }
         let code = match self.interactive() {
             Ok(()) => 0,
             Err(Exit(code)) => code,
@@ -4224,6 +4343,19 @@ impl Setup {
         if owner::check(&self.ctx) != 0 {
             return Err(Exit(1));
         }
+        self._interactive_guard = match super::coordination::try_acquire(self.ctx.state_dir()) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                return die(
+                    "another setup or reconnect is changing this phone; wait for it to finish",
+                )
+            }
+            Err(error) => {
+                return die(format!(
+                    "could not acquire the runner transition lock: {error}"
+                ))
+            }
+        };
         // Before anything is paused or built, so stopping here undoes nothing.
         if sys::stdout_is_tty() && !self.first_run_checklist() {
             return die(format!(
@@ -4231,6 +4363,7 @@ impl Setup {
                 self.ctx.rerun_command()
             ));
         }
+        self.install_self().map_err(Exit)?;
         if let Err(code) = self.begin_status() {
             return Err(Exit(code));
         }
@@ -4403,10 +4536,27 @@ impl Setup {
         Ok(())
     }
 
-    /// Write and bootstrap the supervisor plist: launchd runs the fixed copy
+    /// Stage the supervisor plist: launchd runs the fixed copy
     /// of the setup script with `IPU_RUNNER_KEEPALIVE=1` and this run's settings.
-    fn install_supervisor(&mut self) -> bool {
+    fn stage_supervisor(&mut self) -> bool {
+        let generation = match core::runner_auth::new_token() {
+            Ok(generation) => generation,
+            Err(error) => {
+                warn(&error);
+                return false;
+            }
+        };
+        self.supervisor_generation = Some(generation.clone());
         let ctx = self.ctx.clone();
+        // A legacy daemon may have reloaded the old policy during the build.
+        // Stop it immediately before publishing this run's new configuration.
+        if launchd::loaded(&ctx, &ctx.instance.runner_label) {
+            launchd::bootout(&ctx, &ctx.instance.runner_label);
+            if !launchd::wait_gone(&ctx, &ctx.instance.runner_label) {
+                warn("old runner supervisor did not stop before staging the new configuration");
+                return false;
+            }
+        }
         if !sys::is_executable(&ctx.self_install) {
             warn(&format!(
                 "fixed setup script is missing or not executable: {}",
@@ -4421,6 +4571,7 @@ impl Setup {
         // The key order is the script's, so a plist reads the same either way.
         let mut pairs: Vec<(&str, String)> = vec![
             ("IPU_RUNNER_KEEPALIVE", "1".into()),
+            (SUPERVISOR_GENERATION_ENV, generation),
             ("PATH", super::ctx::SUPERVISOR_PATH.into()),
             ("IPU_RUNNER_UDID", ctx.udid.clone()),
             ("IPU_RUNNER_TEAM_ID", ctx.team_id.clone()),
@@ -4428,12 +4579,17 @@ impl Setup {
         ];
         // A checkout/custom setup must keep using the explicitly selected
         // engine after launchd takes over, rather than an older installed app.
-        if let Ok(binary) = std::env::var("IPHONE_USE_SETUP_BIN") {
-            if !binary.is_empty() {
-                let path = std::fs::canonicalize(&binary).unwrap_or_else(|_| PathBuf::from(binary));
-                pairs.push(("IPHONE_USE_SETUP_BIN", path.to_string_lossy().into_owned()));
-            }
-        }
+        let binary = std::env::var("IPHONE_USE_SETUP_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok());
+        let Some(binary) = binary else {
+            warn("could not identify the setup engine for the supervisor");
+            return false;
+        };
+        let path = std::fs::canonicalize(&binary).unwrap_or(binary);
+        pairs.push(("IPHONE_USE_SETUP_BIN", path.to_string_lossy().into_owned()));
         if ctx.runner_src != ctx.runner_default_src {
             pairs.push((
                 "IPU_RUNNER_SRC",
@@ -4519,15 +4675,19 @@ impl Setup {
             return false;
         }
         self.sup.staged = None;
+        true
+    }
+
+    fn start_supervisor(&self) -> bool {
+        let ctx = self.ctx.clone();
         let label = ctx.instance.runner_label.clone();
-        launchd::bootout(&ctx, &label);
-        if !launchd::wait_gone(&ctx, &label) {
-            warn("old runner supervisor did not finish stopping");
-            return false;
-        }
-        // A prior installer may have disabled the label persistently.
-        launchd::enable(&ctx, &label);
-        if !launchd::bootstrap(&ctx, &ctx.runner_agent_plist) {
+        // The freshly configured daemon may already have started this
+        // exact staged label. Do not boot it out and sever its first session.
+        if !ensure_supervisor_started(
+            || launchd::enable(&ctx, &label),
+            || launchd::loaded(&ctx, &label),
+            || launchd::bootstrap(&ctx, &ctx.runner_agent_plist),
+        ) {
             warn(&format!(
                 "could not bootstrap the runner supervisor: {}",
                 ctx.runner_agent_plist.display()
@@ -4546,34 +4706,37 @@ impl Setup {
         }
     }
 
-    /// Hand the proven runner and relays to the supervisor and verify that a
-    /// fresh supervisor-owned runner replaced this run's, with both relays
-    /// and `/status`, within two minutes.
-    fn handoff(&mut self, target_url: &str) -> Step {
+    /// Launch the prebuilt product only under the supervisor, then verify its
+    /// exact product key, process identities, both relays and signed /status.
+    fn handoff(&mut self, target_url: &str, expected_key: &str) -> Step {
         let ctx = self.ctx.clone();
-        let Some(record) = pid::validate(
-            &ctx,
-            &ctx.runner_pid_file,
-            &self.legacy.runner,
-            Role::Runner,
-            false,
-        )
-        .and_then(|_| pid::parse(&ctx.runner_pid_file, &self.legacy.runner)) else {
-            return die("interactive runner identity was lost before launchd handoff");
-        };
-        let old_id = (record.pid, record.lstart.clone());
         self.phase(
             "supervisor",
             "",
-            "handing the device runner to its launchd supervisor",
+            "starting the prebuilt runner under its launchd supervisor",
         );
-        info("Handing the verified runner setup to its dedicated launchd supervisor");
-        if !self.install_supervisor() {
-            return die("the device runner is reachable now, but its launchd supervisor could not be installed");
+        info("Starting the prebuilt runner under launchd; keep the iPhone unlocked and handle any authorization prompt on it");
+        if !self.start_supervisor() {
+            return die(
+                "the runner product is built, but its launchd supervisor could not be started",
+            );
         }
         let runner_port = valid_port(&ctx.runner_port).unwrap_or(8100);
         let mjpeg_port = valid_port(&ctx.mjpeg_port).unwrap_or(9100);
-        for _ in 0..60 {
+        let started = Instant::now();
+        let mut last_phase = None;
+        while started.elapsed() < SUPERVISOR_START_WINDOW {
+            proc::check()?;
+            let phase = status::active_phase(&ctx.status_file);
+            if phase != last_phase {
+                if let Some(phase) = &phase {
+                    info(&format!(
+                        "Runner supervisor: {phase} ({}s elapsed)",
+                        started.elapsed().as_secs()
+                    ));
+                }
+                last_phase = phase;
+            }
             let new_id = pid::validate(
                 &ctx,
                 &ctx.runner_pid_file,
@@ -4583,10 +4746,18 @@ impl Setup {
             )
             .and_then(|_| pid::parse(&ctx.runner_pid_file, &self.legacy.runner))
             .map(|record| (record.pid, record.lstart));
-            let replaced = new_id
-                .as_ref()
-                .is_some_and(|id| *id != old_id && !id.1.is_empty());
-            if replaced
+            let identified = new_id.as_ref().is_some_and(|id| !id.1.is_empty());
+            let ready = match self.supervisor_generation.as_deref() {
+                Some(expected) => {
+                    match supervisor_ready(&ctx.status_file, expected, expected_key) {
+                        Ok(ready) => ready,
+                        Err(reason) => return die(reason),
+                    }
+                }
+                None => false,
+            };
+            if identified
+                && ready
                 && launchd::loaded(&ctx, &ctx.instance.runner_label)
                 && pid::verify_loopback_listener(
                     &ctx,
@@ -4602,7 +4773,6 @@ impl Setup {
                     Role::Mjpeg,
                     mjpeg_port,
                 )
-                && status::phase_is(&ctx.status_file, "ready")
                 && sys::runner_get(
                     &format!("{target_url}/status"),
                     Duration::from_secs(4),
@@ -4612,14 +4782,15 @@ impl Setup {
                     status < 400 && handoff_daemon_ready(&body, self.embed.is_some())
                 })
             {
-                ok("launchd replacement verified: runner identity, both loopback relays, and runner /status");
+                ok("launchd first startup verified: exact product, runner identity, both loopback relays, and runner /status");
                 return Ok(());
             }
             proc::sleep(Duration::from_secs(2))?;
         }
         self.phase("supervisor-fail", "runner", "launchd handoff not verified");
         die(format!(
-            "runner launchd job loaded, but its replacement runner was not verified within 120s.\n   Check: {}\n   Then:  {} status",
+            "runner supervisor did not reach verified readiness within {}s.\n   Check: {}\n   Then:  {} status",
+            SUPERVISOR_START_WINDOW.as_secs(),
             ctx.runner_agent_log.display(),
             ctx.self_install.display()
         ))
@@ -4722,6 +4893,46 @@ fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Enabling a staged label is idempotent. A competing recovery request may
+/// win bootstrap; the authoritative result is whether the label is loaded.
+fn ensure_supervisor_started(
+    mut enable: impl FnMut() -> bool,
+    mut loaded: impl FnMut() -> bool,
+    mut bootstrap: impl FnMut() -> bool,
+) -> bool {
+    if !enable() {
+        return false;
+    }
+    if loaded() {
+        return true;
+    }
+    let _ = bootstrap();
+    loaded()
+}
+
+/// A fresh ready report with the wrong product cannot become this setup's
+/// success by waiting. Fail immediately rather than using the launch deadline.
+fn supervisor_ready(
+    path: &Path,
+    expected_generation: &str,
+    expected_product: &str,
+) -> Result<bool, &'static str> {
+    let Some(report) = std::fs::read(path)
+        .ok()
+        .and_then(|s| serde_json::from_slice::<serde_json::Value>(&s).ok())
+    else {
+        return Ok(false);
+    };
+    if report["supervisor_generation"] != expected_generation || report["phase"] != "ready" {
+        return Ok(false);
+    }
+    match report.get("product_key").and_then(serde_json::Value::as_str) {
+        Some(product) if product == expected_product => Ok(true),
+        Some(_) => Err("runner supervisor reached ready with a different product; refusing the mismatched configuration and rolling back setup"),
+        None => Err("runner supervisor reached ready without product verification; refusing the unverified startup and rolling back setup"),
+    }
 }
 
 /// Warn, on a background thread, when the video relay has not delivered its

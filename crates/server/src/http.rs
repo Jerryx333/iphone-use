@@ -2210,9 +2210,13 @@ fn start_health_probe(state: &AppState) -> crate::runner::RunnerHealth {
                 );
             }
             Err(_) => {
-                // Preserve the last completed observation. A timeout is not an
-                // authoritative "down", and the next status poll may retry.
-                tracing::warn!("runner health probe timed out; retaining cached health");
+                // A timeout does not prove the runner is down or locked, but
+                // old actionability is no longer evidence that inputs work.
+                // Do not release or restart it; the next completed probe can
+                // restore readiness (#313).
+                recover(health_cache.lock()).actionable = false;
+                actionable.store(false, std::sync::atomic::Ordering::Release);
+                tracing::warn!("runner health probe timed out; actionability is unverified");
             }
         }
     }));
@@ -3273,6 +3277,8 @@ struct RunnerSetupStatus {
     owner_start: String,
     #[serde(default)]
     heartbeat_ts: u64,
+    #[serde(default)]
+    supervisor_generation: String,
 }
 
 fn read_structured_setup_status() -> Option<RunnerSetupStatus> {
@@ -3972,23 +3978,19 @@ fn launchd_job_loaded(domain: &str, label: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the job has a live process (`pid = N` in `launchctl print`).
-fn launchd_job_running(domain: &str, label: &str) -> bool {
-    std::process::Command::new("launchctl")
-        .args(["print", &format!("{domain}/{label}")])
-        .output()
-        .map(|out| {
-            out.status.success() && launchctl_print_has_pid(&String::from_utf8_lossy(&out.stdout))
-        })
-        .unwrap_or(false)
-}
-
 /// The job's own `pid = N` line: one tab deep, unlike the nested blocks.
 fn launchctl_print_has_pid(print: &str) -> bool {
-    print.lines().any(|line| {
-        line.strip_prefix('\t')
-            .and_then(|rest| rest.strip_prefix("pid = "))
-            .is_some_and(|pid| pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0))
+    launchctl_print_pid(print).is_some()
+}
+
+fn launchctl_print_pid(print: &str) -> Option<u32> {
+    print.lines().find_map(|line| {
+        line.strip_prefix('\t')?
+            .strip_prefix("pid = ")?
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
     })
 }
 
@@ -4182,6 +4184,38 @@ fn clear_runner_retry_backoff(state_dir: &std::path::Path) {
     }
 }
 
+fn runner_agent_environment(bytes: &[u8]) -> Option<plist::Dictionary> {
+    plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .ok()?
+        .as_dictionary()?
+        .get("EnvironmentVariables")?
+        .as_dictionary()
+        .cloned()
+}
+
+/// Adopt a live automatic startup instead of restarting its automation session.
+/// Interactive setup is excluded separately by the cross-process transition guard.
+fn preserve_starting_supervisor(
+    environment: &plist::Dictionary,
+    status: Option<&RunnerSetupStatus>,
+    job_pid: Option<u32>,
+    now: u64,
+    owner_alive: impl Fn(u32, &str) -> bool,
+) -> bool {
+    use crate::setup::flow::SUPERVISOR_GENERATION_ENV;
+    let value = |key| environment.get(key).and_then(plist::Value::as_string);
+    let Some(generation) = value(SUPERVISOR_GENERATION_ENV)
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        return false;
+    };
+    status.is_some_and(|status| {
+        status.supervisor_generation == generation
+            && job_pid == Some(status.owner_pid)
+            && setup_in_flight_from(status, now, None, owner_alive)
+    })
+}
+
 /// Start or restart the dedicated runner supervisor without destroying its
 /// persisted signing/path/port policy.
 ///
@@ -4192,15 +4226,35 @@ fn clear_runner_retry_backoff(state_dir: &std::path::Path) {
 /// policy may be kickstarted. A minimal plist is created only when no
 /// setup-generated file exists yet.
 pub fn write_and_bootstrap_runner_agent(setup_sh: &str, log: &str, udid: &str) -> bool {
+    write_and_bootstrap_runner_agent_with(
+        setup_sh,
+        log,
+        udid,
+        crate::instance::current(),
+        &gui_domain(),
+        &SETUP_KICKED_AT,
+        |args| {
+            std::process::Command::new("launchctl")
+                .args(args)
+                .output()
+                .ok()
+        },
+    )
+}
+
+fn write_and_bootstrap_runner_agent_with(
+    setup_sh: &str,
+    log: &str,
+    udid: &str,
+    instance: &crate::instance::Instance,
+    domain: &str,
+    kicked_at: &std::sync::atomic::AtomicU64,
+    launchctl: impl Fn(&[&str]) -> Option<std::process::Output>,
+) -> bool {
     if !std::path::Path::new(setup_sh).is_file() || !valid_runner_udid(udid) {
         return false;
     }
-    // Both callers mean "bring the phone up now" (the setup endpoint and an
-    // explicit reconnect), so neither should inherit a pending backoff.
-    clear_runner_retry_backoff(&crate::instance::current().state_dir);
-    // From here on the status file the old helper left is history.
-    SETUP_KICKED_AT.store(now_secs(), std::sync::atomic::Ordering::Release);
-    let plist_path = crate::instance::current().runner_plist();
+    let plist_path = instance.runner_plist();
     let Some(parent) = plist_path.parent() else {
         return false;
     };
@@ -4213,6 +4267,7 @@ pub fn write_and_bootstrap_runner_agent(setup_sh: &str, log: &str, udid: &str) -
         Err(_) => return false,
     };
 
+    let original_env = original.as_deref().and_then(runner_agent_environment);
     let candidate = if let Some(contents) = &original {
         contents.clone()
     } else {
@@ -4281,7 +4336,7 @@ pub fn write_and_bootstrap_runner_agent(setup_sh: &str, log: &str, udid: &str) -
     <key>StandardErrorPath</key><string>{log_xml}</string>
 </dict></plist>
 "#,
-            label = runner_agent_label()
+            label = instance.runner_label
         )
         .into_bytes()
     };
@@ -4290,7 +4345,13 @@ pub fn write_and_bootstrap_runner_agent(setup_sh: &str, log: &str, udid: &str) -
         Ok(path) => path,
         Err(_) => return false,
     };
-    if original.is_some() {
+    if original.is_some()
+        && original_env
+            .as_ref()
+            .and_then(|env| env.get("IPU_RUNNER_UDID"))
+            .and_then(plist::Value::as_string)
+            != Some(udid)
+    {
         // Edit only the staging copy. A crash or PlistBuddy failure cannot
         // truncate or partially rewrite the live launchd configuration.
         let set_command = format!("Set :EnvironmentVariables:IPU_RUNNER_UDID {udid}");
@@ -4354,104 +4415,91 @@ pub fn write_and_bootstrap_runner_agent(setup_sh: &str, log: &str, udid: &str) -
         let _ = std::fs::remove_file(&staged);
     }
 
-    let domain = gui_domain();
-    let service = format!("{domain}/{}", runner_agent_label());
-    let was_loaded = launchd_job_loaded(&domain, runner_agent_label());
-    // Cold start: the job isn't in the gui domain yet — it was booted out on a
-    // prior stop, or never loaded after login. `launchctl enable`/`kickstart`
-    // both fail on an unknown service with "Could not find service … in domain
-    // for user 501", which used to hit the `enable` early-return below and
-    // leave the daemon wedged `offline`, replaying that same failure on every
-    // reconnect (issue #62). Bootstrap the plist first so the service exists;
-    // RunAtLoad then starts it.
-    if !was_loaded {
-        let bootstrap_job = || {
-            std::process::Command::new("launchctl")
-                .args(["bootstrap", &domain])
-                .arg(&plist_path)
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        };
-        let mut bootstrapped = bootstrap_job();
-        if !bootstrapped && !launchd_job_loaded(&domain, runner_agent_label()) {
-            // A persistently-disabled service refuses bootstrap. Now that the
-            // label is known to the domain, clearing the disabled flag and
-            // retrying recovers it.
-            let _ = std::process::Command::new("launchctl")
-                .args(["enable", &service])
-                .status();
-            bootstrapped = bootstrap_job();
+    let service = format!("{domain}/{}", instance.runner_label);
+    let invoke = |args: &[&str]| launchctl(args).is_some_and(|out| out.status.success());
+    let job = || launchctl(&["print", &service]).filter(|out| out.status.success());
+    let loaded = || job().is_some();
+    let running =
+        || job().is_some_and(|out| launchctl_print_has_pid(&String::from_utf8_lossy(&out.stdout)));
+    let wait_gone = || {
+        for _ in 0..20 {
+            if !loaded() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        if !launchd_job_loaded(&domain, runner_agent_label()) {
+        !loaded()
+    };
+    let enable = || invoke(&["enable", &service]);
+    let bootstrap = || invoke(&["bootstrap", domain, &plist_path.to_string_lossy()]);
+    let kickstart = |kill| {
+        if kill {
+            invoke(&["kickstart", "-k", &service])
+        } else {
+            invoke(&["kickstart", &service])
+        }
+    };
+    let was_loaded = loaded();
+    if was_loaded && !plist_changed {
+        let status = std::fs::read_to_string(instance.status_file())
+            .ok()
+            .and_then(|text| serde_json::from_str::<RunnerSetupStatus>(&text).ok());
+        let job_pid =
+            job().and_then(|out| launchctl_print_pid(&String::from_utf8_lossy(&out.stdout)));
+        if original_env.as_ref().is_some_and(|env| {
+            preserve_starting_supervisor(
+                env,
+                status.as_ref(),
+                job_pid,
+                now_secs(),
+                setup_owner_alive,
+            )
+        }) {
+            // Preserve the existing attempt's status fence and retry policy.
+            // A non-killing kickstart starts a queued job without severing a
+            // launch that raced the process readback.
+            return enable() && (running() || kickstart(false)) && loaded();
+        }
+    }
+    // Only a genuinely new/replacement attempt invalidates the previous
+    // status and clears retry backoff. Adopting an in-flight launch does not.
+    clear_runner_retry_backoff(&instance.state_dir);
+    kicked_at.store(now_secs(), std::sync::atomic::Ordering::Release);
+    if !was_loaded {
+        let mut bootstrapped = bootstrap();
+        if !bootstrapped && !loaded() {
+            let _ = enable();
+            bootstrapped = bootstrap();
+        }
+        if !loaded() {
             if !bootstrapped && plist_changed {
                 restore_plist(&plist_path, original.as_deref());
             }
             return false;
         }
-        // Loaded now, and RunAtLoad normally has it running already. Only
-        // start it when it is not: `kickstart -k` on the run RunAtLoad just
-        // began killed it, and launchd's 30 s ThrottleInterval then held the
-        // restart — every cold connect waited 30 s before setup even began.
-        if !launchd_job_running(&domain, runner_agent_label()) {
-            let _ = std::process::Command::new("launchctl")
-                .args(["kickstart", &service])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+        if !running() {
+            let _ = kickstart(false);
         }
-        return launchd_job_loaded(&domain, runner_agent_label());
+        return loaded();
     }
-    // A persistently disabled service rejects bootstrap. Enable first and treat
-    // failure as authoritative instead of continuing into a misleading start.
-    if !std::process::Command::new("launchctl")
-        .args(["enable", &service])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
+    if !enable() {
         if plist_changed {
-            if was_loaded {
-                let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", &service])
-                    .status();
-                let _ = wait_launchd_job_gone(&domain, runner_agent_label());
-            }
+            let _ = invoke(&["bootout", &service]);
+            let _ = wait_gone();
             restore_plist(&plist_path, original.as_deref());
         }
         return false;
     }
-    let activated = if was_loaded && !plist_changed {
-        // The cached launchd configuration is identical, so kickstart is safe.
-        std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &service])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+    let activated = if !plist_changed {
+        kickstart(running())
     } else {
-        // Any plist change (especially IPU_RUNNER_UDID) requires a full unload/reload;
-        // kickstart alone would reuse launchd's cached old environment.
-        if was_loaded {
-            let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &service])
-                .status();
-        }
-        wait_launchd_job_gone(&domain, runner_agent_label())
-            && std::process::Command::new("launchctl")
-                .args(["bootstrap", &domain])
-                .arg(&plist_path)
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+        let _ = invoke(&["bootout", &service]);
+        wait_gone() && bootstrap()
     };
-    let verified = activated && launchd_job_loaded(&domain, runner_agent_label());
+    let verified = activated && loaded();
     if !verified && plist_changed {
-        // Preserve the last known-good on-disk policy while leaving the
-        // mismatched service down; never restart a cached old target.
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &service])
-            .status();
-        let _ = wait_launchd_job_gone(&domain, runner_agent_label());
+        let _ = invoke(&["bootout", &service]);
+        let _ = wait_gone();
         restore_plist(&plist_path, original.as_deref());
     }
     verified
@@ -4924,10 +4972,56 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
 /// only the lifecycle is freed, so status probes the runner again.
 const RUNNER_BOOTSTRAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectAdmissionError {
+    SetupBusy,
+    LifecycleBusy,
+    CoordinationUnavailable,
+}
+
+impl ReconnectAdmissionError {
+    fn details(self) -> (&'static str, &'static str, bool) {
+        match self {
+            Self::SetupBusy => ("setup_in_progress", "setup is already changing this phone; wait for /agent/status instead of reconnecting", false),
+            Self::LifecycleBusy => ("reconnect_in_progress", "another reconnect or release owns the runner lifecycle", true),
+            Self::CoordinationUnavailable => ("setup_coordination_unavailable", "the runner transition lock could not be checked; see the daemon log", false),
+        }
+    }
+}
+
+fn admit_managed_reconnect(
+    lifecycle: &RunnerLifecycle,
+    state_dir: &std::path::Path,
+) -> Result<(crate::setup::coordination::Guard, RunnerTransitionToken), ReconnectAdmissionError> {
+    // Reading the phase does not acquire it: interactive setup still wins
+    // admission before any reconnect can transition the lifecycle.
+    if lifecycle.is_transitioning() {
+        return Err(ReconnectAdmissionError::LifecycleBusy);
+    }
+    let guard = match crate::setup::coordination::try_acquire(state_dir) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return Err(if lifecycle.is_transitioning() {
+                ReconnectAdmissionError::LifecycleBusy
+            } else {
+                ReconnectAdmissionError::SetupBusy
+            })
+        }
+        Err(error) => {
+            tracing::warn!("could not acquire runner transition lock: {error}");
+            return Err(ReconnectAdmissionError::CoordinationUnavailable);
+        }
+    };
+    let token = lifecycle
+        .try_begin_reconnecting()
+        .ok_or(ReconnectAdmissionError::LifecycleBusy)?;
+    Ok((guard, token))
+}
+
 /// Start one managed reconnect round and run it to its end in the
 /// background: own the lifecycle, start the supervisor, then hand the round
-/// to the readiness wait. `None` when another reconnect or release owns the
-/// lifecycle.
+/// to the readiness wait. Admission refuses an interactive setup, another
+/// reconnect/release, or an unusable cross-process coordination lock.
 ///
 /// The round lives in a detached task holding an ownership guard from the
 /// moment it begins. A request handler that awaited the bootstrap itself was
@@ -4940,15 +5034,23 @@ const RUNNER_BOOTSTRAP_BUDGET: std::time::Duration = std::time::Duration::from_s
 fn begin_managed_reconnect(
     state: &Arc<AppState>,
     udid: String,
-) -> Option<tokio::task::JoinHandle<bool>> {
-    let token = state.runner_lifecycle.try_begin_reconnecting()?;
+) -> Result<tokio::task::JoinHandle<bool>, ReconnectAdmissionError> {
+    let (transition_guard, token) = admit_managed_reconnect(
+        &state.runner_lifecycle,
+        &crate::instance::current().state_dir,
+    )?;
     let ownership = RunnerReadinessOwnership::new(state.runner_lifecycle.clone(), token);
     let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
     let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
     let bootstrap = state.runner_bootstrap;
     let state = state.clone();
-    Some(tokio::spawn(async move {
-        let started = tokio::task::spawn_blocking(move || bootstrap(&setup_sh, &log, &udid));
+    Ok(tokio::spawn(async move {
+        let started = tokio::task::spawn_blocking(move || {
+            // Keep the guard in the blocking operation, even if observing it
+            // times out or the request handler goes away.
+            let _transition_guard = transition_guard;
+            bootstrap(&setup_sh, &log, &udid)
+        });
         let bootstrapped = match tokio::time::timeout(RUNNER_BOOTSTRAP_BUDGET, started).await {
             Ok(Ok(started)) => started,
             Ok(Err(error)) => {
@@ -4982,18 +5084,16 @@ fn begin_managed_reconnect(
 /// Bring an idle-released phone back in the background: the same bring-up
 /// an action on a released phone starts. Returns whether this call started
 /// it (false when another reconnect or release already owns the lifecycle).
-fn start_released_recovery(state: &Arc<AppState>) -> bool {
+fn start_released_recovery(state: &Arc<AppState>) -> Result<(), ReconnectAdmissionError> {
     // Someone just asked for the phone, so it is not idle — restart the
     // clock before the supervisor starts building. Otherwise the idle
     // watchdog can reach its window mid-bring-up and stop the very build
     // this request triggered. (The watchdog skips while the lifecycle is
     // transitioning, so touching right after the round begins is in time.)
-    if begin_managed_reconnect(state, state.device_udid.clone().unwrap_or_default()).is_none() {
-        return false;
-    }
+    let _round = begin_managed_reconnect(state, state.device_udid.clone().unwrap_or_default())?;
     note_reconnect_after_release();
     state.touch_activity();
-    true
+    Ok(())
 }
 
 /// Pre-warm a released phone (see `crate::prewarm`): run the policy gate,
@@ -5038,7 +5138,7 @@ async fn maybe_prewarm(
     if human_handoff_active() {
         return Err(prewarm::Skip::HumanHandoff);
     }
-    if !start_released_recovery(state) {
+    if start_released_recovery(state).is_err() {
         return Err(prewarm::Skip::LifecycleBusy);
     }
     prewarm::note_start(trigger);
@@ -6020,17 +6120,17 @@ async fn agent_mode_inner(
             // ThrottleInterval caps the rebuild rate so a persistent killer
             // (WARP Always-On) thrashes harmlessly instead of hot-looping.
             let was_released = state.released.load(std::sync::atomic::Ordering::Acquire);
-            let Some(round) = begin_managed_reconnect(&state, udid.unwrap_or_default()) else {
-                return with_security_headers(
-                    Response::builder()
+            let round = match begin_managed_reconnect(&state, udid.unwrap_or_default()) {
+                Ok(round) => round,
+                Err(error) => {
+                    let (name, hint, reconnecting) = error.details();
+                    return with_security_headers(Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::RETRY_AFTER, "5")
-                        .body(Body::from(
-                            r#"{"ok":false,"reconnecting":true,"error":"reconnect_in_progress"}"#,
-                        ))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-                );
+                        .body(Body::from(serde_json::json!({"ok": false, "reconnecting": reconnecting, "error": name, "hint": hint, "outcome": "not_sent", "retry_safe": true}).to_string()))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()));
+                }
             };
             if was_released {
                 note_reconnect_after_release();
@@ -6224,7 +6324,7 @@ fn coordinate_swipe_endpoints(
     Ok((x1, y1, x2, y2))
 }
 
-pub(crate) async fn runner_swipe(
+pub(crate) async fn runner_scroll(
     w: &mut crate::runner::RunnerClient,
     nx: f64,
     ny: f64,
@@ -6235,7 +6335,7 @@ pub(crate) async fn runner_swipe(
     let (x1, y1, x2, y2) = coordinate_swipe_endpoints(nx, ny, dx, dy, sw, sh)?;
     let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
     let dur = (dist * 1.2).clamp(120.0, 600.0) as u64;
-    w.swipe(x1, y1, x2, y2, dur).await
+    w.scroll(x1, y1, x2, y2, dur).await
 }
 
 /// Resolve the CoreDevice identifier of the currently-connected iPhone by
@@ -8100,7 +8200,7 @@ async fn scroll_snapshot_element(
             SCROLL_ALERT_HINT,
         ));
     }
-    w.swipe(x1, y1, x2, y2, duration)
+    w.scroll(x1, y1, x2, y2, duration)
         .await
         .map_err(SnapshotElementTapError::AfterDispatch)
 }
@@ -9178,12 +9278,12 @@ async fn runner_control_with_client(
                         }
                         let duration = (((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt() * 1.2)
                             .clamp(120.0, 600.0) as u64;
-                        w.swipe(x1, y1, x2, y2, duration).await
+                        w.scroll(x1, y1, x2, y2, duration).await
                     }
                     Err(error) => Err(error),
                 }
             } else {
-                runner_swipe(w, nx, ny, dx, dy).await
+                runner_scroll(w, nx, ny, dx, dy).await
             }
         }
         "text" => match v.get("text").and_then(|t| t.as_str()) {
@@ -10643,7 +10743,16 @@ fn control_readiness_refusal(state: &Arc<AppState>) -> Option<ControlRefusal> {
                     .with("hint", serde_json::json!("the phone was handed to the person holding it; POST /agent/mode {\"mode\":\"agent\"} to take it back before sending input")),
             );
         }
-        start_released_recovery(state);
+        if let Err(error) = start_released_recovery(state) {
+            if error != ReconnectAdmissionError::LifecycleBusy {
+                let (name, hint, _) = error.details();
+                return Some(
+                    ControlRefusal::new(StatusCode::SERVICE_UNAVAILABLE, name, true)
+                        .with("reconnecting", serde_json::Value::Bool(false))
+                        .with("hint", serde_json::json!(hint)),
+                );
+            }
+        }
         if state.runner_lifecycle.is_releasing() {
             return Some(ControlRefusal::releasing());
         }
@@ -11458,6 +11567,41 @@ async fn wait_probe_missed(
     Some(false)
 }
 
+/// Only an alert's presence and exact text can be established by /alert/text.
+/// Never use this sparse observation to prove app identity, absence, buttons,
+/// identifiers, or element state.
+fn alert_only_expectation(expect: &AgentUiExpectation) -> bool {
+    expect.application.is_none()
+        && expect.absent.is_empty()
+        && !expect.present.is_empty()
+        && expect.present.iter().all(|locator| {
+            locator.kind.as_deref() == Some("Alert")
+                && locator.identifier.is_none()
+                && locator.value.is_none()
+                && locator.focused.is_none()
+                && locator.enabled.is_none()
+                && locator.visible.is_none()
+        })
+}
+
+async fn agent_wait_alert(
+    w: &mut crate::runner::RunnerClient,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<crate::runner::ElementRow>, AgentWaitReadError> {
+    match tokio::time::timeout_at(deadline, w.alert_text_fresh()).await {
+        Ok(Ok(alert)) => Ok(alert
+            .into_iter()
+            .map(|text| crate::runner::ElementRow {
+                kind: "Alert".into(),
+                label: text,
+                ..Default::default()
+            })
+            .collect()),
+        Ok(Err(error)) => Err(AgentWaitReadError::Failed(error)),
+        Err(_) => Err(AgentWaitReadError::TimedOut),
+    }
+}
+
 async fn agent_wait_elements(
     w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
@@ -11610,6 +11754,15 @@ fn needs_scroll_settle(earlier: &[AgentActionStep], current: &serde_json::Value)
         )
 }
 
+/// No screen text survives a privacy refusal, but prior dispatch counts and
+/// retry safety remain visible so an interrupted batch cannot be replayed.
+fn private_batch_refusal(index: usize, completed: usize, applied: usize) -> Response {
+    agent_actions_failure(
+        StatusCode::LOCKED, index, completed, applied, "screen_private",
+        "not_sent", applied == 0, &[], None,
+    )
+}
+
 async fn agent_actions_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -11647,6 +11800,12 @@ async fn agent_actions_inner(
     };
     if let Err(error) = validate_agent_actions(&request) {
         return agent_actions_invalid(error);
+    }
+    let observes_screen = request.observe || request.steps.iter().any(|step| {
+        matches!(step, AgentActionStep::WaitFor { .. })
+    });
+    if observes_screen && state.screen_private_secs() > 0 {
+        return private_batch_refusal(0, 0, 0);
     }
     // `launch_app {"app": …}` becomes a bundle before the first step runs, so
     // a name that does not resolve refuses the whole batch with nothing sent.
@@ -11750,6 +11909,9 @@ async fn agent_actions_inner(
     let mut applied_actions = 0_usize;
     let mut step_results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
+        if observes_screen && state.screen_private_secs() > 0 {
+            return private_batch_refusal(index, completed, applied_actions);
+        }
         if state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
@@ -12125,10 +12287,14 @@ async fn agent_actions_inner(
                 // from "saw it, then lost the read" — a late failure must not
                 // erase history.
                 let mut reads = 0_u64;
-                let probes = wait_probe_predicates(expect);
+                let alert_only = alert_only_expectation(expect);
+                let probes = if alert_only { None } else { wait_probe_predicates(expect) };
                 let mut probe_misses = 0_u64;
                 let mut probes_answered = 0_u64;
                 loop {
+                    if state.screen_private_secs() > 0 {
+                        return private_batch_refusal(index, completed, applied_actions);
+                    }
                     attempts += 1;
                     // While the targets are not there yet, ask runner for just
                     // them (~0.3 s) instead of the whole tree (~0.9–3 s). A
@@ -12153,7 +12319,15 @@ async fn agent_actions_inner(
                             continue;
                         }
                     }
-                    let rows = match agent_wait_elements(&mut w, wait_deadline).await {
+                    let read = if alert_only {
+                        agent_wait_alert(&mut w, wait_deadline).await
+                    } else {
+                        agent_wait_elements(&mut w, wait_deadline).await
+                    };
+                    if state.screen_private_secs() > 0 {
+                        return private_batch_refusal(index, completed, applied_actions);
+                    }
+                    let rows = match read {
                         Ok(rows) => rows,
                         Err(AgentWaitReadError::Failed(error)) => {
                             last_read_error = Some(format!("{error:#}"));
@@ -12244,7 +12418,11 @@ async fn agent_actions_inner(
                         }
                     };
                     reads += 1;
-                    let (matches, observation) = agent_expectation_observation(&rows, expect);
+                    let (matches, mut observation) = agent_expectation_observation(&rows, expect);
+                    if alert_only {
+                        observation["source"] = serde_json::json!("alert");
+                        observation["alert"] = rows.first().map(|row| row.label.clone()).into();
+                    }
                     last_observation = observation;
                     if matches {
                         step_results.push(serde_json::json!({
@@ -12292,14 +12470,16 @@ async fn agent_actions_inner(
         completed += 1;
     }
 
+    if observes_screen && state.screen_private_secs() > 0 {
+        return private_batch_refusal(completed, completed, applied_actions);
+    }
     state.touch_activity();
-    let locked = recover(state.runner_health.lock()).locked;
-    *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {
-        updated_at: std::time::Instant::now(),
-        up: true,
-        actionable: true,
-        locked,
-    };
+    // A read-only wait (including /alert/text) proves no input capability.
+    if applied_actions > 0 {
+        let mut health = recover(state.runner_health.lock());
+        health.up = true;
+        health.actionable = true;
+    }
     let mut result = serde_json::json!({
         "ok": true,
         "completed": completed,
@@ -12311,6 +12491,9 @@ async fn agent_actions_inner(
         let budget = std::time::Duration::from_millis(AGENT_INPUT_SETTLE_DEFAULT_MS);
         let (observed, report) =
             settle_and_read_elements(&mut w, budget, DEVICE_SETTLE_DEFAULT_CAP).await;
+        if state.screen_private_secs() > 0 {
+            return private_batch_refusal(completed, completed, applied_actions);
+        }
         if let Some((snapshot, rows)) = observed {
             let rows = Arc::new(rows);
             remember_element_snapshot(&state, &snapshot, &rows);
@@ -12354,6 +12537,11 @@ async fn agent_actions_inner(
     if let Some(block) = recover(state.agent_focus.lock()).take_notice() {
         result["agent_focus"] = block;
     }
+    // A person can start a private hold while a read is in flight. Discard
+    // every observation, including earlier step text, before returning it.
+    if observes_screen && state.screen_private_secs() > 0 {
+        return private_batch_refusal(completed, completed, applied_actions);
+    }
     agent_actions_json(StatusCode::OK, result)
 }
 
@@ -12363,7 +12551,7 @@ async fn agent_actions_inner(
 // ---------------------------------------------------------------------------
 
 /// The runner as a [`crate::collect::Pager`]: a page is the element tree, a
-/// swipe is the coordinate scroll `/agent/input` sends (`runner_swipe`).
+/// swipe is the coordinate scroll `/agent/input` sends (`runner_scroll`).
 struct RunnerPager<'a> {
     w: &'a mut crate::runner::RunnerClient,
     screen: Option<(f64, f64)>,
@@ -12405,7 +12593,7 @@ impl crate::collect::Pager for RunnerPager<'_> {
         let region = region.unwrap_or(crate::collect::Region::FULL);
         let (x, y) = region.center();
         let dy = crate::collect::page_dy(region.h * height, direction);
-        runner_swipe(self.w, x, y, 0.0, dy).await?;
+        runner_scroll(self.w, x, y, 0.0, dy).await?;
         tokio::time::sleep(crate::collect::SWIPE_SETTLE).await;
         Ok(())
     }
@@ -20556,7 +20744,287 @@ mod tests {
             owner_pid: 4242,
             owner_start: "Fri Sep  5 14:00:00 2026".into(),
             heartbeat_ts,
+            supervisor_generation: String::new(),
         }
+    }
+
+    #[test]
+    fn concurrent_reconnect_keeps_its_lifecycle_busy_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = RunnerLifecycle::new();
+        let (guard, token) = admit_managed_reconnect(&lifecycle, dir.path()).unwrap();
+        assert_eq!(
+            admit_managed_reconnect(&lifecycle, dir.path()).unwrap_err(),
+            ReconnectAdmissionError::LifecycleBusy
+        );
+        assert!(lifecycle.finish_reconnecting(token));
+        // Observation can end while the blocking bootstrap still owns its
+        // descriptor: do not admit another start in that interval either.
+        assert_eq!(
+            admit_managed_reconnect(&lifecycle, dir.path()).unwrap_err(),
+            ReconnectAdmissionError::SetupBusy
+        );
+        drop(guard);
+        let (guard, token) = admit_managed_reconnect(&lifecycle, dir.path()).unwrap();
+        assert!(lifecycle.finish_reconnecting(token));
+        drop(guard);
+    }
+
+    #[test]
+    fn interactive_setup_blocks_reconnect_before_lifecycle_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = RunnerLifecycle::new();
+        let interactive = crate::setup::coordination::try_acquire(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            admit_managed_reconnect(&lifecycle, dir.path()).unwrap_err(),
+            ReconnectAdmissionError::SetupBusy
+        );
+        assert!(!lifecycle.is_transitioning());
+        // Status can be absent, replaced by the child, ready, or rolled back:
+        // the descriptor stays owned until all interactive cleanup has ended.
+        std::fs::write(
+            dir.path().join("runner-setup-status.json"),
+            br#"{"phase":"ready","terminal":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            admit_managed_reconnect(&lifecycle, dir.path()).unwrap_err(),
+            ReconnectAdmissionError::SetupBusy
+        );
+        drop(interactive);
+        let (reconnect, token) = admit_managed_reconnect(&lifecycle, dir.path()).unwrap();
+        assert!(
+            crate::setup::coordination::try_acquire(dir.path())
+                .unwrap()
+                .is_none(),
+            "bootstrap excludes interactive setup too"
+        );
+        assert!(lifecycle.finish_reconnecting(token));
+        drop(reconnect);
+        assert!(crate::setup::coordination::try_acquire(dir.path())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn in_flight_supervisor_requires_the_exact_live_job_and_generation() {
+        use crate::setup::flow::SUPERVISOR_GENERATION_ENV;
+        let mut env = plist::Dictionary::new();
+        env.insert(
+            SUPERVISOR_GENERATION_ENV.into(),
+            plist::Value::String("a".repeat(64)),
+        );
+        let now = 1_000_000;
+        let mut status = protocol_status(true, false, now);
+        status.supervisor_generation = "a".repeat(64);
+        let alive = |pid, start: &str| pid == 4242 && start.starts_with("Fri Sep");
+        assert!(preserve_starting_supervisor(
+            &env,
+            Some(&status),
+            Some(4242),
+            now,
+            alive
+        ));
+        assert!(!preserve_starting_supervisor(
+            &env,
+            Some(&status),
+            Some(4243),
+            now,
+            alive
+        ));
+        assert!(!preserve_starting_supervisor(
+            &env,
+            Some(&status),
+            Some(4242),
+            now + 61,
+            alive
+        ));
+        assert!(!preserve_starting_supervisor(
+            &env,
+            Some(&status),
+            Some(4242),
+            now,
+            |_, _| false
+        ));
+        status.supervisor_generation = "b".repeat(64);
+        assert!(!preserve_starting_supervisor(
+            &env,
+            Some(&status),
+            Some(4242),
+            now,
+            alive
+        ));
+        status.supervisor_generation = "a".repeat(64);
+        status.active = false;
+        status.terminal = true;
+        assert!(!preserve_starting_supervisor(
+            &env,
+            Some(&status),
+            Some(4242),
+            now,
+            alive
+        ));
+        env.insert(
+            SUPERVISOR_GENERATION_ENV.into(),
+            plist::Value::String("invalid".into()),
+        );
+        assert!(!preserve_starting_supervisor(&env, None, None, now, alive));
+    }
+
+    // Exercise the real staging/activation flow. Only launchctl is replaced;
+    // plutil/PlistBuddy operate exclusively on this fixture's private files.
+    fn reconnect_fixture(binary: bool, active_start: bool, running: bool, changed_target: bool) {
+        use crate::setup::flow::SUPERVISOR_GENERATION_ENV;
+        use std::cell::{Cell, RefCell};
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let instance =
+            crate::instance::Instance::derive("launch-fixture", dir.path(), None).unwrap();
+        std::fs::create_dir_all(&instance.state_dir).unwrap();
+        std::fs::create_dir_all(instance.runner_plist().parent().unwrap()).unwrap();
+        std::fs::write(instance.setup_sh(), b"#!/bin/sh\nexit 99\n").unwrap();
+        let retry = instance.state_dir.join(RUNNER_RETRY_STATE_FILE);
+        std::fs::write(&retry, b"fixture backoff").unwrap();
+        let original_target = "00008150-0000000000000000";
+        let target = if changed_target {
+            "00008150-0000000000000001"
+        } else {
+            original_target
+        };
+        let pid = std::process::id();
+        let start = crate::setup::sys::ps_lstart(pid);
+        assert!(!start.is_empty());
+        let mut environment = plist::Dictionary::new();
+        for (key, value) in [
+            ("IPU_RUNNER_UDID", original_target.to_string()),
+            (SUPERVISOR_GENERATION_ENV, "a".repeat(64)),
+            ("IPU_RUNNER_TEAM_ID", "FIXTURE123".into()),
+        ] {
+            environment.insert(key.into(), plist::Value::String(value));
+        }
+        let mut policy = plist::Dictionary::new();
+        policy.insert(
+            "Label".into(),
+            plist::Value::String(instance.runner_label.clone()),
+        );
+        policy.insert(
+            "EnvironmentVariables".into(),
+            plist::Value::Dictionary(environment),
+        );
+        let value = plist::Value::Dictionary(policy);
+        let mut original = Vec::new();
+        if binary {
+            value.to_writer_binary(&mut original).unwrap();
+        } else {
+            value.to_writer_xml(&mut original).unwrap();
+        }
+        std::fs::write(instance.runner_plist(), &original).unwrap();
+        let status = serde_json::json!({
+            "phase": if active_start { "building" } else { "ready" },
+            "ts": now_secs(), "heartbeat_ts": now_secs(), "schema_version": 1,
+            "active": active_start, "terminal": !active_start,
+            "owner_pid": pid, "owner_start": start,
+            "supervisor_generation": "a".repeat(64),
+        });
+        std::fs::write(instance.status_file(), serde_json::to_vec(&status).unwrap()).unwrap();
+        let loaded = Cell::new(true);
+        let calls = RefCell::new(Vec::<Vec<String>>::new());
+        let backend = |args: &[&str]| {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            let mut success = true;
+            let mut stdout = Vec::new();
+            match args[0] {
+                "print" => {
+                    success = loaded.get();
+                    if success && running {
+                        stdout = format!("job = {{\n\tpid = {pid}\n}}\n").into_bytes();
+                    }
+                }
+                "bootout" => loaded.set(false),
+                "bootstrap" => loaded.set(true),
+                "enable" | "kickstart" => {}
+                other => panic!("unexpected launchctl operation: {other}"),
+            }
+            Some(std::process::Output {
+                status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+        let kicked_at = std::sync::atomic::AtomicU64::new(123);
+        assert!(write_and_bootstrap_runner_agent_with(
+            instance.setup_sh().to_str().unwrap(),
+            dir.path().join("runner.log").to_str().unwrap(),
+            target,
+            &instance,
+            "gui/fixture",
+            &kicked_at,
+            backend,
+        ));
+        let calls = calls.into_inner();
+        if changed_target {
+            assert!(calls.iter().any(|args| args[0] == "bootout"));
+            assert!(calls.iter().any(|args| args[0] == "bootstrap"));
+            let updated =
+                runner_agent_environment(&std::fs::read(instance.runner_plist()).unwrap()).unwrap();
+            assert_eq!(updated["IPU_RUNNER_UDID"].as_string(), Some(target));
+            assert_eq!(
+                updated["IPU_RUNNER_TEAM_ID"].as_string(),
+                Some("FIXTURE123")
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(instance.runner_plist()).unwrap(),
+                original,
+                "an unchanged target must preserve XML and binary plist bytes"
+            );
+            assert!(!calls
+                .iter()
+                .any(|args| matches!(args[0].as_str(), "bootout" | "bootstrap")));
+            let kicks: Vec<_> = calls.iter().filter(|args| args[0] == "kickstart").collect();
+            if active_start && running {
+                assert_eq!(kicked_at.load(std::sync::atomic::Ordering::Acquire), 123);
+                assert_eq!(std::fs::read(&retry).unwrap(), b"fixture backoff");
+                assert!(kicks.is_empty());
+            } else {
+                assert_eq!(kicks.len(), 1);
+                if running {
+                    assert_eq!(
+                        kicks[0][1], "-k",
+                        "a completed attempt must still allow recovery"
+                    );
+                } else {
+                    assert_eq!(kicks[0].len(), 2, "a queued job must start without -k");
+                }
+                assert!(!retry.exists());
+                assert!(kicked_at.load(std::sync::atomic::Ordering::Acquire) > 123);
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_adopts_a_running_handoff_without_rewriting_its_plist() {
+        reconnect_fixture(false, true, true, false);
+        reconnect_fixture(true, true, true, false);
+    }
+
+    #[test]
+    fn reconnect_starts_a_queued_handoff_without_killing_a_racing_launch() {
+        reconnect_fixture(false, true, false, false);
+    }
+
+    #[test]
+    fn reconnect_recovers_after_an_automatic_startup_completes() {
+        reconnect_fixture(false, false, true, false);
+    }
+
+    #[test]
+    fn reconnect_reloads_a_changed_target_and_preserves_signing_policy() {
+        reconnect_fixture(false, true, true, true);
     }
 
     // The idle watchdog must not kill a build it is watching start — but it
@@ -24839,7 +25307,7 @@ mod tests {
             assert_eq!(error["status"], 400);
             assert_eq!(error["code"], "invalid argument");
             assert_eq!(error["message"], OFF_SCREEN_REFUSAL);
-            assert_eq!(error["call"], "POST /actions (swipe)");
+            assert_eq!(error["call"], "POST /actions (scroll)");
 
             let body = runner_rejected_body(detail.as_ref());
             assert_eq!(body["error"], "runner_rejected");

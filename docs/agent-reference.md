@@ -107,6 +107,11 @@ curl -s -H "$AUTH" -H "$MUTATION" -H 'Content-Type: application/json' \
   -X POST "$HOST/agent/mode" -d '{"mode":"agent"}'      # MCP: phone_reconnect
 ```
 
+`503 setup_in_progress` means an interactive setup or another supervisor
+bootstrap already owns the transition. That request did not start a second
+reconnect; poll status and let the current setup finish. If the response is
+`setup_coordination_unavailable`, check the daemon log before trying again.
+
 The target is canonical: to switch devices, change `IPHONE_USE_UDID`, rerun
 setup, and restart the daemon. Never pass a one-off UDID. `503
 device_release_in_progress` (with `Retry-After`) means release already started.
@@ -122,7 +127,9 @@ abandoned. Release yours when done: `POST /agent/owner {"release":true}` / MCP
 **Hold.** For a human-in-the-loop pause inside a task (operator types a PIN,
 approves a prompt, fetches a code): `POST /agent/hold {"secs":600}` / MCP
 `phone_hold(secs)` (max 14400; 0 clears). Clear it when the pause ends. A hold
-prevents idle release; it does not start runner or prove readiness. Never use it
+prevents idle release and does not prove readiness. Taking a new owner lease
+can also trigger policy-gated pre-warm on a released phone; check status before
+sending input. Never use it
 to keep the phone ready without a task. Taking a hold extends your owner
 lease to cover it, so no other session can drive the phone during the pause.
 A live owner lease also prevents idle release; the idle window starts when you
@@ -482,6 +489,14 @@ is no longer cached). The action result and the observation are separate facts:
   your tap. Stop, `{"type":"home"}`, re-enter the intended app.
 - Rows with `overlay` (`notification`, `dynamic_island`, `cover_sheet`) belong to
   a system layer: never tap them; wait and re-read.
+- A `wait_for` containing only `present` locators with `kind:"Alert"` and
+  optional exact `label` reads the system alert directly, even when the app's
+  tree is blocked. Its observation says `source:"alert"` and includes the alert
+  text. It does not accept/dismiss the alert or establish app identity, absence,
+  identifiers or element state. Combined conditions still need the full tree.
+- Keep `pause` for short animation gaps (maximum 3000 ms). For a slow page such
+  as iPhone Storage, use a semantic `wait_for` with `timeout_ms:30000` on the
+  expected result instead of chaining pauses.
 - A failed `wait_for` carries `observation`: `read:false` proves nothing;
   `read:true, stale:true` is the last valid view; plain `read:true` means the
   condition really was not met. Locators an empty tree would have "satisfied" are

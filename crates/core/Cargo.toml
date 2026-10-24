@@ -1,7 +1,8 @@
 [package]
 name = "core"
-version = "0.22.1"
+version = "0.22.4"
 edition = "2021"
+license-file = "../../LICENSE"
 
 [dependencies]
 hmac = "0.12"

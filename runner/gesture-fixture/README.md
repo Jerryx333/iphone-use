@@ -24,3 +24,10 @@ to the independently observed Settings bundle ID and source PID.
 hashes and the candidate MCP binary digest are retained in the artifact. The
 caller owns simulator lifecycle and should stop/delete its disposable device.
 This is not a real-phone folder-page acceptance test.
+
+`--input-readiness` adds a standard UIKit table and search controller. The
+fixture records actual row selections, scroll offsets, editing callbacks and
+received text. It checks a settled tap, three scroll-then-tap batches, and three
+first-focus typing batches. Each case starts with a new nonce and sends once;
+an acknowledgement without the matching UIKit result fails. Simulator smoke
+runs these cases in addition to the six gesture cases above.

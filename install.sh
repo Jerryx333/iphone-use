@@ -2444,22 +2444,41 @@ named_plist_env() {
 }
 
 # Our settings in a daemon plist, one name per line: everything spelled
-# IPHONE_USE_* or IPU_RUNNER_*. An upgrade carries forward the ones it does not
-# set itself, so a setting added by hand (or one this installer does not know)
-# survives the nightly auto-update. Left behind on purpose: IPHONE_USE_BACKEND
-# (the mirror backend is gone), pre-rename runner names (read into the new
-# ones), the ASC signing keys (they travel as a set of three or not at all)
+# IPHONE_USE_* or IPU_RUNNER_*, plus the phone-specific DEVELOPER_DIR. An upgrade
+# carries forward the ones it does not set itself, so a setting added by hand
+# (or one this installer does not know)
+# survives the nightly auto-update. Keep the native direct backend marker that
+# setup writes; discard obsolete mirror values. Also leave pre-rename runner
+# names (read into the new ones), the ASC signing keys (they travel as a set)
 # and test hooks.
 plist_own_env_keys() {
-    [ -f "$1" ] || return 0
-    /usr/bin/plutil -extract EnvironmentVariables xml1 -o - "$1" 2>/dev/null \
-        | sed -n 's:^[[:space:]]*<key>\([A-Z][A-Z0-9_]*\)</key>.*:\1:p' \
-        | while IFS= read -r key; do
+    local plist key candidate value seen=" "
+    for plist in "$@"; do
+        [ -f "$plist" ] || continue
+        for key in $(/usr/bin/plutil -extract EnvironmentVariables xml1 -o - "$plist" 2>/dev/null \
+            | sed -n 's:^[[:space:]]*<key>\([A-Z][A-Z0-9_]*\)</key>.*:\1:p'); do
+            # The getter reads these old spellings; select their current names
+            # so legacy-only settings reach it, without writing old names back.
+            case "$key" in PHONE_REMOTE_?*) key="IPHONE_USE_${key#PHONE_REMOTE_}" ;; esac
+            case "$seen" in *" $key "*) continue ;; esac
+            seen="${seen}${key} "
             case "$key" in
-                IPHONE_USE_BACKEND|IPHONE_USE_INTERNAL_TEST_*|IPHONE_USE_WDA_*|IPU_RUNNER_ASC_*) ;;
-                IPHONE_USE_?*|IPU_RUNNER_?*) printf '%s\n' "$key" ;;
+                IPHONE_USE_INTERNAL_TEST_*|IPHONE_USE_WDA_*|IPU_RUNNER_ASC_*) ;;
+                IPHONE_USE_BACKEND)
+                    # Match the default value getter's precedence: a current
+                    # mirror value must not be resurrected from legacy direct.
+                    value=""
+                    for candidate in "$@"; do
+                        value="$(plist_env_get_from "$candidate" "$key")"
+                        [ -z "$value" ] || break
+                    done
+                    if [ "$value" = direct ]; then
+                        printf '%s\n' "$key"
+                    fi ;;
+                DEVELOPER_DIR|IPHONE_USE_?*|IPU_RUNNER_?*) printf '%s\n' "$key" ;;
             esac
         done
+    done
 }
 
 # The daily auto-update job (scripts/auto-update.sh): on by default, so installs
@@ -3465,9 +3484,9 @@ else
 fi
 
 # The rest of our settings in the previous plist, as they were.
-for ENV_KEY in $(plist_own_env_keys "$PLIST_DST"); do
+for ENV_KEY in $(plist_own_env_keys "$PLIST_DST" "$OLD_PLIST"); do
     case "$PLIST_ENV_HANDLED" in *" $ENV_KEY "*) continue ;; esac
-    append_plist_env "$ENV_KEY" "$(plist_env_get_from "$PLIST_DST" "$ENV_KEY")"
+    append_plist_env "$ENV_KEY" "$(plist_env_get "$ENV_KEY")"
 done
 
 # ── Step 7 — Write the LaunchAgent plist ─────────────────────────────────────
