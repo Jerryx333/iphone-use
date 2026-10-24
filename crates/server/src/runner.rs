@@ -1275,26 +1275,40 @@ impl RunnerClient {
     /// `longpress` to [`Self::tap_point`], so context menus and edit affordances
     /// never appeared even though the UI claimed success.
     pub async fn longpress_point(&mut self, x: f64, y: f64, duration_ms: u64) -> Result<()> {
+        self.hold_points(&[(x, y)], duration_ms.clamp(300, 2_000))
+            .await
+    }
+
+    /// Simultaneous touches, dispatched once; never fall back to a single touch.
+    pub async fn hold_points(&mut self, points: &[(f64, f64)], duration_ms: u64) -> Result<()> {
+        anyhow::ensure!(
+            (1..=5).contains(&points.len()) && (1..=10_000).contains(&duration_ms),
+            "hold needs 1–5 points and duration_ms from 1 to 10000"
+        );
+        let actions: Vec<_> = points
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| {
+                serde_json::json!({
+                    "type":"pointer", "id":format!("finger{}", i + 1),
+                    "parameters":{"pointerType":"touch"},
+                    "actions":[
+                        {"type":"pointerMove", "duration":0, "x":x, "y":y},
+                        {"type":"pointerDown", "button":0},
+                        {"type":"pause", "duration":duration_ms},
+                        {"type":"pointerUp", "button":0}
+                    ]
+                })
+            })
+            .collect();
         let sid = self.ensure_session().await?.to_string();
         let response = self
             .post_req(format!("{}/session/{}/actions", self.base, sid))
-            .json(&serde_json::json!({
-                "actions": [{
-                    "type": "pointer",
-                    "id": "finger1",
-                    "parameters": { "pointerType": "touch" },
-                    "actions": [
-                        { "type": "pointerMove", "duration": 0, "x": x, "y": y },
-                        { "type": "pointerDown", "button": 0 },
-                        { "type": "pause", "duration": duration_ms.clamp(300, 2_000) },
-                        { "type": "pointerUp", "button": 0 }
-                    ]
-                }]
-            }))
+            .json(&serde_json::json!({"actions":actions}))
             .send_signed(&self.auth)
             .await
-            .context("POST /actions (long press)")?;
-        ensure_runner_success(response, "POST /actions (long press)").await?;
+            .context("POST /actions (hold)")?;
+        ensure_runner_success(response, "POST /actions (hold)").await?;
         Ok(())
     }
 
@@ -1918,6 +1932,15 @@ impl RunnerClient {
     /// failures and W3C error envelopes are returned to the caller, so an HTTP
     /// ACK never claims that an unconfirmed click landed.
     pub async fn dismiss_keyboard(&mut self) -> Result<()> {
+        self.dismiss_keyboard_mode(false).await
+    }
+
+    /// Only explicit hide-keyboard affordances; never Done, Return or Search.
+    pub async fn dismiss_keyboard_only(&mut self) -> Result<()> {
+        self.dismiss_keyboard_mode(true).await
+    }
+
+    async fn dismiss_keyboard_mode(&mut self, dismiss_only: bool) -> Result<()> {
         let sid = self.ensure_session().await?.to_string();
         const LABELS: &[&str] = &[
             "Hide keyboard",
@@ -1929,8 +1952,16 @@ impl RunnerClient {
             "收起键盘",
             "關閉鍵盤",
         ];
+        const HIDE_LABELS: &[&str] = &[
+            "Hide keyboard",
+            "隐藏键盘",
+            "キーボードを閉じる",
+            "收起键盘",
+            "關閉鍵盤",
+        ];
+        let labels = if dismiss_only { HIDE_LABELS } else { LABELS };
         // NSPredicate: match the accessory dismiss button by name OR label.
-        let quoted = LABELS
+        let quoted = labels
             .iter()
             .map(|l| format!("'{}'", l.replace('\'', "\\'")))
             .collect::<Vec<_>>()
@@ -1954,7 +1985,11 @@ impl RunnerClient {
                 "{}/session/{}/wda/keyboard/dismiss",
                 self.base, sid
             ))
-            .json(&serde_json::json!({ "keyNames": ["Done", "完了", "return", "前往", "search"] }))
+            .json(&serde_json::json!({ "keyNames": if dismiss_only {
+                HIDE_LABELS
+            } else {
+                &["Done", "完了", "return", "前往", "search"][..]
+            } }))
             .send_signed(&self.auth)
             .await
             .context("POST /wda/keyboard/dismiss")?;
@@ -4315,6 +4350,33 @@ mod tests {
 
         assert!(error.contains("invalid session id"), "{error}");
         assert!(error.contains("response lost"), "{error}");
+    }
+
+    #[test]
+    fn dismiss_only_never_looks_for_form_commit_or_submit_keys() {
+        let (base, server) = mock_runner(2, |request| {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            if request.contains("/element ") {
+                let predicate = body["value"].as_str().unwrap();
+                for key in ["Done", "完了", "return", "前往", "search"] {
+                    assert!(!predicate.contains(key), "{predicate}");
+                }
+                return r#"{"value":{"error":"no such element","message":"no hide accessory"}}"#
+                    .into();
+            }
+            assert!(request.contains("/wda/keyboard/dismiss "), "{request}");
+            let names = body["keyNames"].as_array().unwrap();
+            assert!(names.contains(&serde_json::json!("Hide keyboard")));
+            for key in ["Done", "完了", "return", "前往", "search"] {
+                assert!(!names.contains(&serde_json::json!(key)));
+            }
+            r#"{"value":null}"#.into()
+        });
+        let mut client = RunnerClient::new(base).unwrap();
+        client.session = Some("SESSION".into());
+        block(client.dismiss_keyboard_only()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
