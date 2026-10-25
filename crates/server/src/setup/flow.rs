@@ -3039,6 +3039,9 @@ impl Setup {
         // leaving the next reconnect to find it expired.
         const RENEW_CHECK: Duration = Duration::from_secs(30 * 60);
         let mut renew_checked = Instant::now();
+        // Only what the runner logs from here on can say iOS took UI
+        // automation away (see [`runner::log_shows_automation_revoked`]).
+        let mut log_mark = runner::log_len(&self.ctx.run_log);
         let cause = loop {
             // xcodebuild appends to the runner log for as long as the runner
             // lives; it is only truncated at the next launch.
@@ -3066,6 +3069,16 @@ impl Setup {
                 // An iOS 15/16 runner ends with its launcher (and, started over USB, with
                 // the cable): hardware, iPhone 12 mini on iOS 15.4.1.
                 break "runner";
+            }
+            // Both volume keys end UI automation but not the runner: it keeps
+            // answering /status and a root-only read, so only its log tells.
+            if runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark) {
+                if !self.endpoint_locked() {
+                    break "revoked";
+                }
+                // A locked phone refuses the same way; that is the lock
+                // path's to handle. Look again only at what comes next.
+                log_mark = runner::log_len(&self.ctx.run_log);
             }
             if !pid::verify_loopback_listener(
                 &self.ctx,
@@ -3242,10 +3255,11 @@ impl Setup {
         if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked() {
             return self.locked_retry();
         }
-        // The runner process ended with the phone here and unlocked: most
-        // often the person held both volume keys to end UI automation. Leave
-        // the phone to them; the next request brings the runner back.
-        if cause == "runner" {
+        // The person held both volume keys: iOS revoked UI automation (the
+        // runner lives on, refused), or the runner process ended with the
+        // phone here and unlocked. Leave the phone to them; the next request
+        // brings the runner back.
+        if cause == "revoked" || cause == "runner" {
             return self.park_on_phone(crate::phone_exit::Reason::Exited);
         }
         match cause {
