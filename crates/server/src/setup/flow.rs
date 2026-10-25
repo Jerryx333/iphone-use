@@ -197,6 +197,14 @@ impl Setup {
     /// The whole run, cleanup included. Returns the exit code.
     pub fn run_keepalive(mut self) -> i32 {
         proc::install_signal_handlers();
+        // Relaunched by KeepAlive before the daemon released a parked phone.
+        if crate::phone_exit::parked(self.ctx.state_dir()) {
+            let code = match self.wait_parked::<()>() {
+                Ok(()) => 0,
+                Err(Exit(code)) => code,
+            };
+            return self.cleanup(code);
+        }
         if let Err(Exit(code)) = self.wait_for_retry() {
             return self.cleanup(code);
         }
@@ -479,6 +487,45 @@ impl Setup {
             Role::Runner,
         );
         Err(Exit(1))
+    }
+
+    /// The person at the phone ended the session (see [`crate::phone_exit`]):
+    /// stop everything, disable this label so no login or KeepAlive round
+    /// starts it again, and wait for the daemon to release the phone.
+    fn park_on_phone<T>(&self, reason: crate::phone_exit::Reason) -> Step<T> {
+        crate::phone_exit::park(self.ctx.state_dir(), reason);
+        launchd::disable(&self.ctx, &self.ctx.instance.runner_label);
+        for (file, legacy, role) in [
+            (&self.ctx.mjpeg_relay_pid_file, &self.legacy.mjpeg, Role::Mjpeg),
+            (&self.ctx.relay_pid_file, &self.legacy.relay, Role::Relay),
+            (&self.ctx.runner_pid_file, &self.legacy.runner, Role::Runner),
+        ] {
+            pid::stop(&self.ctx, file, legacy, role);
+        }
+        if let Err(error) = retry::reset(&self.ctx.retry_state) {
+            warn(&error);
+        }
+        let message = match reason {
+            crate::phone_exit::Reason::Exited => {
+                "the device runner was ended on the iPhone; it stays off until the next agent or web request"
+            }
+            crate::phone_exit::Reason::PasscodeCanceled => {
+                "the passcode prompt was cancelled on the iPhone; the phone stays with its holder until someone takes it back (web 「交给 agent」 or iphone-use resume)"
+            }
+        };
+        warn(message);
+        self.phase("parked", "", message);
+        self.wait_parked()
+    }
+
+    /// Hold without touching the phone while [`crate::phone_exit::PARKED_FILE`]
+    /// stands. The daemon boots this job out; if the marker goes first (a
+    /// resume), exit so KeepAlive starts a fresh round.
+    fn wait_parked<T>(&self) -> Step<T> {
+        while crate::phone_exit::parked(self.ctx.state_dir()) {
+            proc::sleep(Duration::from_secs(5))?;
+        }
+        Err(Exit(0))
     }
 
     // ── the setup body ──────────────────────────────────────────────────────
@@ -1787,6 +1834,11 @@ impl Setup {
 
     fn report_automation_disabled<T>(&self) -> Step<T> {
         self.remember_passcode_phone();
+        // A person at the phone said no. An interactive setup reports it
+        // like any refusal; the supervisor must not ask again.
+        if self.ctx.keepalive && runner::log_shows_passcode_canceled(&self.ctx.run_log) {
+            return self.park_on_phone(crate::phone_exit::Reason::PasscodeCanceled);
+        }
         self.phase(
             "building-fail",
             "automation_mode_disabled",
@@ -3190,6 +3242,12 @@ impl Setup {
         if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked() {
             return self.locked_retry();
         }
+        // The runner process ended with the phone here and unlocked: most
+        // often the person held both volume keys to end UI automation. Leave
+        // the phone to them; the next request brings the runner back.
+        if cause == "runner" {
+            return self.park_on_phone(crate::phone_exit::Reason::Exited);
+        }
         match cause {
             "unreachable" => {
                 warn(&format!(
@@ -4368,6 +4426,10 @@ impl Setup {
             return Err(Exit(code));
         }
         self.pause_supervisor()?;
+        // Someone ran setup on purpose: an earlier end on the phone no
+        // longer stands.
+        crate::phone_exit::clear_parked(self.ctx.state_dir());
+        crate::phone_exit::set_handoff(self.ctx.state_dir(), false);
         self.body()
     }
 

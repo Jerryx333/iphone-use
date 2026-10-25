@@ -127,6 +127,10 @@ pub fn pause(ctx: &Ctx) -> i32 {
         warn("pause was not fully verified; no process without a matching PID/argv record was killed");
         return 1;
     }
+    // A pause gives the phone to the person holding it: the daemon refuses
+    // agent input instead of starting the runner again on the next request.
+    crate::phone_exit::clear_parked(ctx.state_dir());
+    crate::phone_exit::set_handoff(ctx.state_dir(), true);
     ok("device runner paused: supervisor disabled and all PID-verified runner/relay processes stopped");
     sweep_device_runner(ctx);
     println!("  Resume: {} resume", ctx.self_install.display());
@@ -165,6 +169,8 @@ pub fn resume(ctx: &Ctx) -> i32 {
         warn(&error);
         return 1;
     }
+    crate::phone_exit::clear_parked(ctx.state_dir());
+    crate::phone_exit::set_handoff(ctx.state_dir(), false);
     if !launchd::enable(ctx, label) {
         warn("could not enable the runner supervisor");
         return 1;

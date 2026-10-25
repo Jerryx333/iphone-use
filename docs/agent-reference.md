@@ -41,7 +41,8 @@ passcode.
 | reconnecting (`reconnecting:true`) | Bring-up running | If `setup_blocked_on` is set, follow `hint`; else report `setup_phase`/`setup_message` and poll. A first build after an Xcode update can take minutes. |
 | `blocked` / `offline` | Something stands in the way | Read `hint` and `setup_blocked_on` (see [Setup blockers](#setup-blockers)); resolve it first. When the person has to act, relay `next_step` (`{zh,en}`, the same line the web page and iOS app show) instead of paraphrasing `hint`. |
 | `degraded` | runner answers but the last read/action did not complete (heavy page, stalled app) | **Not** a blocker; `setup_blocked_on` is empty. Wait `retry_after_secs` (3s) and read again; do not restart anything. |
-| `released` + `human_handoff:true` | The operator handed the phone to a person | Input answers `409 phone_handed_to_human`. Ask the operator before sending `{"mode":"agent"}`. |
+| `released` + `human_handoff:true` | The operator handed the phone to a person | Input answers `409 phone_handed_to_human`. Ask the operator before sending `{"mode":"agent"}`. Also set by `iphone-use pause` and by a passcode prompt cancelled on the phone; it survives daemon restarts. `iphone-use resume` clears it. |
+| `released` + `ended_on_phone:true` | The person ended the session on the phone (both volume keys) | Nothing restarts the runner on its own and pre-warm skips it. Ask before acting; the next action or `{"mode":"agent"}` starts it again. |
 
 **Lock readiness.** `lock_readiness` says whether the phone will lock on its
 own while nobody drives it, so an owner with many phones sees which ones get

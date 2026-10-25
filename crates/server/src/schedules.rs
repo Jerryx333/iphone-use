@@ -447,6 +447,11 @@ pub fn gate(status: &serde_json::Value, me: &str) -> Gate {
     if status.get("human_handoff").and_then(|v| v.as_bool()) == Some(true) {
         return Gate::Postpone("the phone was handed to a person".into());
     }
+    // A schedule is not a person's request: it must not undo an end on the
+    // phone at 03:30.
+    if status.get("ended_on_phone").and_then(|v| v.as_bool()) == Some(true) {
+        return Gate::Postpone("the session was ended on the phone".into());
+    }
     if status
         .get("viewer_count")
         .and_then(|v| v.as_u64())
@@ -1963,6 +1968,10 @@ mod tests {
         assert!(matches!(
             s(serde_json::json!({"drivable": false, "released": true, "human_handoff": true})),
             Gate::Postpone(_)
+        ));
+        assert!(matches!(
+            s(serde_json::json!({"drivable": false, "released": true, "ended_on_phone": true})),
+            Gate::Postpone(w) if w.contains("ended on the phone")
         ));
         assert_eq!(
             s(serde_json::json!({"drivable": false, "device_state": "locked"})),

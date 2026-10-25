@@ -209,6 +209,16 @@ pub fn log_shows_automation_disabled(path: &Path) -> bool {
         || text.contains("failed to initialize for ui testing")
 }
 
+/// The person at the phone cancelled the passcode prompt for UI automation
+/// (`Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication
+/// Code=-2 "Canceled by user."`).
+pub fn log_shows_passcode_canceled(path: &Path) -> bool {
+    any_line(&read_log(path), |line| {
+        line.contains("Canceled by user")
+            || ordered(line, "com.apple.LocalAuthentication", "Code=-2 ")
+    })
+}
+
 /// A failure of the product itself (install/launch/signing), the only kind
 /// that evicts a recorded product.
 pub fn log_shows_product_failure(path: &Path) -> bool {
@@ -1052,6 +1062,13 @@ mod tests {
             log("dtxproxy:XCTestDriverInterface:XCTestManager_IDEInterface").path()
         ));
         assert!(log_shows_automation_disabled(
+            log("(Underlying Error: Timed out while enabling automation mode.)").path()
+        ));
+        // Hardware, iOS 27.2 (zh-CN): the passcode prompt cancelled on the phone.
+        let canceled = log(r#"2026-10-25 02:15:01.251711+0900 iPhoneUse-Runner[17603:3266718] [Default] Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication Code=-2 "Canceled by user." UserInfo={NSDebugDescription=Canceled by user., NSLocalizedDescription=认证已取消。, BiometryType=2}"#);
+        assert!(log_shows_passcode_canceled(canceled.path()));
+        assert!(log_shows_automation_disabled(canceled.path()));
+        assert!(!log_shows_passcode_canceled(
             log("(Underlying Error: Timed out while enabling automation mode.)").path()
         ));
         assert!(log_shows_device_unavailable(
