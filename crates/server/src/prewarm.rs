@@ -65,6 +65,8 @@ pub enum Skip {
     NotManaged,
     NotReleased,
     HumanHandoff,
+    /// The session was ended on the phone ([`crate::phone_exit`]).
+    EndedOnPhone,
     LifecycleBusy,
     OwnedByOther,
     Blocked(String),
@@ -81,6 +83,7 @@ impl Skip {
             Self::NotManaged => "not_managed".into(),
             Self::NotReleased => "not_released".into(),
             Self::HumanHandoff => "human_handoff".into(),
+            Self::EndedOnPhone => "ended_on_phone".into(),
             Self::LifecycleBusy => "lifecycle_busy".into(),
             Self::OwnedByOther => "owned_by_other".into(),
             Self::Blocked(blocker) => format!("blocked:{blocker}"),
@@ -99,6 +102,9 @@ pub struct Inputs<'a> {
     pub managed: bool,
     pub released: bool,
     pub human_handoff: bool,
+    /// The person at the phone ended the last session; only an explicit
+    /// claim (a lease) brings it back early.
+    pub ended_on_phone: bool,
     pub lifecycle_busy: bool,
     pub other_owner: bool,
     /// The setup helper's current blocker (`""` when none).
@@ -162,6 +168,9 @@ impl Policy {
         }
         if i.human_handoff {
             return Err(Skip::HumanHandoff);
+        }
+        if i.ended_on_phone && i.trigger.needs_recent_activity() {
+            return Err(Skip::EndedOnPhone);
         }
         if i.lifecycle_busy {
             return Err(Skip::LifecycleBusy);
@@ -311,6 +320,7 @@ mod tests {
             managed: true,
             released: true,
             human_handoff: false,
+            ended_on_phone: false,
             lifecycle_busy: false,
             other_owner: false,
             blocker: "",
@@ -337,6 +347,12 @@ mod tests {
         let mut i = inputs(Trigger::Status);
         i.human_handoff = true;
         assert_eq!(policy.check(&i), Err(Skip::HumanHandoff));
+        let mut i = inputs(Trigger::Status);
+        i.ended_on_phone = true;
+        assert_eq!(policy.check(&i), Err(Skip::EndedOnPhone));
+        let mut i = inputs(Trigger::Lease);
+        i.ended_on_phone = true;
+        assert_eq!(policy.check(&i), Ok(()), "a lease is an explicit claim");
         let mut i = inputs(Trigger::Status);
         i.lifecycle_busy = true;
         assert_eq!(policy.check(&i), Err(Skip::LifecycleBusy));

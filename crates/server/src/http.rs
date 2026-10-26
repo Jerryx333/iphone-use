@@ -2683,6 +2683,8 @@ async fn agent_status(
     let screen_private_secs = state.screen_private_secs();
     let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
     let human_handoff = released && human_handoff_active();
+    let ended_on_phone =
+        ended_on_phone(released, human_handoff, &crate::instance::current().state_dir);
     // L2 health — action-level, not just /status (which lies: it reports
     // `ready` even when every UI action fails Code=41 because the phone is
     // locked or the test session was severed). `runner` stays "runner reachable"
@@ -2847,6 +2849,8 @@ async fn agent_status(
             ("external", "the remote device runner endpoint is externally managed — restart it on the owning host; this daemon will not stop or bootstrap local services")
         } else if released && human_handoff {
             ("handoff", "the phone was handed to a person (mode=human) and the device runner is stopped so they can use it in hand — POST /agent/mode {mode:agent} takes it back")
+        } else if ended_on_phone {
+            ("ended_on_phone", "the session was ended on the iPhone (both volume keys) and nothing restarts the device runner on its own — ask the person before taking it back; the next action or reconnect starts it again")
         } else if released {
             ("released", "direct device service was released after inactivity — reconnect to restart the device runner, then keep the phone unlocked and awake")
         } else if !state.managed_runner {
@@ -2995,7 +2999,7 @@ async fn agent_status(
     // The daemon inside the runner on the phone, as its last /status said.
     let phone_daemon = crate::phone_daemon::status_json(runner);
     let body = format!(
-        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
+        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"ended_on_phone":{ended_on_phone},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&status_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -3369,7 +3373,13 @@ fn setup_working_advice(phase: &str, message: &str) -> Option<(&'static str, &'s
         || phase.ends_with("-fail")
         || matches!(
             phase,
-            "waiting" | "lock-backoff" | "lock-wait" | "interrupted" | "stopped" | "completed"
+            "waiting"
+                | "lock-backoff"
+                | "lock-wait"
+                | "interrupted"
+                | "stopped"
+                | "completed"
+                | "parked"
         )
     {
         return None;
@@ -3521,6 +3531,10 @@ fn human_next_step(
         "handoff" => (
             "手机已交还给持有人；需要远程操作时点「连接手机」",
             "The phone was handed back; choose Connect to control it remotely again",
+        ),
+        "ended_on_phone" => (
+            "已在手机上退出，这台 Mac 不会自动重连；需要远程操作时点「连接手机」",
+            "Ended on the phone; this Mac will not reconnect on its own — choose Connect to control it again",
         ),
         "released" => (
             "一段时间没人操作，连接已暂停；点「连接手机」继续（手机需解锁亮屏）",
@@ -3816,6 +3830,9 @@ fn classify_build_state(phase: &str, age_secs: u64) -> &'static str {
     }
     if phase == "ready" {
         return "ready";
+    }
+    if phase == "parked" {
+        return "parked";
     }
     if phase.ends_with("-fail") {
         return "failed";
@@ -4638,6 +4655,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
     if !state.managed_runner || state.runner.is_none() {
         return; // an external/remote runner is never lifecycle-managed here
     }
+    spawn_phone_exit_watch(state.clone());
     // On by default again (v0.6.3 to v0.7.3 kept the runner up). A runner
     // that is always up is a runner that KeepAlive relaunches whenever iOS
     // kills it, and every launch makes iOS ask for the passcode to enable UI
@@ -4997,6 +5015,8 @@ fn begin_managed_reconnect(
         &state.runner_lifecycle,
         &crate::instance::current().state_dir,
     )?;
+    // Bringing the phone up is the request an end on the phone waited for.
+    crate::phone_exit::clear_parked(&crate::instance::current().state_dir);
     let ownership = RunnerReadinessOwnership::new(state.runner_lifecycle.clone(), token);
     let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
     let log = crate::instance::Instance::path_str(&crate::instance::current().agent_log());
@@ -5074,6 +5094,7 @@ async fn maybe_prewarm(
         managed: state.managed_runner && state.runner.is_some() && !state.managed_runner_pending,
         released: state.released.load(std::sync::atomic::Ordering::Acquire),
         human_handoff: human_handoff_active(),
+        ended_on_phone: crate::phone_exit::parked(&crate::instance::current().state_dir),
         lifecycle_busy: state.runner_lifecycle.is_transitioning(),
         other_owner,
         blocker: &blocker,
@@ -5218,6 +5239,65 @@ pub fn human_handoff_active() -> bool {
 /// phone over by other means).
 pub fn set_human_handoff(active: bool) {
     HUMAN_HANDOFF.store(active, std::sync::atomic::Ordering::Release);
+}
+
+/// Set the hand-off and keep it in the state dir, so a daemon restart (an
+/// upgrade, a login) still leaves the phone with its holder.
+fn persist_human_handoff(active: bool) -> std::io::Result<()> {
+    let persisted = crate::phone_exit::set_handoff(&crate::instance::current().state_dir, active);
+    // A failed release write still refuses input in this process. A failed
+    // resume write must not remove that refusal.
+    if active || persisted.is_ok() { set_human_handoff(active); }
+    persisted
+}
+
+/// Status `ended_on_phone`: released after an end on the phone, and not
+/// handed over (a hand-off says more).
+fn ended_on_phone(released: bool, human_handoff: bool, state_dir: &std::path::Path) -> bool {
+    released && !human_handoff && crate::phone_exit::parked(state_dir)
+}
+
+/// Follow the phone's end-of-session markers (see [`crate::phone_exit`]):
+/// the hand-off file, which the supervisor, `setup pause` and `setup resume`
+/// write too, and a supervisor parked after an end on the phone. Either one
+/// releases the phone here at once instead of after the idle window.
+fn spawn_phone_exit_watch(state: Arc<AppState>) {
+    let state_dir = crate::instance::current().state_dir.clone();
+    set_human_handoff(crate::phone_exit::handoff(&state_dir));
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        let setup_sh = crate::instance::Instance::path_str(&crate::instance::current().setup_sh());
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let handoff = crate::phone_exit::handoff(&state_dir);
+            set_human_handoff(handoff);
+            // `setup pause` stops the supervisor without the daemon; release
+            // here too, so the hand-off takes effect (it applies to a released
+            // phone).
+            if !(handoff || crate::phone_exit::parked(&state_dir))
+                || state.released.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            let Some(release_token) = state.runner_lifecycle.try_begin_releasing() else {
+                continue;
+            };
+            release_agent_focus(&state).await;
+            let script = setup_sh.clone();
+            let stopped = tokio::task::spawn_blocking(move || stop_runner_blocking(&script))
+                .await
+                .unwrap_or(false);
+            if stopped {
+                state.runner_actionable.store(false, Ordering::Release);
+                *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
+                state.released.store(true, Ordering::Release);
+                recover(state.flow_trail.lock()).reset();
+                *recover(state.owner.lock()) = None;
+                tracing::info!("the session was ended on the iPhone; phone released until the next request");
+            }
+            state.runner_lifecycle.finish_releasing(release_token);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -6002,7 +6082,11 @@ async fn agent_mode_inner(
             // launchd accepts the bring-up a few seconds later — the bootstrap
             // can outlast a client's timeout, and status must not keep saying
             // "handed to a human" while the runner is already coming up.
-            HUMAN_HANDOFF.store(false, std::sync::atomic::Ordering::Release);
+            if let Err(error) = persist_human_handoff(false) {
+                tracing::error!(%error, "could not persist agent handoff");
+                return with_security_headers((StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({"ok":false,"error":"handoff_persistence_failed","outcome":"not_sent"}))).into_response());
+            }
             // An explicit reconnect is intent, not idleness: restart the clock
             // before the bring-up begins, or a build longer than the idle
             // window ends with the watchdog stopping the very supervisor this
@@ -6061,6 +6145,7 @@ async fn agent_mode_inner(
             let stopped = tokio::task::spawn_blocking(move || stop_runner_blocking(&script))
                 .await
                 .unwrap_or(false);
+            let mut persisted = true;
             if stopped {
                 state
                     .runner_actionable
@@ -6070,16 +6155,22 @@ async fn agent_mode_inner(
                     .released
                     .store(true, std::sync::atomic::Ordering::Release);
                 *recover(state.owner.lock()) = None;
-                HUMAN_HANDOFF.store(true, std::sync::atomic::Ordering::Release);
+                if let Err(error) = persist_human_handoff(true) {
+                    tracing::error!(%error, "phone stopped but human handoff could not be persisted");
+                    persisted = false;
+                }
                 tracing::info!("phone handed to a human: managed runner stopped on request");
             }
             state.runner_lifecycle.finish_releasing(release_token);
             let body = format!(
-                r#"{{"ok":{stopped},"mode":"human","released":{stopped},"hint":"runner is stopped and the phone is the holder's; POST {{\"mode\":\"agent\"}} hands it back to remote control"}}"#
+                r#"{{"ok":{},"mode":"human","released":{stopped},"hint":"runner is stopped and the phone is the holder's; POST {{\"mode\":\"agent\"}} hands it back to remote control","handoff_persisted":{persisted}}}"#,
+                stopped && persisted
             );
             with_security_headers(
                 Response::builder()
-                    .status(if stopped {
+                    .status(if stopped && !persisted {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else if stopped {
                         StatusCode::OK
                     } else {
                         StatusCode::BAD_GATEWAY
@@ -22438,6 +22529,7 @@ mod tests {
             "reconnecting",
             "external",
             "handoff",
+            "ended_on_phone",
             "released",
             "offline",
             "locked",
@@ -22834,6 +22926,16 @@ mod tests {
     }
 
     #[test]
+    fn an_end_on_the_phone_shows_only_on_a_released_phone_not_handed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ended_on_phone(true, false, dir.path()));
+        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::Exited).unwrap();
+        assert!(ended_on_phone(true, false, dir.path()));
+        assert!(!ended_on_phone(false, false, dir.path()), "not released yet");
+        assert!(!ended_on_phone(true, true, dir.path()), "the hand-off says more");
+    }
+
+    #[test]
     fn idle_release_keeps_a_wifi_runner_that_cannot_be_restarted_over_wifi() {
         assert!(idle_release_keeps_wifi_runner(true, "wifi-tunnel"));
         assert!(
@@ -23130,6 +23232,13 @@ mod tests {
             setup_working(true, Some(&build_status("building-fail", 1)), alive),
             None
         );
+    }
+
+    #[test]
+    fn build_state_parked_is_terminal_and_does_not_claim_work_or_failure() {
+        for age in [0, 10, BUILD_STALE_SECS + 1, 99_999] {
+            assert_eq!(classify_build_state("parked", age), "parked");
+        }
     }
 
     #[test]

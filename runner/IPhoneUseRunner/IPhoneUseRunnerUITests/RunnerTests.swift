@@ -23,6 +23,8 @@ final class RunnerTests: XCTestCase {
   var auth: RunnerAuth?
   var mjpeg: RunnerMJPEGServer?
   var serveExpectation: XCTestExpectation?
+  /// The notification whose End button ends the session from the phone (RunnerExitNotice.swift).
+  var exitNotice: RunnerExitNotice?
   /// Why the command listener stopped, when it failed rather than being shut down.
   var listenFailure: Error?
   let busyLock = NSLock()
@@ -131,10 +133,19 @@ final class RunnerTests: XCTestCase {
     // The agent API on the phone itself, when the daemon library is linked (RunnerDaemon.swift).
     RunnerDaemon.start(environment: environment, runnerPort: port, mjpegPort: mjpegPort)
 
+    if environment["IPU_RUNNER_EXIT_NOTICE"] != "0" {
+      let notice = RunnerExitNotice {
+        DispatchQueue.main.async { expectation.fulfill() }
+      }
+      notice.post(requestPermission: environment["IPU_RUNNER_EXIT_NOTICE"] == "1")
+      exitNotice = notice
+    }
+
     // Block this test (and keep the main run loop spinning for the request handlers) for a year,
     // or until POST /shutdown.
     let result = XCTWaiter.wait(for: [expectation], timeout: 365 * 24 * 60 * 60)
     NSLog("ipu-runner: serve loop ended (%@)", String(describing: result))
+    exitNotice?.remove()
     server.stop()
     mjpeg?.stop()
     // A runner that never served must not end as a passing test: xcodebuild would print

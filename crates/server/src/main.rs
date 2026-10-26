@@ -165,11 +165,30 @@ enum Command {
     ///
     /// An installed daemon runs as a launchd KeepAlive job, so launchd starts
     /// it again at once. To give the phone back and stop its device runner
-    /// from restarting, use `iphone-use setup [--instance NAME] pause`
-    /// (`setup resume` undoes it). To keep the daemon itself down,
+    /// from restarting, use `iphone-use pause` (`iphone-use resume` undoes
+    /// it). To keep the daemon itself down,
     /// `launchctl bootout gui/$(id -u)/com.leeguoo.iphone-use` (a named
     /// instance has its own label).
     Stop,
+    /// Give the phone back: stop its device runner and keep it stopped.
+    ///
+    /// The phone leaves UI automation, nothing on this Mac starts the runner
+    /// again (no restart, no pre-warm), and agent input is refused until
+    /// `iphone-use resume`, or 「交给 agent」 in the web panel. Holding both
+    /// volume keys on the phone also ends the session, but leaves the next
+    /// agent request free to start it again.
+    Pause {
+        /// A named instance (a second phone); default: IPHONE_USE_INSTANCE.
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// Take the phone back for agents after `iphone-use pause` or an end on
+    /// the phone, and start its device runner.
+    Resume {
+        /// A named instance (a second phone); default: IPHONE_USE_INSTANCE.
+        #[arg(long)]
+        instance: Option<String>,
+    },
     /// Print which instance this environment would run as, as JSON, and exit.
     ///
     /// Read-only: derives the instance from IPHONE_USE_INSTANCE / HOME /
@@ -867,6 +886,14 @@ fn main() -> Result<()> {
             }
             let target = onboarding::Target::resolve(instance.as_deref())?;
             std::process::exit(onboarding::run_setup(&target, &args))
+        }
+        Command::Pause { instance } => {
+            let target = onboarding::Target::resolve(instance.as_deref())?;
+            std::process::exit(onboarding::run_setup(&target, &["pause".to_string()]))
+        }
+        Command::Resume { instance } => {
+            let target = onboarding::Target::resolve(instance.as_deref())?;
+            std::process::exit(onboarding::run_setup(&target, &["resume".to_string()]))
         }
         Command::SetupNative { args } => std::process::exit(server::setup::main(&args)),
         Command::SetupApp { instance, args } => {

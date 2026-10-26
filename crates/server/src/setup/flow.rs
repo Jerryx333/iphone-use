@@ -98,6 +98,7 @@ pub struct Setup {
     /// tunnel, not usbmuxd (only for what the log calls it).
     relay_over_tunnel: bool,
     supervisor_generation: Option<String>,
+    runner_log_mark: u64,
     // Held through commit/rollback cleanup; children do not inherit it.
     _interactive_guard: Option<super::coordination::Guard>,
 }
@@ -177,6 +178,7 @@ impl Setup {
             upgrade_rebuild: false,
             relay_over_tunnel: false,
             supervisor_generation: None,
+            runner_log_mark: 0,
             _interactive_guard: None,
         }
     }
@@ -197,6 +199,14 @@ impl Setup {
     /// The whole run, cleanup included. Returns the exit code.
     pub fn run_keepalive(mut self) -> i32 {
         proc::install_signal_handlers();
+        // Relaunched by KeepAlive before the daemon released a parked phone.
+        if crate::phone_exit::parked(self.ctx.state_dir()) {
+            let code = match self.wait_parked::<()>() {
+                Ok(()) => 0,
+                Err(Exit(code)) => code,
+            };
+            return self.cleanup(code);
+        }
         if let Err(Exit(code)) = self.wait_for_retry() {
             return self.cleanup(code);
         }
@@ -481,6 +491,50 @@ impl Setup {
         Err(Exit(1))
     }
 
+    /// The person at the phone ended the session (see [`crate::phone_exit`]):
+    /// stop everything, disable this label so no login or KeepAlive round
+    /// starts it again, and wait for the daemon to release the phone.
+    fn park_on_phone<T>(&self, reason: crate::phone_exit::Reason) -> Step<T> {
+        let persisted = crate::phone_exit::park(self.ctx.state_dir(), reason);
+        launchd::disable(&self.ctx, &self.ctx.instance.runner_label);
+        for (file, legacy, role) in [
+            (&self.ctx.mjpeg_relay_pid_file, &self.legacy.mjpeg, Role::Mjpeg),
+            (&self.ctx.relay_pid_file, &self.legacy.relay, Role::Relay),
+            (&self.ctx.runner_pid_file, &self.legacy.runner, Role::Runner),
+        ] {
+            pid::stop(&self.ctx, file, legacy, role);
+        }
+        if let Err(error) = retry::reset(&self.ctx.retry_state) {
+            warn(&error);
+        }
+        if let Err(error) = persisted {
+            warn(&format!("could not persist phone exit; supervisor disabled and processes stopped: {error}"));
+            self.phase("failed", "state_write_failed", "could not persist phone exit; run resume explicitly after repairing state storage");
+            return Err(Exit(1));
+        }
+        let message = match reason {
+            crate::phone_exit::Reason::Exited => {
+                "the device runner was ended on the iPhone; it stays off until the next agent or web request"
+            }
+            crate::phone_exit::Reason::PasscodeCanceled => {
+                "the passcode prompt was cancelled on the iPhone; the phone stays with its holder until someone takes it back (web 「交给 agent」 or iphone-use resume)"
+            }
+        };
+        warn(message);
+        self.phase("parked", "", message);
+        self.wait_parked()
+    }
+
+    /// Hold without touching the phone while [`crate::phone_exit::PARKED_FILE`]
+    /// stands. The daemon boots this job out; if the marker goes first (a
+    /// resume), exit so KeepAlive starts a fresh round.
+    fn wait_parked<T>(&self) -> Step<T> {
+        while crate::phone_exit::parked(self.ctx.state_dir()) {
+            proc::sleep(Duration::from_secs(5))?;
+        }
+        Err(Exit(0))
+    }
+
     // ── the setup body ──────────────────────────────────────────────────────
 
     pub fn body(&mut self) -> Step {
@@ -556,6 +610,7 @@ impl Setup {
             super::commands::end_device_runner(&self.ctx);
         }
         let _ = std::fs::write(&self.ctx.run_log, b"");
+        self.runner_log_mark = runner::log_len(&self.ctx.run_log);
         let xcodebuild = PathBuf::from(sys::stdout_of("xcrun", &["--find", "xcodebuild"]));
         if xcodebuild.as_os_str().is_empty() || !sys::is_executable(&xcodebuild) {
             return die("could not resolve the selected Xcode's xcodebuild executable");
@@ -1787,6 +1842,11 @@ impl Setup {
 
     fn report_automation_disabled<T>(&self) -> Step<T> {
         self.remember_passcode_phone();
+        // A person at the phone said no. An interactive setup reports it
+        // like any refusal; the supervisor must not ask again.
+        if self.ctx.keepalive && runner::log_shows_passcode_canceled(&self.ctx.run_log) {
+            return self.park_on_phone(crate::phone_exit::Reason::PasscodeCanceled);
+        }
         self.phase(
             "building-fail",
             "automation_mode_disabled",
@@ -2987,6 +3047,10 @@ impl Setup {
         // leaving the next reconnect to find it expired.
         const RENEW_CHECK: Duration = Duration::from_secs(30 * 60);
         let mut renew_checked = Instant::now();
+        // Include this launch’s verification logs: revocation can happen
+        // before the hold loop starts. Only this launch can say iOS took UI
+        // automation away (see [`runner::log_shows_automation_revoked`]).
+        let mut log_mark = self.runner_log_mark;
         let cause = loop {
             // xcodebuild appends to the runner log for as long as the runner
             // lives; it is only truncated at the next launch.
@@ -3014,6 +3078,16 @@ impl Setup {
                 // An iOS 15/16 runner ends with its launcher (and, started over USB, with
                 // the cable): hardware, iPhone 12 mini on iOS 15.4.1.
                 break "runner";
+            }
+            // Both volume keys end UI automation but not the runner: it keeps
+            // answering /status and a root-only read, so only its log tells.
+            if runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark) {
+                if !self.endpoint_locked() {
+                    break "revoked";
+                }
+                // A locked phone refuses the same way; that is the lock
+                // path's to handle. Look again only at what comes next.
+                log_mark = runner::log_len(&self.ctx.run_log);
             }
             if !pid::verify_loopback_listener(
                 &self.ctx,
@@ -3187,8 +3261,17 @@ impl Setup {
             }
             return Err(Exit(1));
         }
-        if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked() {
+        if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked()
+            || (cause == "runner" && self.passcode_required() == Some(true))
+        {
             return self.locked_retry();
+        }
+        // The person held both volume keys: iOS revoked UI automation (the
+        // runner lives on, refused), or the runner process ended with the
+        // phone here and unlocked. Leave the phone to them; the next request
+        // brings the runner back.
+        if cause == "revoked" || cause == "runner" {
+            return self.park_on_phone(crate::phone_exit::Reason::Exited);
         }
         match cause {
             "unreachable" => {
@@ -4368,6 +4451,13 @@ impl Setup {
             return Err(Exit(code));
         }
         self.pause_supervisor()?;
+        // Someone ran setup on purpose: an earlier end on the phone no
+        // longer stands.
+        crate::phone_exit::clear_parked(self.ctx.state_dir());
+        crate::phone_exit::set_handoff(self.ctx.state_dir(), false).map_err(|error| {
+            warn(&format!("could not clear human handoff: {error}"));
+            Exit(1)
+        })?;
         self.body()
     }
 
@@ -5425,6 +5515,7 @@ impl Setup {
         let started = 'launch: {
             'attempts: for attempt in 0..2 {
                 let _ = std::fs::write(&self.ctx.run_log, b"");
+                self.runner_log_mark = runner::log_len(&self.ctx.run_log);
                 // A fresh token per launch; the launcher puts it in the
                 // runner's test environment (never on its command line).
                 let Ok(token) = crate::runner_token::rotate(self.ctx.state_dir()) else {

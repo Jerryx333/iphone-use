@@ -209,6 +209,45 @@ pub fn log_shows_automation_disabled(path: &Path) -> bool {
         || text.contains("failed to initialize for ui testing")
 }
 
+/// The person at the phone cancelled the passcode prompt for UI automation
+/// (`Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication
+/// Code=-2 "Canceled by user."`).
+pub fn log_shows_passcode_canceled(path: &Path) -> bool {
+    any_line(&read_log(path), |line| {
+        line.contains("Canceled by user")
+            || ordered(line, "com.apple.LocalAuthentication", "Code=-2 ")
+    })
+}
+
+/// iOS took UI automation away from a running runner: the person held both
+/// volume keys. The runner process lives on and still answers `/status` and a
+/// root-only read, but every real query logs this (hardware, iOS 27.2:
+/// `xctest issue suppressed: Failed to get system application: Not authorized
+/// for performing UI testing actions.`). Only the log after byte `from` is
+/// read, so lines from before the runner was ready do not count.
+pub fn log_shows_automation_revoked(path: &Path, from: u64) -> bool {
+    use std::io::{Read as _, Seek as _};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // A capped (shorter) log starts over from its kept tail.
+    let from = if from > len { 0 } else { from };
+    if file.seek(std::io::SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&tail).contains("Not authorized for performing UI testing actions")
+}
+
+/// The log's current length, the `from` for [`log_shows_automation_revoked`].
+pub fn log_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
 /// A failure of the product itself (install/launch/signing), the only kind
 /// that evicts a recorded product.
 pub fn log_shows_product_failure(path: &Path) -> bool {
@@ -1052,6 +1091,28 @@ mod tests {
             log("dtxproxy:XCTestDriverInterface:XCTestManager_IDEInterface").path()
         ));
         assert!(log_shows_automation_disabled(
+            log("(Underlying Error: Timed out while enabling automation mode.)").path()
+        ));
+        // Hardware, iOS 27.2: both volume keys held while the runner served.
+        let ready = "2026-10-26 00:31:06.268727+0900 iPhoneUse-Runner[20117:3948577] ipu-runner: GET /source -> 200 (14.3 ms)\n";
+        let revoked = format!("{ready}2026-10-26 00:31:20.965936+0900 iPhoneUse-Runner[20117:3948528] ipu-runner: xctest issue suppressed: Failed to get system application: Not authorized for performing UI testing actions.\n");
+        let file = log(&revoked);
+        assert!(log_shows_automation_revoked(file.path(), 0));
+        assert!(log_shows_automation_revoked(file.path(), ready.len() as u64));
+        assert!(
+            !log_shows_automation_revoked(file.path(), log_len(file.path())),
+            "only lines after the mark count"
+        );
+        assert!(!log_shows_automation_revoked(log(ready).path(), 0));
+        assert!(
+            log_shows_automation_revoked(file.path(), u64::MAX),
+            "a capped log is read from its start"
+        );
+        // Hardware, iOS 27.2 (zh-CN): the passcode prompt cancelled on the phone.
+        let canceled = log(r#"2026-10-25 02:15:01.251711+0900 iPhoneUse-Runner[17603:3266718] [Default] Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication Code=-2 "Canceled by user." UserInfo={NSDebugDescription=Canceled by user., NSLocalizedDescription=认证已取消。, BiometryType=2}"#);
+        assert!(log_shows_passcode_canceled(canceled.path()));
+        assert!(log_shows_automation_disabled(canceled.path()));
+        assert!(!log_shows_passcode_canceled(
             log("(Underlying Error: Timed out while enabling automation mode.)").path()
         ));
         assert!(log_shows_device_unavailable(

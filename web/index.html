@@ -1390,6 +1390,8 @@ const I18N_EN = {
   '页面回到前台，正在取最新一帧': 'Page is back; fetching the latest frame',
   '手机已交还': 'Phone handed back',
   '设备空闲中': 'Device idle',
+  '已在手机上退出': 'Ended on the phone',
+  '这台 Mac 不会自动重连。需要远程操作时点「连接手机」': 'This Mac will not reconnect on its own. Choose Connect to control it remotely again',
   '手机在持有人手里，远程控制已停止。需要远程操作时点「连接手机」': 'The phone is with the person holding it and remote control has stopped. Click “Connect phone” when you need it again',
   '一段时间没人操作，设备连接已暂停。点「连接手机」继续（手机需解锁亮屏）': 'Nobody used it for a while, so the device connection is paused. Click “Connect phone” to continue (the phone must be unlocked with the screen on)',
   '正在释放设备': 'Releasing the device',
@@ -2175,10 +2177,13 @@ function showOverlay(kind) {
     setTextIfChanged(olSub, t('页面回到前台，正在取最新一帧'));
   } else if (kind === 'released') {
     const handedOver = backendStatus?.human_handoff === true;
-    setTextIfChanged(olTitle, handedOver ? t('手机已交还') : t('设备空闲中'));
+    const endedOnPhone = backendStatus?.ended_on_phone === true;
+    setTextIfChanged(olTitle, handedOver ? t('手机已交还') : (endedOnPhone ? t('已在手机上退出') : t('设备空闲中')));
     setTextIfChanged(olSub, handedOver
       ? t('手机在持有人手里，远程控制已停止。需要远程操作时点「连接手机」')
-      : t('一段时间没人操作，设备连接已暂停。点「连接手机」继续（手机需解锁亮屏）'));
+      : (endedOnPhone
+        ? t('这台 Mac 不会自动重连。需要远程操作时点「连接手机」')
+        : t('一段时间没人操作，设备连接已暂停。点「连接手机」继续（手机需解锁亮屏）')));
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'releasing') {
     setTextIfChanged(olTitle, t('正在释放设备'));

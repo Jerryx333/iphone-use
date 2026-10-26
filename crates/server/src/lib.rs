@@ -28,6 +28,7 @@ pub mod mp4;
 pub mod ocr;
 pub mod pairing;
 pub mod phone_daemon;
+pub mod phone_exit;
 pub mod prewarm;
 pub mod protocol;
 pub mod recording;
