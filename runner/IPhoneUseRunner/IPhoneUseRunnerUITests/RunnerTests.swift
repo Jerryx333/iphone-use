@@ -134,15 +134,10 @@ final class RunnerTests: XCTestCase {
     RunnerDaemon.start(environment: environment, runnerPort: port, mjpegPort: mjpegPort)
 
     if environment["IPU_RUNNER_EXIT_NOTICE"] != "0" {
-      let notice = RunnerExitNotice { [weak self] broughtForward in
-        DispatchQueue.main.async {
-          // A tap on the notification opened the blank runner app: leave the person on the Home
-          // Screen, while automation still allows it, instead of an empty app.
-          if broughtForward { XCUIDevice.shared.press(.home) }
-          self?.serveExpectation?.fulfill()
-        }
+      let notice = RunnerExitNotice {
+        DispatchQueue.main.async { expectation.fulfill() }
       }
-      notice.post()
+      notice.post(requestPermission: environment["IPU_RUNNER_EXIT_NOTICE"] == "1")
       exitNotice = notice
     }
 

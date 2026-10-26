@@ -18,6 +18,18 @@ Agent  ── /agent/* ──────────> iphone-use daemon ── 
 
 设计、生命周期、失败状态和安全边界见 **[`docs/direct-device-architecture.html`](direct-device-architecture.html)**。
 
+### 把手机交还给使用者
+
+同时按住两个音量键可结束 iOS UI 自动化。受管 runner 会停住，直到下一次明确的
+agent 或网页请求；后台定时任务和预热不会重连。`iphone-use pause` 还会持久保存
+人工接管状态，需执行 `iphone-use resume` 或在网页切回 agent 模式。取消自动化的
+密码提示也会保存人工接管状态；恢复失败时继续拒绝 agent 输入。
+
+可选通知提供 **结束控制** 按钮。默认启动只使用已有通知授权，不弹权限框；
+明确设置通知权限时可用 `IPU_RUNNER_EXIT_NOTICE=1`，`0` 则禁用通知。拒绝授权后
+仍可使用音量键或 pause 退出。点通知正文不会结束控制，模拟器不显示该通知。
+
+
 ## 快速开始
 
 ### 前置条件

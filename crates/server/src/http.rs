@@ -5243,9 +5243,12 @@ pub fn set_human_handoff(active: bool) {
 
 /// Set the hand-off and keep it in the state dir, so a daemon restart (an
 /// upgrade, a login) still leaves the phone with its holder.
-fn persist_human_handoff(active: bool) {
-    crate::phone_exit::set_handoff(&crate::instance::current().state_dir, active);
-    set_human_handoff(active);
+fn persist_human_handoff(active: bool) -> std::io::Result<()> {
+    let persisted = crate::phone_exit::set_handoff(&crate::instance::current().state_dir, active);
+    // A failed release write still refuses input in this process. A failed
+    // resume write must not remove that refusal.
+    if active || persisted.is_ok() { set_human_handoff(active); }
+    persisted
 }
 
 /// Status `ended_on_phone`: released after an end on the phone, and not
@@ -6079,7 +6082,11 @@ async fn agent_mode_inner(
             // launchd accepts the bring-up a few seconds later — the bootstrap
             // can outlast a client's timeout, and status must not keep saying
             // "handed to a human" while the runner is already coming up.
-            persist_human_handoff(false);
+            if let Err(error) = persist_human_handoff(false) {
+                tracing::error!(%error, "could not persist agent handoff");
+                return with_security_headers((StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({"ok":false,"error":"handoff_persistence_failed","outcome":"not_sent"}))).into_response());
+            }
             // An explicit reconnect is intent, not idleness: restart the clock
             // before the bring-up begins, or a build longer than the idle
             // window ends with the watchdog stopping the very supervisor this
@@ -6138,6 +6145,7 @@ async fn agent_mode_inner(
             let stopped = tokio::task::spawn_blocking(move || stop_runner_blocking(&script))
                 .await
                 .unwrap_or(false);
+            let mut persisted = true;
             if stopped {
                 state
                     .runner_actionable
@@ -6147,16 +6155,22 @@ async fn agent_mode_inner(
                     .released
                     .store(true, std::sync::atomic::Ordering::Release);
                 *recover(state.owner.lock()) = None;
-                persist_human_handoff(true);
+                if let Err(error) = persist_human_handoff(true) {
+                    tracing::error!(%error, "phone stopped but human handoff could not be persisted");
+                    persisted = false;
+                }
                 tracing::info!("phone handed to a human: managed runner stopped on request");
             }
             state.runner_lifecycle.finish_releasing(release_token);
             let body = format!(
-                r#"{{"ok":{stopped},"mode":"human","released":{stopped},"hint":"runner is stopped and the phone is the holder's; POST {{\"mode\":\"agent\"}} hands it back to remote control"}}"#
+                r#"{{"ok":{},"mode":"human","released":{stopped},"hint":"runner is stopped and the phone is the holder's; POST {{\"mode\":\"agent\"}} hands it back to remote control","handoff_persisted":{persisted}}}"#,
+                stopped && persisted
             );
             with_security_headers(
                 Response::builder()
-                    .status(if stopped {
+                    .status(if stopped && !persisted {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else if stopped {
                         StatusCode::OK
                     } else {
                         StatusCode::BAD_GATEWAY
@@ -22915,7 +22929,7 @@ mod tests {
     fn an_end_on_the_phone_shows_only_on_a_released_phone_not_handed_over() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!ended_on_phone(true, false, dir.path()));
-        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::Exited);
+        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::Exited).unwrap();
         assert!(ended_on_phone(true, false, dir.path()));
         assert!(!ended_on_phone(false, false, dir.path()), "not released yet");
         assert!(!ended_on_phone(true, true, dir.path()), "the hand-off says more");

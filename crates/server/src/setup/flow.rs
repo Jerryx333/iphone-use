@@ -98,6 +98,7 @@ pub struct Setup {
     /// tunnel, not usbmuxd (only for what the log calls it).
     relay_over_tunnel: bool,
     supervisor_generation: Option<String>,
+    runner_log_mark: u64,
     // Held through commit/rollback cleanup; children do not inherit it.
     _interactive_guard: Option<super::coordination::Guard>,
 }
@@ -177,6 +178,7 @@ impl Setup {
             upgrade_rebuild: false,
             relay_over_tunnel: false,
             supervisor_generation: None,
+            runner_log_mark: 0,
             _interactive_guard: None,
         }
     }
@@ -493,7 +495,7 @@ impl Setup {
     /// stop everything, disable this label so no login or KeepAlive round
     /// starts it again, and wait for the daemon to release the phone.
     fn park_on_phone<T>(&self, reason: crate::phone_exit::Reason) -> Step<T> {
-        crate::phone_exit::park(self.ctx.state_dir(), reason);
+        let persisted = crate::phone_exit::park(self.ctx.state_dir(), reason);
         launchd::disable(&self.ctx, &self.ctx.instance.runner_label);
         for (file, legacy, role) in [
             (&self.ctx.mjpeg_relay_pid_file, &self.legacy.mjpeg, Role::Mjpeg),
@@ -504,6 +506,11 @@ impl Setup {
         }
         if let Err(error) = retry::reset(&self.ctx.retry_state) {
             warn(&error);
+        }
+        if let Err(error) = persisted {
+            warn(&format!("could not persist phone exit; supervisor disabled and processes stopped: {error}"));
+            self.phase("failed", "state_write_failed", "could not persist phone exit; run resume explicitly after repairing state storage");
+            return Err(Exit(1));
         }
         let message = match reason {
             crate::phone_exit::Reason::Exited => {
@@ -603,6 +610,7 @@ impl Setup {
             super::commands::end_device_runner(&self.ctx);
         }
         let _ = std::fs::write(&self.ctx.run_log, b"");
+        self.runner_log_mark = runner::log_len(&self.ctx.run_log);
         let xcodebuild = PathBuf::from(sys::stdout_of("xcrun", &["--find", "xcodebuild"]));
         if xcodebuild.as_os_str().is_empty() || !sys::is_executable(&xcodebuild) {
             return die("could not resolve the selected Xcode's xcodebuild executable");
@@ -3039,9 +3047,10 @@ impl Setup {
         // leaving the next reconnect to find it expired.
         const RENEW_CHECK: Duration = Duration::from_secs(30 * 60);
         let mut renew_checked = Instant::now();
-        // Only what the runner logs from here on can say iOS took UI
+        // Include this launch’s verification logs: revocation can happen
+        // before the hold loop starts. Only this launch can say iOS took UI
         // automation away (see [`runner::log_shows_automation_revoked`]).
-        let mut log_mark = runner::log_len(&self.ctx.run_log);
+        let mut log_mark = self.runner_log_mark;
         let cause = loop {
             // xcodebuild appends to the runner log for as long as the runner
             // lives; it is only truncated at the next launch.
@@ -3252,7 +3261,9 @@ impl Setup {
             }
             return Err(Exit(1));
         }
-        if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked() {
+        if runner::log_shows_lock(&self.ctx.run_log) || self.endpoint_locked()
+            || (cause == "runner" && self.passcode_required() == Some(true))
+        {
             return self.locked_retry();
         }
         // The person held both volume keys: iOS revoked UI automation (the
@@ -4443,7 +4454,10 @@ impl Setup {
         // Someone ran setup on purpose: an earlier end on the phone no
         // longer stands.
         crate::phone_exit::clear_parked(self.ctx.state_dir());
-        crate::phone_exit::set_handoff(self.ctx.state_dir(), false);
+        crate::phone_exit::set_handoff(self.ctx.state_dir(), false).map_err(|error| {
+            warn(&format!("could not clear human handoff: {error}"));
+            Exit(1)
+        })?;
         self.body()
     }
 
@@ -5501,6 +5515,7 @@ impl Setup {
         let started = 'launch: {
             'attempts: for attempt in 0..2 {
                 let _ = std::fs::write(&self.ctx.run_log, b"");
+                self.runner_log_mark = runner::log_len(&self.ctx.run_log);
                 // A fresh token per launch; the launcher puts it in the
                 // runner's test environment (never on its command line).
                 let Ok(token) = crate::runner_token::rotate(self.ctx.state_dir()) else {
