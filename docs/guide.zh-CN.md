@@ -18,6 +18,18 @@ Agent  ── /agent/* ──────────> iphone-use daemon ── 
 
 设计、生命周期、失败状态和安全边界见 **[`docs/direct-device-architecture.html`](direct-device-architecture.html)**。
 
+### 把手机交还给使用者
+
+同时按住两个音量键可结束 iOS UI 自动化。受管 runner 会停住，直到下一次明确的
+agent 或网页请求；后台定时任务和预热不会重连。`iphone-use pause` 还会持久保存
+人工接管状态，需执行 `iphone-use resume` 或在网页切回 agent 模式。取消自动化的
+密码提示也会保存人工接管状态；恢复失败时继续拒绝 agent 输入。
+
+可选通知提供 **结束控制** 按钮。默认启动只使用已有通知授权，不弹权限框；
+明确设置通知权限时可用 `IPU_RUNNER_EXIT_NOTICE=1`，`0` 则禁用通知。拒绝授权后
+仍可使用音量键或 pause 退出。点通知正文不会结束控制，模拟器不显示该通知。
+
+
 ## 快速开始
 
 ### 前置条件
@@ -242,7 +254,7 @@ verb 定义在 `~/.iphone-use/intents-registry.json`（从 [`deploy/intents-regi
 |---|---|
 | 看 | `phone_status`、`phone_capabilities`（这个版本支持什么，以及此刻能不能用；不唤醒手机、不占租约）、`phone_screenshot`、`phone_elements`（带 `registry` 块，列出当前屏幕上这个 app 已安装的 flow） |
 | 动 | `phone_tap`、`phone_tap_element`（绑定快照）、`phone_tap_label`（精确标签唯一）、`phone_scroll`、`phone_type`（中文无损）、`phone_key`、`phone_shortcut`（`home` / `spotlight`）——每个都可选传 `observe` |
-| 批 | `phone_run_steps`：最多 24 步，含 `tap_locator`、`launch_app`、`picker`、`alert`、`perform`（切换开关、调节滑块）、长按 / 滑动 / 拖动、`wait_for`；`phone_jev_run`：把整个目标交给手机上的快速 agent |
+| 批 | `phone_run_steps`：最多 24 步，含 `tap_locator`、`launch_app`、`picker`、`alert`、`perform`（切换开关、调节滑块）、长按 / 多指长按 / 滑动 / 拖动、`wait_for`；`phone_jev_run`：把整个目标交给手机上的快速 agent |
 | 生命周期 | `phone_reconnect`（在已配置的手机上重启设备运行器，不换 UDID）、`phone_hold`、`phone_release_owner`、`phone_login`（在 daemon 内用用户自己的密码库登录 app） |
 | Flow | `phone_flow_list`、`phone_flow_info`、`phone_flow_run`、`phone_flow_draft`、`phone_flow_update`、`phone_flow_publish`、`phone_flow_report` |
 | 统计 | `phone_run_start`、`phone_run_end`（精确统计一次任务的调用） |
@@ -447,6 +459,18 @@ SOCKS 代理即使能连通，也可能影响**新建 Wi-Fi 隧道**。[#313](ht
 保持手机解锁，有提示时处理；已经授权则检查隧道和 runner 日志。该环境的纯 Wi-Fi
 冷启动、隔离其他变量的 SOCKS 对照仍未验证。
 
+[v0.23.0 实机验收](qa/2026-10-26-wifi-bootstrap.md) 按上述诊断执行，未刷新设备服务，恢复 SOCKS 后无线输入仍通过；不代表已确认 SOCKS 唯一根因或纯无线冷启动。
+
+
+### 恢复缺失配置的命名实例
+
+命名实例丢失 LaunchAgent 后，setup 可从该实例私有的 `runner-product.json`
+（schema 1、v3 产品键）恢复目标设备；显式参数和 plist 配置优先，不借用其他
+实例或默认手机。记录无效时仍需明确 UDID。缺少 daemon 时，在构建或启动 Runner
+前提示带实例名和目标的官方安装器命令，doctor、resume 使用同一恢复方向。
+凭据、端口和 LaunchAgent 仍由官方安装器管理。手机不可见时先 USB 连接、解锁，
+有提示时完成信任；不可见本身不能证明配对丢失。
+
 ## 开发
 
 ```bash
@@ -505,3 +529,31 @@ IPHONE_USE_HOST=0.0.0.0 IPHONE_USE_PASSWORD=secret ./target/release/iphone-use s
 ## 许可证
 
 [PolyForm Shield 1.0.0](../LICENSE)。本项目采用源码可见许可，允许符合条款的非竞争用途、修改和分发；禁止使用本软件提供竞争产品或服务，包括免费竞品。详见[许可范围与第三方声明](../LICENSING.md)。
+
+
+### 多指长按与 Jev 读取恢复
+
+`phone_run_steps` 和保存的 flow 支持 `kind:"multi_longpress"`：
+
+```json
+{"kind":"multi_longpress","points":[{"x":0.3,"y":0.5},{"x":0.5,"y":0.5},{"x":0.7,"y":0.5}],"duration_ms":1500}
+```
+
+`points` 包含 2–5 个互不重复的归一化坐标，数组长度就是手指数。
+HTTP `/agent/input` 或 `/agent/actions` 使用 `type:"multi_longpress"`。
+时长默认 1000 ms，范围 1–10000 ms；发送前检查全部坐标，失败时不会降级为单指。
+普通 `longpress` 收到 `fingers:3` 会拒绝执行。协议与批处理已有自动化测试，
+具体 App 能否识别这一手势仍需真机验证。
+
+Jev 遇到 HTTP 504 `runner_source_timeout` 时，会按响应中的
+`retry_after_secs` 等待 1–60 秒，仅重试一次读取，让服务端返回有界树。
+不会重放前一步点击。操作后的读取恢复失败时返回 `status:"blocked"`，
+保留 `history` 和 `last_successful_action`，供后续接手核验。
+
+
+Jev 收到确认未发送的 `element_occluded`，且当前读屏中键盘可见时，会尝试一次
+`DISMISS_KEYBOARD` 并重新读屏。该动作使用独立的 `keyboard_dismiss_only`，只匹配明确的
+“隐藏键盘”按钮，不按 Done、Return 或 Search；没有这种按钮时返回 blocked。
+旧 daemon 会拒绝这个独立动作，不会忽略保护参数后按下 Search。
+它不清空搜索词、不提交，也不绕过遮挡保护。
+键盘仍在或再次遇到遮挡时返回 blocked；动作结果未知时不触发这条自动恢复路径。

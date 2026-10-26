@@ -41,7 +41,8 @@ passcode.
 | reconnecting (`reconnecting:true`) | Bring-up running | If `setup_blocked_on` is set, follow `hint`; else report `setup_phase`/`setup_message` and poll. A first build after an Xcode update can take minutes. |
 | `blocked` / `offline` | Something stands in the way | Read `hint` and `setup_blocked_on` (see [Setup blockers](#setup-blockers)); resolve it first. When the person has to act, relay `next_step` (`{zh,en}`, the same line the web page and iOS app show) instead of paraphrasing `hint`. |
 | `degraded` | runner answers but the last read/action did not complete (heavy page, stalled app) | **Not** a blocker; `setup_blocked_on` is empty. Wait `retry_after_secs` (3s) and read again; do not restart anything. |
-| `released` + `human_handoff:true` | The operator handed the phone to a person | Input answers `409 phone_handed_to_human`. Ask the operator before sending `{"mode":"agent"}`. |
+| `released` + `human_handoff:true` | The operator handed the phone to a person | Input answers `409 phone_handed_to_human`. Ask the operator before sending `{"mode":"agent"}`. Also set by `iphone-use pause` and by a passcode prompt cancelled on the phone; it survives daemon restarts. `iphone-use resume` clears it. |
+| `released` + `ended_on_phone:true` | The person ended the session on the phone (both volume keys) | Nothing restarts the runner on its own and pre-warm skips it. Ask before acting; the next action or `{"mode":"agent"}` starts it again. |
 
 **Lock readiness.** `lock_readiness` says whether the phone will lock on its
 own while nobody drives it, so an owner with many phones sees which ones get
@@ -333,11 +334,22 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 {"type":"scroll","page":true,"dy":300}                  // the page scroller (long web forms); 422 no_page_scroller if none
 {"type":"swipe","x1":0.5,"y1":0.8,"x2":0.5,"y2":0.2}    // also drag (+hold_ms), longpress (+duration_ms)
 {"type":"drag","points":[{"x":0.3,"y":0.4},{"x":0.13,"y":0.5,"dwell_ms":900},{"x":0.5,"y":0.4}],"hold_ms":400,"duration_ms":300}
+{"type":"multi_longpress","points":[{"x":0.3,"y":0.5},{"x":0.5,"y":0.5},{"x":0.7,"y":0.5}],"duration_ms":1500}
 {"type":"back"}                                         // left-edge swipe, not a Back button
 {"type":"alert","button":"允许"}                        // or "action":"accept"|"dismiss"
 {"type":"picker","column":0,"value":"2026"}
 {"type":"perform","element":9,"snapshot":"…","action":"toggle"}  // increment|decrement|adjust(+value)|toggle|menu|double_tap|two_finger_tap|scroll_to_visible|pinch|rotate
 ```
+
+**Multi-finger hold.** `multi_longpress` holds 2–5 distinct normalized
+`{x,y}` points simultaneously in one runner request; the array length is the
+finger count. `duration_ms` defaults to 1000 and accepts 1–10000. All points
+are validated before sending; no single-finger fallback is used. In MCP
+`phone_run_steps` or saved flows use `kind:"multi_longpress"` with the same
+`points` and `duration_ms`. Ordinary `longpress` is one finger and rejects
+`fingers` other than 1; use explicit points for multiple fingers. This release
+has automated protocol tests; recognition by a particular real iPhone app
+still requires device acceptance.
 
 **Continuous drag.** `drag` accepts either the existing `x1/y1/x2/y2` form or
 `points` (2–16 normalized stops), never both. Each point's `dwell_ms` (default 0)
@@ -414,6 +426,25 @@ Keys: `TYPESAFE_API_KEY` or `~/.config/typesafe/key`; for typing
 send, pay, delete or share what the goal did not ask for; still confirm such
 goals with the user, and verify the end screen. The policy is adapted from
 browser-use/jev-ultrafast (MIT) via chrome-use's `jev run`.
+
+On HTTP 504 `runner_source_timeout`, Jev waits the supplied integer
+`retry_after_secs` (1–60 seconds) and retries **only the screen read once**,
+allowing the daemon's bounded-tree fallback to run. A second failure after an
+action returns `status:"blocked"`, preserves the action in `history`, and
+reports `last_successful_action`; it never repeats the preceding click. Other
+HTTP failures, missing/invalid backoff, and action failures are not retried by
+this recovery path.
+
+For a confirmed `not_sent` / `element_occluded` refusal with a visible keyboard,
+Jev attempts one `DISMISS_KEYBOARD` action (`type:"keyboard_dismiss_only"`)
+and observes again. This mode permits only explicit Hide Keyboard affordances,
+never Done/Return/Search; a keyboard without a safe dismiss affordance blocks.
+This uses a distinct action name so an older daemon rejects it instead of
+silently ignoring a protection flag. Ordinary `keyboard` retains its manual
+behavior and may press Done/Return/Search. It does not clear
+the search, submit it, or bypass the occlusion guard. If the keyboard remains
+or covered targets fail again after dismissal, it returns a precise blocked
+result. Unknown action outcomes do not trigger this automatic dismissal.
 
 ## Batches first
 
@@ -826,7 +857,9 @@ update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
   on a narrowed read. `ocr` (`auto` | `force` | `off`, default off) maps to
   `?ocr=1` / `?ocr=force`; OCR rows are printed under the tree with their
   centre as `phone_tap` x/y, and an `ocr_error` never fails the read.
-  `phone_screenshot overlay=true` is `?overlay=elements`.
+  `include_hidden:true` expands off-screen/not-drawn rows within the normal
+  row/byte budgets, preserving indexes and their hidden status; it does not
+  make a hidden row safe to tap. `phone_screenshot overlay=true` is `?overlay=elements`.
 - Device tools map one-to-one onto the daemon routes: `phone_logs` →
   `POST/GET /agent/logs`, `phone_crashes` → `GET /agent/crashes[/:name]`,
   `phone_set_location` → `POST /agent/location`, `phone_record` →
@@ -853,7 +886,7 @@ update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
   (`<owner>-<n>`).
 - Not in MCP: `set_value`, `keyboard`, element/page `scroll`, uninstall
   (except `phone_install_app fresh=true`), intents. `launch_app`, `open_url`, `alert`, `picker`, `perform`, `swipe`,
-  `drag`, `longpress`, `back` exist only as `phone_run_steps` step kinds.
+  `drag`, `longpress`, `multi_longpress`, `back` exist only as `phone_run_steps` step kinds.
 
 ## Task metrics, runs and advice
 
@@ -1054,7 +1087,7 @@ target and inputs.
 
 Top-level fields are closed (unknown fields are rejected): `version, name,
 description, inputs, steps, app, category, risk, locale, tags, verified_on,
-app_version_min, example_inputs`. Step kinds: `tap, longpress, swipe, drag,
+app_version_min, example_inputs`. Step kinds: `tap, longpress, multi_longpress, swipe, drag,
 tap_label, tap_locator, type, key, shortcut, scroll, launch_app, back, alert,
 picker, wait_for, pause`. `wait_for.expect` takes `application`, `present[]`,
 `absent[]`. Only a `type` step may reference an input (`"input":"name"`), and
@@ -1263,3 +1296,17 @@ not pixel coordinates or a restore format. Read again after moving an icon and
 resolve live UI elements before sending a gesture. An unavailable service returns
 `503 home_layout_unavailable`, never a successful empty layout. Simulator targets
 are explicitly unsupported. No endpoint changes the saved layout.
+
+When `ended_on_phone=true`, automatic schedules remain postponed. An explicitly
+requested manual schedule run may reconnect, but it still respects human handoff,
+other owners, live viewers and lock state. A parked helper reports
+`runner_build.state="parked"`, including after five minutes; it is neither
+building nor stalled.
+
+The runner uses an already authorized notification permission for its optional
+“End control” notice. Startup never requests permission by default. For an
+explicit notification setup run, `IPU_RUNNER_EXIT_NOTICE=1` requests permission;
+`0` disables the notice. Simulator runs never post it. If permission is denied,
+use both volume keys or `iphone-use pause`. Only the notification's explicit
+End control button ends the session; tapping its body does not. Pending
+notification callbacks cannot end a later runner session.

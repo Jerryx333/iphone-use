@@ -13,6 +13,10 @@ use super::usbdiag;
 pub fn run(ctx: &Ctx) -> i32 {
     info("Device runner preflight");
     let mut fail = false;
+    if let Some(message) = ctx.missing_daemon_recovery() {
+        warn(&format!("X {message}"));
+        fail = true;
+    }
     if ctx.state_dir().is_dir() {
         ok(&format!(
             "setup state directory present: {}",
@@ -146,7 +150,7 @@ pub fn run(ctx: &Ctx) -> i32 {
         };
     if absent {
         warn(&format!(
-            "X configured target {} is not connected to this Mac (usbmuxd does not list it; CoreDevice reports it unavailable) — plug it in over USB (or join the same Wi-Fi) and unlock it",
+            "X configured target {} is not connected to this Mac (usbmuxd does not list it; CoreDevice reports it unavailable) — plug it in over USB and unlock it; accept Trust if prompted. Pairing may need repair, but absence alone does not prove pairing was lost",
             ctx.udid
         ));
         if let Some(diagnosis) = &diagnosis {

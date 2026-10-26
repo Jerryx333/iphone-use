@@ -31,12 +31,24 @@ final class RunnerTests: XCTestCase {
     let expectation = XCTestExpectation(description: "ipu-runner serves until /shutdown")
     core.onShutdown = { expectation.fulfill() }
     core.onListenFailure = { _ in expectation.fulfill() }
-    try core.start(environment: ProcessInfo.processInfo.environment)
+    let environment = ProcessInfo.processInfo.environment
+    try core.start(environment: environment)
+
+    // The notification whose End button ends the session from the phone (RunnerExitNotice.swift).
+    var exitNotice: RunnerExitNotice?
+    if environment["IPU_RUNNER_EXIT_NOTICE"] != "0" {
+      let notice = RunnerExitNotice {
+        DispatchQueue.main.async { expectation.fulfill() }
+      }
+      notice.post(requestPermission: environment["IPU_RUNNER_EXIT_NOTICE"] == "1")
+      exitNotice = notice
+    }
 
     // Block this test (and keep the main run loop spinning for the request handlers) for a year,
     // or until POST /shutdown.
     let result = XCTWaiter.wait(for: [expectation], timeout: 365 * 24 * 60 * 60)
     NSLog("ipu-runner: serve loop ended (%@)", String(describing: result))
+    exitNotice?.remove()
     core.stop()
     // A runner that never served must not end as a passing test: xcodebuild would print
     // "TEST EXECUTE SUCCEEDED" for a phone nobody can drive. The usual cause is another runner
