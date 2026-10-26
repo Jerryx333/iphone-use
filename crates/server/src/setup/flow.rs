@@ -484,6 +484,9 @@ impl Setup {
     // ── the setup body ──────────────────────────────────────────────────────
 
     pub fn body(&mut self) -> Step {
+        if let Some(message) = self.ctx.missing_daemon_recovery() {
+            return die(message);
+        }
         self.prerequisites()?;
         self.resolve_device()?;
         let source_hash = self.runner_source()?;

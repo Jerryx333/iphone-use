@@ -134,6 +134,10 @@ pub fn pause(ctx: &Ctx) -> i32 {
 }
 
 pub fn resume(ctx: &Ctx) -> i32 {
+    if let Some(message) = ctx.missing_daemon_recovery() {
+        warn(&message);
+        return 1;
+    }
     if !ctx.state_dir().is_dir() {
         warn(&format!(
             "setup state is not initialized at {}; run setup before resume",
