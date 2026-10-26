@@ -3831,6 +3831,9 @@ fn classify_build_state(phase: &str, age_secs: u64) -> &'static str {
     if phase == "ready" {
         return "ready";
     }
+    if phase == "parked" {
+        return "parked";
+    }
     if phase.ends_with("-fail") {
         return "failed";
     }
@@ -23215,6 +23218,13 @@ mod tests {
             setup_working(true, Some(&build_status("building-fail", 1)), alive),
             None
         );
+    }
+
+    #[test]
+    fn build_state_parked_is_terminal_and_does_not_claim_work_or_failure() {
+        for age in [0, 10, BUILD_STALE_SECS + 1, 99_999] {
+            assert_eq!(classify_build_state("parked", age), "parked");
+        }
     }
 
     #[test]
