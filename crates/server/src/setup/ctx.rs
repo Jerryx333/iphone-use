@@ -171,7 +171,7 @@ impl Ctx {
     }
 
     pub fn missing_daemon_recovery(&self) -> Option<String> {
-        (!self.instance.is_default() && !self.daemon_plist.exists()).then(|| {
+        (!self.instance.is_default() && !self.daemon_plist.is_file()).then(|| {
             format!(
                 "instance {} is missing its daemon LaunchAgent; restore the instance with: {}",
                 self.instance.name,
@@ -871,7 +871,11 @@ mod tests {
         ctx.udid = "DEADBEEF".into();
         ctx.recover_recorded_target();
         assert_eq!(ctx.udid, "DEADBEEF", "configured target takes precedence");
-        std::fs::create_dir_all(ctx.daemon_plist.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&ctx.daemon_plist).unwrap();
+        assert!(ctx.missing_daemon_recovery().is_some(), "a directory is not a daemon plist");
+        assert_eq!(super::super::commands::resume(&ctx), 1);
+        assert!(super::super::flow::Setup::new(ctx.clone()).body().is_err());
+        std::fs::remove_dir(&ctx.daemon_plist).unwrap();
         std::fs::write(&ctx.daemon_plist, "existing").unwrap();
         assert!(ctx.missing_daemon_recovery().is_none());
         let mut other = Ctx::paths(Instance::derive("other", root.path(), None).unwrap());
