@@ -1302,3 +1302,11 @@ requested manual schedule run may reconnect, but it still respects human handoff
 other owners, live viewers and lock state. A parked helper reports
 `runner_build.state="parked"`, including after five minutes; it is neither
 building nor stalled.
+
+The runner uses an already authorized notification permission for its optional
+“End control” notice. Startup never requests permission by default. For an
+explicit notification setup run, `IPU_RUNNER_EXIT_NOTICE=1` requests permission;
+`0` disables the notice. Simulator runs never post it. If permission is denied,
+use both volume keys or `iphone-use pause`. Only the notification's explicit
+End control button ends the session; tapping its body does not. Pending
+notification callbacks cannot end a later runner session.

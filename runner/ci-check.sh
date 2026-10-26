@@ -41,6 +41,7 @@ echo "runner ci-check: names coherent across project, the setup engine and unins
 
 # ── 1. device-independent logic ─────────────────────────────────────────────
 python3 scripts/test-runner-home-check.py
+python3 scripts/test-runner-exit-notice.py
 bash runner/unit-check.sh
 
 # ── 2. unsigned iOS build ───────────────────────────────────────────────────

@@ -105,6 +105,10 @@ pub fn pause(ctx: &Ctx) -> i32 {
         ));
         return 1;
     }
+    if let Err(error) = crate::phone_exit::set_handoff(ctx.state_dir(), true) {
+        warn(&format!("could not persist human handoff: {error}"));
+        return 1;
+    }
     info("Pausing the managed device runner and giving the phone back to the user");
     let label = &ctx.instance.runner_label;
     // Disable before bootout so KeepAlive cannot race the shutdown.
@@ -130,7 +134,6 @@ pub fn pause(ctx: &Ctx) -> i32 {
     // A pause gives the phone to the person holding it: the daemon refuses
     // agent input instead of starting the runner again on the next request.
     crate::phone_exit::clear_parked(ctx.state_dir());
-    crate::phone_exit::set_handoff(ctx.state_dir(), true);
     ok("device runner paused: supervisor disabled and all PID-verified runner/relay processes stopped");
     sweep_device_runner(ctx);
     println!("  Resume: {} resume", ctx.self_install.display());
@@ -170,7 +173,6 @@ pub fn resume(ctx: &Ctx) -> i32 {
         return 1;
     }
     crate::phone_exit::clear_parked(ctx.state_dir());
-    crate::phone_exit::set_handoff(ctx.state_dir(), false);
     if !launchd::enable(ctx, label) {
         warn("could not enable the runner supervisor");
         return 1;
@@ -183,6 +185,12 @@ pub fn resume(ctx: &Ctx) -> i32 {
     if launchd::disabled_state(ctx, label) != Some(false) || !launchd::loaded(ctx, label) {
         launchd::disable(ctx, label);
         warn("resume was not verified; the runner supervisor remains paused");
+        return 1;
+    }
+    if let Err(error) = crate::phone_exit::set_handoff(ctx.state_dir(), false) {
+        launchd::disable(ctx, label);
+        launchd::bootout(ctx, label);
+        warn(&format!("could not clear human handoff; supervisor paused again: {error}"));
         return 1;
     }
     ok("device runner resume requested; lock-screen failures will retry with quiet backoff");

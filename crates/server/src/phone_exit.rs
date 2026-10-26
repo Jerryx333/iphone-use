@@ -42,11 +42,12 @@ impl Reason {
 }
 
 /// Record a phone-side end. A cancelled passcode also hands the phone over.
-pub fn park(state_dir: &Path, reason: Reason) {
-    let _ = std::fs::write(state_dir.join(PARKED_FILE), format!("{}\n", reason.as_str()));
+pub fn park(state_dir: &Path, reason: Reason) -> std::io::Result<()> {
+    // Persist the stronger refusal first, even if the parked write later fails.
     if reason == Reason::PasscodeCanceled {
-        set_handoff(state_dir, true);
+        set_handoff(state_dir, true)?;
     }
+    std::fs::write(state_dir.join(PARKED_FILE), format!("{}\n", reason.as_str()))
 }
 
 pub fn parked(state_dir: &Path) -> bool {
@@ -61,12 +62,15 @@ pub fn handoff(state_dir: &Path) -> bool {
     state_dir.join(HANDOFF_FILE).exists()
 }
 
-pub fn set_handoff(state_dir: &Path, active: bool) {
+pub fn set_handoff(state_dir: &Path, active: bool) -> std::io::Result<()> {
     let path = state_dir.join(HANDOFF_FILE);
     if active {
-        let _ = std::fs::write(path, b"human\n");
+        std::fs::write(path, b"human\n")
     } else {
-        let _ = std::fs::remove_file(path);
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
     }
 }
 
@@ -75,9 +79,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistence_errors_preserve_passcode_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(PARKED_FILE)).unwrap();
+        assert!(park(dir.path(), Reason::PasscodeCanceled).is_err());
+        assert!(handoff(dir.path()));
+        set_handoff(dir.path(), false).unwrap();
+        std::fs::create_dir(dir.path().join(HANDOFF_FILE)).unwrap();
+        assert!(set_handoff(dir.path(), true).is_err());
+        assert!(set_handoff(dir.path(), false).is_err());
+    }
+
+    #[test]
     fn an_exit_parks_without_handing_over() {
         let dir = tempfile::tempdir().unwrap();
-        park(dir.path(), Reason::Exited);
+        park(dir.path(), Reason::Exited).unwrap();
         assert!(parked(dir.path()));
         assert!(!handoff(dir.path()));
         clear_parked(dir.path());
@@ -87,10 +103,10 @@ mod tests {
     #[test]
     fn a_cancelled_passcode_parks_and_hands_over() {
         let dir = tempfile::tempdir().unwrap();
-        park(dir.path(), Reason::PasscodeCanceled);
+        park(dir.path(), Reason::PasscodeCanceled).unwrap();
         assert!(parked(dir.path()));
         assert!(handoff(dir.path()));
-        set_handoff(dir.path(), false);
+        set_handoff(dir.path(), false).unwrap();
         assert!(!handoff(dir.path()));
     }
 }

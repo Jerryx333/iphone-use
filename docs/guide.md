@@ -42,6 +42,21 @@ Agent   ── /agent/* ──────────> iphone-use daemon ──
 Design, lifecycle, failure states, and security boundaries:
 **[`docs/direct-device-architecture.html`](direct-device-architecture.html)**.
 
+### Giving the phone back
+
+Hold both volume keys to end iOS UI automation. The managed runner parks until
+an explicit agent/web request; background schedules and prewarming do not resume
+it. `iphone-use pause` also persists human handoff: use `iphone-use resume` or
+the web panel's agent mode to resume. Cancelling the automation passcode prompt
+also persists human handoff. A failed resume keeps that refusal active.
+
+An optional notification provides an explicit **End control** action. Startup
+uses existing notification authorization without showing a permission prompt.
+For an explicit permission setup run set `IPU_RUNNER_EXIT_NOTICE=1`; `0` disables
+the notice. A denied permission leaves volume-key and pause exit available.
+Tapping the notification body does not end control. Simulator runs omit it.
+
+
 ## Quick start
 
 ### Requirements
