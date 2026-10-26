@@ -538,6 +538,9 @@ impl Setup {
     // ── the setup body ──────────────────────────────────────────────────────
 
     pub fn body(&mut self) -> Step {
+        if let Some(message) = self.ctx.missing_daemon_recovery() {
+            return die(message);
+        }
         self.prerequisites()?;
         self.resolve_device()?;
         let source_hash = self.runner_source()?;
@@ -3723,6 +3726,21 @@ fn handoff_daemon_ready(body: &[u8], expected: bool) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn interactive_missing_daemon_stops_before_preflight_or_state_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let instance = crate::instance::Instance::derive("i13", root.path(), None).unwrap();
+        let mut ctx = Ctx::paths(instance);
+        ctx.udid = "00008110-001ABC".into();
+        let mut setup = Setup::new(ctx.clone());
+        assert!(setup.interactive().is_err());
+        assert!(!ctx.state_dir().exists(), "no transition lock, script or setup state created");
+        assert!(setup._interactive_guard.is_none());
+        std::fs::create_dir_all(&ctx.daemon_plist).unwrap();
+        assert!(Setup::new(ctx.clone()).interactive().is_err());
+        assert!(!ctx.state_dir().exists(), "non-file daemon also stops before side effects");
+    }
+
+    #[test]
     fn a_relay_that_answers_late_is_kept_and_the_runner_is_not_relaunched() {
         use std::cell::Cell;
         // Answers on the third probe: after one relay restart, no failure.
@@ -4422,6 +4440,11 @@ impl Setup {
     }
 
     fn interactive(&mut self) -> Step {
+        // Report missing instance configuration before the interactive checklist,
+        // lease probes or transition-lock creation can obscure its recovery path.
+        if let Some(message) = self.ctx.missing_daemon_recovery() {
+            return die(message);
+        }
         // Another session's lease: this setup would replace its runner.
         if owner::check(&self.ctx) != 0 {
             return Err(Exit(1));
