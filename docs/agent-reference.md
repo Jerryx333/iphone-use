@@ -1296,3 +1296,9 @@ not pixel coordinates or a restore format. Read again after moving an icon and
 resolve live UI elements before sending a gesture. An unavailable service returns
 `503 home_layout_unavailable`, never a successful empty layout. Simulator targets
 are explicitly unsupported. No endpoint changes the saved layout.
+
+When `ended_on_phone=true`, automatic schedules remain postponed. An explicitly
+requested manual schedule run may reconnect, but it still respects human handoff,
+other owners, live viewers and lock state. A parked helper reports
+`runner_build.state="parked"`, including after five minutes; it is neither
+building nor stalled.

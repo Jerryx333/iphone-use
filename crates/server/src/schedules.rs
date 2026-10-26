@@ -439,6 +439,12 @@ pub fn status_locked(status: &serde_json::Value) -> bool {
 
 /// Decide from one `/agent/status` body. `me` is this run's owner name.
 pub fn gate(status: &serde_json::Value, me: &str) -> Gate {
+    gate_for_run(status, me, false)
+}
+
+/// Only an explicitly requested run may resume a phone-ended session.
+/// A human handoff and all other safety gates still take precedence.
+fn gate_for_run(status: &serde_json::Value, me: &str, manual: bool) -> Gate {
     if let Some(owner) = status.get("owner").and_then(|v| v.as_str()) {
         if owner != me {
             return Gate::Postpone(format!("another session ({owner}) is using the phone"));
@@ -449,7 +455,7 @@ pub fn gate(status: &serde_json::Value, me: &str) -> Gate {
     }
     // A schedule is not a person's request: it must not undo an end on the
     // phone at 03:30.
-    if status.get("ended_on_phone").and_then(|v| v.as_bool()) == Some(true) {
+    if !manual && status.get("ended_on_phone").and_then(|v| v.as_bool()) == Some(true) {
         return Gate::Postpone("the session was ended on the phone".into());
     }
     if status
@@ -1044,7 +1050,7 @@ impl Scheduler {
         };
         let owner = Self::owner_for(&run);
         let mut verdict = match self.status().await {
-            Some(status) => gate(&status, &owner),
+            Some(status) => gate_for_run(&status, &owner, run.manual),
             None => Gate::Postpone("the daemon status could not be read".into()),
         };
         if verdict == Gate::Reconnect {
@@ -1057,7 +1063,7 @@ impl Scheduler {
                 let Some(status) = self.status().await else {
                     continue;
                 };
-                match gate(&status, &owner) {
+                match gate_for_run(&status, &owner, run.manual) {
                     Gate::Reconnect => continue,
                     other => {
                         verdict = other;
@@ -1944,6 +1950,24 @@ mod tests {
             error: None,
             artifacts: None,
         }
+    }
+
+    #[test]
+    fn manual_run_can_resume_ended_session_but_never_bypass_handoff_or_owner() {
+        let mut status = serde_json::json!({"ended_on_phone": true, "released": true, "device_state": "released", "drivable": false});
+        assert!(matches!(gate_for_run(&status, "me", false), Gate::Postpone(_)));
+        assert_eq!(gate_for_run(&status, "me", true), Gate::Reconnect);
+        status["human_handoff"] = true.into();
+        assert!(matches!(gate_for_run(&status, "me", true), Gate::Postpone(_)));
+        status["human_handoff"] = false.into();
+        status["owner"] = "someone-else".into();
+        assert!(matches!(gate_for_run(&status, "me", true), Gate::Postpone(_)));
+        status["owner"] = serde_json::Value::Null;
+        status["viewer_count"] = 1.into();
+        assert!(matches!(gate_for_run(&status, "me", true), Gate::Postpone(_)));
+        status["viewer_count"] = 0.into();
+        status["runner_locked"] = true.into();
+        assert_eq!(gate_for_run(&status, "me", true), Gate::WaitUnlock);
     }
 
     #[test]
