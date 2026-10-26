@@ -982,6 +982,8 @@ unlocked, handle a prompt if one appears, and inspect the tunnel and runner log
 if it is already authorized. Cold Wi-Fi startup in the reported environment
 and an isolated SOCKS-only reproduction remain unverified.
 
+A [v0.23.0 device validation](qa/2026-10-26-wifi-bootstrap.md) followed this diagnostic without a device-service refresh and verified wireless input after restoring SOCKS. It does not establish SOCKS-only causality or cold Wi-Fi startup.
+
 ## Development
 
 ```bash
