@@ -999,6 +999,19 @@ and an isolated SOCKS-only reproduction remain unverified.
 
 A [v0.23.0 device validation](qa/2026-10-26-wifi-bootstrap.md) followed this diagnostic without a device-service refresh and verified wireless input after restoring SOCKS. It does not establish SOCKS-only causality or cold Wi-Fi startup.
 
+
+### Recovering an incomplete named instance
+
+If a named instance loses its LaunchAgents, setup can recover its target from
+that instance's private `runner-product.json` (schema 1, v3 product key). An
+explicit or plist-configured target still wins; other instances and the default
+phone are never used as fallbacks. Missing or invalid records require an explicit
+UDID. A missing daemon is reported before building or launching the runner, with
+an instance-specific official installer command; doctor and resume give the same
+recovery direction. The installer remains responsible for daemon credentials,
+ports and LaunchAgents. If the phone is unavailable, connect it over USB, unlock
+it and accept Trust if prompted; absence alone does not establish lost pairing.
+
 ## Development
 
 ```bash
@@ -1062,15 +1075,3 @@ user's consent) when the API misleads them, and to send flow problems to the
 ## License
 
 [PolyForm Shield 1.0.0](../LICENSE). This project is source-available. Non-competing use, modification and distribution are permitted subject to the license; using the software to provide a competing product or service, including a free one, is prohibited. See [licensing scope and third-party notices](../LICENSING.md).
-
-### Recovering an incomplete named instance
-
-If a named instance loses its LaunchAgents, setup can recover its target from
-that instance's private `runner-product.json` (schema 1, v3 product key). An
-explicit or plist-configured target still wins; other instances and the default
-phone are never used as fallbacks. Missing or invalid records require an explicit
-UDID. A missing daemon is reported before building or launching the runner, with
-an instance-specific official installer command; doctor and resume give the same
-recovery direction. The installer remains responsible for daemon credentials,
-ports and LaunchAgents. If the phone is unavailable, connect it over USB, unlock
-it and accept Trust if prompted; absence alone does not establish lost pairing.
