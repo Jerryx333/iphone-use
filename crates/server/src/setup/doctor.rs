@@ -12,10 +12,22 @@ use super::usbdiag;
 /// Exit 0 when nothing blocks setup, 1 otherwise.
 pub fn run(ctx: &Ctx) -> i32 {
     info("Device runner preflight");
+    info(&format!("Runner host: {}", ctx.runner_host.as_str()));
     let mut fail = false;
     if let Some(message) = ctx.missing_daemon_recovery() {
         warn(&format!("X {message}"));
         fail = true;
+    }
+    if !ctx.runner_host.manages_test_app() {
+        if super::selfrunner::token_from_file(&super::selfrunner::psk_path(ctx)).is_ok() {
+            ok("Self Runner phone-gateway pairing PSK present (32 bytes)");
+        } else {
+            warn(&format!(
+                "X selfrunner_pairing: {}",
+                super::selfrunner::PAIRING_HINT
+            ));
+            fail = true;
+        }
     }
     if ctx.state_dir().is_dir() {
         ok(&format!(
@@ -42,57 +54,59 @@ pub fn run(ctx: &Ctx) -> i32 {
             fail = true;
         }
     }
-    match checks::resolve_signing(ctx) {
-        Ok(signing) => {
-            ok(&format!("Dev team: {}", signing.team));
-            if signing.derived {
-                ok(&format!(
-                    "Runner bundle ID: {} (derived for this team)",
-                    signing.bundle
-                ));
-            } else {
-                ok(&format!(
-                    "Runner bundle ID: {} (explicit or persisted)",
-                    signing.bundle
-                ));
+    if ctx.runner_host.manages_test_app() {
+        match checks::resolve_signing(ctx) {
+            Ok(signing) => {
+                ok(&format!("Dev team: {}", signing.team));
+                if signing.derived {
+                    ok(&format!(
+                        "Runner bundle ID: {} (derived for this team)",
+                        signing.bundle
+                    ));
+                } else {
+                    ok(&format!(
+                        "Runner bundle ID: {} (explicit or persisted)",
+                        signing.bundle
+                    ));
+                }
+            }
+            Err(error) => {
+                warn(&format!("X {error}"));
+                checks::open_xcode_for_account(ctx);
+                fail = true;
             }
         }
-        Err(error) => {
-            warn(&format!("X {error}"));
-            checks::open_xcode_for_account(ctx);
-            fail = true;
-        }
-    }
-    match checks::runner_source_valid(ctx) {
-        Ok(()) => match checks::runner_source_hash(&ctx.runner_src) {
-            Some(hash) => {
-                ok(&format!(
-                    "Device runner source: {} (sha256 {})",
-                    ctx.runner_src.display(),
-                    &hash[..12]
-                ));
-                // An upgrade lays down new sources but leaves a running
-                // runner alone (issue #257): say when it is the older build.
-                if let Some(built) = super::runner::built_source_hash(ctx) {
-                    if built != hash {
-                        warn(&format!(
+        match checks::runner_source_valid(ctx) {
+            Ok(()) => match checks::runner_source_hash(&ctx.runner_src) {
+                Some(hash) => {
+                    ok(&format!(
+                        "Device runner source: {} (sha256 {})",
+                        ctx.runner_src.display(),
+                        &hash[..12]
+                    ));
+                    // An upgrade lays down new sources but leaves a running
+                    // runner alone (issue #257): say when it is the older build.
+                    if let Some(built) = super::runner::built_source_hash(ctx) {
+                        if built != hash {
+                            warn(&format!(
                             "~ the device runner was last built from other sources (sha256 {}); run `iphone-use setup` to rebuild it from these",
                             &built[..12.min(built.len())]
                         ));
+                        }
                     }
                 }
-            }
-            None => {
-                warn(&format!(
-                    "X device runner sources could not be read: {}",
-                    ctx.runner_src.display()
-                ));
+                None => {
+                    warn(&format!(
+                        "X device runner sources could not be read: {}",
+                        ctx.runner_src.display()
+                    ));
+                    fail = true;
+                }
+            },
+            Err(error) => {
+                warn(&format!("X {error}"));
                 fail = true;
             }
-        },
-        Err(error) => {
-            warn(&format!("X {error}"));
-            fail = true;
         }
     }
     if ctx.runner_dir.join(".git").is_dir() {

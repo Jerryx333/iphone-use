@@ -204,6 +204,7 @@ pub fn resume(ctx: &Ctx) -> i32 {
 }
 
 pub fn status(ctx: &Ctx) -> i32 {
+    info(&format!("Runner host: {}", ctx.runner_host.as_str()));
     if !ctx.state_dir().is_dir() {
         warn(&format!(
             "setup state is not initialized at {}; run setup before requesting runtime status",
@@ -244,17 +245,19 @@ pub fn status(ctx: &Ctx) -> i32 {
         warn("runner supervisor not loaded");
         failed = true;
     }
-    match pid::validate(
-        ctx,
-        &ctx.runner_pid_file,
-        &legacy.runner,
-        Role::Runner,
-        false,
-    ) {
-        Some(pid) => ok(&format!("PID-verified device runner alive: {pid}")),
-        None => {
-            warn("device runner PID record is absent, stale, or does not match its process");
-            failed = true;
+    if ctx.runner_host.manages_test_app() {
+        match pid::validate(
+            ctx,
+            &ctx.runner_pid_file,
+            &legacy.runner,
+            Role::Runner,
+            false,
+        ) {
+            Some(pid) => ok(&format!("PID-verified device runner alive: {pid}")),
+            None => {
+                warn("device runner PID record is absent, stale, or does not match its process");
+                failed = true;
+            }
         }
     }
     if pid::verify_loopback_listener(
@@ -300,7 +303,7 @@ pub fn status(ctx: &Ctx) -> i32 {
 /// session trips over. Found over USB (usbmuxd) and ended through devicectl;
 /// a Wi-Fi-only phone is left alone (nothing to ask).
 fn sweep_device_runner(ctx: &Ctx) {
-    if ctx.udid.is_empty() {
+    if !ctx.runner_host.manages_test_app() || ctx.udid.is_empty() {
         return;
     }
     let udid = ctx.udid.clone();
@@ -338,6 +341,9 @@ fn sweep_device_runner(ctx: &Ctx) {
 /// its port on the phone (#265). Not for iOS 15/16, whose runner CoreDevice
 /// cannot see.
 pub(super) fn end_device_runner(ctx: &Ctx) -> bool {
+    if !ctx.runner_host.manages_test_app() {
+        return false;
+    }
     if ctx.udid.is_empty() {
         return false;
     }

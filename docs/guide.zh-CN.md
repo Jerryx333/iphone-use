@@ -414,6 +414,8 @@ iphone-use upgrade    # 或者：curl -fsSL https://raw.githubusercontent.com/le
 | `IPHONE_USE_IDLE_RELEASE_SECS` | `300` | 空闲多少秒后停 runner 并停放 supervisor，下一次 agent 请求再拉起；`0` 表示常驻，代价是 iOS 每杀一次 runner 就弹一次密码。 |
 | `IPHONE_USE_KEEP_AWAKE_SECS` | `120` | 有人在操作手机时、以及最后一次请求之后这么多秒内，不让手机自动锁屏（hold、实时画面、owner 租约期间也一样）。runner 每 10 秒按一下 iOS 不响应的 F13 键，已锁屏的手机不碰。`0` 关闭。 |
 | `IPHONE_USE_OWNER_LEASE_SECS` | `300` | `X-Phone-Owner` 租约在没有请求刷新时的存活时间。 |
+| `IPU_RUNNER_HOST` | `xctest` | 托管运行器宿主：`xctest`（未设或空串同此）构建测试 App；`selfrunner` 只打开已有 Self Runner，不构建、安装、卸载或续签 App。会持久化到 supervisor。 |
+| `IPU_SELFRUNNER_BUNDLE_ID` | `dev.iphoneuse.selfrunner.spike` | 已安装 Self Runner 的反向域名 bundle ID。见 [托管 Self Runner 设置](selfrunner-remote-setup.md#用-self-runner-当托管模式的运行器)。 |
 | `IPU_RUNNER_SRC` | `~/.iphone-use/runner` | setup 编译的设备 runner 源码（仓库里的 `scripts/setup-runner.sh` 用仓库自己的 `runner/`）。只有不是默认值时才持久化。 |
 | `IPU_RUNNER_REBUILD` | 关 | `1` 让下一次 setup 忽略记录的 runner 产物、重新编译。 |
 | `IPU_EMBED` | 开 | `0` 编译不带手机端 daemon 的设备 runner。会写进 supervisor。 |

@@ -44,6 +44,68 @@ pub fn resolve_transport(raw: &str) -> Result<&'static str, String> {
     }
 }
 
+/// The managed runner's on-phone host. The plan also governs recovery/prebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerHost {
+    Xctest,
+    SelfRunner,
+}
+
+impl RunnerHost {
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "" | "xctest" => Ok(Self::Xctest),
+            "selfrunner" => Ok(Self::SelfRunner),
+            _ => Err("IPU_RUNNER_HOST must be xctest or selfrunner".into()),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Xctest => "xctest",
+            Self::SelfRunner => "selfrunner",
+        }
+    }
+    /// Build/install/uninstall, rotate tokens, renew profiles and track the launcher PID.
+    pub fn manages_test_app(self) -> bool {
+        self.plan() == HostPlan::Xctest
+    }
+    pub fn plan(self) -> HostPlan {
+        match self {
+            Self::Xctest => HostPlan::Xctest,
+            Self::SelfRunner => HostPlan::SelfRunner,
+        }
+    }
+}
+
+/// Pure lifecycle selection, shared by initial setup, prebuild and hold recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPlan {
+    /// Source, embed, xcconfig, build, install/launch XCTest, rotate, renew, track PID.
+    Xctest,
+    /// Derive pairing token, open installed App, relay, wait; recovery repeats open/relay/wait.
+    SelfRunner,
+}
+
+pub const SELFRUNNER_BUNDLE: &str = "dev.iphoneuse.selfrunner.spike";
+pub fn selfrunner_bundle(raw: &str) -> Result<String, String> {
+    let value = if raw.is_empty() {
+        SELFRUNNER_BUNDLE
+    } else {
+        raw
+    };
+    if value.split('.').count() < 2
+        || !value.split('.').all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+        })
+    {
+        return Err("IPU_SELFRUNNER_BUNDLE_ID must be a reverse-domain bundle ID".into());
+    }
+    Ok(value.into())
+}
+
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub instance: Instance,
@@ -92,6 +154,8 @@ pub struct Ctx {
     /// is off the cable through CoreDevice's encrypted Wi-Fi tunnel, USB
     /// preferred when both are there; `usb` requires the cable for that.
     pub transport: String,
+    pub runner_host: RunnerHost,
+    pub selfrunner_bundle_id: String,
     pub udid: String,
     /// `IPU_RUNNER_KEEPALIVE=1`: the launchd supervisor's run.
     pub keepalive: bool,
@@ -225,6 +289,8 @@ impl Ctx {
             asc_issuer_id: String::new(),
             allow_lan: "0".into(),
             transport: TRANSPORT_AUTO.into(),
+            runner_host: RunnerHost::Xctest,
+            selfrunner_bundle_id: SELFRUNNER_BUNDLE.into(),
             udid: String::new(),
             keepalive: false,
             developer_dir: None,
@@ -407,6 +473,21 @@ impl Ctx {
         ctx.asc_issuer_id = asc_issuer;
         ctx.allow_lan = allow_lan;
         ctx.transport = transport;
+        let configured = |key: &str| {
+            std::env::var(key).ok().unwrap_or_else(|| {
+                let saved = runner_env(key);
+                if saved.is_empty() {
+                    daemon_env(key)
+                } else {
+                    saved
+                }
+            })
+        };
+        ctx.runner_host =
+            RunnerHost::parse(Some(&configured("IPU_RUNNER_HOST"))).map_err(|e| (e, 1))?;
+        ctx.selfrunner_bundle_id =
+            selfrunner_bundle(&configured("IPU_SELFRUNNER_BUNDLE_ID")).map_err(|e| (e, 1))?;
+
         ctx.udid = udid;
         ctx.recover_recorded_target();
         Ok(ctx)

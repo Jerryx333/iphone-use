@@ -926,6 +926,8 @@ environment and in an existing LaunchAgent plist; when both are set,
 | `IPHONE_USE_IDLE_RELEASE` | *(unset)* | `force` releases idle runners even on a phone whose next start needs a person (a passcode phone, or one that cannot start over Wi-Fi); see `keep_runner_alive` in Lifecycle. |
 | `IPHONE_USE_KEEP_AWAKE_SECS` | `120` | Keep the phone from auto-locking while it is driven and for this many seconds after the last request (a hold, a live view or an owner lease also keep it awake). The runner presses F13, a key iOS ignores, every 10 s and never touches a locked phone. `0` turns it off. |
 | `IPHONE_USE_OWNER_LEASE_SECS` | `300` | How long an `X-Phone-Owner` lease lives without a refreshing request. |
+| `IPU_RUNNER_HOST` | `xctest` | Managed runner host: `xctest` (also unset/empty) builds the test app; `selfrunner` opens an already installed Self Runner without building, installing, uninstalling or renewing apps. Persisted for the supervisor. |
+| `IPU_SELFRUNNER_BUNDLE_ID` | `dev.iphoneuse.selfrunner.spike` | Reverse-domain bundle ID of the installed Self Runner. See [managed Self Runner setup](selfrunner-remote-setup.md#用-self-runner-当托管模式的运行器). |
 | `IPU_RUNNER_SRC` | `~/.iphone-use/runner` | Device runner sources setup builds (a repo checkout's `scripts/setup-runner.sh` uses its own `runner/`). Persisted only when not the default. |
 | `IPU_RUNNER_REBUILD` | off | `1` makes the next setup ignore the recorded runner product and build again. |
 | `IPU_EMBED` | on | `0` builds the device runner without the on-phone daemon. Persisted for the supervisor. |

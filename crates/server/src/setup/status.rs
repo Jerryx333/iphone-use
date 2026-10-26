@@ -36,6 +36,9 @@ const STICKY_ON_BEGIN: &[&str] = &[
     "legacy_needs_usb",
     "not_connected",
     "runner",
+    "selfrunner_pairing",
+    "selfrunner_not_started",
+    "selfrunner_token_mismatch",
 ];
 
 #[derive(Debug, Clone)]

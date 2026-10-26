@@ -543,6 +543,9 @@ impl Setup {
         }
         self.prerequisites()?;
         self.resolve_device()?;
+        if !self.ctx.runner_host.manages_test_app() {
+            return self.selfrunner_body();
+        }
         let source_hash = self.runner_source()?;
         self.embed = self.embed_library()?;
         let (deployment_override, sdk) = self.xcconfig()?;
@@ -677,6 +680,169 @@ impl Setup {
         Ok(())
     }
 
+    fn selfrunner_failure(&self, reason: &str) -> Step {
+        let hint = if reason == super::selfrunner::PAIRING {
+            super::selfrunner::PAIRING_HINT
+        } else if reason == super::selfrunner::TOKEN_MISMATCH {
+            "Self Runner 签名被拒；确认 Mac 与手机使用同一 phone-gateway 配对，参见 docs/selfrunner-remote-setup.md"
+        } else {
+            super::selfrunner::START_HINT
+        };
+        self.phase("serving", reason, hint);
+        die(hint)
+    }
+
+    fn selfrunner_token(&self) -> Step {
+        let token =
+            match super::selfrunner::token_from_file(&super::selfrunner::psk_path(&self.ctx)) {
+                Ok(token) => token,
+                Err(reason) => return self.selfrunner_failure(reason),
+            };
+        if crate::runner_token::write(self.ctx.state_dir(), &token).is_err() {
+            return die("could not store Self Runner credentials in the state dir");
+        }
+        Ok(())
+    }
+
+    fn selfrunner_launch(&mut self) -> Step {
+        self.wait_for_developer_services()?;
+        self.wait_for_unlock()?;
+        self.phase(
+            "serving",
+            "",
+            "opening Self Runner; waiting for Start on the phone",
+        );
+        // Never terminate an existing app/session. Readiness below is authoritative,
+        // including when devicectl cannot open an already running app.
+        sys::devicectl(
+            30,
+            &[
+                "device",
+                "process",
+                "launch",
+                "--device",
+                &self.ctx.udid,
+                &self.ctx.selfrunner_bundle_id,
+            ],
+        );
+        Ok(())
+    }
+
+    fn selfrunner_wait(&self, target_url: &str) -> Step {
+        let started = Instant::now();
+        loop {
+            proc::check()?;
+            let response = sys::runner_get(
+                &format!("{target_url}/status"),
+                Duration::from_secs(4),
+                &self.ctx.runner_auth(),
+            );
+            match super::selfrunner::readiness(
+                response
+                    .as_ref()
+                    .map(|(code, body)| (*code, body.as_slice())),
+                started.elapsed() >= Duration::from_secs(120),
+            ) {
+                Ok(true) => return Ok(()),
+                Err(reason) => return self.selfrunner_failure(reason),
+                Ok(false) => proc::sleep(Duration::from_secs(1))?,
+            }
+        }
+    }
+
+    fn selfrunner_start(&mut self) -> Step<String> {
+        self.selfrunner_launch()?;
+        self.phone_url = "http://127.0.0.1:8100".into();
+        let target = self.relays("http://127.0.0.1:8100")?;
+        self.selfrunner_wait(&target)?;
+        Ok(target)
+    }
+
+    fn selfrunner_body(&mut self) -> Step {
+        if self.ctx.udid.is_empty() {
+            return die("Self Runner needs one exact target iPhone; set IPU_RUNNER_UDID");
+        }
+        self.legacy = Legacy::new(&self.ctx, &self.ctx.team_id, &self.ctx.bundle_id);
+        self.announce_device();
+        self.selfrunner_token()?;
+        let key = "selfrunner";
+        let url = "http://127.0.0.1:8100";
+        if !self.ctx.keepalive {
+            // Preserve the existing foreground → launchd ownership handoff.
+            if !self.stage_supervisor() {
+                return die("could not stage Self Runner supervisor");
+            }
+            retry::reset(&self.ctx.retry_state).map_err(|_| Exit(1))?;
+            let target = format!("http://127.0.0.1:{}", self.ctx.runner_port);
+            let daemon = self.configure_daemon(&target)?;
+            self.handoff(&target, key)?;
+            self.verify_product(&daemon)?;
+            self.commit_setup();
+            self.summary(url, &target, &daemon, key);
+            return Ok(());
+        }
+        let target = self.selfrunner_start()?;
+        let daemon = self.configure_daemon(&target)?;
+        self.verify_supervision(&target)?;
+        self.verify_product(&daemon)?;
+        retry::reset(&self.ctx.retry_state).map_err(|_| Exit(1))?;
+        if let Some(run) = &self.run {
+            run.product_key(key);
+        }
+        self.phase("ready", "", "Self Runner and loopback relays verified");
+        self.commit_setup();
+        self.summary(url, &target, &daemon, key);
+        Ok(())
+    }
+
+    fn selfrunner_hold(&mut self) -> Step {
+        // No xcodebuild PID or provisioning profile belongs to this host.
+        loop {
+            proc::sleep(Duration::from_secs(10))?;
+            let target = format!("http://127.0.0.1:{}", self.ctx.runner_port);
+            let relays_alive = [
+                (
+                    &self.ctx.relay_pid_file,
+                    &self.legacy.relay,
+                    Role::Relay,
+                    &self.ctx.runner_port,
+                ),
+                (
+                    &self.ctx.mjpeg_relay_pid_file,
+                    &self.legacy.mjpeg,
+                    Role::Mjpeg,
+                    &self.ctx.mjpeg_port,
+                ),
+            ]
+            .iter()
+            .all(|(file, legacy, role, port)| {
+                pid::verify_loopback_listener(
+                    &self.ctx,
+                    file,
+                    legacy,
+                    *role,
+                    valid_port(port).unwrap_or(0),
+                )
+            });
+            let response = sys::runner_get(
+                &format!("{target}/status"),
+                Duration::from_secs(4),
+                &self.ctx.runner_auth(),
+            );
+            match super::selfrunner::recovery(
+                response.as_ref().map(|(c, b)| (*c, b.as_slice())),
+                relays_alive,
+            ) {
+                Err(reason) => return self.selfrunner_failure(reason),
+                Ok(super::selfrunner::Recovery::Hold) => continue,
+                Ok(super::selfrunner::Recovery::OpenAndRelay) => {
+                    self.selfrunner_start()?;
+                }
+            }
+            self.phase("ready", "", "Self Runner recovered without rebuilding");
+        }
+    }
+
     fn commit_setup(&mut self) {
         self.handoff_complete = true;
         let _ = std::fs::remove_file(&self.daemon.rollback);
@@ -766,6 +932,9 @@ impl Setup {
             ));
         }
         ok(&format!("Xcode: {version}"));
+        if !self.ctx.runner_host.manages_test_app() {
+            return Ok(());
+        }
         let signing = match checks::resolve_signing(&self.ctx) {
             Ok(signing) => signing,
             Err(error) => {
@@ -811,7 +980,14 @@ impl Setup {
         let app = format!("{old}.xctrunner");
         let out = sys::devicectl(
             30,
-            &["device", "uninstall", "app", "--device", &self.ctx.udid, &app],
+            &[
+                "device",
+                "uninstall",
+                "app",
+                "--device",
+                &self.ctx.udid,
+                &app,
+            ],
         );
         // devicectl answers this for an app that was never installed too.
         if out.contains("App uninstalled") {
@@ -958,7 +1134,11 @@ impl Setup {
             return die(error);
         }
         let Some(hash) = checks::runner_source_hash(&self.ctx.runner_src) else {
-            self.phase("prereq", "runner", "device runner sources could not be read");
+            self.phase(
+                "prereq",
+                "runner",
+                "device runner sources could not be read",
+            );
             return die(format!(
                 "could not read the device runner sources in {}",
                 self.ctx.runner_src.display()
@@ -2038,10 +2218,7 @@ impl Setup {
         let Ok(token) = crate::runner_token::rotate(self.ctx.state_dir()) else {
             return die("could not store the device runner's launch token in the state dir");
         };
-        let mut env = vec![(
-            crate::runner_token::XCODEBUILD_TOKEN_ENV.to_string(),
-            token,
-        )];
+        let mut env = vec![(crate::runner_token::XCODEBUILD_TOKEN_ENV.to_string(), token)];
         env.extend(self.phone_daemon_env(crate::phone_daemon::XCODEBUILD_PREFIX)?);
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let Ok(spawned) = proc::spawn_detached_env(
@@ -2580,6 +2757,11 @@ impl Setup {
         let status_url = format!("{target_url}/status");
         let auth = self.ctx.runner_auth();
         let mut failures = 0u32;
+        // Self Runner may still need a human to press Start. Its signed readiness
+        // loop must classify 401 and timeout, rather than this generic relay probe.
+        if !self.ctx.runner_host.manages_test_app() {
+            return Ok(target_url);
+        }
         let answered = recover_relay(
             || {
                 let answered = sys::runner_ok(&status_url, Duration::from_secs(5), &auth);
@@ -2699,6 +2881,17 @@ impl Setup {
         if current("DEVELOPER_DIR") != want_dir {
             changed.push("DEVELOPER_DIR");
         }
+        for (key, value) in [
+            ("IPU_RUNNER_HOST", ctx.runner_host.as_str()),
+            (
+                "IPU_SELFRUNNER_BUNDLE_ID",
+                ctx.selfrunner_bundle_id.as_str(),
+            ),
+        ] {
+            if current(key) != value {
+                changed.push(key);
+            }
+        }
         let needs_restart = !changed.is_empty();
         if current("IPU_RUNNER_ALLOW_LAN") != ctx.allow_lan {
             changed.push("IPU_RUNNER_ALLOW_LAN");
@@ -2716,6 +2909,11 @@ impl Setup {
                 ("IPHONE_USE_RUNNER_MANAGED", "true"),
                 ("IPU_RUNNER_ALLOW_LAN", ctx.allow_lan.as_str()),
                 ("IPU_RUNNER_TRANSPORT", ctx.transport.as_str()),
+                ("IPU_RUNNER_HOST", ctx.runner_host.as_str()),
+                (
+                    "IPU_SELFRUNNER_BUNDLE_ID",
+                    ctx.selfrunner_bundle_id.as_str(),
+                ),
             ] {
                 plist_set_env(&staged, key, value);
             }
@@ -2793,14 +2991,15 @@ impl Setup {
         let runner_port = valid_port(&ctx.runner_port).unwrap_or(8100);
         let mjpeg_port = valid_port(&ctx.mjpeg_port).unwrap_or(9100);
         let verified = launchd::loaded(ctx, &ctx.instance.runner_label)
-            && pid::validate(
-                ctx,
-                &ctx.runner_pid_file,
-                &self.legacy.runner,
-                Role::Runner,
-                false,
-            )
-            .is_some()
+            && (!ctx.runner_host.manages_test_app()
+                || pid::validate(
+                    ctx,
+                    &ctx.runner_pid_file,
+                    &self.legacy.runner,
+                    Role::Runner,
+                    false,
+                )
+                .is_some())
             && pid::verify_loopback_listener(
                 ctx,
                 &ctx.relay_pid_file,
@@ -2983,6 +3182,14 @@ impl Setup {
             ctx.self_install.display()
         );
         println!("  Resume    : {} resume", ctx.self_install.display());
+        if !ctx.runner_host.manages_test_app() {
+            println!(
+                "  Host      : selfrunner ({}) — use Self Runner's own re-signing script",
+                ctx.selfrunner_bundle_id
+            );
+            super::term::flush();
+            return;
+        }
         println!(
             "  Source    : {} (sha256 {})",
             ctx.runner_src.display(),
@@ -3027,6 +3234,9 @@ impl Setup {
     pub fn hold(&mut self) -> Step {
         if !self.ctx.keepalive {
             return Ok(());
+        }
+        if !self.ctx.runner_host.manages_test_app() {
+            return self.selfrunner_hold();
         }
         info("KeepAlive mode: holding while the PID-verified runner and relays stay healthy");
         const MAX_FAILURES: u32 = ProbeCount::MAX;
@@ -3256,7 +3466,11 @@ impl Setup {
             self.phase("waiting", "not_connected", NOT_CONNECTED_MESSAGE);
             self.failure_kind = Kind::NotConnected;
             for (file, legacy, role) in [
-                (&self.ctx.mjpeg_relay_pid_file, &self.legacy.mjpeg, Role::Mjpeg),
+                (
+                    &self.ctx.mjpeg_relay_pid_file,
+                    &self.legacy.mjpeg,
+                    Role::Mjpeg,
+                ),
                 (&self.ctx.relay_pid_file, &self.legacy.relay, Role::Relay),
                 (&self.ctx.runner_pid_file, &self.legacy.runner, Role::Runner),
             ] {
@@ -4124,7 +4338,12 @@ mod tests {
         assert!(!probes.suspicious(), "busy alone does not even count");
         // Busy probes between real read failures do not hide them.
         let mut probes = ProbeCount::default();
-        let pattern = [Probe::ReadFail, Probe::Busy, Probe::ReadFail, Probe::ReadFail];
+        let pattern = [
+            Probe::ReadFail,
+            Probe::Busy,
+            Probe::ReadFail,
+            Probe::ReadFail,
+        ];
         let verdicts: Vec<bool> = pattern.iter().map(|p| probes.record(*p)).collect();
         assert_eq!(verdicts, [false, false, false, true]);
         assert!(probes.half_dead());
@@ -4349,6 +4568,10 @@ impl Setup {
     }
 
     fn prebuild_product(&mut self) -> Step {
+        if !self.ctx.runner_host.manages_test_app() {
+            info("selfrunner 模式无需预构建");
+            return Ok(());
+        }
         let skip = |why: &str| {
             info(&format!("Runner prebuild skipped: {why}"));
             Ok(())
@@ -4550,7 +4773,8 @@ impl Setup {
         // Any source setup itself would sign with counts: an explicit or
         // persisted team, an App Store Connect key, the team last picked in
         // Xcode, or a signed-in account.
-        let account = !ctx.team_id.is_empty()
+        let account = !ctx.runner_host.manages_test_app()
+            || !ctx.team_id.is_empty()
             || ctx.asc_signing_enabled()
             || !sys::plist_env(&ctx.runner_agent_plist, "IPU_RUNNER_TEAM_ID").is_empty()
             || !sys::defaults_read(
@@ -4713,6 +4937,18 @@ impl Setup {
         pairs.push(("MJPEG_PORT", ctx.mjpeg_port.clone()));
         pairs.push(("IPU_RUNNER_ALLOW_LAN", ctx.allow_lan.clone()));
         pairs.push(("IPU_RUNNER_TRANSPORT", ctx.transport.clone()));
+        pairs.push(("IPU_RUNNER_HOST", ctx.runner_host.as_str().into()));
+        pairs.push(("IPU_SELFRUNNER_BUNDLE_ID", ctx.selfrunner_bundle_id.clone()));
+        if !ctx.runner_host.manages_test_app() {
+            pairs.push((
+                "PHONE_GATEWAY_HOME",
+                super::selfrunner::psk_path(&ctx)
+                    .parent()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         // The on-phone daemon: the supervisor's relaunches must build and
         // start the same runner as this run.
         pairs.push(("IPU_EMBED", ctx.embed.clone()));
@@ -4850,16 +5086,38 @@ impl Setup {
                 }
                 last_phase = phase;
             }
-            let new_id = pid::validate(
-                &ctx,
-                &ctx.runner_pid_file,
-                &self.legacy.runner,
-                Role::Runner,
-                false,
-            )
-            .and_then(|_| pid::parse(&ctx.runner_pid_file, &self.legacy.runner))
-            .map(|record| (record.pid, record.lstart));
-            let identified = new_id.as_ref().is_some_and(|id| !id.1.is_empty());
+            if !ctx.runner_host.manages_test_app() {
+                if let Some(report) = std::fs::read(&ctx.status_file)
+                    .ok()
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                {
+                    if report["supervisor_generation"].as_str()
+                        == self.supervisor_generation.as_deref()
+                    {
+                        if let Some(
+                            reason @ (super::selfrunner::PAIRING
+                            | super::selfrunner::NOT_STARTED
+                            | super::selfrunner::TOKEN_MISMATCH),
+                        ) = report["blocked_on"].as_str()
+                        {
+                            return self.selfrunner_failure(reason);
+                        }
+                    }
+                }
+            }
+            let identified = if ctx.runner_host.manages_test_app() {
+                pid::validate(
+                    &ctx,
+                    &ctx.runner_pid_file,
+                    &self.legacy.runner,
+                    Role::Runner,
+                    false,
+                )
+                .and_then(|_| pid::parse(&ctx.runner_pid_file, &self.legacy.runner))
+                .is_some_and(|record| !record.lstart.is_empty())
+            } else {
+                true
+            };
             let ready = match self.supervisor_generation.as_deref() {
                 Some(expected) => {
                     match supervisor_ready(&ctx.status_file, expected, expected_key) {
@@ -4892,13 +5150,21 @@ impl Setup {
                     &self.ctx.runner_auth(),
                 )
                 .is_some_and(|(status, body)| {
-                    status < 400 && handoff_daemon_ready(&body, self.embed.is_some())
+                    status < 400
+                        && if ctx.runner_host.manages_test_app() {
+                            handoff_daemon_ready(&body, self.embed.is_some())
+                        } else {
+                            super::selfrunner::readiness(Some((status, &body)), false) == Ok(true)
+                        }
                 })
             {
                 ok("launchd first startup verified: exact product, runner identity, both loopback relays, and runner /status");
                 return Ok(());
             }
             proc::sleep(Duration::from_secs(2))?;
+        }
+        if !ctx.runner_host.manages_test_app() {
+            return self.selfrunner_failure(super::selfrunner::NOT_STARTED);
         }
         self.phase("supervisor-fail", "runner", "launchd handoff not verified");
         die(format!(
@@ -5266,7 +5532,11 @@ impl Setup {
             // Wi-Fi lockdown (Finder's "show this iPhone when on Wi-Fi") is
             // what lets the next start go over the network; it needs one
             // trusted connection and survives reboots.
-            let args = ["enable-wifi".to_string(), "--udid".into(), self.ctx.udid.clone()];
+            let args = [
+                "enable-wifi".to_string(),
+                "--udid".into(),
+                self.ctx.udid.clone(),
+            ];
             let (out, code) = legacy_ios::run_launcher(&launcher, &args, Duration::from_secs(20));
             if code != Some(0) {
                 warn(&format!(
@@ -5290,7 +5560,9 @@ impl Setup {
         if host.is_none() && !on_usb {
             let mut message = legacy_needs_usb_message(&ios);
             if !self.ctx.wifi_tunnel_allowed() {
-                message.push_str(" (IPU_RUNNER_TRANSPORT=usb: Wi-Fi starts are turned off for this phone)");
+                message.push_str(
+                    " (IPU_RUNNER_TRANSPORT=usb: Wi-Fi starts are turned off for this phone)",
+                );
             }
             self.phase("prereq", "legacy_needs_usb", &message);
             // Retried at once when the cable comes or the phone answers on
@@ -5350,7 +5622,11 @@ impl Setup {
                 die("the iPhone is locked, so the Developer Disk Image cannot be mounted. Unlock it, then rerun setup.")
             }
             legacy_ios::Mount::Failed(error) => {
-                self.phase("ddi-fail", "ddi", &format!("mounting the Developer Disk Image failed: {error}"));
+                self.phase(
+                    "ddi-fail",
+                    "ddi",
+                    &format!("mounting the Developer Disk Image failed: {error}"),
+                );
                 die(format!("mounting the Developer Disk Image failed: {error}"))
             }
         }

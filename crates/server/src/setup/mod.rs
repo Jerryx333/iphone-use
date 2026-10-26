@@ -27,6 +27,7 @@ pub mod pid;
 pub mod proc;
 pub mod retry;
 pub mod runner;
+pub mod selfrunner;
 pub mod status;
 pub mod sys;
 pub mod term;

@@ -24,6 +24,8 @@
 #                                       # (after an upgrade; never touches the phone)
 #
 # Env overrides:
+#   IPU_RUNNER_HOST=...        xctest (default) or selfrunner (already installed App)
+#   IPU_SELFRUNNER_BUNDLE_ID=... default: dev.iphoneuse.selfrunner.spike
 #   IPU_RUNNER_UDID=...        target device UDID (default: the one USB iPhone)
 #   IPU_RUNNER_TEAM_ID=...     Apple dev team (default: Xcode's last-selected team)
 #   IPU_RUNNER_ASC_KEY_PATH=... absolute .p8 path; with both IDs, use ASC API key signing

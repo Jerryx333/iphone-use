@@ -170,3 +170,21 @@ SR_LAN_HOST=192.168.1.10                    # Mac 在家里局域网的地址，
 - 手机重启后要人解锁、开 VPN、点开 App。
 - 自动重签重装 App 后，自动化会话有时要人在手机上点 Start 并输一次密码，远程做不到；`selfrunner-watchdog` 会通知。
 - 在外（`link=wss`）时所有字节走 Cloudflare 免费套餐，不要长时间开 MJPEG 或录屏（§15.9）。
+
+## 用 Self Runner 当托管模式的运行器
+
+先按本文完成 Self Runner 安装及 phone-gateway 配对，再在 Mac 上运行：
+
+```bash
+IPU_RUNNER_HOST=selfrunner iphone-use setup-native
+# 自定义 App 标识时同时指定：
+# IPU_SELFRUNNER_BUNDLE_ID=dev.example.selfrunner
+```
+
+保留托管模式（`IPHONE_USE_RUNNER_MANAGED=true`，回环端点默认开启）。setup 会持久化宿主选择，拉起已有的 Self Runner，并将手机 8100/9100 中继到 Mac 回环端口；它不会构建、安装、卸载任何 App，也不会轮换运行器令牌或续签。`prebuild` 在此模式下直接成功退出。免费 Apple ID 的设备自签 App 名额只需 **1 个**；如果之前安装过独立运行器，需自行移除，setup 不会代为卸载。
+
+运行器令牌由 Mac 的 `$PHONE_GATEWAY_HOME/psk`（默认 `~/.config/phone-gateway/psk`，base64 编码的 32 字节配对 PSK）派生，Mac 必须与手机使用同一配对。令牌只写入实例状态目录的 `runner-token`（0600），不要复制到命令行或日志。自定义 `PHONE_GATEWAY_HOME` 会随 supervisor 持久化。
+
+**手机重启后仍要人操作**：在手机上打开 Self Runner 点 Start，按提示输一次密码。devicectl 只能打开 App，不能替人点 Start 或授权；不会使用 terminate-existing 打断已有会话。Self Runner 的签名有效期、安装和重签由它自己的脚本管理；此模式不会自动修复过期签名，也不能保证 App 被系统终止后完全无人值守恢复。USB / CoreDevice 隧道、开发者服务、解锁等前置条件仍适用；远程非托管模式不受影响。
+
+`status` / `doctor` 显示宿主模式。`selfrunner_pairing` 表示 PSK 缺失、无效或长度不是 32 字节；`selfrunner_token_mismatch` 表示签名请求被 401 拒绝，需要核对配对；`selfrunner_not_started` 表示等待就绪超时，需要在手机上点 Start。守护进程只监测 HTTP 与中继，失败后重新打开 App 和等待就绪，不重建产物。
