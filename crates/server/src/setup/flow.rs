@@ -509,7 +509,7 @@ impl Setup {
         }
         if let Err(error) = persisted {
             warn(&format!("could not persist phone exit; supervisor disabled and processes stopped: {error}"));
-            self.phase("failed", "state_write_failed", "could not persist phone exit; run resume explicitly after repairing state storage");
+            self.phase("park-fail", "state_write_failed", "could not persist phone exit; run resume explicitly after repairing state storage");
             return Err(Exit(1));
         }
         let message = match reason {
