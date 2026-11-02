@@ -41,6 +41,7 @@ pub mod scroll_progress;
 pub mod setup;
 pub mod selfrunner;
 pub mod simulator;
+pub mod skills;
 pub mod syslog;
 pub mod telemetry;
 pub mod text_input;

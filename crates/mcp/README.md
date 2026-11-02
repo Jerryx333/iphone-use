@@ -351,6 +351,7 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 | `phone_record` | `action` | Record the screen to an MP4 on the daemon's Mac: `start`, `stop` (returns path, length, size), `status` |
 | `phone_install_app` | `path?` \| `url?`, `fresh?` | Install an `.ipa`/`.app` from a path on the daemon's Mac or an https URL (≤ 2 GB); `fresh=true` uninstalls first. Apps in `IPHONE_USE_BLOCKED_APPS` are refused |
 | `phone_app_notes` | `bundle`, `text?` | Per-app notes kept by the daemon across sessions: read without `text`, replace with it (Markdown, ≤ 16 KB). Also shown in the `registry` block when the agent enters the app |
+| `phone_skills` | `op?`, `name?`, `bundle?`, `text?`, `result?`, `draft_only?` | Learned skills (`/agent/skills`): list, read, draft, accept (after the user agrees), result (verified / failed / unreviewed; failing runs suspend), suspend, resume, restore, delete. CLI: `iphone-use-mcp skill …`. |
 
 ### Tool profiles and annotations
 

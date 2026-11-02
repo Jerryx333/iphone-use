@@ -25,6 +25,18 @@ fn text(value: &Value, key: &str) -> Option<String> {
     }
 }
 
+/// Percent-encode a query value (skill names and bundle ids are plain ASCII,
+/// but a stray character must not break the query).
+pub fn query_escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 fn clip(line: &str, max: usize) -> String {
     let flat = line.replace('\n', " ⏎ ");
     let mut out: String = flat.chars().take(max).collect();
@@ -427,6 +439,60 @@ pub fn installed(json: &Value) -> Option<String> {
         Some(bundle) => format!("installed {bundle}; launch it with a launch_app step"),
         None => "installed".to_string(),
     })
+}
+
+/// `/agent/skills`: a skill's text, the list, or what an op did.
+pub fn skills(json: &Value) -> Option<String> {
+    if json.get("ok") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    if let Some(rows) = json.get("skills").and_then(Value::as_array) {
+        if rows.is_empty() {
+            return Some("no learned skills yet".to_string());
+        }
+        return Some(
+            rows.iter()
+                .map(|row| {
+                    let name = text(row, "name").unwrap_or_default();
+                    let status = text(row, "status").unwrap_or_default();
+                    let description = text(row, "description").unwrap_or_default();
+                    let recent = row
+                        .get("recent")
+                        .and_then(Value::as_array)
+                        .map(|r| {
+                            let r: Vec<&str> = r.iter().filter_map(Value::as_str).collect();
+                            format!(" (recent: {})", r.join(", "))
+                        })
+                        .unwrap_or_default();
+                    format!("{name} [{status}] {description}{recent}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    let name = text(json, "name").unwrap_or_default();
+    if json.get("text").is_some() || json.get("draft").is_some() {
+        let mut out = Vec::new();
+        if let Some(live) = json.get("text").and_then(Value::as_str) {
+            out.push(format!("{name} [{}]:\n{live}", text(json, "status").unwrap_or_default()));
+        }
+        if let Some(draft) = json.get("draft").and_then(Value::as_str) {
+            out.push(format!("pending draft of {name} (not in use until accepted):\n{draft}"));
+        }
+        return Some(out.join("\n\n"));
+    }
+    let mut line = match (text(json, "status"), text(json, "deleted")) {
+        (_, Some(what)) => format!("deleted the {what} {name}"),
+        (Some(status), _) => format!("{name} is now {status}"),
+        _ => format!("{name}: done"),
+    };
+    for key in ["message", "next"] {
+        if let Some(extra) = text(json, key) {
+            line.push_str("\n");
+            line.push_str(&extra);
+        }
+    }
+    Some(line)
 }
 
 /// `GET /agent/app-notes`.

@@ -814,13 +814,14 @@ worked example below.
 
 ## MCP specifics
 
-37 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
+39 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
 `phone_release_owner`, `phone_login`, `phone_apps`, `phone_screenshot`, `phone_elements`, `phone_tap`,
 `phone_tap_element`, `phone_tap_label`, `phone_scroll`, `phone_scroll_find`, `phone_collect_list`, `phone_type`,
 `phone_key`, `phone_shortcut`, `phone_run_steps`, `phone_jev_run`,
 `phone_run_start`, `phone_run_end`, `phone_flow_list / info / run / draft /
 update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
-`phone_set_location`, `phone_record`, `phone_install_app`, `phone_app_notes`.
+`phone_set_location`, `phone_record`, `phone_install_app`, `phone_app_notes`, and
+`phone_skills` (learned skills, `/agent/skills`).
 
 - The text block is compact and meant for the model. It carries the settled
   change, one line per element, or a batch's verdict and end screen; for a
@@ -1151,6 +1152,58 @@ over coordinates; never persist snapshot indexes, runner element ids or snapshot
 tokens; wait for states, not fixed sleeps (`pause`/`after_ms` cap at 3s); never
 make passwords, codes, private content, or payment/send/publish/delete targets
 into inputs. The browser's **流程** panel can also record v1 JSON.
+
+### Learned skills
+
+A flow replays fixed taps; a **skill** is a short markdown how-to for a kind
+of task that worked before, read by you and followed with judgment, so it
+survives small UI changes. Skills live beside `app-notes/` on the Mac
+(`~/.iphone-use/skills/`) and never leave it.
+
+- **Seeing them.** An app's `registry` block lists the skills in use for it
+  (`skills`: name, description, `trial` / `active`, recent results) and how
+  many drafts wait (`skill_drafts_waiting`). If one matches the task, read it
+  first — `GET /agent/skills?name=…` / `phone_skills(op="read")` /
+  `iphone-use-mcp skill show <name>` — and follow it.
+- **Reporting.** Reading a skill marks it followed. The release reply
+  (`POST /agent/owner {"release":true}`) then carries `learn.report`: report
+  each one you followed with `op=result` and `verified` (done, end screen
+  showed it), `failed` (not done or only partly) or `unreviewed` (stopped for
+  reasons unrelated to the skill). A trial skill becomes active on its first
+  verified run and is suspended by a failed one; an active skill is
+  suspended when two of its last three reviewed runs were not verified.
+  Suspended skills are hidden; tell the user when a reply says so.
+- **Learning.** When the session drove an app for 5+ steps and followed no
+  skill, the release reply carries `learn.draft` (the app, the step count,
+  and its existing skills). Only if the task got done and you checked the end
+  screen, write one and save it with `op=draft` (`skill draft <file>`):
+
+  ```markdown
+  ---
+  name: send-wechat-message
+  display: 发微信
+  description: 给用户指定的联系人发一条微信
+  apps: [com.tencent.xin]
+  aliases: [发微信, 给他说一声]
+  updates: <existing name, only when this is the same kind of task>
+  ---
+  ## 入口
+  ## 步骤
+  ## 容易出错的地方
+  ## 怎样算办成
+  ## 什么时候停下交给用户
+  ```
+
+  English headings (Entry / Steps / Pitfalls / Done when / Hand over) work
+  too. Under 4000 characters; the general way along the route that worked,
+  detours under pitfalls; this run's contacts, amounts, text and dates as
+  `<参数>`; no passwords, codes, long numbers or e-mail addresses (refused).
+  Same kind of task as an existing skill → `updates:` it rather than adding a
+  second one; accepting replaces it and keeps the old text for `restore`.
+- **Accepting is the user's call.** A draft is never shown to later runs.
+  Tell the user in one line what was learned and run `op=accept` only after
+  they agree. They can also `suspend`, `resume`, `restore` (previous
+  version) or `delete` (`draft_only` drops just a draft).
 
 ### Fixing a flow
 

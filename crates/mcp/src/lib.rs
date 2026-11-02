@@ -17,6 +17,7 @@ pub mod registry;
 pub mod schedule;
 pub mod screen;
 pub mod server;
+pub mod skill;
 pub mod suite;
 pub mod task;
 pub mod types;

@@ -70,13 +70,20 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure st
    the action was sent, not that it achieved anything.
    → reference: *Reading results*
 
-6. **Offer to save it.** When a response carries `flow_suggestion`, or you
-   finish a multi-step task that no flow covered, **ask the user** whether to
-   keep it as a flow. Only if they agree: get the draft
-   (`phone_flow_draft(save_as=…)` / `flow draft --out …` /
-   `GET /agent/flow/draft`), fix its `todo` list, validate it, and run the file
-   once. Publishing opens a public PR, so ask again before
-   `phone_flow_publish(confirm=true)`. → reference: *Saving a flow*
+6. **Learn from it.** If the app's `registry` block listed a skill that
+   matched, you read and followed it; the release reply (`learn.report`)
+   asks how it went — report `op=result` (`verified` / `failed` /
+   `unreviewed`), never guess `verified`. If it instead carries
+   `learn.draft`, and the task got done and you checked the end screen,
+   write the general way as a skill and save it as a draft
+   (`phone_skills(op="draft")` / `iphone-use-mcp skill draft <file>`); then
+   tell the user in one line what was learned and `op=accept` only after
+   they agree. → reference: *Learned skills*
+   For a task whose steps never vary, a flow is one call instead: on a
+   `flow_suggestion`, ask the user; only if they agree, get the draft
+   (`phone_flow_draft(save_as=…)` / `flow draft --out …`), fix its `todo`,
+   validate it and run the file once. Publishing opens a public PR, so ask
+   again before `phone_flow_publish(confirm=true)`. → reference: *Saving a flow*
 
 When the task is done, release the phone: `phone_release_owner` /
 `POST /agent/owner {"release":true}`. If a response carried `agent_focus`, the
@@ -219,9 +226,9 @@ reference: *Flows*.
    user with the host's question tool (plain text if there is none or it is
    unavailable right now) and wait, then clear the hold and re-read the screen. → reference:
    *When the person has to sign in*
-7. **Saving and publishing are the user's call.** Ask before saving a flow, and
-   ask again before publishing it or filing an issue. Both use their GitHub
-   account.
+7. **Saving and publishing are the user's call.** Ask before saving a flow or
+   accepting a learned skill, and ask again before publishing a flow or filing
+   an issue. Both use their GitHub account.
 
 A file the task needs on the Mac comes over by AirDrop and lands in
 `~/Downloads` (reference: *Getting files from the phone to the Mac*).

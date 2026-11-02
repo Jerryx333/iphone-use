@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 
-use iphone_use_mcp::{client, compat, contrib, flow, http, jev, registry, schedule, server, suite};
+use iphone_use_mcp::{client, compat, contrib, flow, http, jev, registry, schedule, server, skill, suite};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -91,12 +91,59 @@ enum Command {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    /// Learned skills: markdown how-tos the agent drafts after a task that
+    /// worked. A draft is used only after `accept`; failing runs suspend it.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Fast phone agent: TypeSafe's Jev picks each step from the screen's
     /// element table (needs TYPESAFE_API_KEY or ~/.config/typesafe/key; text
     /// fields also TEXT_MODEL_API_KEY or ~/.config/openrouter/key).
     Jev {
         #[command(subcommand)]
         command: JevCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Skills and drafts, with status and recent results.
+    List {
+        /// Only skills for this bundle id.
+        #[arg(long)]
+        bundle: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One skill's text and its pending draft.
+    Show {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save a markdown file (`-` for stdin) as a draft.
+    Draft {
+        file: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put a draft into use, on trial (only after the user agreed).
+    Accept { name: String },
+    /// Report a run that followed the skill: verified, failed or unreviewed.
+    Result { name: String, result: String },
+    /// Hide a skill from later runs.
+    Suspend { name: String },
+    /// Back on trial, recent results cleared.
+    Resume { name: String },
+    /// Swap back the previous version.
+    Restore { name: String },
+    /// Delete a skill (with its draft and previous version).
+    Delete {
+        name: String,
+        /// Delete only the pending draft.
+        #[arg(long)]
+        draft_only: bool,
     },
 }
 
@@ -352,6 +399,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         )
         .await;
         std::process::exit(code);
+    }
+    if let Some(Command::Skill { command }) = cli.command {
+        let daemon = client::DaemonClient::from_env();
+        let none = serde_json::Value::Null;
+        return match command {
+            SkillCommand::List { bundle, json } => skill::list(&daemon, bundle.as_deref(), json).await,
+            SkillCommand::Show { name, json } => skill::show(&daemon, &name, json).await,
+            SkillCommand::Draft { file, json } => {
+                let text = skill::read_draft(&file)?;
+                skill::op(&daemon, "draft", None, serde_json::json!({ "text": text }), json).await
+            }
+            SkillCommand::Accept { name } => skill::op(&daemon, "accept", Some(&name), none, false).await,
+            SkillCommand::Result { name, result } => {
+                skill::op(&daemon, "result", Some(&name), serde_json::json!({ "result": result }), false).await
+            }
+            SkillCommand::Suspend { name } => skill::op(&daemon, "suspend", Some(&name), none, false).await,
+            SkillCommand::Resume { name } => skill::op(&daemon, "resume", Some(&name), none, false).await,
+            SkillCommand::Restore { name } => skill::op(&daemon, "restore", Some(&name), none, false).await,
+            SkillCommand::Delete { name, draft_only } => {
+                skill::op(&daemon, "delete", Some(&name), serde_json::json!({ "draft_only": draft_only }), false)
+                    .await
+            }
+        };
     }
     if let Some(Command::Schedule { command }) = cli.command {
         let daemon = client::DaemonClient::from_env();

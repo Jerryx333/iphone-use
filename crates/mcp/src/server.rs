@@ -844,6 +844,31 @@ pub struct AppNotesParams {
     pub text: Option<String>,
 }
 
+/// Parameters for [`PhoneHandler::phone_skills`].
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsParams {
+    /// list (default), read, draft, accept, result, suspend, resume,
+    /// restore or delete.
+    #[serde(default)]
+    pub op: Option<String>,
+    /// The skill's name (all ops but list and draft).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// list: only skills for this bundle id.
+    #[serde(default)]
+    pub bundle: Option<String>,
+    /// draft: the skill markdown (front matter + five sections).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// result: verified, failed or unreviewed.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// delete: drop only the pending draft, keep the skill in use.
+    #[serde(default)]
+    pub draft_only: Option<bool>,
+}
+
 impl PhoneHandler {
     pub fn new(daemon: DaemonClient) -> Self {
         Self::with_shared_profile(daemon, std::sync::Arc::new(ToolProfile::from_env()))
@@ -2527,6 +2552,74 @@ impl PhoneHandler {
             Err(e) => CallToolResult::error(vec![Content::text(format!(
                 "install failed: {e:#}. Whether the app got installed is unknown: check with \
                  phone_apps (source=installed) before trying again."
+            ))]),
+        }
+    }
+
+    #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false,
+        ),
+        description = "Learned skills: short markdown how-tos for kinds of tasks that worked before, read by you (not \
+        replayed tap by tap like a flow). An app's registry block lists the ones in use; op=read returns one (read \
+        it before driving when it matches the task). op=draft saves a new one (front matter name/display/description/ \
+        apps/aliases[/updates] + sections 入口, 步骤, 容易出错的地方, 怎样算办成, 什么时候停下交给用户; under 4000 \
+        characters; this run's contacts, amounts and text as <参数>) — only after the task got done, and it stays a \
+        draft. op=accept puts it on trial ONLY after the user agreed. op=result reports a run that followed one \
+        (verified / failed / unreviewed); failing runs suspend it. Also suspend, resume, restore (previous version), \
+        delete (draft_only to drop just a draft)."
+    )]
+    async fn phone_skills(
+        &self,
+        Parameters(params): Parameters<SkillsParams>,
+    ) -> CallToolResult {
+        let op = params.op.as_deref().map(str::trim).unwrap_or("list").to_string();
+        let name = params.name.as_deref().map(str::trim).unwrap_or("").to_string();
+        let response = match op.as_str() {
+            "list" => {
+                let path = match params.bundle.as_deref().map(str::trim) {
+                    Some(bundle) if !bundle.is_empty() => {
+                        format!("/agent/skills?bundle={}", crate::device::query_escape(bundle))
+                    }
+                    _ => "/agent/skills".to_string(),
+                };
+                self.daemon.request_json(reqwest::Method::GET, &path, None).await
+            }
+            "read" => {
+                if name.is_empty() {
+                    return CallToolResult::error(vec![Content::text(
+                        "op=read needs the skill's name (op=list shows them). Nothing was sent.",
+                    )]);
+                }
+                let path = format!("/agent/skills?name={}", crate::device::query_escape(&name));
+                self.daemon.request_json(reqwest::Method::GET, &path, None).await
+            }
+            _ => {
+                let mut body = serde_json::json!({ "op": op });
+                if !name.is_empty() {
+                    body["name"] = serde_json::json!(name);
+                }
+                if let Some(text) = &params.text {
+                    body["text"] = serde_json::json!(text);
+                }
+                if let Some(result) = &params.result {
+                    body["result"] = serde_json::json!(result);
+                }
+                if let Some(draft_only) = params.draft_only {
+                    body["draft_only"] = serde_json::json!(draft_only);
+                }
+                self.daemon
+                    .request_json(reqwest::Method::POST, "/agent/skills", Some(&body))
+                    .await
+            }
+        };
+        match response {
+            Ok(response) => rendered_result(&response, crate::device::skills),
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "skills {op} failed: {e:#}. A write may still have landed: op=list before retrying."
             ))]),
         }
     }
@@ -4358,7 +4451,7 @@ mod tests {
 
         assert_eq!(
             names.len(),
-            38,
+            39,
             "tool count changed; update README, the skill, and the CI assertion: {names:?}"
         );
         for required in [
@@ -4381,6 +4474,7 @@ mod tests {
             "phone_record",
             "phone_install_app",
             "phone_app_notes",
+            "phone_skills",
         ] {
             assert!(names.contains(&required), "{required} missing: {names:?}");
         }
@@ -5173,7 +5267,7 @@ mod tests {
                 assert!(tool.get("_meta").is_none(), "{name} has no _meta: {tool}");
             }
         }
-        assert_eq!(tools.len(), 38, "the whole documented surface");
+        assert_eq!(tools.len(), 39, "the whole documented surface");
     }
 
     #[test]
@@ -5634,6 +5728,60 @@ mod tests {
         refused_offline(block(handler_for("http://127.0.0.1:9").phone_app_notes(Parameters(
             AppNotesParams { bundle: "微信".into(), text: None },
         ))));
+    }
+
+    #[test]
+    fn phone_skills_lists_reads_and_posts_ops() {
+        let (result, line, headers, _) = device_call(
+            "200 OK",
+            r#"{"ok":true,"skills":[{"name":"send-wechat","status":"trial","description":"发微信","recent":["verified"]}]}"#,
+            |h| async move {
+                h.phone_skills(Parameters(SkillsParams {
+                    op: None, name: None, bundle: Some("com.tencent.xin".into()),
+                    text: None, result: None, draft_only: None,
+                }))
+                .await
+            },
+        );
+        assert_eq!(line, "GET /agent/skills?bundle=com.tencent.xin HTTP/1.1");
+        assert!(!headers.contains("x-phone-control"), "{headers}");
+        assert_eq!(text_of(&result), "send-wechat [trial] 发微信 (recent: verified)");
+
+        let (result, line, _, _) = device_call(
+            "200 OK",
+            r#"{"ok":true,"name":"send-wechat","status":"active","text":"---\nname: send-wechat"}"#,
+            |h| async move {
+                h.phone_skills(Parameters(SkillsParams {
+                    op: Some("read".into()), name: Some("send-wechat".into()), bundle: None,
+                    text: None, result: None, draft_only: None,
+                }))
+                .await
+            },
+        );
+        assert_eq!(line, "GET /agent/skills?name=send-wechat HTTP/1.1");
+        assert!(text_of(&result).starts_with("send-wechat [active]:\n---"), "{}", text_of(&result));
+
+        let (result, line, headers, body) = device_call(
+            "200 OK",
+            r#"{"ok":true,"name":"send-wechat","status":"suspended","message":"suspended now"}"#,
+            |h| async move {
+                h.phone_skills(Parameters(SkillsParams {
+                    op: Some("result".into()), name: Some("send-wechat".into()), bundle: None,
+                    text: None, result: Some("failed".into()), draft_only: None,
+                }))
+                .await
+            },
+        );
+        assert_eq!(line, "POST /agent/skills HTTP/1.1");
+        assert!(headers.contains("x-phone-control: 1"), "{headers}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body, serde_json::json!({"op":"result","name":"send-wechat","result":"failed"}));
+        assert_eq!(text_of(&result), "send-wechat is now suspended\nsuspended now");
+
+        let missing = block(handler_for("http://127.0.0.1:9").phone_skills(Parameters(SkillsParams {
+            op: Some("read".into()), name: None, bundle: None, text: None, result: None, draft_only: None,
+        })));
+        assert_eq!(missing.is_error, Some(true));
     }
 
     #[test]

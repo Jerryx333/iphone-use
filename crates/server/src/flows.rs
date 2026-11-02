@@ -164,11 +164,17 @@ fn risk_rank(risk: Option<&str>) -> u8 {
 /// The `registry` block for one app. `None` only when the store is unreadable
 /// (a hint must never break the response it decorates).
 pub fn registry_block(key: AppKey<'_>) -> Option<Value> {
-    with_app_notes(
+    let mut block = with_app_notes(
         registry_block_from(index_path().as_deref(), key),
         key,
         &app_notes_dir(),
-    )
+    )?;
+    if let AppKey::Bundle(bundle) = key {
+        if block.get("bundle").is_none() {
+            block["bundle"] = json!(bundle);
+        }
+    }
+    Some(crate::skills::with_skills(block, &crate::skills::Store::open()))
 }
 
 fn registry_block_from(path: Option<&Path>, key: AppKey<'_>) -> Option<Value> {
@@ -387,6 +393,8 @@ struct Trail {
     hinted: bool,
     /// A `flow_suggestion` already went out for this trail.
     suggested: bool,
+    /// A release reply already offered to learn a skill from this trail.
+    learned: bool,
 }
 
 impl Trail {
@@ -415,6 +423,8 @@ pub struct FlowTrail {
     /// can be recovered by a read-only status request.
     stopped_recording: Option<Value>,
     recording_revision: u64,
+    /// Learned skills read since the last release (`crate::skills`).
+    skills_read: Vec<String>,
 }
 
 /// Single actions in a row before the agent is told to batch.
@@ -757,6 +767,30 @@ impl FlowTrail {
                 trail.steps.len()
             ),
         }))
+    }
+
+    /// A learned skill was read: the release reply asks how following it went.
+    pub fn read_skill(&mut self, name: &str) {
+        if !self.skills_read.iter().any(|n| n == name) {
+            self.skills_read.push(name.to_string());
+        }
+    }
+
+    /// For the release reply: `(bundle, steps)` of each trail not offered yet,
+    /// and the skills read since the last release. Marks both as handled.
+    pub fn take_learning(&mut self) -> (Vec<(String, usize)>, Vec<String>) {
+        let mut apps = Vec::new();
+        for trail in [Some(&mut self.current), self.previous.as_mut()].into_iter().flatten() {
+            if trail.learned {
+                continue;
+            }
+            trail.learned = true;
+            if let Some(bundle) = &trail.bundle {
+                apps.push((bundle.clone(), trail.steps.len()));
+            }
+        }
+        apps.sort_by_key(|(_, steps)| std::cmp::Reverse(*steps));
+        (apps, std::mem::take(&mut self.skills_read))
     }
 
     /// The draft for the current trail, or the last finished one.

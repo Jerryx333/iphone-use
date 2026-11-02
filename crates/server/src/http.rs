@@ -749,6 +749,12 @@ async fn agent_owner_inner(
     // idle window starts when it is given back, not at the last action.
     state.touch_activity();
     let mut released = serde_json::json!({"ok": true, "owner": null});
+    let (apps, followed) = recover(state.flow_trail.lock()).take_learning();
+    if let Some(block) =
+        crate::skills::learn_block(&crate::skills::Store::open(), &apps, &followed)
+    {
+        released["learn"] = block;
+    }
     if let Some(block) = release_agent_focus(&state).await {
         released["agent_focus"] = block;
     }
@@ -1067,6 +1073,7 @@ fn api_routes() -> Router<Arc<AppState>> {
             "/agent/app-notes",
             get(agent_app_notes_get).put(agent_app_notes_put),
         )
+        .route("/agent/skills", get(agent_skills_get).post(agent_skills_post))
         // Scheduled flows and test suites (see `schedules`; the page is in
         // `router`'s pages).
         .route(
@@ -19907,6 +19914,116 @@ async fn agent_app_notes_put(
                 format!("the notes could not be saved: {error}"),
             )
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsQuery {
+    name: Option<String>,
+    bundle: Option<String>,
+}
+
+/// `GET /agent/skills` — learned skills and drafts (`?bundle=` narrows to
+/// one app); `?name=` returns one skill's text, and counts as the session
+/// reading it (the release reply then asks how following it went).
+async fn agent_skills_get(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SkillsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(refused) = authorize_extension(&state, &headers, false) {
+        return refused;
+    }
+    let store = crate::skills::Store::open();
+    if let Some(name) = query.name.as_deref().map(str::trim) {
+        let (live, draft) = store.get(name);
+        if live.is_none() && draft.is_none() {
+            return agent_error(
+                StatusCode::NOT_FOUND,
+                "no_such_skill",
+                format!("no skill or draft named {name:?}; GET /agent/skills lists them"),
+            );
+        }
+        let mut body = serde_json::json!({"ok": true, "name": name});
+        if let Some(text) = live {
+            let status = store.status(name).map_or(crate::skills::Status::Trial, |r| r.status);
+            body["status"] = serde_json::json!(status);
+            body["text"] = serde_json::json!(text);
+            if status != crate::skills::Status::Suspended {
+                recover(state.flow_trail.lock()).read_skill(name);
+            }
+        }
+        if let Some(text) = draft {
+            body["draft"] = serde_json::json!(text);
+        }
+        return json_response(StatusCode::OK, body);
+    }
+    let bundle = query.bundle.as_deref().map(str::trim).filter(|b| !b.is_empty());
+    let skills: Vec<serde_json::Value> = store
+        .list()
+        .iter()
+        .filter(|e| bundle.is_none_or(|b| e.meta.apps.iter().any(|a| a == b)))
+        .map(crate::skills::Entry::to_json)
+        .collect();
+    json_response(StatusCode::OK, serde_json::json!({"ok": true, "skills": skills}))
+}
+
+/// `POST /agent/skills {"op": …}` — `draft` (with `text`), `accept`,
+/// `result` (with `result`: verified / failed / unreviewed), `suspend`,
+/// `resume`, `restore`, `delete` (`draft_only` to drop just the draft).
+/// Skills do not touch the phone, so they take no owner lease.
+async fn agent_skills_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(refused) = authorize_extension(&state, &headers, true) {
+        return refused;
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return agent_error(StatusCode::BAD_REQUEST, "invalid_json", "send a JSON object with an `op`");
+    };
+    let field = |key: &str| request.get(key).and_then(serde_json::Value::as_str).map(str::trim);
+    let store = crate::skills::Store::open();
+    let op = field("op").unwrap_or("");
+    let name = field("name").unwrap_or("");
+    if op != "draft" && !crate::skills::valid_name(name) {
+        return agent_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "pass the skill's `name` (GET /agent/skills lists them)",
+        );
+    }
+    let outcome = match op {
+        "draft" => match field("text") {
+            Some(text) => store.draft(text),
+            None => Err("pass the skill markdown as `text`".to_string()),
+        },
+        "accept" => store.accept(name),
+        "result" => match field("result").and_then(crate::skills::Outcome::parse) {
+            Some(result) => store.result(name, result),
+            None => Err("`result` is verified, failed or unreviewed".to_string()),
+        },
+        "suspend" => store.set_suspended(name, true),
+        "resume" => store.set_suspended(name, false),
+        "restore" => store.restore(name),
+        "delete" => store.delete(
+            name,
+            request.get("draft_only").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        ),
+        _ => Err("op is one of draft, accept, result, suspend, resume, restore, delete".to_string()),
+    };
+    match outcome {
+        Ok(mut reply) => {
+            if op == "draft" {
+                reply["next"] = serde_json::json!(
+                    "Saved as a draft; later runs do not see it yet. Tell the user in one line what was learned \
+                     and accept it (op=accept) only after they agree."
+                );
+            }
+            json_response(StatusCode::OK, reply)
+        }
+        Err(message) => agent_error(StatusCode::BAD_REQUEST, "skill_refused", message),
     }
 }
 
