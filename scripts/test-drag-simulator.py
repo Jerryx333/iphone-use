@@ -144,8 +144,25 @@ class Daemon:
             data = json.dumps(body).encode()
             headers.update({"Content-Type": "application/json", "X-Phone-Control": "1"})
         request = urllib.request.Request(self.base + path, data=data, headers=headers)
-        with urllib.request.urlopen(request, timeout=40) as response:
-            return json.load(response)
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as error:
+                # A healthy Runner may finish its slow AX read after the first
+                # response. Retry only that read, once, never a dispatched action.
+                if attempt or body is not None or path.split("?", 1)[0] != "/agent/elements" or error.code != 504:
+                    raise
+                try:
+                    busy = json.loads(error.read(65536))
+                except (ValueError, OSError):
+                    raise error
+                delay = busy.get("retry_after_secs") if isinstance(busy, dict) else None
+                if (not isinstance(busy, dict) or busy.get("error") != "runner_source_timeout"
+                        or busy.get("runner_busy") is not True or type(delay) is not int or not 1 <= delay <= 60):
+                    raise
+                error.close()
+                time.sleep(delay)
 
     def require_simulator(self, udid):
         status = self.call("/agent/status")
@@ -183,6 +200,11 @@ class Daemon:
         return last
 
 
+class NoNativeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def runner_call(args, target, body=None):
     record = json.loads(args.runner_record.read_text())
     if str(record.get("udid", "")).lower() != args.udid.lower():
@@ -192,14 +214,18 @@ def runner_call(args, target, body=None):
         raise RuntimeError("runner record has no valid port")
     # This disposable instance's token only; never runner_auth.token(), whose
     # default may belong to a personal phone. No token or auth header is logged.
-    token = (args.runner_record.parent / "runner-token").read_text().strip()
+    token_path = args.runner_record.parent / "runner-token"
+    if token_path.is_symlink() or not token_path.is_file() or token_path.resolve().parent != args.runner_record.parent.resolve():
+        raise RuntimeError("disposable runner token is not an owned regular file")
+    token = token_path.read_text().strip()
     if not re.fullmatch(r"[0-9a-f]{32,128}", token):
         raise RuntimeError("invalid disposable runner token")
     data = None if body is None else json.dumps(body).encode()
     method = "GET" if body is None else "POST"
     request = urllib.request.Request(f"http://127.0.0.1:{port}" + target, data=data,
         headers={"Content-Type": "application/json", "Authorization": authorization(token, method, target, data or b"")})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoNativeRedirect())
+    with opener.open(request, timeout=30) as response:
         return json.load(response), response.headers
 
 
@@ -317,6 +343,33 @@ def judge_input(record, nonce, kind, row):
     return errors
 
 
+def input_scroll_anchor(record, dy=300):
+    """Keep the requested viewport travel; put touch-down inside UIKit's table.
+
+    x/y is the *middle* of the viewport scroll span, not its down point. A fixed
+    .65 can therefore begin on a bottom toolbar in another device/OS layout.
+    """
+    size, rect = record.get("window_size"), record.get("table_rect")
+    if not (isinstance(size,list) and len(size)==2 and isinstance(rect,list) and len(rect)==4
+            and all(type(v) in (int,float) and math.isfinite(v) for v in size+rect)):
+        raise RuntimeError("no independent UIKit scroll geometry; nothing sent")
+    width,height=size;left,top,table_width,table_height=rect
+    if min(width,height,table_width,table_height)<=0 or dy<=0:
+        raise RuntimeError("invalid UIKit scroll geometry; nothing sent")
+    travel=min(max(abs(dy)*1.5,.15*height),.75*height)
+    low=max(top+12,travel+44)
+    high=min(top+table_height-12,height-44)
+    if low>high:
+        raise RuntimeError("requested scroll has no valid table touch-down point; nothing sent")
+    start=min(max(top+table_height/2,low),high)
+    end=start-travel
+    x=left+table_width/2
+    if not (top+12<=start<top+table_height and end>=44 and 44<=x<=width-44):
+        raise RuntimeError("requested scroll cannot start inside this table/screen; nothing sent")
+    return x/width, (start+end)/2/height
+
+
+
 def input_case(daemon, args, label, kind):
     out = args.out / label
     out.mkdir()
@@ -332,8 +385,9 @@ def input_case(daemon, args, label, kind):
     row = 8 if kind == "scroll" else 3
     steps = []
     if kind == "scroll":
+        anchor_x, anchor_y = input_scroll_anchor(before)
         steps.extend([
-            {"kind": "action", "action": {"type": "scroll", "x": 0.5, "y": 0.65, "dx": 0, "dy": 300}},
+            {"kind": "action", "action": {"type": "scroll", "x": anchor_x, "y": anchor_y, "dx": 0, "dy": 300}},
             {"kind": "wait_for", "expect": {"present": [{"identifier": f"input-row-{row}", "kind": "Cell"}]}, "timeout_ms": 4000},
         ])
     if kind == "typing":

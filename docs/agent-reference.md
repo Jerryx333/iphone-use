@@ -43,6 +43,31 @@ passcode.
 | `degraded` | runner answers but the last read/action did not complete (heavy page, stalled app) | **Not** a blocker; `setup_blocked_on` is empty. Wait `retry_after_secs` (3s) and read again; do not restart anything. |
 | `released` + `human_handoff:true` | The operator handed the phone to a person | Input answers `409 phone_handed_to_human`. Ask the operator before sending `{"mode":"agent"}`. Also set by `iphone-use pause` and by a passcode prompt cancelled on the phone; it survives daemon restarts. `iphone-use resume` clears it. |
 | `released` + `ended_on_phone:true` | The person ended the session on the phone (both volume keys) | Nothing restarts the runner on its own and pre-warm skips it. Ask before acting; the next action or `{"mode":"agent"}` starts it again. |
+| `released` + `runner_parked:true` + `ended_on_phone:false` | The test connection was invalidated or the parked evidence is unknown | Automatic schedules and prewarming stay off. A new explicit request may reconnect. `runner_parked_reason` describes the recorded evidence; it does not assert a human exit or a Wi-Fi cause. |
+
+**First setup and selection.** `target_configured:false` with `recovery_owner:unconfigured`
+means no target was selected; it does not inventory paired phones. `phone_instances`
+returns installed daemon instances (`scope:installed_daemon_instances`), with each
+available row's `target_configured` and `recovery_owner`. On the daemon's Mac,
+inspect `xcrun devicectl list devices` and run `iphone-use doctor`. If multiple
+phones plausibly match the task, ask which one. For an authorized, confirmed
+target, use `IPU_RUNNER_UDID=<UDID> iphone-use setup` (add `--instance NAME`
+for a named instance). Preserve ownership, private holds and human handoffs;
+never use `--force` as routine recovery. `recovery_owner:external` must recover
+on the owning host, not through local setup/restart. Do not loop setup or reconnect while
+setup is active. After recovery, check status, re-read the screen and resume
+the original task without replaying an uncertain mutation.
+
+Status adds nullable `recovery` metadata for unconfigured targets and known
+trust/authorization blockers: `cause`, `actor`, `action`, `pause_screen_reads`
+and `verify`. Unconfigured recovery includes host discovery/doctor/setup command
+templates and requires an unambiguous authorized target. Authorization handoffs
+set `actor:person_on_phone`, `disclose_passcode:false`, `retry_reconnect:false`
+and `prompt_detection:not_confirmed`: historical setup evidence is not a live
+prompt detector. During sensitive input, pause screenshots, elements, the live
+panel and other screen reads; the person enters any passcode only on the phone.
+After they finish, check `phone_status`. `drivable:true` describes current
+readiness, not a guarantee against a later iOS authorization prompt.
 
 **Lock readiness.** `lock_readiness` says whether the phone will lock on its
 own while nobody drives it, so an owner with many phones sees which ones get
@@ -99,9 +124,38 @@ recordVideo`: its status and summary carry `"via":"simctl"` and no `frames`, `wi
 simulator is still booting and `shutdown` when it is off; wait, or run `iphone-use
 simulator start` again.
 
+**Task end and reconnect on use.** On a daemon-managed runner
+(`recovery_owner:"daemon"`), `POST /agent/owner {"release":true}`
+(`phone_release_owner`) ends the task and the daemon stops the device runner
+right away — on a passcode phone too — so the phone leaves automation mode
+between tasks; a lease that lapses without a release counts as a task end as
+well. A live viewer, an active `phone_hold` or a running recording keeps the
+runner until they end. `IPHONE_USE_TASK_END_RELEASE=0` keeps the runner until
+the idle window. An external runner is never stopped by this daemon. Nothing
+brings the phone back on its own: no status read, session start or health
+check does (unless `IPHONE_USE_MCP_PREWARM=1` opts into pre-warming on those). The next MCP tool that needs the phone (reads, taps,
+batches, flows, a recording start) reconnects, waits up to 150 s and then
+runs (not during a private hold); when a
+person has to act it answers `phone_not_ready` (`outcome:"not_sent"`) with the
+wait and the next step — for `needs_passcode_on_phone`, if the phone shows
+the passcode prompt, ask the person to enter it there and call the tool again.
+`IPHONE_USE_MCP_RECONNECT_ON_USE=0` turns that off. HTTP clients keep the
+behaviour below.
+
 **Reconnect** only when the current task needs the phone, `recovery_owner` is
 `daemon`, blockers are resolved, and no release/reconnect is in progress. Send
-it once, then poll status until `drivable:true`:
+it once, then poll status until `drivable:true` (MCP: `phone_reconnect` with
+`wait_secs`, e.g. 180, does the polling and returns `wait.outcome`
+`drivable` / `blocked` / `retrying` / `stopped` / `timeout` with the compact
+final status). After a failed setup round, status carries `setup_retry`
+(`{kind, attempt, next_in_secs}`) while the supervisor has its own retry
+scheduled; a blocker it is about to retry (a Wi-Fi tunnel that was briefly
+not found) often clears with no one touching the phone. The wait keeps going
+across such a retry, and returns `retrying` when the retry is due within a
+minute but after the wait would end: check status after `next_in_secs` before
+asking a person to plug in or unlock the phone. A retry further out than a
+minute (a slow backoff), or a blocker that held for 20 s across one retry,
+returns `blocked`:
 
 ```bash
 curl -s -H "$AUTH" -H "$MUTATION" -H 'Content-Type: application/json' \
@@ -140,6 +194,17 @@ screenshots, `/agent/elements` and live video answer `423 screen_private`, open
 streams end, and status shows `screen_private_secs`. A later hold without
 `private` lifts it.
 
+Standalone `/agent/screenshot` and `/agent/elements` reads carry the privacy
+generation from their start through response-body publication. A private hold
+invalidates in-flight reads, queued bodies and settled-frame caches even if the
+hold is lifted before they finish. MJPEG/H.264 subscriptions from that earlier
+generation end; a new permitted viewer can start a fresh producer. Cleaning up
+an already expired deadline preserves work begun after expiry. The live panel
+clears its previous image on failed captures, including a body interrupted after
+HTTP headers. Bytes already committed to the connection cannot be recalled.
+Action-attached observations have a separate action receipt contract.
+
+
 **Pre-warm.** A released phone may already be coming back when you look:
 `warming:true` means the daemon started the bring-up ahead of time. MCP startup
 and status only request pre-warming with `IPHONE_USE_MCP_PREWARM=1` (off by
@@ -172,7 +237,15 @@ KeepAlive keeps the last concrete blocker while it re-checks).
   are not the problem; do not reconnect or run doctor for this.
 - **`proxy`**: an enabled macOS HTTP/HTTPS/SOCKS entry is malformed or points at
   a loopback port with no listener; start that proxy app or disable the stale entry.
-- **`trust`**: a one-time "trust the Apple Development certificate" tap on the phone.
+- **`trust`**: can mean computer pairing or developer-certificate approval.
+  For **Trust This Computer**, the person unlocks and confirms on the iPhone.
+  If `setup_message` reports an untrusted **Apple Development** certificate,
+  on the iPhone open **Settings > General > VPN & Device Management**,
+  select the matching **Apple Development** certificate and trust it. This is
+  separate from **Trust This Computer** pairing. If no certificate or prompt
+  appears, run doctor and inspect the runner log instead of looping reconnect.
+  A separate passcode/UI automation authorization may appear later; the person
+  handles it on the phone while screen reads are paused.
 - **`automation_mode_disabled`**: the runner did not become ready for UI
   automation (for example, "Timed out while enabling automation mode"). Check
   **Settings › Developer › Enable UI Automation** and handle a prompt if one
@@ -300,7 +373,7 @@ only on a trusted network.
 | `GET /agent/app-notes?bundle=`, `PUT …` | Per-app notes (markdown, ≤16 KB): `{bundle, text, updated_at?}` ([below](#app-notes)) |
 | `GET /agent/reference` | This document, as compiled into the running daemon (`text/markdown`) |
 | `GET /agent/apps` | Installed apps `{device, apps:[{bundle,name,version,bundle_version,system,…}]}`; `?bundle=`; cached 10 min (`?refresh=1`). `503 apps_unavailable` = unknown, not "not installed" |
-| `GET /agent/apps?query=<name>` | App lookup by name: `{candidates:[{name,bundle_id,source,installed_verified,match,publisher?}], installation_checked, warnings}`. `source=auto` (phone's app list → bundled catalog → App Store), `installed`, `catalog` (offline), `apple` (`country=cn`, rate limited). Exact matches hide partial ones. MCP `phone_apps` |
+| `GET /agent/apps?query=<name>` | App lookup by name: `{candidates:[{name,bundle_id,source,installed_verified,match,publisher?}], installation_checked, warnings}`. `source=auto` (phone's app list → bundled catalog → App Store, searched unless a local match is exact), `installed`, `catalog` (offline), `apple` (`country` defaults to `IPHONE_USE_STORE_COUNTRY`, else the store the phone's apps came from, else its Region setting, else `cn` with a warning; `country_source` says which; rate limited). Exact matches hide partial ones. MCP `phone_apps` |
 | `GET /agent/intents`, `POST /agent/intent` | Semantic intents ([below](#semantic-intents)) |
 | `POST /agent/mode`, `/agent/hold`, `/agent/owner`, `/agent/prewarm` | Reconnect / hold / release lease / pre-warm ([above](#phone-states-and-recovery)) |
 | `POST /agent/runner-handoff` | Setup's: after it verifies a new runner the daemon still reports down, the daemon drops its state from the previous runner and probes again; answers `{up, actionable, locked, retried, error}`. Agents never need it |
@@ -318,9 +391,15 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 
 ```jsonc
 {"type":"launch_app","bundle":"com.apple.Health"}       // or "name":"健康" for built-in apps
-{"type":"launch_app","app":"微信"}                       // any app's exact name; 422 ambiguous_app|app_not_found|app_not_installed (+candidates), nothing sent
+{"type":"launch_app","app":"微信"}                       // any app's exact name, or a loose name that starts a word of exactly ONE installed app ("idol ludo" → Idol Ludo Board); the step result's `resolved` {app,name,bundle_id,match} says which; 422 ambiguous_app|app_not_found|app_not_installed (+candidates), nothing sent
 {"type":"open_url","url":"https://example.com/page"}    // http/https always; other schemes only if the owner allows them (403 url_scheme_not_allowed)
 {"type":"tap","element":3,"snapshot":"…"}               // from the SAME elements read
+// A token from an older read of the SAME screen still works when the screen only changed a little
+// (clock, badge, a switch you just flipped, keyboard): the row is found again by kind + identifier +
+// label + enclosing rows, never by value or frame. Another app, another page (navigation bar differs),
+// a new alert/sheet, most rows replaced, or a row with no label/identifier → 409 stale_element_snapshot;
+// two look-alikes nothing tells apart → ambiguous. Either way nothing is sent: read again.
+// When it does act on a changed screen, the result carries "rebound":{"from":3,"to":4} (old index → live index).
 {"type":"tap","label":"新备忘录"}                         // exact, unique; add "kind":"Button" if a StaticText shares it
 {"type":"tap_locator","locator":{"identifier":"save"}}  // label/identifier/kind/value/focused/enabled/visible
 {"type":"tap","x":0.5,"y":0.3}                          // last resort
@@ -328,7 +407,7 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 {"type":"set_value","element":5,"snapshot":"…","value":"你好"}  // write a field directly; 409 value_not_applied → tap + text instead (web views)
 {"type":"key","name":"return"}                          // return|enter|send|go|search fire Return; escape, space, tab, delete/backspace, arrows
 {"type":"keyboard"}                                     // dismiss the keyboard
-{"type":"shortcut","name":"home"}                       // home | spotlight (switcher is unsupported)
+{"type":"shortcut","name":"home"}                       // home | spotlight | save_screenshot | volume_up | volume_down (switcher is unsupported)
 {"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}        // ≈15% of a screen; ≈400 → 75%
 {"type":"scroll","element":7,"snapshot":"…","dy":120}   // inside that element only
 {"type":"scroll","page":true,"dy":300}                  // the page scroller (long web forms); 422 no_page_scroller if none
@@ -340,6 +419,53 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 {"type":"picker","column":0,"value":"2026"}
 {"type":"perform","element":9,"snapshot":"…","action":"toggle"}  // increment|decrement|adjust(+value)|toggle|menu|double_tap|two_finger_tap|scroll_to_visible|pinch|rotate
 ```
+
+On a Runner advertising `ipu:guardedInput`, agent `text` captures one live focused
+editable field before clearing or typing. Each chunk and guarded clear checks that
+same retained AX handle and foreground process; another mutation invalidates the
+binding. A refused later chunk is not reselected or replayed. Secure fields,
+ambiguous/incomplete focus evidence and unavailable state refuse guarded input.
+Older Runners retain their legacy behavior and do not provide this binding.
+Checks occur before and after a chunk, not between individual characters: an
+in-flight focus change can still make that chunk's outcome uncertain. Partial
+receipts never authorize automatic continuation into a newly selected field.
+
+`text` with `clear:true` and `set_value` stop if the clear request fails;
+replacement text is not appended afterward. A clear may already have deleted
+some content before an error, so inspect the field and the returned outcome
+before retrying. An acknowledged clear is not independent proof that the field
+is empty or that its focus stayed unchanged.
+
+On a runner with the selected input target, a `set_value` replacement returns
+a `replacement` block — on success and on failure: `phase`
+(`clear`/`type`/`verify`/`done`), `clear.status` (`cleared`, `recovered`,
+`failed`, `not_sent`), `segments_total`/`segments_delivered`,
+`characters_confirmed`/`characters_uncertain`/`characters_total` and
+`stopped_at_segment` (1-based), plus `segments[]` with each segment's
+`characters` and `status` (`delivered`, `uncertain`, `not_sent`). When the
+field loses focus or selection during the clear, the daemon reads it back: a
+field still holding its old value, or one already empty, is bound again once
+(at most one guarded focus tap) and the replacement continues
+(`clear.status:"recovered"`); a field left partly cleared or unreadable stops
+before any text is typed. A clear that keeps failing on an unchanged field
+answers `replacement_not_applied`. Older runners keep the plain clear/type
+path without this block.
+
+`volume_up` and `volume_down` require a physical device and a Runner advertising `ipu:volumeButtons=true`. Missing capability refuses before the button request. An acknowledgement does not verify the volume level; do not replay an uncertain press.
+
+`phone_shortcut {"name":"save_screenshot"}` requests one iOS system screenshot
+for the phone's Photos library. The HTTP form is
+`POST /agent/input {"type":"shortcut","name":"save_screenshot"}`. It requires
+a native Runner declaring `ipu:systemCaptureRequest`; an older Runner is
+refused before the capture event. The action receipt reports
+`system_capture.requested:true` and `saved_verified:false`: the OS acknowledged
+the request, while the saved image still needs checking in Photos or a picker.
+On newer iOS, the capture can open a full-screen preview. Inspect that system
+UI and choose Done/Save to Photos for the existing image, then verify Photos;
+do not request another screenshot to complete its save. An unknown outcome
+must never be repeated. `phone_screenshot` continues to
+return an observation image to the caller without adding a Photos asset.
+
 
 **Multi-finger hold.** `multi_longpress` holds 2–5 distinct normalized
 `{x,y}` points simultaneously in one runner request; the array length is the
@@ -361,20 +487,34 @@ hovering at an edge to flip a folder page. Use coordinates observed on the
 current screen, then verify the end screen. Flow drafts preserve all points and
 dwells. `supported.drag_path` in `/agent/capabilities` advertises this format.
 
-**Long text.** Text over 200 characters is typed in chunks of about 200 (never
-splitting an emoji, flag, or combining mark), roughly 60 characters a second;
-the request's deadline grows with the text. If typing stops part-way the answer
-is `502 text_partially_typed` with `characters_confirmed` (Unicode scalar
-values from the start), `characters_uncertain`, `remaining_text`, and
-`retry_safe:false`: read the field, then send only what is missing with
-`clear:false` — never the whole text again. One batch types at most 20000
-characters in total.
-To check a long text, look at a screenshot of its end. Do not compare
-`value`: iOS cuts a text field's or text view's accessibility value at 512
-UTF-16 code units (an emoji counts two to four). On an iPhone 17 Pro Max
-with iOS 27, a 1986-character note read back as only its first 477
-characters, although the whole text was on screen. When the cut splits an
-emoji, the value ends in U+FFFD.
+**Long text.** Text over 200 Unicode scalars is sent in complete grapheme
+chunks. If typing stops, `502 text_partially_typed` reports acknowledged
+`characters_confirmed`, `characters_uncertain`, and `remaining_text`, with
+`retry_safe:false`. An uncertain prefix must not be replayed.
+
+A named owner can set `budget_ms` from 6000 to 15000 on a Runner advertising
+`ipu:inputContinuation`. When time runs out between acknowledged chunks, the
+response can include `continuation_safe:true` and an opaque `continue_token`.
+Continue with only that token; the daemon retains the original field and unsent
+suffix. Do not send text, clear or a new budget with a continuation.
+
+```jsonc
+{"type":"text","text":"…","budget_ms":6000}
+{"type":"text","continue_token":"<the returned token>"}
+```
+
+MCP uses `phone_type {"continue_token":"…"}` or the `type_continue` step in
+`phone_run_steps`. A token can be used once and expires within 60 seconds;
+another action, ownership/privacy change, Runner restart, session replacement
+or original-field expiry can invalidate it sooner. No token is issued after
+uncertain delivery or a scope interruption. If continuation is refused, inspect
+the original field before explicitly planning more input. Ordinary text without
+a budget retains the existing behavior on older Runners.
+
+Snapshot values may be shortened. Use a complete `phone_read_value` response
+when available, or inspect the original field on screen; an incomplete value
+preview cannot prove which text is missing. Explicit bound text preserves
+private-use Unicode scalars as data; use `phone_key` for Return or editing keys.
 
 **Links.** `open_url` hands the URL to iOS, which opens it in Safari or in the
 app that owns its scheme. The `url` needs a scheme and at most 2048 bytes
@@ -525,18 +665,82 @@ is no longer cached). The action result and the observation are separate facts:
   tree is blocked. Its observation says `source:"alert"` and includes the alert
   text. It does not accept/dismiss the alert or establish app identity, absence,
   identifiers or element state. Combined conditions still need the full tree.
+- Locators also accept `label_contains`: a case-sensitive literal substring,
+  ANDed with label, identifier, kind, value and state fields. The fragment must
+  have 1–1000 characters. NUL is refused in locator strings before execution.
+- Wait locators additionally accept `index:0..199` (default0), selecting an
+  ordinal among matching rows, not a snapshot element index. `index:2` means
+  presence requires at least3 known matching rows; absence requires proving
+  fewer than3 possible matches. Unknown attributes and partial trees remain
+  unproven unless the known witnesses already meet the threshold. Wait
+  observations return `present_counts` / `absent_counts` with required, known
+  and unproven counts and a completeness flag. `coverage` is `complete`,
+  `partial`, or `unknown`; proving shortage requires a new Native
+  `X-IPU-Tree-Complete:1` acknowledgement. Old or unacknowledged providers can
+  prove presence from enough known rows, but cannot prove shortage. Update
+  the selected instance's Runner source when negative checks need that proof.
+  Index-only locators, null/bool/
+  fractional/out-of-range indexes and indexed action locators are rejected.
+  Actions keep their existing unique-target contract. Counts describe the
+  current provider snapshot, not business completion or durable item identity.
+- For a tree `wait_for`, `timeout_ms:0` selects one observation attempt bounded
+  to 500 ms, with no predicate pre-probe, snapshot probe, read retry or polling.
+  A standalone request includes runner-lock queueing in that budget and does
+  not prewarm or engage Focus. A zero wait inside a longer batch starts its
+  read window when reached and counts 500 ms against the declared-wait cap.
+  Set `phone_run_steps`'s `observe:false` to omit its separate final batch
+  observation. Flow failure diagnosis reuses this observation rather than
+  issuing another read. `single_read:true`, `attempts` and `reads` distinguish
+  a known unmet condition from unavailable state. OCR waits still require a
+  positive timeout; a timeout or empty/unknown tree cannot prove absence.
+  `single_read_timeout` means the observation budget expired without a tree;
+  it does not establish a disconnected runner or discard its existing session.
 - Keep `pause` for short animation gaps (maximum 3000 ms). For a slow page such
   as iPhone Storage, use a semantic `wait_for` with `timeout_ms:30000` on the
   expected result instead of chaining pauses.
+- Canvas screens (games, Flutter/Unity) have no labels to wait on. Wait for
+  their text by OCR instead: `{"kind":"wait_for","expect":{"ocr_present":["长按自动"]},"timeout_ms":60000}`
+  (`ocr_absent` for a caption that must disappear, e.g. `Loading`). Each entry
+  matches a recognized line containing it, ignoring case and spaces; each poll
+  is a screenshot plus Vision OCR (about 1 s). An OCR wait may run up to
+  60000 ms, cannot be mixed with `application`/`present`/`absent` in the same
+  step, and on timeout its `observation` lists the `lines` it did read.
+- Boolean wait conditions (`enabled`, `visible`, `focused`) require a known
+  provider state. Missing or malformed flags satisfy neither a positive condition
+  nor absence of that condition. `present_unproven` and `absent_unproven` identify
+  affected expectation indexes; polling continues within the existing timeout.
+  Truncated, unsupported or protected secure values likewise cannot establish
+  exact value presence or absence. A known mismatch in another requested field
+  still rules out that row.
 - A failed `wait_for` carries `observation`: `read:false` proves nothing;
-  `read:true, stale:true` is the last valid view; plain `read:true` means the
-  condition really was not met. Locators an empty tree would have "satisfied" are
+  `read:true, stale:true` is the last valid view; plain `read:true` means a
+  current tree was returned. Check the unproven indexes before drawing a conclusion. Locators an empty tree would have "satisfied" are
   listed in `absent_unproven` and do not pass. Never conclude something is gone
   from a tree with nothing in it — screenshot instead.
 - A 502/504 after dispatch (`outcome_unknown`, `retry_safe:false`) may have
   acted. Read elements or a screenshot before deciding; never replay text,
   scroll, back, pay, send or delete blindly. When the runner answered with an
   error, `runner_error` (`call`, `status`, `code`, `message`) says why.
+- From v0.27.20, direct action dispatch checks the original owner/privacy scope, Runner generation and deadline
+  before each Runner transport request, including compound input subrequests.
+  `409 control_scope_changed` stops the remainder after authorization or request
+  lifetime changes. With zero mutating requests admitted it reports `not_sent`,
+  `retry_safe:true`; otherwise it reports `unknown`, `retry_safe:false`. A request
+  already admitted may have acted; there is no rollback. Retry safety is a delivery
+  fact, not permission to reclaim control or replay uncertain work.
+  Long-text completion only renews its original, still-live owner lease; it never
+  reuses a takeover header to reclaim the phone. An unlock acknowledgement cannot
+  cancel a concurrent release.
+- A fresh app launch checks authorization before terminating and again before
+  launching, including after session setup. A terminate error stops the sequence.
+  `409 app_launch_interrupted` (`outcome:partial`, `retry_safe:false`) means the
+  terminate request was acknowledged but launch was refused. Do not replay the
+  whole fresh launch. `app_lifecycle.terminate_acknowledged` confirms only the
+  request acknowledgement, not an independently verified restart.
+  `launch_attempted:true` means launch was admitted for a transport attempt; it
+  may have reached the Runner. `false` means it was not admitted. A missing field
+  is unknown, including cancellation during the wait after termination. These
+  receipts survive failed single actions, batches and MCP Full/Slim/Off modes.
 - `422 runner_rejected` (`not_sent`, `retry_safe:true`): the runner refused the
   action before touching the screen (for example a point outside the screen it
   measures); `runner_error.message` names the reason.
@@ -592,21 +796,23 @@ you (the MCP tool included): pass one only from a read of the app you mean to
 swipe.
 
 A row without a label (most Cells) is named by its texts, joined with ` · `.
-Rows are deduplicated on `(kind, label, value)`, so identical-looking rows
-collapse into one. `stop_reason`:
+Rows are deduplicated on `(kind, identifier, label, value)`. Different exposed
+identifiers keep identical-looking rows distinct; absent or reused identifiers
+with identical content may collapse. A changed page that adds no distinct rows
+still continues within the page/time budget: later pages may expose new rows. `stop_reason`:
 
 | `stop_reason` | Meaning |
 |---|---|
 | `end_label` | The end label was on screen — the only case with `complete:true` |
-| `duplicate_page` | After a swipe the page was the same: the list did not move (its end, or the swipe hit something that does not scroll) |
-| `no_progress` | The list moved but showed nothing new |
+| `duplicate_page` | After a swipe the exposed row identities, labels and frames repeated: further progress cannot be confirmed (identical-looking pages may also repeat) |
 | `max_pages` | Page budget used up; more rows may follow |
 | `deadline` | Too little of the 80 s call budget was left to swipe and read another page |
 | `read_failed` / `swipe_failed` | Stopped early; rows so far are returned, no snapshot |
 | `no_rows` | No row of that kind on the first page: check `row_kind` or `region` |
 
-`complete` is false in every case but `end_label`; `duplicate_page` and
-`no_progress` are not proof the list ended. `snapshot` is the last page's
+`complete` retains its end-marker meaning (`complete_scope:"end_label_visibility"`).
+`business_complete` is always false: even reaching the marker does not verify
+row counts or business totals. `complete` is false in every case but `end_label`; `duplicate_page` is not proof the list ended. `snapshot` is the last page's
 tree; rows from earlier pages are off screen and carry no index.
 
 `POST /agent/scroll_find` (MCP `phone_scroll_find`) looks for one exact label:
@@ -837,11 +1043,11 @@ worked example below.
 
 ## MCP specifics
 
-39 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
-`phone_release_owner`, `phone_login`, `phone_apps`, `phone_screenshot`, `phone_elements`, `phone_tap`,
+43 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_read_value`, `phone_reconnect`, `phone_hold`,
+`phone_release_owner`, `phone_login`, `phone_apps`, `phone_screenshot`, `phone_elements`, `phone_home_layout`, `phone_instances`, `phone_tap`,
 `phone_tap_element`, `phone_tap_label`, `phone_scroll`, `phone_scroll_find`, `phone_collect_list`, `phone_type`,
 `phone_key`, `phone_shortcut`, `phone_run_steps`, `phone_jev_run`,
-`phone_run_start`, `phone_run_end`, `phone_flow_list / info / run / draft /
+`phone_run_start`, `phone_run_end`, `phone_run_trace`, `phone_subtree`, `phone_flow_list / info / run / draft /
 update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
 `phone_set_location`, `phone_record`, `phone_install_app`, `phone_app_notes`, and
 `phone_skills` (learned skills, `/agent/skills`).
@@ -897,8 +1103,10 @@ update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
   tools also `destructiveHint`, `idempotentHint`). Read-only: `phone_status`,
   `phone_capabilities`, `phone_apps`, `phone_screen`, `phone_screen_frame`,
   `phone_screenshot`, `phone_elements`, `phone_crashes`, `phone_flow_list`,
-  `phone_flow_info`, `phone_flow_draft`. `phone_logs` is not read-only (its
-  start/stop change the capture); `phone_install_app` is destructive.
+  `phone_flow_info`, `phone_flow_draft`, `phone_instances`. `phone_logs` is not read-only (its
+  start/stop change the capture); `phone_install_app` is destructive. `phone_home_layout` reads
+  without `action` and writes with it (destructive); the `readonly` profile keeps the read and
+  hides the write actions, as it does `phone_flow_draft`'s `save_as`.
 - `IPHONE_USE_MCP_TOOLS` picks the exposed tools: `all` (default), `readonly`
   (only the read-only set), or a comma list of tool names (unknown names are
   warned about on stderr and ignored). A hidden tool is not listed, and a call
@@ -946,6 +1154,17 @@ locators.
 
 ### Scoped and searched reads
 
+**Diagnostic state.** `GET /agent/elements?locator_state=1` preserves known
+`enabled`, `visible`, `focused` and empty `value` strings from that same fresh
+snapshot, with a per-row `value_known` boolean. `value_known:false` means the
+value is unsupported, protected or truncated. With `value_known:true`, an
+omitted `value` is known absence; `value:""` is a known empty string. Unknown
+booleans remain omitted. The response echoes `locator_state:1`. This projection
+requires a full read without `since`, preserves original indices and the full
+snapshot cache, and does not change default compact reads. Flow diagnosis uses
+it once after a failure. Older daemons may omit the metadata; the MCP treats
+missing value information as unproven without issuing a fallback read.
+
 **Scoped reads.** `GET /agent/elements?scope=…` filters the same fresh read.
 The `snapshot` and every row's original `index` stay valid for taps.
 - `app`: the active app's subtree, plus the keyboard. The top-level `alert`
@@ -967,6 +1186,46 @@ or raising `limit`. A `query` that is empty or over 200 characters is 400
 `invalid_query`; a bad `limit` is 400 `invalid_limit`. A `delta` answer
 (`since` without `scope=changed`) is not filtered. Search when you know the words on screen.
 Read the whole screen when you do not.
+
+**Field selectors.** MCP `phone_elements` also accepts a `selector` object,
+for example `{"kind":"Button","identifier":"save.primary","enabled":true}`.
+HTTP callers pass the same object as URL-encoded JSON in `?selector=`.
+Fields combine with AND: exact `kind`, `identifier`, `label`, `value`, boolean
+`enabled`, and case-sensitive `label_contains`. Exact values preserve whitespace
+and newlines; an empty `value` matches a present empty value, not a missing one.
+Known truncated value previews cannot match an exact value filter; use
+`phone_read_value` to inspect bounded full values.
+From v0.27.22, `value_present:true` matches exposed snapshot strings, including
+empty strings and truncated previews. `false` matches an unprovided snapshot
+value (omitted or null on non-secure rows), not proof that an App's full AX value
+is null. Protected `SecureTextField` rows match neither boolean; their redaction
+must not be classified as either a real value or an empty field.
+This predicate uses the provider snapshot; ordinary compact output can omit an
+empty string. Filtering restores that known empty metadata. A malformed non-string
+snapshot value matches neither boolean. Provider numbers and booleans retain the
+existing normalization to strings; object/array normalization failures remain
+unknown rather than becoming absent. A truncated-value marker without any value
+also stays unknown and matches neither boolean. Combining `value_present:false` with an
+exact `value` is invalid. For example, `{"kind":"Button","value_present":false}`
+finds buttons without an exposed snapshot value in one read.
+Known enabled state and explicit empty values are included when those fields
+are filtered; redacted secure values are never treated as empty. Ordinary reads
+keep the compact representation. Unknown enabled state matches neither true nor false. The optional
+`XCUIElementType` prefix is accepted for `kind`. Selectors need at least one
+field; strings are limited to 1000 characters. No predicates are evaluated.
+
+Selector filtering combines with `scope`, `query` and `limit`, preserving the
+full tree's snapshot and original indexes. The `filter` summary includes the
+selector and match/omission counts. It applies to accessibility rows; separate
+OCR rows are unchanged. A match is not proof of visibility or hittability.
+Selectors require a full read: combining one with `since` (including
+`scope=changed`) is refused before the device read. Malformed/unsupported
+selectors return 400 `invalid_selector`.
+
+The MCP checks that `filter.selector` confirms the requested selector before
+returning or caching the read. Missing or different confirmation fails instead
+of silently returning a broader view; ordinary reads still work with older
+daemons. Update the selected instance when its daemon lacks selector support.
 
 **Images only when needed.** `?image=auto` attaches a screenshot only when the
 tree is unusable (no interactive rows, containers only). The screenshot is
@@ -1277,7 +1536,11 @@ Two helpers for Mode A:
   centre of its `rect` by coordinates (divide by `screen` for the 0–1
   fractions), never by `element`. It runs Apple's Vision on a fresh
   screenshot (macOS; the first use compiles a small helper and can take
-  longer). A failure is `ocr_error` beside a normal answer, never a failed read.
+  longer). A failure is `ocr_error` beside a normal answer, never a failed read,
+  with `ocr_status`: `warming` (Vision was cold after idle; the read stopped
+  waiting after 10 s but the recognition keeps going, so retry after
+  `ocr_retry_after_ms`), `busy` (an earlier run is still going; retry soon) or
+  `failed`. `ocr_ms` is the time OCR added to the read.
 - **Numbered screenshot.** `GET /agent/screenshot?overlay=elements` outlines
   each interactive element and draws its index in a magenta badge, so you can
   say "tap 12" from the picture: `{"type":"tap","element":12,"snapshot":…}`
@@ -1371,9 +1634,35 @@ mean the geometry is unknown; unknown items remain in the inventory. These are
 not pixel coordinates or a restore format. Read again after moving an icon and
 resolve live UI elements before sending a gesture. An unavailable service returns
 `503 home_layout_unavailable`, never a successful empty layout. Simulator targets
-are explicitly unsupported. No endpoint changes the saved layout.
+are explicitly unsupported.
 
-When `ended_on_phone=true`, automatic schedules remain postponed. An explicitly
+### Writing a layout
+
+`POST /agent/home-layout {"action","file"?,"confirm"?}` / MCP `phone_home_layout`
+with `action` (CLI: `iphone-use home-layout backup|apply|restore [file] [--dry-run]`)
+replaces the whole icon state through SpringBoard's `setIconState`. It needs
+`X-Phone-Control` and the owner lease. Files are plists on the Mac, saved in
+`~/.iphone-use-backups` unless a path is given.
+
+- `backup` saves the current layout. Dates are cut to whole seconds so `plutil`
+  and Python's `plistlib` can read the file (SpringBoard's carry nanoseconds).
+- `preview` compares `file` with the phone **by app identifier**
+  (`bundleIdentifier`, `displayIdentifier`, `webClipIdentifier`), never by name:
+  two apps called "Authenticator" stay two apps. It lists `added`, `removed`,
+  `moved` (pages, 0 is the Dock) and the count of widgets/stacks, which have no
+  identifier, before and after.
+- `apply` writes `file`; `restore` writes the newest automatic backup, or `file`.
+  Without `confirm:true` both answer the preview and write nothing: show it to
+  the person and send again only after they agree. A write first saves the
+  layout it replaces as `home-before-apply-<time>.plist`, so `restore` undoes it.
+
+After writing, read the layout again. Apps left out of the new layout go to the
+App Library, and SpringBoard can bring hidden App Library apps back onto Home
+pages over several passes, so a second read can differ from the first; repeat
+the write only after reading. Widgets and stacks are easy to lose in a
+rearrangement: the preview warns when the new layout has fewer of them.
+
+When `runner_parked=true` (or legacy `ended_on_phone=true`), automatic schedules remain postponed. An explicitly
 requested manual schedule run may reconnect, but it still respects human handoff,
 other owners, live viewers and lock state. A parked helper reports
 `runner_build.state="parked"`, including after five minutes; it is neither
@@ -1386,3 +1675,145 @@ explicit notification setup run, `IPU_RUNNER_EXIT_NOTICE=1` requests permission;
 use both volume keys or `iphone-use pause`. Only the notification's explicit
 End control button ends the session; tapping its body does not. Pending
 notification callbacks cannot end a later runner session.
+
+Notification setup is explicit: `IPU_RUNNER_EXIT_NOTICE=1 iphone-use setup`
+requests permission on this instance's Runner. Use `0` to disable the notice or
+`auto` to return to using existing permission without a prompt. The managed
+supervisor remembers this choice and forwards it through both Xcode and the
+iOS 15/16 launcher. Other instances keep their own choice.
+
+## Choosing among installed phones in MCP
+
+`phone_instances` lists local installed LaunchAgents and bounded read-only
+status without reconnecting. All other `phone_*` tools accept optional
+`instance:"i13"` or `instance:"default"`. Use it consistently through reads and
+actions; omitted instance refers only to the server's configured daemon.
+An unavailable/unsafe selection fails without another-phone fallback or reused
+ambient credentials. Each instance keeps its own snapshots, runs and progress.
+The live panel waits for its opening tool's selection and uses it for frames
+and Home; a host that does not deliver tool input/result leaves the panel
+waiting, rather than guessing another target. This selects an installed daemon;
+it never changes a daemon's phone configuration or bypasses handoff/privacy/owner gates.
+
+
+All observing batches retain the privacy generation from request entry. A private
+on/off transition cancels that observation and later steps; queued response
+bodies withhold screen observations and wait verdicts while preserving known action delivery receipts.
+`phone_reconnect(wait_secs=N)` bounds each status read by the remaining wait
+budget and returns `stopped` for recorded phone exit, parking or human handoff.
+Only the initial reconnect request can start recovery; waiting never sends a
+second reconnect.
+
+### Complete selected AX values
+
+`POST /agent/value` (MCP `phone_read_value`) reads one current AX value selected
+by exactly one `identifier` or exact `label`, optionally `kind`. It never taps,
+focuses, unlocks, or takes a control lease. Ambiguous selectors refuse. Secure
+fields require a person; an older Runner without `ipu:valueRead` refuses rather
+than passing off a snapshot preview as full text.
+
+`max_utf16` is 1–65536 (default 8192). The reply carries `source`, `complete`,
+`truncated`, `utf16_length`, `returned_utf16_length` and `limit_utf16`. Clipping
+preserves surrogate pairs. Complete means this API did not clip the AX attribute;
+it does not prove that an app exposes its entire document. Owner changes, lease
+expiry, privacy changes or a control transition withhold an in-flight or queued
+value. Same-owner renewal and cleanup of an already expired owner preserve fresh
+permitted reads. Plan a fresh read only after checking current status.
+
+The Native complete-value route is explicitly opted into with `complete=1`;
+existing attribute/value snapshot reads and POST value writes keep their contracts.
+
+
+From v0.27.21, `full_value_unavailable` retains its existing 501 status and adds
+`reason` so a selected-element failure does not imply that the Runner needs an
+upgrade. It never carries a value or promotes a snapshot preview.
+
+| Reason | What this read established |
+| --- | --- |
+| `runner_capability_missing` | The selected Runner did not advertise `ipu:valueRead`. |
+| `ax_attribute_unavailable` | This request did not return the selected full AX attribute. Its value remains unknown. |
+| `ax_value_not_scalar` | The returned AX attribute is outside this API's scalar contract. |
+| `ax_bridge_unavailable` | The Native AX bridge could not service this request. |
+| `ax_read_failed` | The Native AX read failed for this request. |
+| `runner_endpoint_unavailable` | The Runner refused the complete-value endpoint without a recognized Native diagnosis. |
+| `invalid_contract` | The returned payload failed completeness validation. |
+
+Only a successful, validated complete-value contract can report a complete null
+or empty value. An unavailable attribute is evidence of neither.
+
+## Action evidence and recovery
+
+Input and batch responses add `action_evidence` without changing `ok`, `outcome`,
+`batch_outcome` or `retry_safe`. `delivery.status` is `not_sent`, `delivered`,
+`partial`, `uncertain` or `unavailable`. `postcondition.status` separately says
+`verified`, `unverified` or `unavailable`. A native acknowledgement is delivery
+only. A readable `set_value` match verifies the element value; it does not prove
+that the application saved or submitted it. Secure fields stay unverified. A
+successful terminal `wait_for` verifies its UI expectation only. The existing
+`alert` block accompanies observed actions; no alert block does not prove that
+no alert exists.
+
+Errors also carry `recovery.action`: `next_step` is a fixed strategy,
+`retry_allowed` is permission to reassess a retry only when the whole request was certainly
+not delivered. Partial batches and uncertain writes require reading the live
+state and deciding where to resume. Never branch on `hint` wording.
+
+### Waiting for a delayed loader
+
+Add `absent_after_present:true` inside a `wait_for` expectation when a negative
+target must first appear before its absence can count:
+
+```json
+{"kind":"wait_for","expect":{"absent":[{"label":"Loading"}],"absent_after_present":true},"timeout_ms":10000}
+```
+
+Every absent selector needs its own positive observation in this wait; this
+also works with `ocr_absent`. Unknown/partial reads never prove disappearance.
+A loader that never appears times out. Omit the option for an ordinary absence
+check. This option requires a nonzero timeout and at least one negative target.
+
+### Reading one element's subtree
+
+`POST /agent/subtree` (`phone_subtree`) accepts `snapshot`, `element`,
+`max_depth` (default 8, range 1–64) and `max_nodes` (default 500, range 1–5000).
+The daemon resolves a unique semantic target, then requests only that native
+AX element's subtree. Locator resolution may still read the application tree.
+The reply includes `rows`, `coverage`, `complete` and `partial`; a capped read
+must not be used as proof of absence. Older runners return
+`subtree_not_supported`; no global source read is silently substituted.
+
+These rows have **local, read-only positions**, not action refs. The reply
+carries no actionable snapshot token. Use a unique locator or get new full
+`phone_elements` refs before input. Other regions' snapshot refs are unchanged.
+
+### Native action checks
+
+The updated runner samples only the target element's frame before element
+clicks, text edits and adjustments. Disabled targets, positively noneditable
+editors, unavailable frames and frames that keep moving refuse before input.
+Missing enabled/editable metadata stays unknown, not false. The bounded frame
+samples run on the phone, not as repeated whole-screen network reads. These
+checks require updating the runner; a daemon-only update cannot add them to an
+older runner. Coordinate-only actions cannot prove a semantic target's enabled
+or editable state.
+
+### Watching and inspecting a run
+
+The control panel shows nonsensitive named element targets in green: a ripple and, when available,
+an outline. Element geometry is a snapshot's rectangle centre, not proof of the
+actual dispatched hit point. Runner-point targets are drawn only with a known
+runner viewport. Unresolved, stale and historical targets are not animated. Activity history never contains point/rect geometry. The panel explicitly requests live=true; only the latest eligible target is exposed as live_target, bound to the active owner/privacy/lifecycle scope and erased after 1.5 seconds. Private mode and ownership changes clear it; live responses use no-store and a publication scope fence. Each live target carries ttl_ms remaining at response construction; the panel subtracts the request duration using its own monotonic clock and never compares sender/browser wall clocks. Arbitrary coordinate taps, keypad keys and input fields have no geometry even in live feedback.
+
+`POST /agent/run {"action":"start","run_id":"task-1","trace":true}`
+(or `phone_run_start(trace=true)`) opts into a redacted action timeline. This
+`trace` option is independent of `complete_trace`, which counts model turns.
+End with the usual run end. Lease release, expiry/reclaim or takeover ends the prior owner's active trace while preserving export; start a fresh run ID to trace again. Read it with
+`GET /agent/trace?run_id=task-1` (`phone_run_trace`), or add `format=jsonl` for
+newline-delimited JSON export. Export requires the same authenticated owner.
+
+The timeline stores action kinds, bounded numerical target metadata, delivery,
+verification and counts. It does not store typed values, labels, URLs,
+screenshots or arbitrary runner messages. Private/revoked requests add no event.
+It is bounded memory (16 runs, 200 events/run), reports dropped events and is
+lost on restart or eviction. It supports reviewing what happened, not automatic
+replay of mutations. Tracing is off by default.

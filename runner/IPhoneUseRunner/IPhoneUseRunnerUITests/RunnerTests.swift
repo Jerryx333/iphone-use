@@ -37,6 +37,7 @@ final class RunnerCore: NSObject {
   static let sessionID = UUID().uuidString
   static let systemVersion = UIDevice.current.systemVersion
   let elements = ElementRegistry()
+  var inputBinding: String?
   /// Holds off Auto-Lock while the daemon says the phone is in use (`POST /wda/keepawake`).
   let keepAwake = KeepAwake()
   /// Last alert scan and when it ran; reused for a second while nothing was POSTed (RunnerClient asks
@@ -253,6 +254,8 @@ final class RunnerCore: NSObject {
     defer { IPURBridge.setRequestCacheEnabled(false) }
     if request.method != "GET", Self.mayChangeScreen(request.path) {
       alertCache = nil
+      if !InputTargetCheck.preservesBinding(path: request.path, binding: inputBinding,
+          body: (try? request.jsonObject()) ?? [:]) { inputBinding = nil }
       elements.prune()
     }
     defer {
@@ -524,6 +527,7 @@ final class RunnerCore: NSObject {
       "X-IPU-Node-Count": "\(tree[IPURTreeNodeCountKey] ?? 0)",
       "X-IPU-Depth": "\(tree[IPURTreeDepthKey] ?? 0)",
       "X-IPU-Truncated": ((tree[IPURTreeTruncatedKey] as? Bool) == true) ? "1" : "0",
+      "X-IPU-Tree-Complete": ((tree[IPURTreeTruncatedKey] as? Bool) == false) ? "1" : "0",
       "X-IPU-Extension-Calls": "\(tree[IPURTreeExtensionCallsKey] ?? 0)",
       "X-IPU-Pid": "\(pid)",
     ]
@@ -531,15 +535,16 @@ final class RunnerCore: NSObject {
 
   // MARK: - Gestures
 
-  /// Runs a synthesized gesture; when the private path is missing or fails, runs `fallback`
-  /// (public XCUICoordinate API, quiescence skipped) and reports which path acted.
+  /// Use the public path only when synthesis is unavailable before dispatch.
+  /// Any synthesis error stays uncertain; never replay a possibly delivered gesture.
   func gesture(
     _ name: String,
     synthesized: () -> String?,
     fallback: (XCUIApplication) -> Void
   ) throws -> HTTPResponse {
-    if let error = timed("Synthesize", synthesized) {
-      NSLog("ipu-runner: %@ synthesis failed, using XCUICoordinate: %@", name, error)
+    let backend = try GestureDelivery.run(name, synthesisAvailable: IPURBridge.eventSynthesisAvailable(),
+        synthesized: { timed("Synthesize", synthesized) }) {
+      NSLog("ipu-runner: %@ synthesis unavailable before dispatch, using XCUICoordinate", name)
       let application = foreground().application
       let issuesBefore = recordedIssues.count
       var exception: String?
@@ -548,14 +553,13 @@ final class RunnerCore: NSObject {
         IPURBridge.invalidateRequestCache()
       }
       if let exception {
-        throw RunnerError.failed("\(name) failed (synthesis: \(error); coordinate: \(exception))")
+        throw RunnerError.failed("\(name) coordinate outcome unknown: \(exception)")
       }
       if recordedIssues.count > issuesBefore {
-        throw RunnerError.failed("\(name) failed (synthesis: \(error); coordinate: \(recordedIssues.last!))")
+        throw RunnerError.failed("\(name) coordinate outcome unknown: \(recordedIssues.last!)")
       }
-      return .value(NSNull(), headers: ["X-IPU-Gesture": "xcui-coordinate"])
     }
-    return .value(NSNull(), headers: ["X-IPU-Gesture": "synthesized"])
+    return .value(NSNull(), headers: ["X-IPU-Gesture": backend])
   }
 
   func coordinate(_ application: XCUIApplication, _ point: CGPoint) -> XCUICoordinate {
@@ -603,20 +607,9 @@ final class RunnerCore: NSObject {
     }
     if text.isEmpty { return .value(NSNull()) }
     let frequency = UInt(max(1, min(1000, number(body, "frequency") ?? 60)))
-    if let error = IPURBridge.synthesizeText(text, charactersPerSecond: frequency, pid: 0) {
-      NSLog("ipu-runner: text synthesis failed, using XCUIApplication.typeText: %@", error)
-      let application = foreground().application
-      let issuesBefore = recordedIssues.count
-      var exception: String?
-      IPURBridge.performWithoutQuiescence(application) {
-        exception = IPURBridge.catchException { application.typeText(text) }
-      }
-      if let failure = exception ?? (recordedIssues.count > issuesBefore ? recordedIssues.last : nil) {
-        throw RunnerError.failed("type failed (synthesis: \(error); typeText: \(failure))")
-      }
-      return .value(NSNull(), headers: ["X-IPU-Gesture": "xcui-typetext"])
-    }
-    return .value(NSNull(), headers: ["X-IPU-Gesture": "synthesized"])
+    // /type accepts literal text; only the WebDriver routes map private-use keys.
+    let path = try typeIntoFocus(text, frequency: frequency, mapKeys: false)
+    return .value(NSNull(), headers: ["X-IPU-Gesture": path])
   }
 
   /// Send Home once to dismiss system UI; activate SpringBoard only if the event had no effect.

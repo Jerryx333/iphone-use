@@ -13,6 +13,17 @@ use std::time::Duration;
 const DEFAULT_URL: &str = "http://127.0.0.1:44321";
 const DAEMON_LABEL: &str = "com.leeguoo.iphone-use";
 
+/// A real loopback destination, parsed before any local credential lookup.
+fn loopback_daemon_url(value: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") { return None; }
+    let host = url.host_str()?;
+    let ip = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')).unwrap_or(host);
+    let local = host.eq_ignore_ascii_case("localhost")
+        || ip.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback());
+    local.then_some(url)
+}
+
 /// Daemon URL and bearer token: the environment first, then the installed
 /// daemon's own LaunchAgent. The agent token wins over the password because
 /// a daemon with an agent token refuses the password as a bearer.
@@ -39,8 +50,13 @@ fn daemon_target(
     });
     let token = env("IPHONE_USE_TOKEN").or_else(|| {
         // Only a daemon on this Mac can be the one the plist describes.
-        let local =
-            base_url.starts_with("http://127.0.0.1:") || base_url.starts_with("http://localhost:");
+        let configured_port = plist(&label, "IPHONE_USE_PORT")
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .or_else(|| (label == DAEMON_LABEL).then_some(44321));
+        let local = loopback_daemon_url(&base_url).is_some_and(|url| {
+            url.username().is_empty() && url.password().is_none()
+                && url.port_or_known_default() == configured_port
+        });
         local
             .then(|| {
                 plist(&label, "IPHONE_USE_AGENT_TOKEN")
@@ -347,11 +363,17 @@ impl DaemonClient {
 
     fn http(&self) -> &Client {
         self.client.get_or_init(|| {
-            Client::builder()
+            let builder = Client::builder()
                 .connect_timeout(self.connect_timeout)
-                .timeout(self.request_timeout)
-                .build()
-                .expect("reqwest client construction is infallible")
+                .timeout(self.request_timeout);
+            // Installed daemon credentials must stay on this Mac even when
+            // the MCP host supplies HTTP_PROXY / ALL_PROXY.
+            let builder = if loopback_daemon_url(&self.base_url).is_some() {
+                builder.no_proxy()
+            } else {
+                builder
+            };
+            builder.build().expect("reqwest client construction is infallible")
         })
     }
 
@@ -381,6 +403,10 @@ impl DaemonClient {
             ),
             None => "/agent/input?return=delta".to_string(),
         }
+    }
+
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.base_url == other.base_url && self.token == other.token
     }
 
     /// The configured base URL (used for logging).
@@ -450,8 +476,18 @@ impl DaemonClient {
     /// `POST /agent/run` start: open an explicit run for this owner; every
     /// later request carries it until [`Self::run_end`].
     pub async fn run_start(&self, run_id: &str, complete_trace: bool) -> anyhow::Result<String> {
+        self.run_start_with_trace(run_id, complete_trace, false).await
+    }
+
+    pub async fn action_trace(&self, run_id: &str) -> anyhow::Result<String> {
+        let response = self.auth(self.http().get(self.url("/agent/trace")))
+            .query(&[("run_id", run_id)]).send().await?;
+        Ok(check_status(response).await?.text().await?)
+    }
+
+    pub async fn run_start_with_trace(&self, run_id: &str, complete_trace: bool, trace: bool) -> anyhow::Result<String> {
         let body = serde_json::json!({
-            "action": "start", "run_id": run_id, "complete_trace": complete_trace
+            "action": "start", "run_id": run_id, "complete_trace": complete_trace, "trace": trace
         });
         let req = self
             .auth(self.http().post(self.url("/agent/run")))
@@ -592,6 +628,16 @@ impl DaemonClient {
         read_response(req.send().await?).await
     }
 
+    /// Read only this client's task aggregates; never acquire control or wake a Runner.
+    pub async fn metrics(&self) -> anyhow::Result<DaemonResponse> {
+        let owner = self.owner().trim();
+        anyhow::ensure!(!owner.is_empty() && owner.len() <= 64 && !owner.chars().any(char::is_control),
+            "metrics requires a valid X-Phone-Owner of at most 64 bytes");
+        let req = self.auth(self.http().get(self.url("/agent/metrics")))
+            .query(&[("owner", owner)]);
+        read_response(req.send().await?).await
+    }
+
     /// A complete home-screen inventory, without changing the foreground app.
     pub async fn home_layout(&self, page: Option<usize>) -> anyhow::Result<DaemonResponse> {
         let mut request = self
@@ -603,14 +649,35 @@ impl DaemonClient {
         read_response(request.send().await?).await
     }
 
+    /// `POST /agent/home-layout`: backup, preview, apply or restore (#383).
+    pub async fn home_layout_write(&self, body: serde_json::Value) -> anyhow::Result<DaemonResponse> {
+        let request = self
+            .auth(self.http().post(self.url("/agent/home-layout")))
+            .header("x-phone-control", "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .timeout(Duration::from_secs(60))
+            .body(body.to_string());
+        read_response(request.send().await?).await
+    }
+
     /// `POST /agent/input` with the daemon's structured result kept.
     ///
     /// `observe` asks the daemon for a post-action observation
-    /// (`?return=delta`); without it the request is byte-for-byte what
-    /// [`Self::input`] sends, so existing callers are unaffected.
+    /// (`?return=delta`); both forms preserve the same action fields as
+    /// [`Self::input`].
     pub async fn input_observed(
         &self,
         msg: &InputMsg,
+        observe: bool,
+    ) -> anyhow::Result<DaemonResponse> {
+        self.input_value_observed(&serde_json::to_value(msg)?, observe)
+            .await
+    }
+
+    /// Observed action envelope, including a single-use text continuation.
+    pub async fn input_value_observed(
+        &self,
+        action: &serde_json::Value,
         observe: bool,
     ) -> anyhow::Result<DaemonResponse> {
         let path = if observe {
@@ -622,10 +689,15 @@ impl DaemonClient {
             .auth(self.http().post(self.url(&path)))
             .header("x-phone-control", "1")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(msg.to_json());
-        let typing = match msg {
-            InputMsg::Text { text } => text_allowance(text),
-            _ => Duration::ZERO,
+            .body(action.to_string());
+        let typing = if action.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+            action
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(text_allowance)
+                .unwrap_or_default()
+        } else {
+            Duration::ZERO
         };
         if observe {
             req = req.timeout(OBSERVE_TIMEOUT + typing);
@@ -636,7 +708,6 @@ impl DaemonClient {
         self.remember_snapshot(response.json.as_ref());
         Ok(response)
     }
-
 
     /// `POST /agent/input` with an arbitrary action body (element taps,
     /// set_value, …), keeping the daemon's structured result.
@@ -754,6 +825,12 @@ impl DaemonClient {
         read_response(req.send().await?).await
     }
 
+    /// Metadata POST for a read; deliberately carries no control header.
+    pub async fn read_value(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
+        let request=self.auth(self.http().post(self.url("/agent/value"))).timeout(Duration::from_secs(20)).json(body);
+        read_response(request.send().await?).await
+    }
+
     /// A swiping list call (`/agent/collect`, `/agent/scroll_find`): several
     /// reads and swipes in one request, so it gets the batch budget — the
     /// daemon answers within its own 80 s deadline.
@@ -833,8 +910,22 @@ impl DaemonClient {
     /// (L2 / WebDriverAgent). Returns the JSON body verbatim:
     /// `{"snapshot":"…","elements":[{kind,label,identifier?,rect,
     /// enabled?,visible?,accessible?,focused?,placeholder?,depth},…]}`.
+    pub async fn subtree(&self, snapshot: &str, element: usize, max_depth: u32, max_nodes: u32) -> anyhow::Result<String> {
+        let response = self.auth(self.http().post(self.url("/agent/subtree")))
+            .header("x-phone-control", "1")
+            .json(&serde_json::json!({"snapshot":snapshot,"element":element,"max_depth":max_depth,"max_nodes":max_nodes}))
+            .send().await?;
+        Ok(check_status(response).await?.text().await?)
+    }
+
     pub async fn elements(&self) -> anyhow::Result<String> {
-        self.elements_at("/agent/elements").await
+        self.elements_at("/agent/elements", None).await
+    }
+
+    /// One fresh read preserving known locator state. Older daemons may ignore
+    /// the query; diagnosis treats their omitted values conservatively.
+    pub async fn elements_for_diagnosis(&self) -> anyhow::Result<String> {
+        self.elements_at("/agent/elements?locator_state=1&ocr=off", None).await
     }
 
     /// [`Self::elements`] with the daemon's `image=auto` policy: when the tree
@@ -849,16 +940,22 @@ impl DaemonClient {
     ///
     /// `ocr` (`1` or `force`) asks for text read from a fresh screenshot when
     /// the tree is unusable (or always, with `force`).
-    pub async fn elements_with_image(
-        &self,
-        query: Option<&str>,
-        limit: Option<usize>,
-        ocr: Option<&str>,
+    pub async fn elements_with_selector(
+        &self, query: Option<&str>, limit: Option<usize>, ocr: Option<&str>,
+        selector: Option<&iu_core::element_selector::ElementSelector>,
     ) -> anyhow::Result<String> {
-        self.elements_at(&elements_path(query, limit, ocr)).await
+        let mut path = elements_path(query, limit, ocr);
+        if let Some(selector) = selector {
+            let mut url = reqwest::Url::parse(&format!("http://daemon{path}"))?;
+            url.query_pairs_mut().append_pair("selector", &serde_json::to_string(selector)?);
+            path = format!("{}?{}", url.path(), url.query().unwrap_or_default());
+        }
+        self.elements_at(&path, selector).await
     }
 
-    async fn elements_at(&self, path: &str) -> anyhow::Result<String> {
+    async fn elements_at(
+        &self, path: &str, selector: Option<&iu_core::element_selector::ElementSelector>,
+    ) -> anyhow::Result<String> {
         // A cold runner call may create a session and then request the source tree;
         // each upstream step is bounded by the daemon, but together can exceed
         // the generic 30-second MCP timeout. Wait long enough for the daemon to
@@ -868,6 +965,11 @@ impl DaemonClient {
             .auth(self.http().get(self.url(path)))
             .timeout(ELEMENTS_TIMEOUT);
         let resp = req.send().await?;
+        if selector.is_some_and(|selector|selector.index.is_some()) && resp.status()==reqwest::StatusCode::CONFLICT {
+            let response=read_response(resp).await?;
+            if response.too_large {anyhow::bail!("ordinal read error exceeded the bounded response limit");}
+            return Err(DaemonHttpError {status:reqwest::StatusCode::CONFLICT,body:response.body}.into());
+        }
         let resp = check_status(resp).await?;
         // Bounded like every structured daemon read: a runaway tree is
         // refused, not held in memory.
@@ -876,6 +978,15 @@ impl DaemonClient {
             anyhow::bail!(
                 "/agent/elements answered more than {DAEMON_RESPONSE_READ_LIMIT} bytes; not read"
             );
+        }
+        if let Some(selector) = selector {
+            let expected = serde_json::to_value(selector)?;
+            let acknowledged = response.json.as_ref()
+                .and_then(|body| body.get("filter"))
+                .and_then(|filter| filter.get("selector"));
+            if acknowledged != Some(&expected) {
+                anyhow::bail!("selected daemon did not acknowledge the requested selector; read result discarded. Verify or update the selected instance before retrying");
+            }
         }
         self.remember_snapshot(response.json.as_ref());
         Ok(response.body)
@@ -1285,6 +1396,45 @@ pub(crate) mod tests {
     use std::thread::JoinHandle;
 
     #[tokio::test]
+    async fn selector_reply_must_acknowledge_the_requested_filter_before_caching() {
+        let selector: iu_core::element_selector::ElementSelector = serde_json::from_value(
+            serde_json::json!({"identifier":"primary","value_present":false})
+        ).unwrap();
+        for body in [
+            serde_json::json!({"snapshot":"unfiltered","elements":[{"label":"UNRELATED_SCREEN"}]}),
+            serde_json::json!({"snapshot":"wrong-filter","elements":[],"filter":{"selector":{"identifier":"other"}}}),
+            serde_json::json!({"snapshot":"partial-ack","elements":[],"filter":{"selector":{"identifier":"primary"}}}),
+            serde_json::json!({"snapshot":"legacy-query-only","elements":[],"filter":{"query":"primary"}}),
+        ] {
+            let (url,task)=mock_daemon("200 OK",&body.to_string());
+            let client=DaemonClient::new(&url,None);
+            client.remember_snapshot(Some(&serde_json::json!({"snapshot":"previous"})));
+            let result=client.elements_with_selector(None,None,None,Some(&selector)).await;
+            task.join().unwrap();
+            assert!(result.is_err(),"a legacy or different filter must not silently broaden results");
+            assert_eq!(client.last_snapshot.lock().unwrap().as_deref(),Some("previous"));
+            assert!(!result.unwrap_err().to_string().contains("UNRELATED_SCREEN"));
+        }
+    }
+
+    #[tokio::test]
+    async fn selector_acknowledgement_and_legacy_plain_reads_remain_supported() {
+        let selector: iu_core::element_selector::ElementSelector = serde_json::from_value(
+            serde_json::json!({"identifier":"primary"})
+        ).unwrap();
+        for selected in [false,true] {
+            let mut body=serde_json::json!({"snapshot":"accepted","elements":[]});
+            if selected { body["filter"]=serde_json::json!({"selector":selector}); }
+            let (url,task)=mock_daemon("200 OK",&body.to_string());
+            let client=DaemonClient::new(&url,None);
+            let result=client.elements_with_selector(None,None,None,selected.then_some(&selector)).await;
+            task.join().unwrap();
+            assert!(result.is_ok());
+            assert_eq!(client.last_snapshot.lock().unwrap().as_deref(),Some("accepted"));
+        }
+    }
+
+    #[tokio::test]
     async fn http_pool_is_lazy_and_shared_but_session_state_is_separate() {
         let client = DaemonClient::new("http://127.0.0.1:9", None);
         let session = client.for_session(1);
@@ -1666,6 +1816,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn local_credentials_require_a_parsed_loopback_host_without_userinfo() {
+        for url in ["http://127.0.0.1:44321@remote.invalid/", "http://localhost:44321@remote.invalid/",
+            "http://localhost.remote.invalid:44321", "http://user:pass@127.0.0.1:44321", "http://127.0.0.1:45432"] {
+            let (_, token) = daemon_target(|key| (key == "IPHONE_USE_URL").then(|| url.into()),
+                |_, key| (key == "IPHONE_USE_AGENT_TOKEN").then(|| "synthetic-local-secret".into()));
+            assert!(token.is_none(), "local credentials borrowed for {url}");
+        }
+        for url in ["http://127.0.0.1:44321", "http://localhost:44321", "http://[::1]:44321"] {
+            let (_, token) = daemon_target(|key| (key == "IPHONE_USE_URL").then(|| url.into()),
+                |_, key| (key == "IPHONE_USE_AGENT_TOKEN").then(|| "synthetic-local-secret".into()));
+            assert_eq!(token.as_deref(), Some("synthetic-local-secret"));
+        }
+        let (_, token) = daemon_target(|key| match key {
+            "IPHONE_USE_URL" => Some("https://remote.invalid".into()),
+            "IPHONE_USE_TOKEN" => Some("explicit-remote-token".into()), _ => None,
+        }, |_, _| None);
+        assert_eq!(token.as_deref(), Some("explicit-remote-token"));
+    }
+
+    #[test]
     fn an_unset_target_is_read_from_the_installed_launch_agent() {
         let plist = |label: &str, key: &str| match (label, key) {
             ("com.leeguoo.iphone-use", "IPHONE_USE_PORT") => Some("45432".to_string()),
@@ -1929,6 +2099,24 @@ pub(crate) mod tests {
             !sent.iter().any(|request| request.starts_with("POST")),
             "no mutation may be dispatched when the label did not resolve: {sent:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn compound_tab_caption_suggests_the_full_label_without_sending_a_tap() {
+        let elements = serde_json::json!({"snapshot":"tabs-v1","elements":[
+            {"kind":"Button","label":"Teclado, tab, 1 of 3"},
+            {"kind":"Button","label":"Conversas, tab, 2 of 3"},
+            {"kind":"Button","label":"Histórico, tab, 3 of 3"}
+        ]}).to_string();
+        let (url, task, requests) = mock_daemon_sequence(&[("200 OK", &elements)]);
+        let failure = DaemonClient::new(url, None).tap_label_observed("Conversas", false)
+            .await.expect_err("a suggestion must remain before dispatch");
+        task.join().unwrap();
+        assert!(matches!(failure, TapLabelFailure::BeforeDispatch(_)), "{failure}");
+        assert!(failure.to_string().contains("did you mean \"Conversas, tab, 2 of 3\""), "{failure}");
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("GET /agent/elements"), "{sent:?}");
     }
 
     /// The element read itself failing is also before dispatch.

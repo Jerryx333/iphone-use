@@ -147,7 +147,12 @@ impl Candidate {
             .chain(std::iter::once(self.bundle_id.as_str()))
     }
 
-    /// 2 = an exact name, alias or bundle id; 1 = a substring of one; 0 = no match.
+    /// 2 = an exact name, alias or bundle id; 1 = a substring of one, or a
+    /// name the query starts with ("PayPayカード" finds PayPay, whose card
+    /// lives in the main app); 0 = no match.
+    ///
+    /// The second partial form only suggests: a loose `launch_app` name still
+    /// needs the installed name to start with it ([`word_prefix_match`]).
     fn score(&self, wanted: &str) -> u8 {
         if wanted.is_empty() {
             return 0;
@@ -159,6 +164,14 @@ impl Candidate {
                 return 2;
             }
             if name.contains(wanted) {
+                best = 1;
+            }
+        }
+        if best == 0 {
+            // Only the app's own name: a short alias ("IG") would make any
+            // query that happens to start with it ("ignite") a candidate.
+            let name = normalize(&self.name);
+            if name.chars().count() >= 2 && wanted.starts_with(&name) {
                 best = 1;
             }
         }
@@ -377,8 +390,9 @@ pub enum ResolveError {
     Ambiguous { candidates: Vec<Ranked> },
 }
 
-/// Resolve an app name for `launch_app` without guessing: only an exact name
-/// or alias counts, and it has to be unique. With an inventory, only apps on
+/// Resolve an app name for `launch_app` without guessing: an exact name or
+/// alias counts, and it has to be unique; failing that, a loose name that
+/// starts a word of exactly one installed app's name (see below). With an inventory, only apps on
 /// the phone qualify. The Apple store is never consulted here — a store hit
 /// is not evidence the app is installed.
 pub fn resolve_for_launch(
@@ -388,6 +402,23 @@ pub fn resolve_for_launch(
     let ranked = rank(query, installed, catalog(), &[]);
     let exact: Vec<Ranked> = ranked.iter().filter(|r| r.exact).cloned().collect();
     if exact.is_empty() {
+        // A loose name ("idol ludo" for "Idol Ludo Board") launches only when
+        // the phone's own app list was read and exactly one installed app's
+        // name or alias starts with it at a word boundary. Two such apps are
+        // ambiguous; anything else stays a suggestion.
+        if installed.is_some() {
+            let wanted = normalize(query);
+            let loose: Vec<Ranked> = ranked
+                .iter()
+                .filter(|r| r.installed_verified && word_prefix_match(&r.candidate, &wanted))
+                .cloned()
+                .collect();
+            match loose.len() {
+                0 => {}
+                1 => return Ok(loose.into_iter().next().expect("one")),
+                _ => return Err(ResolveError::Ambiguous { candidates: loose }),
+            }
+        }
         return Err(ResolveError::NotFound {
             suggestions: ranked.into_iter().take(5).collect(),
         });
@@ -409,6 +440,32 @@ pub fn resolve_for_launch(
         1 => Ok(pool.into_iter().next().expect("one")),
         _ => Err(ResolveError::Ambiguous { candidates: pool }),
     }
+}
+
+/// Shortest normalized query a loose (partial) launch accepts: two
+/// characters covers CJK names ("微信") without letting one letter launch.
+const LOOSE_MIN_CHARS: usize = 2;
+
+/// Whether `wanted` (normalized) starts a word of the candidate's display
+/// name or one of its aliases — never the bundle id, which users do not say.
+fn word_prefix_match(candidate: &Candidate, wanted: &str) -> bool {
+    if wanted.chars().count() < LOOSE_MIN_CHARS {
+        return false;
+    }
+    std::iter::once(candidate.name.as_str())
+        .chain(candidate.aliases.iter().map(String::as_str))
+        .any(|name| {
+            let mut previous: Option<char> = None;
+            name.char_indices().any(|(at, c)| {
+                let starts_word = match previous {
+                    None => true,
+                    Some(p) => !p.is_alphanumeric() && c.is_alphanumeric()
+                        || (p.is_lowercase() && c.is_uppercase()),
+                };
+                previous = Some(c);
+                starts_word && normalize(&name[at..]).starts_with(wanted)
+            })
+        })
 }
 
 /// The unique exact match among Apple's built-in apps, which needs no
@@ -709,16 +766,51 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // A partial name is never launched.
-        match resolve_for_launch("WeCh", Some(&phone)) {
+        // A name that starts no word of any installed app is never launched.
+        match resolve_for_launch("eChat", Some(&phone)) {
             Err(ResolveError::NotFound { suggestions }) => {
                 assert_eq!(suggestions[0].candidate.bundle_id, "com.tencent.xin")
             }
             other => panic!("{other:?}"),
         }
+        // Without the phone's app list, a partial name is never launched.
+        assert!(matches!(
+            resolve_for_launch("WeCh", None),
+            Err(ResolveError::NotFound { .. })
+        ));
         match resolve_for_launch("no such app anywhere", None) {
             Err(ResolveError::NotFound { suggestions }) => assert!(suggestions.is_empty()),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_unique_loose_name_launches_the_one_installed_app() {
+        let phone = installed(json!([
+            {"bundle":"com.kr.idolludobroard","name":"Idol Ludo Board"},
+            {"bundle":"com.example.zeta.a","name":"Zeta Tool Pro"},
+            {"bundle":"com.example.zeta.b","name":"Zeta Tool Lite"},
+        ]));
+        let found = resolve_for_launch("idol ludo", Some(&phone)).unwrap();
+        assert_eq!(found.candidate.bundle_id, "com.kr.idolludobroard");
+        assert!(!found.exact);
+        assert_eq!(found.to_json()["match"], "partial");
+        // A later word counts too, case-insensitively.
+        assert_eq!(
+            resolve_for_launch("LUDO board", Some(&phone)).unwrap().candidate.bundle_id,
+            "com.kr.idolludobroard"
+        );
+        // Two installed apps start with it: refuse, listing both.
+        match resolve_for_launch("zeta tool", Some(&phone)) {
+            Err(ResolveError::Ambiguous { candidates }) => assert_eq!(candidates.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // Mid-word fragments, one letter, and the bundle id do not count.
+        for query in ["dol ludo", "i", "kr.idol"] {
+            assert!(
+                matches!(resolve_for_launch(query, Some(&phone)), Err(ResolveError::NotFound { .. })),
+                "{query}"
+            );
         }
     }
 
@@ -760,6 +852,62 @@ mod tests {
             ranked[0].to_json()["store_url"],
             "https://apps.apple.com/cn/app/id392899425"
         );
+    }
+
+    #[test]
+    fn a_product_name_finds_the_app_it_lives_in() {
+        // What the jp storefront answered for "PayPayカード" on 2026-11-02:
+        // PayPay first, then unrelated popular apps.
+        let rows = parse_apple(
+            &json!({"results": [
+                {"trackName":"PayPay","bundleId":"jp.pay2.app.ios","trackId":1435783608,"sellerName":"PAYPAY CORPORATION"},
+                {"trackName":"PayPay銀行","bundleId":"jp.co.japannetbank.smtapp.balance","trackId":1,"sellerName":"PayPay Bank Corporation"},
+                {"trackName":"楽天カード：明細確認アプリ","bundleId":"jp.co.rakuten-card.RakutenCard","trackId":2,"sellerName":"RAKUTEN CARD,INC."},
+                {"trackName":"Instagram","bundleId":"com.burbn.instagram","trackId":3,"sellerName":"Instagram, Inc."},
+                {"trackName":"ChatGPT","bundleId":"com.openai.chat","trackId":4,"sellerName":"OpenAI OpCo, LLC"}
+            ]}),
+            "jp",
+        )
+        .unwrap();
+        let ranked = rank("PayPayカード", Some(&[] as &[Candidate]), &[], &rows);
+        let ids: Vec<&str> = ranked.iter().map(|r| r.candidate.bundle_id.as_str()).collect();
+        assert_eq!(ids, ["jp.pay2.app.ios"], "only the brand prefix, not the rest of the store page");
+        assert!(!ranked[0].exact);
+
+        // The catalog alias makes the card's name an exact match for the app.
+        let ranked = rank("PayPayカード", None, catalog(), &[]);
+        assert_eq!(ranked[0].candidate.bundle_id, "jp.pay2.app.ios");
+        assert!(ranked[0].exact);
+
+        // A suggestion is never a loose launch: the installed name does not
+        // start with the query.
+        let phone = [Candidate {
+            name: "PayPay".into(),
+            aliases: vec![],
+            bundle_id: "jp.pay2.app.ios".into(),
+            source: "installed",
+            system: false,
+            publisher: None,
+            country: None,
+            track_id: None,
+        }];
+        assert!(matches!(
+            resolve_for_launch("PayPay銀行", Some(&phone)),
+            Err(ResolveError::NotFound { .. })
+        ));
+
+        // Only the app's own name is a brand: a short alias is not.
+        let instagram = [Candidate {
+            name: "Instagram".into(),
+            aliases: vec!["IG".into()],
+            bundle_id: "com.burbn.instagram".into(),
+            source: "installed",
+            system: false,
+            publisher: None,
+            country: None,
+            track_id: None,
+        }];
+        assert!(rank("ignite", Some(&instagram), &[], &[]).is_empty());
     }
 
     #[test]

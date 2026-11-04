@@ -2,7 +2,130 @@
 // Pure logic, no XCTest, so runner/unit-check.sh can exercise it on the Mac.
 
 import CoreGraphics
+import CoreFoundation
 import Foundation
+
+/// A synthesis error may follow delivered input. Only capability absence,
+/// established before invoking synthesis, permits another implementation.
+enum GestureDelivery {
+  static func run(
+    _ name: String, synthesisAvailable: Bool,
+    synthesized: () -> String?, fallback: () throws -> Void
+  ) throws -> String {
+    guard synthesisAvailable else {
+      try fallback()
+      return "xcui-coordinate"
+    }
+    if let error = synthesized() {
+      throw RunnerError.failed("\(name) synthesis outcome unknown: \(error); no coordinate fallback attempted")
+    }
+    return "synthesized"
+  }
+}
+
+/// A target-bound tap may execute only at the pose the caller checked.
+struct CheckedElementTap {
+  let expected: CGRect
+  let requestedPoint: CGPoint?
+  let expectedTarget: [String: Any]?
+
+  init(_ body: [String: Any]) throws {
+    guard Set(body.keys).isSubset(of: ["expected_rect", "point", "expected_target"]) else {
+      throw RunnerError.invalidArgument("unknown checked tap field")
+    }
+    if let supplied = body["expected_target"] {
+      guard let target = supplied as? [String: Any], !target.isEmpty,
+            Set(target.keys).isSubset(of: ["identifier", "kind", "label", "label_contains", "value", "focused", "enabled", "visible"]) else {
+        throw RunnerError.invalidArgument("checked target must contain literal locator fields")
+      }
+      for (key, value) in target {
+        if ["focused", "enabled", "visible"].contains(key) {
+          guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            throw RunnerError.invalidArgument("checked target state must be boolean")
+          }
+        } else {
+          guard let text = value as? String, !text.contains("\0"), key != "label_contains" || !text.isEmpty else {
+            throw RunnerError.invalidArgument("checked target text must be literal")
+          }
+        }
+      }
+      expectedTarget = target
+    } else {
+      // Compatibility for older hosts: their frame-only guarantee is unchanged.
+      expectedTarget = nil
+    }
+    func numbers(_ value: Any?, count: Int) throws -> [Double] {
+      guard let values = value as? [Any], values.count == count else {
+        throw RunnerError.invalidArgument("checked tap requires a numeric array")
+      }
+      return try values.map { item in
+        guard let value = item as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite else {
+          throw RunnerError.invalidArgument("checked tap coordinates must be finite numbers")
+        }
+        return value.doubleValue
+      }
+    }
+    let rect = try numbers(body["expected_rect"], count: 4)
+    guard rect[2] > 0, rect[3] > 0 else { throw RunnerError.invalidArgument("checked tap requires a non-empty frame") }
+    expected = CGRect(x: rect[0], y: rect[1], width: rect[2], height: rect[3])
+    if let supplied = body["point"] {
+      let point = try numbers(supplied, count: 2)
+      requestedPoint = CGPoint(x: point[0], y: point[1])
+    } else { requestedPoint = nil }
+  }
+
+  func checkTarget(_ attributes: [String: Any]) throws {
+    guard let expectedTarget else { return }
+    let label = (attributes["label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+      ?? (attributes["name"] as? String) ?? ""
+    let rawType = attributes["type"] as? String ?? ""
+    let kind = rawType.hasPrefix("XCUIElementType") ? String(rawType.dropFirst(15)) : rawType
+    let strings: [String: String?] = ["identifier": attributes["rawIdentifier"] as? String,
+      "kind": kind, "label": label, "value": attributes["value"] as? String]
+    func changed() -> RunnerError {
+      RunnerError(status: 409, code: "target changed", message: "target locator changed; no tap sent")
+    }
+    for (key, wanted) in expectedTarget {
+      if let text = wanted as? String {
+        if key == "label_contains" {
+          guard Data(label.utf8).range(of: Data(text.utf8)) != nil else { throw changed() }
+        } else {
+          if key == "value" {
+            if kind == "SecureTextField" { throw changed() }
+            if let flag = attributes["value_truncated"] {
+              let knownFalse = (flag as? String).map { $0 == "0" || $0 == "false" }
+                ?? (flag as? NSNumber).map { !$0.boolValue } ?? false
+              guard knownFalse else { throw changed() }
+            }
+          }
+          guard let actual = strings[key].flatMap({ $0 }), actual.utf8.elementsEqual(text.utf8) else { throw changed() }
+        }
+      } else {
+        let raw = attributes[["enabled":"isEnabled", "focused":"isFocused", "visible":"isVisible"][key] ?? ""]
+        let actual: Bool?
+        if let text = raw as? String, text == "0" || text == "1" { actual = text == "1" }
+        else if let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() { actual = number.boolValue }
+        else { actual = nil }
+        guard actual == (wanted as? NSNumber)?.boolValue else { throw changed() }
+      }
+    }
+  }
+
+  func point(live: CGRect, screen: CGSize) throws -> CGPoint {
+    let actual = [live.minX, live.minY, live.width, live.height]
+    let wanted = [expected.minX, expected.minY, expected.width, expected.height]
+    guard actual.allSatisfy({ $0.isFinite }), live.width > 0, live.height > 0,
+          zip(actual, wanted).allSatisfy({ pair in abs(pair.0 - pair.1) <= 1 }) else {
+      throw RunnerError(status: 409, code: "target changed", message: "target frame changed; no tap sent")
+    }
+    let point = requestedPoint ?? CGPoint(x: live.midX, y: live.midY)
+    guard point.x >= live.minX, point.x < live.maxX, point.y >= live.minY, point.y < live.maxY,
+          point.x >= 0, point.y >= 0, point.x < screen.width, point.y < screen.height else {
+      throw RunnerError(status: 409, code: "target changed", message: "checked point is no longer valid; no tap sent")
+    }
+    return point
+  }
+}
 
 enum W3CActions {
   static func number(_ object: [String: Any], _ key: String) -> Double? {
@@ -15,6 +138,20 @@ enum W3CActions {
   static let tapHold = 0.05
   /// The shortest hold an explicit pause between down and up gets.
   static let minimumHold = 0.01
+
+  /// Public tap fallback cannot preserve a hold, a delayed start or a drag.
+  static func coordinateTapPoint(_ paths: [[[String: Any]]]) -> CGPoint? {
+    guard paths.count == 1, paths[0].count == 2 else { return nil }
+    let down = paths[0][0], up = paths[0][1]
+    guard down["type"] as? String == "down", up["type"] as? String == "up",
+          up["explicitPointerUp"] as? Bool == true,
+          let x = number(down, "x"), let y = number(down, "y"),
+          let endX = number(up, "x"), let endY = number(up, "y"),
+          let start = number(down, "t"), let end = number(up, "t"),
+          [x, y, endX, endY, start, end].allSatisfy({ $0.isFinite }),
+          x == endX, y == endY, start == 0, end > 0, end <= tapHold else { return nil }
+    return CGPoint(x: x, y: y)
+  }
 
   /// Turns one W3C pointer source's `actions` into touch paths (one per down…up). Moves while the
   /// pointer is down keep their timed endpoints for XCTest to interpolate; a down…up with no time between them is held for
@@ -67,7 +204,9 @@ enum W3CActions {
       case "pointerUp", "pointerCancel":
         if let down = downAt {
           t = max(t, down + (t > down ? minimumHold : tapHold))
-          current.append(step("up", position, t))
+          var up = step("up", position, t)
+          up["explicitPointerUp"] = action["type"] as? String == "pointerUp"
+          current.append(up)
           paths.append(current)
           current = []
           downAt = nil

@@ -28,6 +28,8 @@ pub enum Reason {
     /// The runner exited while the phone stayed connected and unlocked
     /// (most often the volume-key exit).
     Exited,
+    /// The session ended with an invalidated connection; operator intent is unknown.
+    SessionInvalidated,
     /// The person cancelled the passcode prompt for UI automation.
     PasscodeCanceled,
 }
@@ -36,6 +38,7 @@ impl Reason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Exited => "exited",
+            Self::SessionInvalidated => "session_invalidated",
             Self::PasscodeCanceled => "passcode_canceled",
         }
     }
@@ -52,6 +55,21 @@ pub fn park(state_dir: &Path, reason: Reason) -> std::io::Result<()> {
 
 pub fn parked(state_dir: &Path) -> bool {
     state_dir.join(PARKED_FILE).exists()
+}
+
+/// The recorded evidence, independent of whether the marker exists. Unknown
+/// or damaged contents still park the runner but do not claim a phone-side exit.
+pub fn reason(state_dir: &Path) -> Option<Reason> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(state_dir.join(PARKED_FILE)).ok()?.take(65).read_to_string(&mut text).ok()?;
+    if text.len() > 64 { return None; }
+    match text.trim() {
+        "exited" => Some(Reason::Exited),
+        "passcode_canceled" => Some(Reason::PasscodeCanceled),
+        "session_invalidated" => Some(Reason::SessionInvalidated),
+        _ => None,
+    }
 }
 
 pub fn clear_parked(state_dir: &Path) {
@@ -77,6 +95,24 @@ pub fn set_handoff(state_dir: &Path, active: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidated_and_unknown_markers_stay_parked_without_phone_exit_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        park(dir.path(), Reason::SessionInvalidated).unwrap();
+        assert!(parked(dir.path()));
+        assert_eq!(reason(dir.path()), Some(Reason::SessionInvalidated));
+        assert!(!handoff(dir.path()));
+        std::fs::write(dir.path().join(PARKED_FILE), "unknown").unwrap();
+        assert!(parked(dir.path()));
+        assert_eq!(reason(dir.path()), None);
+        std::fs::write(dir.path().join(PARKED_FILE), "x".repeat(100)).unwrap();
+        assert_eq!(reason(dir.path()), None);
+        park(dir.path(), Reason::Exited).unwrap();
+        assert_eq!(reason(dir.path()), Some(Reason::Exited));
+        park(dir.path(), Reason::PasscodeCanceled).unwrap();
+        assert_eq!(reason(dir.path()), Some(Reason::PasscodeCanceled));
+    }
 
     #[test]
     fn persistence_errors_preserve_passcode_handoff() {

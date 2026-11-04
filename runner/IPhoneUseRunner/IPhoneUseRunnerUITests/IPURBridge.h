@@ -29,6 +29,8 @@ FOUNDATION_EXPORT NSString *const IPURTreeExtensionCallsKey; // NSNumber: re-roo
 FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 
 @interface IPURBridge : NSObject
++ (BOOL)systemScreenshotAvailable NS_SWIFT_NAME(systemScreenshotAvailable());
++ (NSDictionary *)requestSystemScreenshot NS_SWIFT_NAME(requestSystemScreenshot());
 
 /// Turns every XCTest quiescence / idle wait into a no-op for the whole process
 /// (XCUIApplicationProcess waitForQuiescence…, XCAXClient_iOS
@@ -74,6 +76,12 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 + (nullable id)systemApplicationElement;
 
 /// Pid of an XCAccessibilityElement, or 0.
++ (BOOL)sameAXElement:(id)left other:(id)right NS_SWIFT_NAME(sameAXElement(_:_:));
++ (BOOL)focusRecoveryAvailable;
++ (nullable NSString *)synthesizeFocusTapForAXElement:(id)element atPoint:(CGPoint)point pid:(int)pid
+  allowDispatch:(BOOL (NS_NOESCAPE ^)(void))allowDispatch
+  NS_SWIFT_NAME(synthesizeFocusTap(forAXElement:at:pid:allowDispatch:));
+
 + (int)pidForAXElement:(id)element;
 
 /// Bundle id of a running process, via XCUIDevice.applicationMonitor
@@ -102,6 +110,34 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 
 // MARK: - Accessibility tree
 
+/// Fetches the full AX Value attribute rather than the snapshot's truncated value.
+/// Returned strings are clipped only at scalar boundaries; metadata uses UTF-16 units.
++ (nullable NSDictionary<NSString *, id> *)readValueForAXElement:(id)element
+                                               maxUTF16Length:(NSUInteger)limit
+                                                  placeholder:(nullable NSString *)placeholder
+                                                        error:(NSString *_Nullable *_Nullable)error
+  NS_SWIFT_NAME(readValue(for:maxUTF16:placeholder:error:));
+
+
+/// Read the live value length and selected UTF-16 range, without changing selection.
++ (nullable NSDictionary<NSString *, NSNumber *> *)textSelectionForAXElement:(id)element
+                                                                    error:(NSString *_Nullable *_Nullable)error
+    NS_SWIFT_NAME(textSelection(for:error:));
+/// A bounded deletion plan for the current AX selection/value (100 UTF-16 units max).
+/// Returns only deletion keys, never field text. Nil selects no mutation path.
++ (nullable NSString *)shortClearKeysForAXElement:(id)element
+                                           error:(NSString *_Nullable *_Nullable)error
+    NS_SWIFT_NAME(shortClearKeys(for:error:));
+/// Target Select All at the original process, then verify its AX value/range.
+/// Acknowledged no-effect returns private retry state; synthesis/read errors do not.
+/// Retry state is internal only and must never be serialized or logged.
++ (nullable NSDictionary<NSString *, id> *)selectAllTextForAXElement:(id)element
+                                                               pid:(int)pid
+                                                        retryState:(nullable NSDictionary<NSString *, id> *)retryState
+                                                             error:(NSString *_Nullable *_Nullable)error
+    NS_SWIFT_NAME(selectAllText(for:pid:retryState:error:));
+
+
 /// Snapshots `axElement` through XCAXClient_iOS requestSnapshotForElement:attributes:parameters:error:
 /// with only nine attributes, walking a depth ladder on kAXErrorIllegalArgument and re-rooting
 /// depth-capped frontier nodes (bounded by `extensionCallLimit`). The root is serialized into
@@ -121,6 +157,10 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
                                    extensionCallLimit:(NSInteger)extensionCallLimit
                                           rememberKey:(nullable NSString *)rememberKey
                                       includeElements:(BOOL)includeElements;
+
+/// Optional, element-only AX editable attribute. nil means unavailable, never true.
++ (nullable NSNumber *)editableStateForAXElement:(id)element
+    NS_SWIFT_NAME(editableState(for:));
 
 /// Serializes an already-taken snapshot (public XCUIElementSnapshot or private XCElementSnapshot)
 /// into runner's /source node shape.
@@ -156,6 +196,8 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 /// "Hold" (the records' scheduled length) and "Calls". Empty when nothing was synthesized. Resets.
 + (NSDictionary<NSString *, NSNumber *> *)takeSynthesisTiming;
 
+/// Probe before selecting an input path; an error after synthesis starts never permits replay.
++ (BOOL)textSynthesisAvailable;
 /// Types into whatever holds keyboard focus. `charactersPerSecond` 0 → 60.
 + (nullable NSString *)synthesizeText:(NSString *)text
                   charactersPerSecond:(NSUInteger)charactersPerSecond

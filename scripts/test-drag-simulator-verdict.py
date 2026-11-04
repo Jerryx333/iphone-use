@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Device-free checks of the simulator gesture acceptance verdict."""
 import copy
+import io
 import importlib.util
 from pathlib import Path
 import unittest
@@ -15,6 +16,60 @@ spec.loader.exec_module(check)
 
 
 class VerdictTests(unittest.TestCase):
+    def test_scroll_touch_down_uses_independent_table_geometry_without_reducing_travel(self):
+        record={"window_size":[402,874],"table_rect":[0,246,402,542]}
+        x,y=check.input_scroll_anchor(record)
+        travel=300*1.5
+        start=y*874+travel/2
+        end=y*874-travel/2
+        self.assertEqual(x,.5)
+        self.assertTrue(246<start<788)
+        self.assertGreaterEqual(end,44)
+        self.assertEqual(start-end,travel)
+        self.assertGreater(.65*874+travel/2,788)
+        for bad in [{},dict(record,table_rect=[0,0,10,10]),dict(record,window_size=[402,float('nan')])]:
+            with self.assertRaises(RuntimeError):check.input_scroll_anchor(bad)
+
+    def busy_error(self, payload=None, code=504):
+        if payload is None:
+            payload = {"error":"runner_source_timeout","runner_busy":True,"retry_after_secs":2}
+        return check.urllib.error.HTTPError("http://127.0.0.1/agent/elements", code, "busy", None,
+            io.BytesIO(json.dumps(payload).encode()))
+
+    def test_busy_read_retries_once_and_returns_the_fresh_response(self):
+        fresh = {"snapshot":"fresh","elements":[{"identifier":"gesture-result","value":"new"}]}
+        with patch.object(check.urllib.request, "urlopen", side_effect=[self.busy_error(), io.BytesIO(json.dumps(fresh).encode())]) as opened, patch.object(check.time, "sleep") as sleep:
+            result = check.Daemon("http://127.0.0.1:1", "fixture").call("/agent/elements")
+        self.assertEqual(result, fresh)
+        self.assertEqual([call.args[0].get_method() for call in opened.call_args_list], ["GET","GET"])
+        sleep.assert_called_once_with(2)
+
+    def test_busy_action_is_not_replayed(self):
+        with patch.object(check.urllib.request, "urlopen", side_effect=self.busy_error()) as opened, patch.object(check.time, "sleep") as sleep:
+            with self.assertRaises(check.urllib.error.HTTPError):
+                check.Daemon("http://127.0.0.1:1", "fixture").call("/agent/actions", {"steps":[]})
+        opened.assert_called_once()
+        self.assertEqual(opened.call_args.args[0].get_method(), "POST")
+        sleep.assert_not_called()
+
+    def test_busy_read_stops_after_one_retry(self):
+        with patch.object(check.urllib.request, "urlopen", side_effect=[self.busy_error(),self.busy_error()]) as opened, patch.object(check.time, "sleep") as sleep:
+            with self.assertRaises(check.urllib.error.HTTPError):
+                check.Daemon("http://127.0.0.1:1", "fixture").call("/agent/elements")
+        self.assertEqual(opened.call_count,2)
+        sleep.assert_called_once_with(2)
+
+    def test_unrecognized_or_unbounded_errors_are_not_retried(self):
+        for payload, code in [({"error":"runner_source_failed"},504),
+                ({"error":"runner_source_timeout","runner_busy":True,"retry_after_secs":61},504),
+                ({"error":"runner_source_timeout","runner_busy":True,"retry_after_secs":True},504),
+                ({"error":"runner_source_timeout","runner_busy":True,"retry_after_secs":2},423)]:
+            with self.subTest(payload=payload,code=code), patch.object(check.urllib.request, "urlopen", side_effect=self.busy_error(payload,code)) as opened, patch.object(check.time, "sleep") as sleep:
+                with self.assertRaises(check.urllib.error.HTTPError):
+                    check.Daemon("http://127.0.0.1:1", "fixture").call("/agent/elements")
+                opened.assert_called_once()
+                sleep.assert_not_called()
+
     def test_scroll_ack_without_the_right_selection_is_not_a_pass(self):
         record = {"run_id": "fresh", "selections": [8], "offset_y": 439}
         self.assertEqual(check.judge_input(record, "fresh", "scroll", 8), [])

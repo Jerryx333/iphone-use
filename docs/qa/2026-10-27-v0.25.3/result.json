@@ -1,0 +1,150 @@
+{
+  "release": {
+    "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.25.3",
+    "published_at": "2026-10-26T12:00:47Z",
+    "checksums": {
+      "browser-use-bridge-macos-universal.tar.gz": "2b6785b8fa1bb2a89f89648e00546ecf4697b65bb36ebefc1d63d65f3e9fe438",
+      "iPhoneUse.app.zip": "2ddcb7bb39913844e4409f23a9b834863e11f36a0d5ca3f8037651586ae949cb",
+      "iphone-use-app.tar.gz": "3877e0ea7682dd76253f3c0bedddb53b18cd2301ce825191367b718263472760",
+      "iphone-use-mcp-macos-universal.tar.gz": "ec7c1676ee02fa21a393e91cb0474e6406bfcfb8171761bfeb56196e2bd9e6d9",
+      "iphone-use-runner.tar.gz": "9a258d37f1ee0828f27dcc4bea5e1c20d87af11a76f2c9d79a56de050cb38ba6"
+    },
+    "app_version": "0.25.3",
+    "cli_version": "iphone-use 0.25.3",
+    "codesign_verified": true,
+    "notarized_developer_id": true,
+    "stapled_ticket_verified": true,
+    "architectures": {
+      "iphone-use": [
+        "x86_64",
+        "arm64"
+      ],
+      "iphone-use-mcp": [
+        "x86_64",
+        "arm64"
+      ],
+      "iphone-use-legacy-launch": [
+        "x86_64",
+        "arm64"
+      ]
+    },
+    "embedded_mcp": {
+      "version": "0.25.3",
+      "tools": 39,
+      "names": [
+        "phone_app_notes",
+        "phone_apps",
+        "phone_capabilities",
+        "phone_collect_list",
+        "phone_crashes",
+        "phone_elements",
+        "phone_flow_draft",
+        "phone_flow_info",
+        "phone_flow_list",
+        "phone_flow_publish",
+        "phone_flow_report",
+        "phone_flow_run",
+        "phone_flow_update",
+        "phone_hold",
+        "phone_home_layout",
+        "phone_install_app",
+        "phone_instances",
+        "phone_jev_run",
+        "phone_key",
+        "phone_login",
+        "phone_logs",
+        "phone_reconnect",
+        "phone_record",
+        "phone_release_owner",
+        "phone_run_end",
+        "phone_run_start",
+        "phone_run_steps",
+        "phone_screen",
+        "phone_screen_frame",
+        "phone_screenshot",
+        "phone_scroll",
+        "phone_scroll_find",
+        "phone_set_location",
+        "phone_shortcut",
+        "phone_status",
+        "phone_tap",
+        "phone_tap_element",
+        "phone_tap_label",
+        "phone_type"
+      ]
+    },
+    "standalone_mcp_matches": true,
+    "standalone_mcp_codesign_verified": true,
+    "standalone_mcp_architectures": [
+      "x86_64",
+      "arm64"
+    ],
+    "runner_sources_match_tag": {
+      "IPURBridge.h": "4f3af589eca4f8cf69519a36e890c773a472c4b96ea6e54d26cfa01ca3e31130",
+      "IPURBridge.m": "45805f81c6864b2e7bfa00e1902cc53fcd9d60f5d372d12d42c88d4dc5e2f66d",
+      "RunnerExitNotice.swift": "2159c2eca0ced5a9caee9c28f2bbf7e7ba082e05d0b07abcfeb1d52461d1deae",
+      "RunnerTests.swift": "b690fa24ff0cf931645294e47162bacfaa12ecea82b8030c561789eda6dbb241"
+    },
+    "installed": false,
+    "physical_acceptance": false
+  },
+  "installed": {
+    "app_version": "0.25.3",
+    "installed_binary_matches_download": true,
+    "runtime_instances": [
+      {
+        "instance": "default",
+        "version": "0.25.3",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": false,
+        "runner_parked": false,
+        "runner_parked_reason": null,
+        "drivable": false,
+        "runner_build_state": "stopped"
+      },
+      {
+        "instance": "i13",
+        "version": "0.25.3",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": true,
+        "runner_parked": true,
+        "runner_parked_reason": "exited",
+        "drivable": false,
+        "runner_build_state": "stopped"
+      }
+    ],
+    "iPhone17_target_preserved": true,
+    "i13_phone_ended_marker_preserved": true,
+    "ui_setup_requested": false
+  },
+  "installed_mcp": {
+    "installed_mcp_version": "0.25.3",
+    "tools": 39,
+    "environment_proxy_points_to_closed_port": true,
+    "real_instances_read_only": [
+      {
+        "instance": "default",
+        "version": "0.25.3",
+        "released": true,
+        "runner_parked": false,
+        "runner_parked_reason": null,
+        "drivable": false
+      },
+      {
+        "instance": "i13",
+        "version": "0.25.3",
+        "released": true,
+        "runner_parked": true,
+        "runner_parked_reason": "exited",
+        "drivable": false
+      }
+    ],
+    "i13_phone_ended_marker_preserved": true,
+    "ui_input_sent": false,
+    "reconnect_requested": false
+  },
+  "mcp_registry_version": "0.25.3",
+  "plugin_marketplace_version": "0.25.3"
+}

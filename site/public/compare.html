@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iphone-use 对比 mobile-mcp、Appium 和 iPhone MCP</title>
+  <meta name="description" content="iphone-use 与 agent-device、Mobile MCP、Appium XCUITest 及其他 iPhone MCP 服务的对比：支持设备、真机接入方式、接口和许可证。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/compare" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/compare" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/compare" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/compare" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="iphone-use 对比 mobile-mcp、Appium 和 iPhone MCP" />
+  <meta property="og:description" content="iphone-use 与 agent-device、Mobile MCP、Appium XCUITest 及其他 iPhone MCP 服务的对比：支持设备、真机接入方式、接口和许可证。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/compare" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="iphone-use 对比 mobile-mcp、Appium 和 iPhone MCP" />
+  <meta name="twitter:description" content="iphone-use 与 agent-device、Mobile MCP、Appium XCUITest 及其他 iPhone MCP 服务的对比：支持设备、真机接入方式、接口和许可证。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/"},{"@type":"ListItem","position":2,"name":"iphone-use 和其他 iPhone 自动化方案对比","item":"https://iphone-use.leeguoo.com/compare"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"iphone-use 和其他 iPhone 自动化方案对比","description":"iphone-use 与 agent-device、Mobile MCP、Appium XCUITest 及其他 iPhone MCP 服务的对比：支持设备、真机接入方式、接口和许可证。","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/compare","mainEntityOfPage":"https://iphone-use.leeguoo.com/compare","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="compare" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item active" aria-current="page" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">开始</p>
+
+      <div class="du-title-row">
+        <h1>iphone-use 和其他 iPhone 自动化方案对比</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        让 agent 或测试操作 iPhone 的项目有好几个。它们的区别在于<span class="mark">面向什么设备</span>、怎么连到真机、拿来做什么。
+        这里只比较事实，不排名次。
+      </p>
+      <p class="du-asof">2026-10-27 核对，依据各项目自己的 README。项目会更新，以链接里的当前状态为准。</p>
+
+      <h2>一览</h2>
+      <table class="du-compare">
+        <thead><tr><th>项目</th><th>支持的设备</th><th>真机接入方式</th><th>接口</th><th>宿主要求</th><th>许可证</th></tr></thead>
+        <tbody>
+          <tr><td>iphone-use</td><td>真实 iPhone（iOS 15+）；iOS 模拟器（预览）</td><td>自研 XCTest runner，走 USB 或加密 Wi-Fi 隧道</td><td>MCP、HTTP API、CLI、网页、iOS App</td><td>Mac，macOS 15+，Xcode</td><td>PolyForm Shield 1.0.0（源码可见）</td></tr>
+          <tr><td><a href="https://github.com/callstack/agent-device">agent-device</a></td><td>iOS、Android、HarmonyOS（模拟器、仿真器、真机）、电视平台、Web、macOS、Linux</td><td>iOS 交互和 iOS 真机用 XCTest</td><td>CLI、MCP server、带类型的 Node.js API</td><td>Node.js 22.12+</td><td>MIT</td></tr>
+          <tr><td><a href="https://github.com/mobile-next/mobile-mcp">Mobile MCP</a></td><td>iOS 和 Android：模拟器、仿真器、真机；通过 Mobile Next Cloud 接云设备</td><td>USB 连接并已信任的设备；基于 mobilecli</td><td>MCP</td><td>Node.js 20+、Xcode 命令行工具、Android platform tools</td><td>Apache-2.0</td></tr>
+          <tr><td><a href="https://github.com/appium/appium-xcuitest-driver">Appium XCUITest driver</a></td><td>iOS、iPadOS、tvOS；watchOS（仅模拟器）</td><td>通过 WebDriverAgent 调用 Apple XCTest</td><td>WebDriver（Appium）</td><td>Appium 3（driver 10.0.0 起）</td><td>Apache-2.0</td></tr>
+          <tr><td><a href="https://github.com/blitzdotdev/iPhone-mcp">blitzdotdev/iPhone-mcp</a></td><td>真实 iPhone 和模拟器</td><td>在手机上构建并安装 WebDriverAgent；USB 或同一 Wi-Fi</td><td>MCP、浏览器实时画面（真机）</td><td>macOS、Xcode、Node.js 18+、Homebrew</td><td>MIT</td></tr>
+          <tr><td><a href="https://github.com/emazaheri/ios-agent">ios-agent</a></td><td>iOS 模拟器或真实 iPhone，有线或 Wi-Fi</td><td>WebDriverAgent；真机用 go-ios</td><td>终端程序、MCP、Python 库</td><td>macOS、Xcode 16.3+、Python 3.12+</td><td>MIT</td></tr>
+          <tr><td><a href="https://github.com/Lakr233/iphone-mcp">Lakr233/iphone-mcp</a></td><td>按 UDID 指定的真实 iPhone</td><td>Appium + XCUITest driver + WebDriverAgent</td><td>MCP（streamable HTTP）</td><td>Python 3.8+、Node.js、Xcode</td><td>MIT</td></tr>
+        </tbody>
+      </table>
+      <p>同样来自这些 README：WebDriverAgent 仓库说明开发已迁到 <a href="https://github.com/appium/appium-ios">appium-ios monorepo</a>。GitHub 上看到的最近推送：blitzdotdev/iPhone-mcp 为 2026-04-01，Lakr233/iphone-mcp 为 2025-09-01。</p>
+
+      <h2>iphone-use 侧重什么</h2>
+      <ul>
+        <li><strong>你自己的真实 iPhone 和上面已有的 App</strong>，带着登录状态：健康、银行、聊天 App、你在测的 App。手机由你 Mac 上的守护进程托管。</li>
+        <li><strong>自研 XCTest 设备 runner</strong>，从 v0.14.0 起取代 WebDriverAgent，保留 WebDriverAgent 的 HTTP API。发给它的请求按每次启动签名。</li>
+        <li><strong>明确的动作结果</strong>：已执行、没发出去或不确定，附带 <code>retry_safe</code>；点到被遮住的元素会被拒绝。</li>
+        <li><strong>确定性的 flow 重放</strong>，来自经过审阅的 <a href="/flows">flow 源</a>，不经过模型。</li>
+        <li><strong>人和 agent 共用一台手机</strong>：网页和 iOS App 远程控制，同一时间只有一个使用者。</li>
+        <li>宿主是 Mac，操作的是 iPhone（以及预览中的 iOS 模拟器），不支持 Android 设备。</li>
+      </ul>
+
+      <h2>怎么选</h2>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">📱</span> 在自己的 iPhone 上用日常 App</div>
+          <p>从没有 API 的 App 里读数据，你能看着、能随时接手：这是 iphone-use 的设计目标。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🤝</span> 一个工具同时管 iOS 和 Android</div>
+          <p>agent-device 和 Mobile MCP 都覆盖 iOS 和 Android 的模拟器与真机，也能接设备云。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🧪</span> 维护一套 WebDriver 测试</div>
+          <p>Appium 加 XCUITest driver 是成熟的 WebDriver 生态，适合跨平台端到端测试。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🐍</span> 自带循环的 Python agent</div>
+          <p>ios-agent 提供终端 agent、MCP server 和 Python 库，支持 iOS 模拟器和真实 iPhone。</p>
+        </div>
+      </div>
+
+      <h2>一组实测对比</h2>
+      <div class="du-callout note">
+        <div class="du-callout-title">ℹ️ 维护者实测，不是第三方评测</div>
+        iphone-use 的 README 记录了同一台 iPhone 13、USB 连接下的结果（2026 年 10 月）：读屏 iphone-use runner 用 0.08–0.135 秒，
+        agent-device 约 0.7 秒；点击并等画面稳定分别是 1.0 秒和 2.8–3.3 秒。本页其他工具没有被项目实测过。比较速度需要同一台设备、
+        同样的操作和同样的等待条件。
+      </div>
+
+      <p>这些项目都在持续更新，本页事实可能过时。发现不对的地方，欢迎<a href="https://github.com/leeguooooo/iphone-use/issues">提 issue</a>。iphone-use 的实现细节见<a href="/how-it-works">它怎么工作</a>。</p><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/compare" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

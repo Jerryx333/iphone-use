@@ -14,8 +14,9 @@ final class UINode {
   private(set) var children: [UINode] = []
   private(set) weak var parent: UINode?
   let pid: Int32
+  let treeComplete: Bool
 
-  init(raw: [String: Any], parent: UINode?, pid: Int32) {
+  init(raw: [String: Any], parent: UINode?, pid: Int32, treeComplete: Bool = false) {
     var attributes = raw
     attributes.removeValue(forKey: "children")
     let element = attributes.removeValue(forKey: IPURNodeAXElementKey)
@@ -23,6 +24,7 @@ final class UINode {
     self.axElement = element as AnyObject?
     self.parent = parent
     self.pid = pid
+    self.treeComplete = parent?.treeComplete ?? treeComplete
     children = (raw["children"] as? [[String: Any]] ?? []).map { UINode(raw: $0, parent: self, pid: pid) }
   }
 
@@ -32,10 +34,28 @@ final class UINode {
   var name: String? { identifier ?? label }
   var value: String? { attributes["value"] as? String }
   var placeholder: String? { nonEmpty(attributes["placeholderValue"]) }
-  var isEnabled: Bool { attributes["isEnabled"] as? String != "0" }
-  var isFocused: Bool { attributes["isFocused"] as? String == "1" }
-  /// Only selected nodes carry the key (see IPURSerialize).
-  var isSelected: Bool { attributes["isSelected"] as? String == "1" }
+  var isEnabled: Bool? { booleanState("isEnabled") }
+  var editableState: Bool? { booleanState("isEditable") }
+  var focusedState: Bool? { booleanState("isFocused") }
+  /// Convenience for positive focus evidence; false does not establish absence.
+  var isFocused: Bool { focusedState == true }
+  var isSelected: Bool? { booleanState("isSelected") }
+
+  private func booleanState(_ key: String) -> Bool? {
+    if let text = attributes[key] as? String {
+      switch text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "0", "false": return false
+      case "1", "true": return true
+      default: return nil
+      }
+    }
+    if let number = attributes[key] as? NSNumber {
+      guard ["c", "C", "s", "S", "i", "I", "l", "L", "q", "Q", "B"].contains(String(cString: number.objCType)) else { return nil }
+      if number.doubleValue == 0 { return false }
+      if number.doubleValue == 1 { return true }
+    }
+    return nil
+  }
 
   var rect: CGRect {
     let r = attributes["rect"] as? [String: Any] ?? [:]
@@ -76,14 +96,18 @@ final class UINode {
     ]
     var object: [String: Any] = [
       "type": type, "wdType": type, "elementType": RunnerElementTypes.rawValue(of: type),
-      "enabled": isEnabled, "isEnabled": isEnabled, "wdEnabled": isEnabled,
       "visible": visible, "isVisible": visible, "wdVisible": visible,
       "accessible": true, "isAccessible": true, "wdAccessible": true,
-      "focused": isFocused, "hasFocus": isFocused, "isFocused": isFocused, "wdFocused": isFocused,
-      "selected": isSelected, "isSelected": isSelected, "wdSelected": isSelected,
       "rect": rectDictionary, "wdRect": rectDictionary, "frame": rectDictionary,
       "hittable": visible, "isHittable": visible, "wdHittable": visible,
     ]
+    for (state, aliases) in [
+      (isEnabled, ["enabled", "isEnabled", "wdEnabled"]),
+      (focusedState, ["focused", "hasFocus", "isFocused", "wdFocused"]),
+      (isSelected, ["selected", "isSelected", "wdSelected"]),
+    ] {
+      if let state { for alias in aliases { object[alias] = state } }
+    }
     if let name { object["name"] = name; object["wdName"] = name }
     if let label { object["label"] = label; object["wdLabel"] = label }
     if let value { object["value"] = value; object["wdValue"] = value }
@@ -96,6 +120,52 @@ final class UINode {
   private func nonEmpty(_ value: Any?) -> String? {
     guard let string = value as? String, !string.isEmpty else { return nil }
     return string
+  }
+}
+
+/// Read-only polling of a retained element, never a screen snapshot or an input retry.
+/// A sample budget bounds AX calls; a slow synchronous AX call cannot be interrupted.
+enum ElementFrameStability {
+  static func observe(
+    read: () throws -> UINode, wait: () -> Void,
+    now: () -> Double = { ProcessInfo.processInfo.systemUptime }
+  ) throws -> (node: UINode, stable: Bool?, samples: Int) {
+    let deadline = now() + 0.2
+    var previous = try read()
+    guard valid(previous.rect) else { return (previous, nil, 1) }
+    for sample in 2...4 {
+      guard now() < deadline else { return (previous, sample > 2 ? false : nil, sample - 1) }
+      wait()
+      guard now() < deadline else { return (previous, sample > 2 ? false : nil, sample - 1) }
+      let current = try read()
+      guard valid(current.rect) else { return (current, nil, sample) }
+      let sameTarget = previous.pid == current.pid && previous.type == current.type
+        && previous.identifier == current.identifier
+      if !sameTarget { throw RunnerError.staleElement("element changed while observing its frame") }
+      if close(previous.rect, current.rect) { return (current, true, sample) }
+      previous = current
+    }
+    return (previous, false, 4)
+  }
+
+  static func valid(_ rect: CGRect) -> Bool {
+    [rect.minX, rect.minY, rect.width, rect.height].allSatisfy { $0.isFinite }
+      && rect.width > 0 && rect.height > 0
+  }
+
+  static func close(_ a: CGRect, _ b: CGRect) -> Bool {
+    zip([a.minX, a.minY, a.width, a.height], [b.minX, b.minY, b.width, b.height])
+      .allSatisfy { abs($0 - $1) <= 0.5 }
+  }
+
+  /// Missing AX state remains unknown. Focus/value checks still establish text routing.
+  static func requireState(_ node: UINode, editable: Bool?, editing: Bool) throws {
+    if node.isEnabled == false {
+      throw RunnerError(status: 400, code: "invalid element state", message: "element is disabled; nothing was sent")
+    }
+    if editing && editable == false {
+      throw RunnerError(status: 400, code: "invalid element state", message: "element is not editable; nothing was sent")
+    }
   }
 }
 
@@ -310,6 +380,54 @@ struct ClassChain {
   }
 }
 
+/// A retained live AX handle, rather than a label or rectangle, authorizes input.
+enum InputTargetCheck {
+  static func focusPointOccluded(target: UINode, root: UINode, point: CGPoint) -> Bool {
+    var ancestors = Set<ObjectIdentifier>()
+    var parent = target.parent
+    while let node = parent { ancestors.insert(ObjectIdentifier(node)); parent = node.parent }
+    let actionable: Set<String> = ["XCUIElementTypeButton", "XCUIElementTypeLink", "XCUIElementTypeCell",
+      "XCUIElementTypeTextField", "XCUIElementTypeSecureTextField", "XCUIElementTypeSearchField",
+      "XCUIElementTypeTextView", "XCUIElementTypeSwitch", "XCUIElementTypeSlider", "XCUIElementTypeStepper",
+      "XCUIElementTypePickerWheel", "XCUIElementTypeDatePicker", "XCUIElementTypeKey", "XCUIElementTypeAlert",
+      "XCUIElementTypeSheet", "XCUIElementTypePopover", "XCUIElementTypeMenu", "XCUIElementTypeMenuItem"]
+    return ([root] + root.descendants()).contains { node in
+      node !== target && !ancestors.contains(ObjectIdentifier(node)) && node.rect.contains(point)
+        && (actionable.contains(node.type) || (node.type == "XCUIElementTypeOther" && node.label != nil && node.children.isEmpty))
+    }
+  }
+
+  static func replacementRefusal(original: UINode, current: UINode,
+      foregroundPID: Int32, visible: Bool, bindingMatches: Bool, requireFocus: Bool) -> String? {
+    guard bindingMatches else { return "replacement_binding_changed" }
+    guard original.pid == current.pid, original.type == current.type,
+          original.identifier == current.identifier,
+          original.identifier != nil || original.label == current.label else {
+      return "replacement_identity_changed"
+    }
+    guard visible else { return "replacement_target_not_visible" }
+    return refusal(type: current.type, focused: !requireFocus || current.isFocused,
+      enabled: current.isEnabled, pid: current.pid, foregroundPID: foregroundPID,
+      live: current.axElement != nil)
+  }
+
+  static func preservesBinding(path: String, binding: String?, body: [String: Any]) -> Bool {
+    guard let binding, body["inputTarget"] as? String == binding else { return false }
+    return path.hasSuffix("/wda/keys") || path.hasSuffix("/element/\(binding)/clear")
+  }
+
+  static func refusal(type: String, focused: Bool, enabled: Bool?, pid: Int32,
+                      foregroundPID: Int32, live: Bool) -> String? {
+    guard live else { return "input_target_unreadable" }
+    guard pid > 0, foregroundPID == pid else { return "input_target_app_changed" }
+    guard type != "XCUIElementTypeSecureTextField" else { return "input_target_secure_field_requires_human" }
+    guard ["XCUIElementTypeTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"].contains(type)
+    else { return "input_target_not_editable" }
+    guard enabled == true, focused else { return "input_target_focus_changed" }
+    return nil
+  }
+}
+
 // MARK: - Registry
 
 /// Element ids handed out by the find routes, runner style. Entries keep the node they were found
@@ -341,6 +459,15 @@ final class ElementRegistry {
   }
 
   func node(_ id: String) -> UINode? { entries[id]?.node }
+
+  /// Only acknowledged activity on a still-live handle can extend its lifetime.
+  func renew(_ id: String, node: UINode, now: Date = Date()) {
+    guard let entry = entries[id], now.timeIntervalSince(entry.at) <= Self.maxAgeSeconds else { return }
+    entries[id] = (node, now)
+    order.removeAll { $0 == id }
+    order.append(id)
+  }
+
 
   /// Drops ids registered more than `maxAgeSeconds` before `now` (order is registration order).
   func prune(now: Date = Date()) {

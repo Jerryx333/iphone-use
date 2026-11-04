@@ -70,6 +70,61 @@ do {
   check(scenario([false], activateFails: true) == ["press", "activate", "error"], "activation failure propagates")
 }
 
+// MARK: Gesture delivery and non-replay
+
+do {
+  var calls: [String] = []
+  let native = try GestureDelivery.run("tap", synthesisAvailable: true, synthesized: {
+    calls.append("delivered"); return nil
+  }, fallback: { calls.append("fallback") })
+  check(native == "synthesized" && calls == ["delivered"], "successful synthesis acts exactly once")
+
+  for error in ["timeout after delivery", "private XCTest event synthesis failed: could not create event record",
+                "private XCTest event synthesis unavailable (XCSynthesizedEventRecord / XCPointerEventPath)"] {
+    calls = []
+    expectThrows("unknown error", "a synthesis error never authorizes gesture replay") {
+      _ = try GestureDelivery.run("tap", synthesisAvailable: true, synthesized: {
+        calls.append("delivered"); return error
+      }, fallback: { calls.append("fallback") })
+    }
+    check(calls == ["delivered"], "error text cannot promote a possibly delivered gesture to safe fallback")
+  }
+  calls = []
+  let fallback = try GestureDelivery.run("tap", synthesisAvailable: false, synthesized: {
+    calls.append("synthesis"); return nil
+  }, fallback: { calls.append("fallback") })
+  check(fallback == "xcui-coordinate" && calls == ["fallback"], "missing capability selects public input before synthesis")
+  calls = []
+  expectThrows("unknown error", "coordinate failure is preserved without synthesis retry") {
+    _ = try GestureDelivery.run("tap", synthesisAvailable: false, synthesized: {
+      calls.append("synthesis"); return nil
+    }, fallback: { calls.append("fallback"); throw RunnerError.failed("coordinate timeout") })
+  }
+  check(calls == ["fallback"], "failed public input is never retried")
+
+  let down: [String: Any] = ["type":"down", "x":20.0, "y":30.0, "t":0.0]
+  let up: [String: Any] = ["type":"up", "x":20.0, "y":30.0, "t":0.05, "explicitPointerUp":true]
+  check(W3CActions.coordinateTapPoint([[down,up]]) == CGPoint(x:20,y:30), "plain W3C tap retains public fallback")
+  let start: [[String: Any]] = [
+    ["type":"pointerMove", "x":20.0, "y":30.0], ["type":"pointerDown"]
+  ]
+  for ending in ["pointerUp", "pointerCancel", "missing"] {
+    let actions = start + (ending == "missing" ? [] : [["type":ending]])
+    let paths = try W3CActions.pointerPaths(actions) { _ in .zero }
+    check((W3CActions.coordinateTapPoint(paths) != nil) == (ending == "pointerUp"),
+          "only explicit pointerUp permits tap fallback: \(ending)")
+  }
+  var held = up; held["t"] = 1.5
+  check(W3CActions.coordinateTapPoint([[down,held]]) == nil, "long hold cannot become a public tap")
+  var delayed = down; delayed["t"] = 0.02
+  check(W3CActions.coordinateTapPoint([[delayed,up]]) == nil, "delayed input cannot silently lose its pause")
+  var moved = up; moved["x"] = 40.0
+  check(W3CActions.coordinateTapPoint([[down,moved]]) == nil, "moving touch cannot become a public tap")
+  check(W3CActions.coordinateTapPoint([[down,up],[down,up]]) == nil, "multiple touches cannot collapse to one tap")
+  var invalid = up; invalid["t"] = Double.nan
+  check(W3CActions.coordinateTapPoint([[down,invalid]]) == nil, "nonfinite gesture cannot select public fallback")
+}
+
 // MARK: HTTP
 
 do {
@@ -776,6 +831,18 @@ do {
   check(registry.node(fresh) != nil, "a recent id survives the prune")
   for _ in 0..<20 { _ = registry.register(tree, now: start.addingTimeInterval(66)) }
   check(registry.count <= 8, "the registry never holds more than its capacity")
+  let renewed = ElementRegistry(capacity: 8)
+  let active = renewed.register(tree, now: start)
+  let stale = renewed.register(tree, now: start)
+  renewed.renew(active, node: tree, now: start.addingTimeInterval(55))
+  renewed.prune(now: start.addingTimeInterval(65))
+  check(renewed.node(active) != nil, "acknowledged activity keeps the same handle alive")
+  check(renewed.node(stale) == nil, "renewal does not hide expired handles behind a fresh one")
+  renewed.renew(active, node: tree, now: start.addingTimeInterval(121))
+  renewed.prune(now: start.addingTimeInterval(121))
+  check(renewed.node(active) == nil, "renewal cannot revive an already expired handle")
+  renewed.renew("missing", node: tree, now: start.addingTimeInterval(122))
+  check(renewed.count == 0, "renewal cannot create an unknown handle")
 }
 
 // MARK: - Request signing (RunnerAuth)
@@ -1005,6 +1072,58 @@ do {
         "name fallback exists but is not an identifier")
 } catch {
   check(false, "strict identifier predicate: \(error)")
+}
+
+// Guarded input uses live identity and focus, never labels or geometry.
+do {
+  func replacementNode(_ changes: [String: Any] = [:], pid: Int32 = 42) -> UINode {
+    var raw: [String: Any] = ["type":"XCUIElementTypeTextField", "rawIdentifier":"field-a",
+      "label":"Draft", "isEnabled":"1", "isFocused":"0", IPURNodeAXElementKey:NSObject()]
+    for (key, value) in changes { raw[key] = value }
+    return UINode(raw: raw, parent: nil, pid: pid)
+  }
+  let original = replacementNode(["isFocused":"1"])
+  func replacementAllowed(_ node: UINode, foreground: Int32 = 42, visible: Bool = true,
+      binding: Bool = true, requireFocus: Bool = false) -> Bool {
+    InputTargetCheck.replacementRefusal(original: original, current: node, foregroundPID: foreground,
+      visible: visible, bindingMatches: binding, requireFocus: requireFocus) == nil
+  }
+  check(replacementAllowed(replacementNode()), "retained unfocused original may be inspected for clear proof")
+  check(!replacementAllowed(replacementNode(), requireFocus: true), "unfocused proof cannot authorize typing")
+  check(replacementAllowed(replacementNode(["isFocused":"1"]), requireFocus: true), "same focused original passes replacement identity gate")
+  check(!replacementAllowed(replacementNode(), binding: false), "initial focus cannot revive an invalidated binding")
+  check(!replacementAllowed(replacementNode(), foreground: 43), "initial focus refuses a changed foreground")
+  check(!replacementAllowed(replacementNode(pid: 43), foreground: 43), "initial focus refuses another process even if foreground")
+  check(!replacementAllowed(replacementNode(["rawIdentifier":"field-b"])), "same-label different field cannot be restored")
+  check(!replacementAllowed(replacementNode(["rawIdentifier":NSNull()])), "lost identifier cannot rebind by label")
+  check(!replacementAllowed(replacementNode(["type":"XCUIElementTypeSecureTextField"])), "secure conversion refuses initial focus")
+  check(!replacementAllowed(replacementNode(["isEnabled":"0"])), "disabled original refuses initial focus")
+  check(!replacementAllowed(replacementNode(), visible: false), "hidden original refuses initial focus")
+  let noAX = UINode(raw:["type":"XCUIElementTypeTextField", "rawIdentifier":"field-a"], parent:nil, pid:42)
+  check(!replacementAllowed(noAX), "stored metadata without live AX cannot authorize initial focus")
+  let field: [String:Any] = ["type":"XCUIElementTypeTextField", "rawIdentifier":"a",
+    "rect":["x":0,"y":0,"width":100,"height":40]]
+  let covering: [String:Any] = ["type":"XCUIElementTypeButton", "rawIdentifier":"overlay",
+    "rect":["x":0,"y":0,"width":100,"height":40]]
+  func scene(_ children:[[String:Any]]) -> UINode {
+    UINode(raw:["type":"XCUIElementTypeWindow","children":children],parent:nil,pid:42)
+  }
+  let point=CGPoint(x:50,y:20)
+  let alone=scene([field])
+  check(!InputTargetCheck.focusPointOccluded(target:alone.children[0],root:alone,point:point), "uncovered original focus point is permitted")
+  let covered=scene([field,covering])
+  check(InputTargetCheck.focusPointOccluded(target:covered.children[0],root:covered,point:point), "new sibling action covering the field blocks initial focus")
+  var disabledCover=covering;disabledCover["isEnabled"]="0"
+  let disabledScene=scene([field,disabledCover])
+  check(InputTargetCheck.focusPointOccluded(target:disabledScene.children[0],root:disabledScene,point:point), "disabled control still blocks a physical focus point")
+  var distant=covering;distant["rect"]=["x":200,"y":0,"width":100,"height":40]
+  let separate=scene([field,distant])
+  check(!InputTargetCheck.focusPointOccluded(target:separate.children[0],root:separate,point:point), "unrelated nonoverlapping control does not block initial focus")
+  let cell=scene([["type":"XCUIElementTypeCell","rect":["x":0,"y":0,"width":100,"height":40],"children":[field]]])
+  check(!InputTargetCheck.focusPointOccluded(target:cell.children[0].children[0],root:cell,point:point), "original's ancestor container is not a sibling occluder")
+  var withClear=field;withClear["children"]=[covering]
+  let childAction=scene([withClear])
+  check(InputTargetCheck.focusPointOccluded(target:childAction.children[0],root:childAction,point:point), "an actionable descendant cannot be blindly tapped as the field")
 }
 
 print(failures == 0 ? "unit check: \(checks) checks passed" : "unit check: \(failures) of \(checks) checks FAILED")

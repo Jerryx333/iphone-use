@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iphone-use：让 AI agent 操作你的真实 iPhone</title>
+  <meta name="description" content="Claude Code、Codex 或任何 MCP 客户端把 iPhone 屏幕读成文字，在任意 App 里点击、输入、滑动，没有 API 的 App 也行。运行在你的 Mac 上。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:description" content="Claude Code、Codex 或任何 MCP 客户端把 iPhone 屏幕读成文字，在任意 App 里点击、输入、滑动，没有 API 的 App 也行。运行在你的 Mac 上。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta name="twitter:description" content="Claude Code、Codex 或任何 MCP 客户端把 iPhone 屏幕读成文字，在任意 App 里点击、输入、滑动，没有 API 的 App 也行。运行在你的 Mac 上。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","@id":"https://iphone-use.leeguoo.com/#software","name":"iphone-use","alternateName":"iphone-use by leeguoo","applicationCategory":"DeveloperApplication","applicationSubCategory":"iPhone automation for AI agents (MCP server, HTTP API, CLI)","operatingSystem":"macOS, iOS","description":"Claude Code、Codex 或任何 MCP 客户端把 iPhone 屏幕读成文字，在任意 App 里点击、输入、滑动，没有 API 的 App 也行。运行在你的 Mac 上。","url":"https://iphone-use.leeguoo.com/","inLanguage":"zh-Hans","downloadUrl":"https://github.com/leeguooooo/iphone-use/releases","installUrl":"https://iphone-use.leeguoo.com/install","softwareVersion":"0.27.7","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"isAccessibleForFree":true,"license":"https://polyformproject.org/licenses/shield/1.0.0","image":"https://iphone-use.leeguoo.com/assets/og.png","screenshot":"https://iphone-use.leeguoo.com/assets/og.png","author":{"@id":"https://leeguoo.com/about#person"},"creator":{"@id":"https://leeguoo.com/about#person"},"codeRepository":"https://github.com/leeguooooo/iphone-use","sameAs":["https://github.com/leeguooooo/iphone-use","https://www.producthunt.com/products/iphone-use","https://glama.ai/mcp/servers/leeguooooo/iphone-use"]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Person","@id":"https://leeguoo.com/about#person","name":"郭立","alternateName":["Guo Li","Leo","leeguoo"],"url":"https://leeguoo.com/about","sameAs":["https://github.com/leeguooooo","https://blog.leeguoo.com","https://x.com/leeguooooo"]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/","mainEntity":[{"@type":"Question","name":"需要越狱吗？","acceptedAnswer":{"@type":"Answer","text":"不需要。需要安装签名过的 XCTest runner，iOS 16 及以上还需打开开发者模式，安装脚本会用你的 Xcode 开发团队来构建它。"}},{"@type":"Question","name":"哪些 agent 能用？","acceptedAnswer":{"@type":"Answer","text":"Claude Code、Codex、Cursor、Claude Desktop 以及其他 MCP 客户端，都通过随附的 MCP server 接入；脚本和其他 agent 可以调用 /agent/* 下的 HTTP 接口。"}},{"@type":"Question","name":"必须有 Mac 吗？","acceptedAnswer":{"@type":"Answer","text":"必须。守护进程运行在 macOS 15 以上、装了 Xcode 的 Mac 上。其他设备可以访问它的网页和接口，但手机本身由这台 Mac 托管。"}},{"@type":"Question","name":"免费吗？是开源的吗？","acceptedAnswer":{"@type":"Answer","text":"下载和使用都不收费。它采用 PolyForm Shield 1.0.0 源码可见许可，不是 OSI 认可的开源许可：允许符合条款的非竞争用途、修改和分发，禁止用它提供竞争产品或服务。"}}]}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="overview" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item active" aria-current="page" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">开始</p>
+
+      <div class="du-title-row">
+        <h1>iphone-use</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <span class="du-doodle" style="top:40px; right:8px; width:46px; height:46px;">
+        <svg viewBox="0 0 60 60" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M30 6 l6 16 17 1 -13 11 5 16 -15 -9 -15 9 5 -16 -13 -11 17 -1z"/>
+        </svg>
+      </span>
+
+      <p class="du-lede">
+        <span class="mark">让 AI agent 操作你的真实 iPhone。</span>在 Mac 上装好 iphone-use 之后，Claude Code、Codex
+        或任何 MCP 客户端都能把手机屏幕读成文字，在任意 App 里点击、输入、滑动，<strong>包括没有 API 的 App</strong>：
+        健康、银行、聊天软件，或者你正在测的 App。你可以实时看着它操作，随时把手机拿回来。
+      </p>
+
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash · 在插着 iPhone 的那台 Mac 上</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+      </div>
+
+      <h2>三步接上你的 agent</h2>
+      <ol class="du-steps">
+        <li>
+          <strong>准备好手机</strong>：一台 macOS 15 以上的 Mac，装好 Xcode 并登录 Apple ID；一台 iOS 15 及以上的 iPhone，以及首次配置用的数据线。iOS 16 及以上需打开开发者模式（设置 → 隐私与安全性 → 开发者模式）。iOS 17 及以上可用免费账号；iOS 15/16 在 Xcode 26 及以后需要付费账号的 App Store Connect API key，见<a href="/install">安装要求</a>。把 iPhone 插上并解锁。
+        </li>
+        <li>
+          <strong>运行上面的安装命令</strong>。它会把手机配好，让 agent 打开「设置」读一遍屏幕给你看，在 Claude Code 和 Codex
+          里注册 MCP server（装了 Cursor、Claude Desktop 的话也一并注册），再用一次性链接在浏览器里打开控制页。缺什么会直接告诉你缺什么、怎么补。
+          <div class="du-code">
+            <div class="du-code-head">
+              <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+              <span class="du-code-name">bash</span>
+            </div>
+<pre><code><span class="du-prompt">$</span> iphone-use doctor   <span class="du-cmt"># 缺什么、怎么补</span>
+<span class="du-prompt">$</span> iphone-use try      <span class="du-cmt"># 无害的检查：打开设置、读屏、回桌面</span></code></pre>
+          </div>
+        </li>
+        <li>
+          <strong>直接跟 agent 说</strong>。在 Claude Code 或 Codex 里新开一个对话，说你想在手机上做什么。不用学命令，
+          随附的 skill 会教 agent 怎么操作。其他客户端见 <a href="/connect">MCP、HTTP API 与 skill</a>。
+        </li>
+      </ol>
+      <p>完整的环境要求、插件、升级和第二台手机：见<a href="/install">安装</a>。</p>
+
+      
+      <div style="display:flex;gap:16px;flex-wrap:wrap;justify-content:center;margin:1.5em 0">
+        <a href="/remote" style="flex:1 1 220px;max-width:280px;text-align:center"><img src="/assets/shots/remote-control.png" alt="iPhone 17 远程操作另一台 iPhone" loading="lazy" style="width:100%;height:auto;border-radius:18px;border:1px solid rgba(0,0,0,.12)" /><div style="font-size:.85em;opacity:.7;margin-top:.4em">iPhone 17 远程操作另一台 iPhone</div></a>
+        <a href="/phone-agent" style="flex:1 1 220px;max-width:280px;text-align:center;align-self:flex-start"><img src="/assets/shots/phone-agent.png" alt="手机上的助手" loading="lazy" style="width:100%;height:auto;border-radius:18px;border:1px solid rgba(0,0,0,.12)" /><div style="font-size:.85em;opacity:.7;margin-top:.4em">手机上的助手</div></a>
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>可以让它做什么</h2>
+      <p>下面这些说法在手机上的任何 App 里都适用。agent 可以按名字打开 App，一次输入一长段文字，跨页读完整个列表。</p>
+      <div class="du-cards">
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">❤️</span> 从 App 里读数据</div>
+          <p class="du-say">打开健康，告诉我这周每天走了多少步。</p>
+          <p>屏幕以文字（无障碍树）的形式返回，不是像素。</p>
+        </a>
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">💬</span> 没有 API 的聊天 App</div>
+          <p class="du-say">在微信里找到妈妈发的最新一条消息，念给我听。</p>
+          <p>点击、输入（中文也行）、滑动都通过手机上的一个小型 XCTest runner 完成。</p>
+        </a>
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">🏦</span> 长列表一直读到底</div>
+          <p class="du-say">把这个银行流水页面的每一笔交易都抄下来，一直翻到底。</p>
+          <p>跨页读列表，并说明有没有读到底。禁止截屏的页面按元素操作。</p>
+        </a>
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">📝</span> 一次写进长文本</div>
+          <p class="du-say">把这篇 2000 字的草稿写进备忘录，新建一条。</p>
+          <p>一次输入最长 2 万字。</p>
+        </a>
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">🧪</span> 测你自己的 App</div>
+          <p class="du-say">在真机上跑一遍我们 App 的登录测试，告诉我哪一步失败了。</p>
+          <p>读日志和崩溃报告、录屏、安装测试包、模拟定位，都在同一套工具里。</p>
+        </a>
+        <a class="du-card" href="/flows">
+          <div class="du-card-title"><span class="du-card-ico">🔁</span> 做一次，以后一键重放</div>
+          <p class="du-say">把刚才做的这些存成 flow，下次一次调用就能跑完。</p>
+          <p>存好的 flow 重放时不经过模型，不花 token。</p>
+        </a>
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>不想开终端</h2>
+      <div class="du-cards">
+        <a class="du-card" href="/install">
+          <div class="du-card-title"><span class="du-card-ico">🤖</span> 让 agent 帮你装</div>
+          <p>把一段提示词贴给 Codex 或 Claude Code。它会跑安装脚本，遇到只能你做的步骤（比如在 iPhone 上点「信任」）就停下来等你，绝不向你要密码或验证码。</p>
+        </a>
+        <a class="du-card" href="/how-it-works">
+          <div class="du-card-title"><span class="du-card-ico">🖥️</span> 用浏览器操作</div>
+          <p>H.264 实时画面：单击是点击，拖动是滑动，用你自己的输入法打字。「流程」面板能把你的操作录下来。</p>
+        </a>
+        <a class="du-card" href="/remote">
+          <div class="du-card-title"><span class="du-card-ico">📲</span> 用另一台 iPhone 远程控制</div>
+          <p>扫码配对后看画面、点、滑、打字。被控手机可以自己跑控制服务，不需要电脑；自建一个 Cloudflare 中继，在外面用蜂窝网络也能连回来。</p>
+        </a>
+        <a class="du-card" href="/phone-agent">
+          <div class="du-card-title"><span class="du-card-ico">🤖</span> 手机自己操作自己</div>
+          <p>在 iPhone 上的「助手」里说一句要做的事，它就在这台手机上自己去点，做完告诉你。不需要电脑，模型用你自己的密钥。</p>
+        </a>
+        <a class="du-card" href="/connect">
+          <div class="du-card-title"><span class="du-card-ico">👀</span> 实时看 agent 在做什么</div>
+          <p>支持 MCP Apps 的 agent 客户端能在侧边栏看到手机画面，也可以在浏览器或 iOS App 里看。</p>
+        </a>
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>为什么用真实 iPhone</h2>
+      <div class="du-cards">
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">🔓</span> 任何 App 都行，不需要 API</div>
+          <p>健康、银行和支付 App（包括禁止截屏的）、聊天 App、你自己在测的 App，用的都是手机上已有的登录状态。</p>
+        </a>
+        <a class="du-card" href="/how-it-works">
+          <div class="du-card-title"><span class="du-card-ico">📶</span> USB 或 Wi-Fi，老 iPhone 也行</div>
+          <p>第一次用数据线配好，之后可以通过加密隧道走 Wi-Fi 操作。支持 iOS 15 及以上，不用升级手机系统。</p>
+        </a>
+        <a class="du-card" href="/connect">
+          <div class="du-card-title"><span class="du-card-ico">✅</span> 结果说实话</div>
+          <p>每个操作都说明是已执行、没发出去还是结果不确定，以及能不能安全重试。点到被遮住的元素会直接拒绝。</p>
+        </a>
+        <a class="du-card" href="/privacy">
+          <div class="du-card-title"><span class="du-card-ico">🖱️</span> 不打扰你的 Mac</div>
+          <p>不碰 Mac 的屏幕、光标和窗口焦点。agent 和人共用一台手机，同一时间只有一方在用。</p>
+        </a>
+      </div>
+
+      <div class="du-callout note">
+        <div class="du-callout-title">ℹ️ 速度：维护者自己的实测</div>
+        同一台 iPhone 13、USB 连接（2026 年 10 月）：iphone-use runner 读屏 0.08–0.135 秒，点击并等画面稳定 1.0 秒；
+        <a href="https://github.com/callstack/agent-device">agent-device</a> 约 0.7 秒和 2.8–3.3 秒。走完整的 agent 接口，在
+        iPhone 17 Pro Max 上按标签点击并带回稳定后的变化约 1.9 秒。这些数字来自项目
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/README.zh-CN.md#速度">README</a> 中的自测，不是第三方评测。
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>底层怎么做的</h2>
+      <p>每台手机在 Mac 上对应一个守护进程。它把屏幕读成无障碍树，通过装在 iPhone 上的自研 XCTest runner 发送点击和输入，并在画面稳定后才返回结果。</p>
+      <div class="du-cards">
+        <a class="du-card" href="/how-it-works">
+          <div class="du-card-title"><span class="du-card-ico">⚙️</span> 它怎么工作</div>
+          <p>守护进程、XCTest runner、USB 与 Wi-Fi 隧道、空闲释放、把手机交还给人。</p>
+        </a>
+        <a class="du-card" href="/connect">
+          <div class="du-card-title"><span class="du-card-ico">🔌</span> MCP、HTTP API 与 skill</div>
+          <p>Claude Code、Codex、Cursor、VS Code、Claude Desktop、Gemini CLI、opencode、Windsurf 的配置。</p>
+        </a>
+        <a class="du-card" href="/flows">
+          <div class="du-card-title"><span class="du-card-ico">🔁</span> Flow 录制与重放</div>
+          <p>经过审阅的按 App 脚本、官方 flow 源、测试套件和定时运行。</p>
+        </a>
+        <a class="du-card" href="/compare">
+          <div class="du-card-title"><span class="du-card-ico">⚖️</span> 和其他方案对比</div>
+          <p>mobile-mcp、agent-device、Appium 和其他 iPhone MCP 服务，依据各自的 README。</p>
+        </a>
+      </div>
+
+      <hr class="du-divider" />
+
+      <section class="du-faq">
+        <h2>常见问题速答</h2>
+        <h3>需要越狱吗？</h3>
+        <p>不需要。需要安装签名过的 XCTest runner，iOS 16 及以上还需打开开发者模式，安装脚本会用你的 Xcode 开发团队来构建它。</p>
+        <h3>哪些 agent 能用？</h3>
+        <p>Claude Code、Codex、Cursor、Claude Desktop 以及其他 MCP 客户端，都通过随附的 MCP server 接入；脚本和其他 agent 可以调用 <code>/agent/*</code> 下的 HTTP 接口。</p>
+        <h3>必须有 Mac 吗？</h3>
+        <p>必须。守护进程运行在 macOS 15 以上、装了 Xcode 的 Mac 上。其他设备可以访问它的网页和接口，但手机本身由这台 Mac 托管。</p>
+        <h3>免费吗？是开源的吗？</h3>
+        <p>下载和使用都不收费。它采用 PolyForm Shield 1.0.0 源码可见许可，不是 OSI 认可的开源许可：允许符合条款的非竞争用途、修改和分发，禁止用它提供竞争产品或服务。</p>
+      </section>
+      <p>更多见<a href="/faq">常见问题</a>。</p>
+
+      <hr class="du-divider" />
+
+      <h2>*-use 家族</h2>
+      <p>一组小工具，各自把 agent 的手伸到一个你本来就在用的真实东西上。</p>
+      <div class="du-cards cols-3">
+        <a class="du-card" href="https://chrome-use.leeguoo.com/">
+          <div class="du-card-title"><span class="du-card-ico">🌐</span> chrome-use</div>
+          <p>让 agent 用你已登录的真实 Chrome。</p>
+        </a>
+        <a class="du-card" href="https://blog.leeguoo.com/zh/posts/iphone-use/">
+          <div class="du-card-title"><span class="du-card-ico">✍️</span> iphone-use 产品介绍</div>
+          <p>作者博客：安装、MCP 接入、flow 和选型对比。</p>
+        </a>
+        <a class="du-card" href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">
+          <div class="du-card-title"><span class="du-card-ico">🎬</span> 演示视频</div>
+          <p>一分钟看懂 iphone-use，手机画面都是真机录屏。</p>
+        </a>
+      </div>
+
+      <h2>付费接入与赞助</h2>
+      <p>需要帮你配置真实 iPhone、接入 agent，或建立 iOS App 测试流程？<a href="mailto:leeguoooo@gmail.com?subject=iphone-use%20%E4%BB%98%E8%B4%B9%E6%8E%A5%E5%85%A5%E5%92%A8%E8%AF%A2">发邮件给维护者</a>，说明设备环境、要跑通的流程和预期结果，以及目前卡在哪里；先确认服务范围、验收方式和报价再开工。普通问题和功能建议仍可在 <a href="https://github.com/leeguooooo/iphone-use/issues">GitHub issues</a> 提交。咨询时请勿附上密码、验证码或私人账号数据。</p>
+
+      <p class="du-small" style="margin-top:22px; color:var(--ink-faint); font-size:.85rem;">
+        PolyForm Shield 1.0.0（源码可见）· <a href="https://github.com/leeguooooo/iphone-use">GitHub</a>
+        · 作者 <a href="https://leeguoo.com/about" rel="author">郭立 (leeguoo)</a> · <a href="/privacy">隐私</a>
+      </p><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

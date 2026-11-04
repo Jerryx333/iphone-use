@@ -1,0 +1,58 @@
+<!doctype html>
+<!-- Source of public/assets/og.png (1200x630). Render: see site/README.md. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>iphone-use og image</title>
+<link href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&family=Permanent+Marker&family=JetBrains+Mono:wght@400;700&display=block" rel="stylesheet" />
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { width: 1200px; height: 630px; overflow: hidden; background: #fcfbf4; color: #1a1a1a;
+         font-family: -apple-system, system-ui, "PingFang SC", sans-serif; }
+  .card { position: relative; box-sizing: border-box; width: 1200px; height: 630px; padding: 64px 72px;
+          background-image: radial-gradient(rgba(26,26,26,.07) 1px, transparent 1px); background-size: 22px 22px; }
+  .brand { display: flex; align-items: center; gap: 18px; }
+  .brand img { width: 76px; height: 76px; border-radius: 18px; box-shadow: 3px 4px 0 rgba(26,26,26,.15); }
+  .word { font-family: "Permanent Marker", cursive; font-size: 54px; line-height: 1; }
+  .word .accent { color: #e03131; }
+  .tag { font-family: "JetBrains Mono", monospace; font-size: 18px; color: #555; border: 1.5px solid #ccc8b8;
+         border-radius: 20px; padding: 4px 12px; background: #f4f1e6; transform: rotate(-1.5deg); }
+  h1 { font-family: "ZCOOL KuaiLe", cursive; font-weight: 400; font-size: 76px; line-height: 1.12; margin: 46px 0 0; max-width: 760px; }
+  h1 .mark { background: linear-gradient(transparent 58%, #ffe066 58%, #ffe066 92%, transparent 92%); }
+  p.sub { font-size: 27px; line-height: 1.45; color: #3a3a3a; margin: 26px 0 0; max-width: 700px; }
+  .foot { position: absolute; left: 72px; bottom: 54px; font-family: "JetBrains Mono", monospace; font-size: 22px; color: #3b5bdb; }
+  .phone { position: absolute; right: 86px; top: 118px; width: 250px; height: 440px; border: 4px solid #1a1a1a;
+           border-radius: 44px 40px 46px 38px / 38px 46px 40px 44px; background: #fff; box-shadow: 6px 8px 0 rgba(26,26,26,.14); transform: rotate(3deg); }
+  .phone .notch { width: 84px; height: 20px; border-radius: 12px; background: #1a1a1a; margin: 14px auto 18px; }
+  .row { margin: 0 22px 12px; padding: 10px 12px; border: 2px solid #1a1a1a; border-radius: 12px 6px 12px 6px / 6px 12px 6px 12px;
+         font-family: "JetBrains Mono", monospace; font-size: 15px; display: flex; justify-content: space-between; }
+  .row.hit { background: #ffe066; }
+  .row span:last-child { color: #888; }
+  .say { position: absolute; right: 70px; top: 50px; z-index: 2; font-family: "JetBrains Mono", monospace; font-size: 17px; background: #12100c; color: #eae6d8;
+         padding: 12px 16px; border-radius: 10px; transform: rotate(-2deg); box-shadow: 4px 5px 0 rgba(26,26,26,.15); }
+  .say b { color: #ffe066; font-weight: 700; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <img src="../public/assets/icon-180.png" alt="" />
+      <span class="word">iphone<span class="accent">-use</span></span>
+      <span class="tag">MCP · HTTP API · CLI</span>
+    </div>
+    <h1>Let AI agents use your <span class="mark">real iPhone</span></h1>
+    <p class="sub">Claude Code, Codex or any MCP client reads the screen as text and taps, types and swipes in any app.</p>
+    <div class="foot">iphone-use.leeguoo.com</div>
+    <div class="say"><b>&gt;</b> phone_tap_label "Health"</div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="row"><span>Settings</span><span>›</span></div>
+      <div class="row hit"><span>Health</span><span>›</span></div>
+      <div class="row"><span>Notes</span><span>›</span></div>
+      <div class="row"><span>Wallet</span><span>›</span></div>
+      <div class="row"><span>Messages</span><span>›</span></div>
+      <div class="row"><span>Photos</span><span>›</span></div>
+    </div>
+  </div>
+</body>
+</html>

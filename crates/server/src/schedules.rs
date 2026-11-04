@@ -455,8 +455,13 @@ fn gate_for_run(status: &serde_json::Value, me: &str, manual: bool) -> Gate {
     }
     // A schedule is not a person's request: it must not undo an end on the
     // phone at 03:30.
-    if !manual && status.get("ended_on_phone").and_then(|v| v.as_bool()) == Some(true) {
-        return Gate::Postpone("the session was ended on the phone".into());
+    if !manual {
+        if status.get("ended_on_phone").and_then(|v| v.as_bool()) == Some(true) {
+            return Gate::Postpone("the session was ended on the phone".into());
+        }
+        if status.get("runner_parked").and_then(|v| v.as_bool()) == Some(true) {
+            return Gate::Postpone("the runner is parked until an explicit request".into());
+        }
     }
     if status
         .get("viewer_count")
@@ -1950,6 +1955,16 @@ mod tests {
             error: None,
             artifacts: None,
         }
+    }
+
+    #[test]
+    fn automatic_runs_do_not_resume_an_invalidated_or_unknown_parked_session() {
+        let mut status = serde_json::json!({"runner_parked":true,"ended_on_phone":false,
+            "released":true,"device_state":"released","drivable":false});
+        assert!(matches!(gate_for_run(&status, "me", false), Gate::Postpone(_)));
+        assert_eq!(gate_for_run(&status, "me", true), Gate::Reconnect);
+        status["human_handoff"] = true.into();
+        assert!(matches!(gate_for_run(&status, "me", true), Gate::Postpone(_)));
     }
 
     #[test]

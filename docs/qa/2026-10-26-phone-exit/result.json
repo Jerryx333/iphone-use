@@ -1,0 +1,25 @@
+{
+  "release_tested": "0.24.1",
+  "device": "iPhone 13",
+  "ios": "27.0",
+  "transport": "USB",
+  "instance": "i13",
+  "stock_setup_exit_code": 0,
+  "packaged_runner_source_hash": "98d503db3c3bb23b629fadf0c553c1a5858ad9749d98f999aeff2b268ed8047a",
+  "built_source_matches_packaged_source": true,
+  "owned_fixture_foreground_verified": true,
+  "operator_confirmation_within_observation_window": true,
+  "system_automation_revocation_log_seen": true,
+  "parked_marker_present": true,
+  "no_automatic_reconnect_observed_seconds": 46.13,
+  "ui_input_sent": false,
+  "post_exit_reconnect_requested": false,
+  "owned_fixture_removed": true,
+  "all_preexisting_apps_preserved": true,
+  "preexisting_app_count": 10,
+  "cleanup_errors": [],
+  "earlier_attempts": {
+    "first_receipt_not_ready": "excluded; fixed bounded receipt wait",
+    "first_hardware_window": "expired without confirmed action; excluded"
+  }
+}

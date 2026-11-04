@@ -492,6 +492,22 @@ python3 scripts/runner-smoke.py --runs 5   # timing of the native routes
 - **`appium/settings`** values other than the MJPEG ones are stored and echoed but change nothing.
   The runner never waits for idle anyway.
 
+## Gesture delivery failures
+
+Tap, swipe, long press and alert tap choose the public coordinate implementation
+only when event synthesis is unavailable before invoking it. Once synthesis was
+invoked, an error may follow delivered input: the Runner reports an unknown
+outcome and never attempts the coordinate implementation for the same action.
+Read the current screen before deciding the next action. Even a setup-looking
+error string is treated conservatively after invocation; strings do not prove
+that dispatch was absent.
+
+W3C actions retain coordinate fallback only for a single, immediate, stationary
+tap. A long hold, delayed start, drag or multiple fingers cannot be converted to
+an ordinary tap. Failure after a pointer action stops the remaining key source.
+This policy prevents automatic replay; it does not cancel events already in
+flight or resolve the separate long-text focus-change limitation.
+
 ## Private-API caveats
 
 All private classes, selectors and functions are looked up at runtime and checked before use. When

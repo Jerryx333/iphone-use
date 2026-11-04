@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>安装 iphone-use：Mac、Xcode 和真实 iPhone</title>
+  <meta name="description" content="一条命令安装 iphone-use：需要 macOS 15+、Xcode、iOS 15+ 和开发者模式；安装脚本做了什么、升级、第二台手机和模拟器。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/install" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/install" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/install" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/install" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="安装 iphone-use：Mac、Xcode 和真实 iPhone" />
+  <meta property="og:description" content="一条命令安装 iphone-use：需要 macOS 15+、Xcode、iOS 15+ 和开发者模式；安装脚本做了什么、升级、第二台手机和模拟器。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/install" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="安装 iphone-use：Mac、Xcode 和真实 iPhone" />
+  <meta name="twitter:description" content="一条命令安装 iphone-use：需要 macOS 15+、Xcode、iOS 15+ 和开发者模式；安装脚本做了什么、升级、第二台手机和模拟器。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/"},{"@type":"ListItem","position":2,"name":"安装 iphone-use","item":"https://iphone-use.leeguoo.com/install"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"安装 iphone-use","description":"一条命令安装 iphone-use：需要 macOS 15+、Xcode、iOS 15+ 和开发者模式；安装脚本做了什么、升级、第二台手机和模拟器。","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/install","mainEntityOfPage":"https://iphone-use.leeguoo.com/install","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="install" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item active" aria-current="page" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">开始</p>
+
+      <div class="du-title-row">
+        <h1>安装 iphone-use</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        在插着 iPhone 的那台 Mac 上跑一条命令。安装脚本会把手机配好，让 agent 操作一遍给你看，
+        <span class="mark">在你的 agent 里注册好 MCP server</span>，再在浏览器里打开控制页。缺什么会直接告诉你缺什么、怎么补。
+      </p>
+
+      <h2>需要准备</h2>
+      <ul>
+        <li><strong>一台 macOS 15 以上的 Mac</strong>，装好完整的 <strong>Xcode.app</strong>（只有命令行工具不够），在 Xcode → 设置 → Accounts 里登录 Apple ID 并选好开发团队。免费的 Personal Team 可以用，但它的 runner 描述文件需要定期续签。也可以用 App Store Connect API key（<code>IPU_RUNNER_ASC_KEY_PATH</code>、<code>IPU_RUNNER_ASC_KEY_ID</code>、<code>IPU_RUNNER_ASC_ISSUER_ID</code>）签名，不用 Xcode 账号。</li>
+        <li><strong>一台 iOS 15 及以上的 iPhone</strong>；iOS 16 及以上需要打开开发者模式（设置 → 隐私与安全性 → 开发者模式），并通过 USB 和这台 Mac 配对、信任。</li>
+        <li><strong>第一次配置需要一根数据线。</strong>安装前把 iPhone 插上并解锁。构建、启动和使用 runner 时手机要保持解锁和亮屏；Face ID 和锁屏密码它过不去。</li>
+        <li>不需要 Homebrew 包。只有从源码构建时才需要 Rust 工具链。</li>
+      </ul>
+
+      <div class="du-callout warn">
+        <div class="du-callout-title">⚠️ iOS 15 和 16</div>
+        这些手机不用升级系统，但从 Xcode 26 起 Xcode 看不到它们，所以 setup 会走自己的旧系统路径。这条路径需要
+        <strong>付费开发者账号的 App Store Connect API key</strong>；没有的话 setup 会停在 <code>ios_too_old</code> 并说明原因。
+        iOS 14 及更早的系统低于 runner 的最低要求。
+      </div>
+
+      <h2>安装</h2>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh</code></pre>
+      </div>
+
+      <h3>安装脚本做了什么</h3>
+      <ol class="du-steps">
+        <li>下载最新的 GitHub Release，注册当前用户的 LaunchAgent，安装配套的 agent skill，把设备 runner 的源码放到 <code>~/.iphone-use/runner</code>，并把 <code>iphone-use</code> 命令链接到 <code>~/.local/bin</code>。</li>
+        <li>插着 iPhone 时，接着运行 <code>iphone-use setup</code>（构建、签名、安装并启动 runner，启动转发）和 <code>iphone-use try</code>（打开设置、读屏、回桌面），安装结束前你就能看到 agent 操作手机。</li>
+        <li>在 Claude Code 和 Codex 里注册 MCP server，装了 Cursor 和 Claude Desktop 的话也一并注册（<code>IPHONE_USE_NO_CLIENT_SETUP=1</code> 跳过这两个）。server 从 LaunchAgent 读取守护进程地址和令牌，客户端配置里不会留下密钥。</li>
+        <li>用一次性登录链接在浏览器里打开控制页，并打印一个 iPhone 相机能扫的二维码，谁都不用抄密码。</li>
+      </ol>
+      <p><code>--no-setup</code>（或 <code>IPHONE_USE_NO_SETUP=1</code>）跳过配置手机这一步；升级时从不运行这一步。</p>
+
+      <h3>常用命令</h3>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> iphone-use status    <span class="du-cmt"># 手机现在能不能给 agent 用</span>
+<span class="du-prompt">$</span> iphone-use doctor    <span class="du-cmt"># 缺什么、怎么补</span>
+<span class="du-prompt">$</span> iphone-use setup     <span class="du-cmt"># 重新配置手机（换了 iPhone 或 Xcode 之后）</span>
+<span class="du-prompt">$</span> iphone-use try       <span class="du-cmt"># 无害的检查：打开设置、读屏、回桌面</span>
+<span class="du-prompt">$</span> iphone-use login     <span class="du-cmt"># 重新登录浏览器，附手机扫码用的二维码</span>
+<span class="du-prompt">$</span> iphone-use upgrade   <span class="du-cmt"># 升级全部组件</span>
+<span class="du-prompt">$</span> ~/.iphone-use/uninstall.sh --dry-run   <span class="du-cmt"># 看卸载会删掉什么（去掉 --dry-run 就真的卸载）</span></code></pre>
+      </div>
+
+      <div class="du-callout tip">
+        <div class="du-callout-title">✅ setup 报 “No Accounts”？</div>
+        打开报错里给出的 runner 工程（通常是 <code>~/.iphone-use/runner/IPhoneUseRunner/IPhoneUseRunner.xcodeproj</code>），
+        选中 <code>IPhoneUseRunner</code> scheme 和你的 iPhone，执行一次 <strong>Product → Build For → Testing</strong>。
+        提示访问钥匙串时允许，让 Xcode 生成签名证书和描述文件，然后重新运行 setup。
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>或者让 agent 帮你装</h2>
+      <p>在插着 iPhone 的那台 Mac 上，把下面这段贴给 Codex 或 Claude Code：</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">提示词</span>
+        </div>
+<pre><code>在这台 Mac 上安装 iphone-use（https://github.com/leeguooooo/iphone-use），让你能操作我的 iPhone。
+1. 运行：curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
+2. 运行 `iphone-use doctor`。终端里能修的直接修；它让你运行 `iphone-use setup` 时就运行。
+3. 有几步只能我自己做：在 Xcode 里登录 Apple ID、在 iPhone 上点「信任」、打开开发者模式、
+   解锁手机。遇到这些就停下，告诉我具体怎么做，等我说做完了再继续。不要向我要密码或验证码。
+4. 再跑 `iphone-use doctor`，直到什么都不缺，然后运行 `iphone-use try`。
+5. 如果这个对话里还没有 phone_* 工具，告诉我新开一个对话。</code></pre>
+      </div>
+
+      <h2>Codex 和 Claude Code 插件</h2>
+      <p>插件带 skill 和 MCP server，但仍需先完成上面的安装。</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">Codex</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> codex plugin marketplace add leeguooooo/iphone-use &amp;&amp; codex plugin add iphone-use@iphone-use</code></pre>
+      </div>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">Claude Code</span>
+        </div>
+<pre><code><span class="du-prompt">&gt;</span> /plugin marketplace add leeguooooo/iphone-use
+<span class="du-prompt">&gt;</span> /plugin install iphone-use@iphone-use</code></pre>
+      </div>
+      <p>其他 MCP 客户端（Cursor、VS Code、Claude Desktop、Gemini CLI、opencode、Windsurf）和 HTTP 接口见 <a href="/connect">MCP、HTTP API 与 skill</a>。</p>
+
+      <hr class="du-divider" />
+
+      <h2>升级</h2>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> iphone-use upgrade            <span class="du-cmt"># 安装最新版本（守护进程 + skill）</span>
+<span class="du-prompt">$</span> iphone-use upgrade --check    <span class="du-cmt"># 什么都不改，只报告</span></code></pre>
+      </div>
+      <p>
+        <strong>自动升级</strong>默认开启，并且只在手机空闲时进行。每天 04:30 有一个任务检查新版本，只有没人在用那台手机时才升级：
+        没有 owner 租约、没有 hold、没有人在看实时画面，最近 15 分钟也没有 agent 请求。手机忙的话就等到第二天。
+        升级用的是该版本自己的 <code>install.sh</code>，带 SHA-256 校验和回滚，所有设置都会保留。
+      </p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> ~/.iphone-use/auto-update.sh disable    <span class="du-cmt"># 关闭，重装后也保持关闭</span>
+<span class="du-prompt">$</span> ~/.iphone-use/auto-update.sh status     <span class="du-cmt"># 开没开、现在会做什么、上次结果</span></code></pre>
+      </div>
+
+      <h2>第二台手机</h2>
+      <p>一个守护进程只驱动一台手机。要同时驱动另一台 iPhone，就为它装一个命名实例，默认安装保持不动。实例有自己的一份 App、状态目录、令牌和端口。</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh -s -- --instance lab --udid &lt;UDID&gt;
+<span class="du-prompt">$</span> iphone-use setup --instance lab</code></pre>
+      </div>
+
+      <h2>手边没有手机：模拟器（预览）</h2>
+      <p>runner 也能跑在 iOS 模拟器上，不需要手机、Apple ID 和签名，只要装了带模拟器运行时的 Xcode。</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> iphone-use simulator start <span class="du-str">"iPhone 16 Pro"</span>
+<span class="du-prompt">$</span> claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp</code></pre>
+      </div>
+      <p>模拟器没有相机、App Store 应用、真实推送和 Face ID，需要这些的任务只能在真机上做。</p>
+
+      <h2>iOS App</h2>
+      <p>iOS App 不在 App Store 上架。用你自己的签名团队（就是 setup 给 runner 用的那个）构建并安装：</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> iphone-use setup-app   <span class="du-cmt"># 第二台手机加 --instance &lt;名字&gt;</span></code></pre>
+      </div>
+      <ul>
+        <li><strong>免费 Apple ID：遥控版 App。</strong>操作由 Mac 托管的手机，在 Mac 网页上扫码配对。</li>
+        <li><strong>付费开发者团队：完整版 App，支持本机控制。</strong>手机自己就能提供点击、输入、读屏和 agent 接口，运行时不需要 Mac（iOS 17.4 及以上）。第一次配对仍需要插一次数据线。</li>
+      </ul>
+      <p>下一步：<a href="/tasks">可以让 agent 做什么</a>，或者<a href="/how-it-works">它怎么工作</a>。</p><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/install" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

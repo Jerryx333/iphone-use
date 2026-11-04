@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iphone-use privacy and security: local, no telemetry</title>
+  <meta name="description" content="Where iphone-use keeps your data: a daemon on your own Mac, signed runner requests, telemetry off, secrets you enter yourself, limits agents cannot bypass." />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;display=swap&amp;text=%20%21%22%23%24%25%26%27%28%29%2A%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;display=swap&amp;text=%20%21%22%23%24%25%26%27%28%29%2A%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/en/privacy" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/privacy" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/privacy" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/privacy" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="iphone-use privacy and security: local, no telemetry" />
+  <meta property="og:description" content="Where iphone-use keeps your data: a daemon on your own Mac, signed runner requests, telemetry off, secrets you enter yourself, limits agents cannot bypass." />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/en/privacy" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use: let AI agents use your real iPhone" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:locale:alternate" content="zh_CN" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="iphone-use privacy and security: local, no telemetry" />
+  <meta name="twitter:description" content="Where iphone-use keeps your data: a daemon on your own Mac, signed runner requests, telemetry off, secrets you enter yourself, limits agents cannot bypass." />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use: let AI agents use your real iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/en/"},{"@type":"ListItem","position":2,"name":"Reference","item":"https://iphone-use.leeguoo.com/en/faq"},{"@type":"ListItem","position":3,"name":"Privacy & security","item":"https://iphone-use.leeguoo.com/en/privacy"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"Privacy & security","description":"Where iphone-use keeps your data: a daemon on your own Mac, signed runner requests, telemetry off, secrets you enter yourself, limits agents cannot bypass.","inLanguage":"en","url":"https://iphone-use.leeguoo.com/en/privacy","mainEntityOfPage":"https://iphone-use.leeguoo.com/en/privacy","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="privacy" data-lang="en">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="Documentation"><div class="du-nav-group"><div class="du-nav-label">Getting Started</div><a class="du-nav-item" href="/en/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">Overview</span></a><a class="du-nav-item" href="/en/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">Install</span></a><a class="du-nav-item" href="/en/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">vs Other Tools</span></a></div><div class="du-nav-group"><div class="du-nav-label">What Agents Can Do</div><a class="du-nav-item" href="/en/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">Ask Your Agent</span></a><a class="du-nav-item" href="/en/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flows &amp; Replay</span></a></div><div class="du-nav-group"><div class="du-nav-label">Connecting Agents</div><a class="du-nav-item" href="/en/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">Phone Drives Itself</span></a><a class="du-nav-item" href="/en/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">Remote Control</span></a><a class="du-nav-item" href="/en/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP, HTTP API &amp; Skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">Under the Hood</div><a class="du-nav-item" href="/en/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">How It Works</span></a></div><div class="du-nav-group"><div class="du-nav-label">Reference</div><a class="du-nav-item" href="/en/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">FAQ</span></a><a class="du-nav-item active" aria-current="page" href="/en/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">Privacy &amp; Security</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">Reference</p>
+
+      <div class="du-title-row">
+        <h1>Privacy &amp; security</h1>
+        <button class="du-copy-page" type="button" aria-label="Copy page">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">Copy page</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        iphone-use runs on <span class="mark">your own Mac</span> and talks to <strong>your own iPhone</strong>. There is no
+        iphone-use account and no developer server in the loop. This page sums up what stays where, what an agent can and
+        cannot do, and how to reach the phone safely from outside your network. The full texts are
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/privacy.md">docs/privacy.md</a> and
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/telemetry.md">docs/telemetry.md</a>.
+      </p>
+
+      <h2>Local by default</h2>
+      <ul>
+        <li>The daemon listens on <code>127.0.0.1:44321</code> behind a password. Agents authenticate with a bearer token (<code>IPHONE_USE_AGENT_TOKEN</code>, or the password as a legacy fallback), and every state-changing request also needs <code>X-Phone-Control: 1</code>.</li>
+        <li>The runner on the phone refuses any request not signed with a token that setup generates at each runner launch: HMAC-SHA256 over the method, target, body, a timestamp and a one-time nonce. The token stays on the Mac (mode 0600) and is never sent, so a captured request can be neither replayed nor altered.</li>
+        <li>USB and the CoreDevice Wi-Fi tunnel are private to this Mac. Signing does not encrypt: the iOS 15/16 LAN relay and the explicit <code>IPU_RUNNER_ALLOW_LAN=1</code> relay are plain HTTP, so someone watching that Wi-Fi can see the screen, but cannot drive the phone.</li>
+        <li>Anyone who can read your user's files on the Mac can read the token. Treat the daemon's URL and password as credentials.</li>
+      </ul>
+
+      <h2>Secrets stay with you</h2>
+      <ul>
+        <li>For logins, passcodes and Face ID the agent stops and asks you to finish on the phone. It never asks for the password or the code.</li>
+        <li>If you use <a href="https://github.com/leeguooooo/bitwarden-use">bitwarden-use</a>, <code>phone_login</code> fills an app's sign-in form from your own vault entry inside the daemon. The password never reaches the model; the answer names the entry and a masked account only.</li>
+        <li>Flow inputs are given per run and never written back to the flow file. Inputs must not carry credentials, codes or private content.</li>
+      </ul>
+
+      <h2>Limits the agent cannot talk its way past</h2>
+      <p>The phone's owner sets these in the daemon's environment; they hold whatever an agent's prompt says.</p>
+      <ul>
+        <li><code>IPHONE_USE_BLOCKED_APPS</code> (for example <code>Wallet, Passwords</code>): an agent cannot open, install or uninstall those apps.</li>
+        <li><code>IPHONE_USE_MAX_ACTIONS</code>: caps the actions per task.</li>
+        <li>A refusal answers <code>403</code> with <code>outcome:"not_sent"</code>: nothing reached the phone.</li>
+      </ul>
+      <p>Details: <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/agent-reference.md#owner-limits-and-the-activity-feed">Owner limits and the activity feed</a>.</p>
+
+      <h2>You see what it does</h2>
+      <ul>
+        <li>The web page shows each action over the live screen in plain words, for example <code>Tapped “Wi-Fi”</code>. Typed text is never kept, only its length.</li>
+        <li>Every <code>/agent/*</code> request is timed in <code>~/.iphone-use/agent-timing.jsonl</code>: route, owner and timings only, never request or screen content.</li>
+        <li>A phone has one owner at a time. While you are in control, an agent waits or is told who holds the phone.</li>
+      </ul>
+
+      <h2>Telemetry: off</h2>
+      <div class="du-callout tip">
+        <div class="du-callout-title">✅ This build sends no usage data</div>
+        The daemon contains code for anonymous usage counts, but no project token ships with it, so it sends nothing unless you
+        set <code>IPHONE_USE_TELEMETRY_TOKEN</code> yourself. If a future release turns it on, it will say so in
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/privacy.md">privacy.md</a> and
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/telemetry.md">telemetry.md</a>.
+      </div>
+      <p>If it were ever on, each event would carry only which agent API endpoint was called, whether it worked, a failure class from a fixed list, its duration, the daemon's version and platform, and a random install id. It would never send typed or read text, element labels, screenshots or video, app bundle ids, phone identifiers or names, or file paths. Either of these turns it off completely:</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code>IPHONE_USE_TELEMETRY=0
+DO_NOT_TRACK=1</code></pre>
+      </div>
+
+      <h2>The iOS app</h2>
+      <p>The iOS app (Phone Use Remote) collects no data, and the developer runs no server for it: no account, no analytics, crash reporting, advertising or tracking SDKs. It talks only to the Mac address you enter or scan. The address is kept in the app's preferences and the password or pairing token in the iOS Keychain; the camera is used only to read the pairing QR code, and local network access only to reach that Mac. <strong>Forget this Mac</strong> in the app's settings removes the saved password and pairing token.</p>
+
+      <h2>Reaching the phone from outside</h2>
+      <ul>
+        <li>Reach port <code>44321</code> through an authenticated HTTPS reverse proxy or a trusted VPN such as Tailscale, never by exposing the runner's ports.</li>
+        <li>Binding the daemon to <code>0.0.0.0</code> makes a password mandatory. Never do it on an untrusted network.</li>
+        <li><code>iphone-use-mcp --listen</code> on a loopback address is reachable only from the same Mac. Listening on any other address requires <code>IPHONE_USE_MCP_TOKEN</code>.</li>
+        <li>The owner lease is coordination between cooperating sessions, not a security boundary. Do not leave payment apps, private chats or 2FA screens open while exposing access, and stop the LaunchAgent when you are not using it.</li>
+      </ul>
+
+      <h2>This website</h2>
+      <p>iphone-use.leeguoo.com is a static site. It loads Google Analytics 4 (the leeguoo.com stream) and the blog.leeguoo.com visitor beacon to count visits. It shows no ads. Neither has anything to do with the iphone-use software on your Mac or phone.</p><!-- seo:footer --><nav class="du-static-footer" aria-label="Site"><a href="/en/">iphone-use</a> · <a href="/en/">Overview</a> · <a href="/en/install">Install</a> · <a href="/en/compare">vs Other Tools</a> · <a href="/en/tasks">Ask Your Agent</a> · <a href="/en/flows">Flows &amp; Replay</a> · <a href="/en/phone-agent">Phone Drives Itself</a> · <a href="/en/remote">Remote Control</a> · <a href="/en/connect">MCP, HTTP API &amp; Skill</a> · <a href="/en/how-it-works">How It Works</a> · <a href="/en/faq">FAQ</a> · <a href="/en/privacy">Privacy &amp; Security</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">Official flow registry</a> · <a href="https://blog.leeguoo.com/en/posts/iphone-use/">Blog: iphone-use guide</a> · <a href="https://blog.leeguoo.com/en/posts/iphone-use-video/">Blog: demo video</a> · <a href="https://chrome-use.leeguoo.com/en/">chrome-use (agents in your Chrome)</a> · <a href="https://leeguoo.com/about/en">Author</a> · <a href="/privacy" hreflang="zh-Hans">中文</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

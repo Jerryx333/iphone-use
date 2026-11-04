@@ -33,9 +33,9 @@ stray="$(printf '%s\n' "$FN" | sed -n "${after_def},${ok_line}p" | grep -n '[^_]
 [ -z "$stray" ] || bad "plain die between bootout and success: $stray"
 ok_t "no plain die between the bootout and the success line"
 
-printf '%s\n' "$FN" | grep -q 'wait_label_gone "gui/\$UID_NUM/\$label"' \
+printf '%s\n' "$FN" | grep 'wait_label_gone "gui/\$UID_NUM/\$label"' >/dev/null \
     || bad "no wait after bootout"
-printf '%s\n' "$FN" | grep -q 'probe_launchd_daemon "gui/\$UID_NUM/\$label" "\$binary"' \
+printf '%s\n' "$FN" | grep 'probe_launchd_daemon "gui/\$UID_NUM/\$label" "\$binary"' >/dev/null \
     || bad "readiness does not use probe_launchd_daemon"
 ok_t "waits for the old job to go and probes identity + authenticated status"
 

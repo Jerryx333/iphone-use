@@ -1,0 +1,174 @@
+{
+  "version": "0.27.3",
+  "artifact_audit": {
+    "version": "0.27.3",
+    "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.27.3",
+    "published_at": "2026-10-27T15:50:17Z",
+    "tag_commit": "a76ebc6344bcbf077ae8f44d0fa6d5e128eff20f",
+    "checksums": {
+      "iphone-use-app.tar.gz": "8e08dbcfcf9a45412d5199773702af097799050ca4f7eba7a920722d125d797e",
+      "iPhoneUse.app.zip": "abd408bea19cf4b2389ce61103f6e28783ee9e611012fe7d75a29455a259246b",
+      "iphone-use-runner.tar.gz": "4c6457eac1aa1f135837c589321766d37252a26938ff47fab636f68c514b9574",
+      "iphone-use-mcp-macos-universal.tar.gz": "e1aea84b6ca0318d69b9bd4da2d382fd075a1a1670774a6d8ac3bb09e7e5d82c",
+      "browser-use-bridge-macos-universal.tar.gz": "8bf08de93f78379ef4a8de7a907da729617b63765dd99c588895fde83404f709"
+    },
+    "github_asset_digests_verified": true,
+    "mac_app_signature_notarization_and_ticket_verified": true,
+    "architectures": {
+      "iphone-use": [
+        "arm64",
+        "x86_64"
+      ],
+      "iphone-use-mcp": [
+        "arm64",
+        "x86_64"
+      ],
+      "iphone-use-legacy-launch": [
+        "arm64",
+        "x86_64"
+      ]
+    },
+    "mcp_tools": 40,
+    "mcp_names": [
+      "phone_app_notes",
+      "phone_apps",
+      "phone_capabilities",
+      "phone_collect_list",
+      "phone_crashes",
+      "phone_elements",
+      "phone_flow_draft",
+      "phone_flow_info",
+      "phone_flow_list",
+      "phone_flow_publish",
+      "phone_flow_report",
+      "phone_flow_run",
+      "phone_flow_update",
+      "phone_hold",
+      "phone_home_layout",
+      "phone_install_app",
+      "phone_instances",
+      "phone_jev_run",
+      "phone_key",
+      "phone_login",
+      "phone_logs",
+      "phone_read_value",
+      "phone_reconnect",
+      "phone_record",
+      "phone_release_owner",
+      "phone_run_end",
+      "phone_run_start",
+      "phone_run_steps",
+      "phone_screen",
+      "phone_screen_frame",
+      "phone_screenshot",
+      "phone_scroll",
+      "phone_scroll_find",
+      "phone_set_location",
+      "phone_shortcut",
+      "phone_status",
+      "phone_tap",
+      "phone_tap_element",
+      "phone_tap_label",
+      "phone_type"
+    ],
+    "standalone_mcp_identical": true,
+    "runner_sources_match_tag": {
+      "IPURBridge.h": "23d2bfe4fec73bd53004eb2cd691cf70722fabfaee53869f6aadb73ef8d79623",
+      "IPURBridge.m": "1caee3ff20ff7f297b09c50b2cc7750b15ae0aa0a372e8ab39a6b1be4e887230",
+      "RunnerExitNotice.swift": "2159c2eca0ced5a9caee9c28f2bbf7e7ba082e05d0b07abcfeb1d52461d1deae",
+      "RunnerTests.swift": "c05f44a01264cce4e2512eb3f0e9bf5dc0dccd291dd3ccbc3a964483f230ba3a",
+      "RunnerActions.swift": "705ec97ae8a405c5c9800f72c6aa42a6d4f2a0b89bb8b21432a11dcc3e9af3a1",
+      "RunnerRoutes.swift": "b50585c4c59502a9e508fb3cd64b526480ef51de50f8b01c1cdc696f570152e6"
+    },
+    "browser_bridge_architectures": [
+      "arm64",
+      "x86_64"
+    ],
+    "phone_host_architectures": [
+      "arm64",
+      "x86_64"
+    ],
+    "phone_static_libraries": {
+      "app/native/libipu_phone_host.a": [
+        "arm64"
+      ],
+      "app/apps/ios/SessionLibraries/iphoneos/libipu_browser_session.a": [
+        "arm64"
+      ]
+    },
+    "label_hint_fixture": {
+      "issue365_hint_verified": true,
+      "mutation_requests": 0,
+      "read_requests": 1
+    },
+    "installed": false,
+    "physical_acceptance": false
+  },
+  "installation_validation": {
+    "instances": [
+      {
+        "instance": "default",
+        "version": "0.27.3",
+        "all_three_binaries_match_download": true,
+        "signature_verified": true,
+        "target_ports_auth_preserved": true,
+        "park_marker_state_preserved": true
+      },
+      {
+        "instance": "i13",
+        "version": "0.27.3",
+        "all_three_binaries_match_download": true,
+        "signature_verified": true,
+        "target_ports_auth_preserved": true,
+        "park_marker_state_preserved": true
+      }
+    ],
+    "setup_requested": false,
+    "phone_input_sent": false,
+    "physical_acceptance": false,
+    "verified_at": "2026-10-27T16:16:20.739053+00:00"
+  },
+  "runtime_snapshot": {
+    "instances": [
+      {
+        "instance": "default",
+        "version": "0.27.3",
+        "owner": null,
+        "released": true,
+        "drivable": false,
+        "runner_build": "stopped"
+      },
+      {
+        "instance": "i13",
+        "version": "0.27.3",
+        "owner": null,
+        "released": true,
+        "drivable": false,
+        "runner_build": "failed"
+      }
+    ],
+    "verified_at": "2026-10-27T16:20:21.073Z"
+  },
+  "skill_release": {
+    "ref": "v0.27.3",
+    "commit": "a76ebc6344bcbf077ae8f44d0fa6d5e128eff20f",
+    "sha256": "b7e33c0ee9f8ec6198432d079d616fc753131315c65dd6722f21cc4bdf95ac66"
+  },
+  "mcp_registry": {
+    "version": "0.27.3",
+    "status": "active",
+    "url": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.leeguooooo%2Fiphone-use/versions/0.27.3",
+    "recovery_run": "https://github.com/leeguooooo/iphone-use/actions/runs/40538645937"
+  },
+  "marketplace_snapshot": {
+    "version": "0.27.3",
+    "blob_sha": "1800a3f3e20bb31cf28651aca3d2e0fe74e811ae",
+    "sync_run": "https://github.com/leeguooooo/plugins/actions/runs/40539061235"
+  },
+  "original_release_run": {
+    "url": "https://github.com/leeguooooo/iphone-use/actions/runs/40532742950",
+    "mac_build": "success",
+    "registry": "cancelled before execution because a hosted macOS runner was not acquired"
+  },
+  "verified_at": "2026-10-27T16:22:27.076590+00:00"
+}

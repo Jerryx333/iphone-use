@@ -20,19 +20,27 @@ HOST="${IPHONE_USE_URL:-http://127.0.0.1:44321}"
 AUTH="Authorization: Bearer $IPHONE_USE_TOKEN"   # daemon password or IPHONE_USE_AGENT_TOKEN
 MUTATION="X-Phone-Control: 1"                      # required on every state-changing POST
 OWNER="X-Phone-Owner: <your-session-name>"          # MCP sends this for you
-curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure stop and report
+curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure follow recovery below
 ```
 
 ## The loop
 
-1. **Probe.** `GET /agent/status` / `phone_status`. Screen reads and UI input
-   require `drivable:true`; otherwise report `hint` and stop those operations.
+1. **Probe.** If the user names a phone or multiple phones are installed, first
+   use `phone_instances`, then pass that `instance` on every MCP read/action.
+   Omitted instance reports only the configured daemon, never all phones.
+   `GET /agent/status` / `phone_status`. Screen reads and UI input
+   require `drivable:true`; otherwise pause those operations and follow the recovery steps below.
    Paired metadata reads (`phone_home_layout`, `phone_apps`) and cached capability
    discovery do not require a running Runner. Use them without reconnecting or
-   opening Home, and respect any private-hold refusal. Reconnect once
-   (`phone_reconnect` / `POST /agent/mode {"mode":"agent"}`) only when the
-   user's current task needs the phone, never for a health check: each runner
-   launch can make the operator type the passcode. If `owner` is another
+   opening Home, and respect any private-hold refusal. A phone `released`
+   after the last task comes back by itself: the next MCP phone tool
+   (`phone_elements`, `phone_tap`, `phone_run_steps`, …) reconnects, waits, and
+   answers `phone_not_ready` with what to do when a person must act (enter the
+   passcode on the phone). Reconnect by hand once (`phone_reconnect`, with
+   `wait_secs` to block until drivable or a blocker / `POST /agent/mode
+   {"mode":"agent"}`) only when the user's current task needs the phone and no
+   tool brought it back, never for a health check: each runner launch can make
+   the operator type the passcode. If `owner` is another
    session, do not drive. → reference: *Phone states and recovery*
 
 2. **Look for a saved flow first.** Entering an app — a `launch_app` response,
@@ -86,29 +94,76 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure st
    again before `phone_flow_publish(confirm=true)`. → reference: *Saving a flow*
 
 When the task is done, release the phone: `phone_release_owner` /
-`POST /agent/owner {"release":true}`. If a response carried `agent_focus`, the
+`POST /agent/owner {"release":true}`. That also stops the device runner right
+away, so the phone leaves automation mode until the next task needs it. If a response carried `agent_focus`, the
 phone is on Do Not Disturb for your session: tell the user, and releasing turns
 it off again.
+
+## First-failure recovery
+
+Only recover a phone for an unfinished task that authorizes its use. For a
+health check, report status and stop. Run host commands on the daemon's Mac,
+not an unrelated remote MCP client.
+
+1. `target_configured:false` with `recovery_owner:unconfigured` is an unselected
+   target, not proof that connected
+   phones are offline. `phone_instances` lists installed daemon instances,
+   not paired phones. Inspect `xcrun devicectl list devices` and run
+   `iphone-use doctor` yourself. Match the user's named phone; if several
+   targets are plausible, ask which one. Never select by list order.
+2. For a confirmed target, run `IPU_RUNNER_UDID=<UDID> iphone-use setup` (add
+   `--instance NAME` for a named instance). Do not change another instance,
+   use `--force`, clear a private hold, or take over another owner.
+   `recovery_owner:external` means recovery belongs on the owning host; do not
+   configure or restart a local runner for it. With an
+   already configured phone, follow `setup_blocked_on`, `next_step` and
+   `recovery`; reconnect once only when the task needs it, recovery_owner is
+   `daemon`, and no blocker, handoff, or reconnect is in progress.
+3. While setup is active, inspect progress/status without repeatedly restarting
+   setup. For `trust`, distinguish computer pairing from certificate approval:
+   the person confirms **Trust This Computer** on the phone if that prompt
+   appears. For an untrusted Apple Development certificate in `setup_message`,
+   the person uses **iPhone Settings > General > VPN &
+   Device Management > the matching Apple Development certificate > Trust**.
+   This is separate from **Trust This Computer**. If there is no certificate
+   or prompt, inspect doctor output and runner logs; do not assume a popup
+   exists or retry trust by restarting the runner.
+4. Certificate trust may be followed later by a separate passcode or UI
+   automation authorization. The person handles it only on the phone. Never
+   ask for or type their passcode. Pause screenshots, elements, the live panel
+   and other screen reads during sensitive input. A historical
+   `needs_passcode_on_phone` blocker does not confirm a currently visible
+   prompt. Wait for the person, then check `phone_status`; `drivable:true`
+   is current readiness, not a guarantee that iOS will never ask again.
+5. Once ready, re-read the current app/screen and resume the original task.
+   Do not replay a prior mutation with an unknown outcome. If still blocked,
+   retain the setup phase, blocker, message and relevant redacted logs.
+   An iOS/SDK version warning alone does not establish incompatibility.
 
 ## Core actions
 
 | What | HTTP `/agent/input` `type` | MCP | Flow / batch step `kind` |
 |---|---|---|---|
 | Find an app's bundle id | `GET /agent/apps?query=微信` | `phone_apps` | — |
-| Open an app | `launch_app` `bundle` (or `name` for built-ins, or `app`: any app's exact name — refused with candidates if ambiguous) | `phone_run_steps` step | `launch_app` (`bundle` or `app`) |
+| Open an app | `launch_app` `bundle` (or `name` for built-ins, or `app`: any app's exact name, or a loose name matching exactly one installed app — `resolved` says which; refused with candidates if ambiguous) | `phone_run_steps` step | `launch_app` (`bundle` or `app`) |
 | Read home pages, Dock and folders | `GET /agent/home-layout?page=0` (omit page for all) | `phone_home_layout` (`page?`) | — |
-| Read the screen | `GET /agent/elements` | `phone_elements` | `wait_for` (`application`, `present`, `absent`) |
+| Read this client's task timing | `GET /agent/metrics?owner=<current-owner>` | `phone_metrics` (`limit?`) | — |
+| Read the screen | `GET /agent/elements` | `phone_elements` | `wait_for` (`application`, `present`, `absent`; on canvas/game screens `ocr_present` / `ocr_absent`, up to 60 s) |
 | Tap an element | `tap` + `element` + `snapshot` | `phone_tap_element` | `tap_locator` (durable) |
 | Tap a unique label | `tap` + `label` | `phone_tap_label` | `tap_label` |
 | Tap by locator | `tap_locator` + `locator` | `phone_run_steps` step | `tap_locator` |
 | Tap a point | `tap` + `x`,`y` | `phone_tap` | `tap` |
-| Type | `text` (into the focused field; up to 20000 chars — on `text_partially_typed` send only `remaining_text` with `clear:false`) | `phone_type` | `type` (`input` names a runtime value) |
+| Type | `text` (up to 20000 scalars; optional `budget_ms` 6000..15000 requires `inputContinuation`; use a returned `continue_token` alone, once; uncertain delivery requires inspecting the original field, never replaying the whole text) | `phone_type` | `type` (`input` names a runtime value) |
 | Key | `key` `return`… | `phone_key` | `key` |
-| Home / Spotlight | `shortcut` | `phone_shortcut` | `shortcut` |
+| Home / Spotlight / Photos capture / physical volume | `shortcut` (`home`, `spotlight`, `save_screenshot`, `volume_up`, `volume_down`) | `phone_shortcut` | `shortcut` |
 | Scroll | `scroll` `dy` (80 ≈ 15% of a screen, 400 ≈ 75%) | `phone_scroll` (`x`, `y`, `dx`, `dy` required) | `scroll` (`x`, `y`, `dx`, `dy` required in MCP batches) |
 | System alert | `alert` `button` / `action` | `phone_run_steps` step | `alert` |
 | App asks you to log in | `POST /agent/login` (`iphone-use auth login`) | `phone_login` | — |
 | Switch / slider | `perform` `toggle` / `adjust` | `phone_run_steps` `perform` step (element + snapshot) | — |
+
+`save_screenshot` requests a new image in Photos; its acknowledgement is not independent save verification. Complete an existing system preview without taking another capture.
+
+Volume shortcuts require a physical device and an explicitly capable Runner. Acknowledgement confirms a button request, not the audible volume level. Never repeat an uncertain volume action.
 
 For a drag that needs an edge hover, a `drag` step can use
 `points: [{x, y, dwell_ms}, …]` instead of `x1/y1/x2/y2`. Use 2–16 points from
@@ -146,7 +201,7 @@ curl -s -H "$AUTH" -H "$MUTATION" -H "$OWNER" -X POST "$HOST/agent/actions" -d '
 | Tap coordinates guessed from a screenshot | Read `phone_elements`, tap by element + snapshot or by label |
 | Take a screenshot after every step | `observe:true` / `?return=delta` returns the change |
 | One tap per call when the next steps are visible | One `phone_run_steps` / `/agent/actions` batch with `wait_for` |
-| `sleep` a fixed number of seconds | `wait_for` with `present` / `absent` / `application` |
+| `sleep` a fixed number of seconds | `wait_for` with `present` / `absent` / `application` (`ocr_present` when the screen is a canvas) |
 | Tap a system alert's button | The `alert` action (`button` or `action`) |
 | Tap a switch or slider | `perform` `toggle` / `adjust` |
 | Resend after `outcome_unknown` or `retry_safe:false` | Read the screen first; the phone may already have acted |
@@ -204,7 +259,11 @@ reference: *Flows*.
 
 1. **`retry_safe:false` or `outcome_unknown` means do not replay.** The phone may
    already have acted. Read the screen first; never resend text, send, pay or
-   delete blindly. The same applies to a failed flow.
+   delete blindly. The same applies to a failed flow. A fresh launch can return
+   `app_launch_interrupted` after the terminate request was acknowledged; inspect
+   `app_lifecycle` and current status before continuing, never replay the whole
+   fresh launch. `launch_attempted` records an attempt, not verified delivery;
+   a missing field does not mean false.
 2. **`risk: side_effect` and destructive taps need the user's explicit OK** on
    the exact target and inputs (`confirm=true` / `--confirm`). Never operate
    payment or 2FA screens unattended.
@@ -254,3 +313,64 @@ Jev retries only one observation on HTTP 504 `runner_source_timeout`, after
 the server's 1–60 second `retry_after_secs`. It never replays the preceding
 action. If post-action observation recovery fails, inspect `status:"blocked"`,
 `history`, and `last_successful_action`, then read before acting again.
+
+## Multiple installed phones
+
+Use `phone_instances` for a read-only local instance inventory. Pass `instance`
+(e.g. `i13`, `default`) on each other `phone_*` call to address that daemon.
+Keep it consistent across reads and actions; omitted instance preserves the
+MCP server's startup configuration. No target is changed and no unavailable
+instance falls back to another phone. Do not read tokens or hand-write HTTP just
+to switch instances. Discovery never reconnects; ordinary ownership, privacy,
+lock and phone-ended/human-handoff rules still apply. Runtime selection supports
+installed local LaunchAgents; simulator-only records remain separate.
+
+
+When a task needs the complete value of one non-secure field, use
+`phone_read_value` with its fresh identifier or exact label. Check the returned
+completeness and UTF-16 limit. A truncated preview is not a full value; secure or
+unsupported fields require a permitted alternative. Ownership/privacy changes
+withhold results. This read does not focus, unlock, or claim control.
+
+### Native Files handoff (opt-in candidate)
+
+When an export needs an explicit file, check `iphone-use files --help`. With
+Runner Files enabled, use the source app's native Save to Files UI, finish the
+save into the Runner inbox, then receive that exact filename:
+
+```sh
+iphone-use files receive --device '<selected-udid>' --bundle '<installed-runner>.xctrunner' \
+  --instance '<selected-instance>' --owner '<your-existing-lease-owner>' \
+  --filename '<exact-saved-name>' --destination '<absolute-mac-folder>'
+```
+
+Use your own lease, the selected instance and verified bundle ID. This command
+does not acquire someone else's control or establish that a source writer has
+finished. Its current checks require a wired connection but do not lock the
+transport. Confirm `committed:true`; retain the transfer ID and digest. After
+interruption, use `iphone-use files result` with the same device, bundle,
+instance, state directory and transfer ID. An unknown outcome requires
+inspection before another receive. `files stop` requests receiver cancellation.
+The receiver remains a candidate with documented checkpoint and upgrade gaps.
+
+## Focused observation and action receipts
+
+`phone_subtree(element, snapshot)` reads a unique native element's descendants.
+Read `complete`/`coverage`; its local row positions are read-only and cannot be
+used as action refs. Use locators or fresh `phone_elements` refs for input.
+Older runners explicitly refuse this operation.
+
+`action_evidence` separates delivery from postcondition verification. A native
+ACK is not application success; even verified element values do not establish
+saving or submission. Errors carry `recovery.action.next_step` and
+`retry_allowed`. Never replay partial or uncertain requests.
+
+For delayed loaders use `expect.absent_after_present:true` with `absent` or
+`ocr_absent`: every target must appear during this wait before absence counts.
+A loader never observed causes timeout; ordinary absence checks omit the flag.
+
+`phone_run_start(trace=true)` enables a redacted, owner-scoped timeline for this
+run. Read it with `phone_run_trace(run_id)` and close with `phone_run_end`.
+It is bounded memory, lost on restart, and contains no input values, labels,
+URLs or screenshots. It supports inspection, never automatic action replay.
+Native per-element enabled/editable/frame checks require an updated runner.

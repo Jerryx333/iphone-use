@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iPhone flow 录制与重放，不经过模型 · iphone-use</title>
+  <meta name="description" content="把 iPhone 上的任务存成 flow：经过审阅的按 App 分类的 JSON 脚本，一次调用重放，不经过模型、不花 token。含官方源、测试套件和定时运行。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/flows" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/flows" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/flows" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/flows" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="iPhone flow 录制与重放，不经过模型 · iphone-use" />
+  <meta property="og:description" content="把 iPhone 上的任务存成 flow：经过审阅的按 App 分类的 JSON 脚本，一次调用重放，不经过模型、不花 token。含官方源、测试套件和定时运行。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/flows" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="iPhone flow 录制与重放，不经过模型 · iphone-use" />
+  <meta name="twitter:description" content="把 iPhone 上的任务存成 flow：经过审阅的按 App 分类的 JSON 脚本，一次调用重放，不经过模型、不花 token。含官方源、测试套件和定时运行。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/"},{"@type":"ListItem","position":2,"name":"让 agent 做事","item":"https://iphone-use.leeguoo.com/tasks"},{"@type":"ListItem","position":3,"name":"Flow：做过一次的事，以后一键重放","item":"https://iphone-use.leeguoo.com/flows"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"Flow：做过一次的事，以后一键重放","description":"把 iPhone 上的任务存成 flow：经过审阅的按 App 分类的 JSON 脚本，一次调用重放，不经过模型、不花 token。含官方源、测试套件和定时运行。","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/flows","mainEntityOfPage":"https://iphone-use.leeguoo.com/flows","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="flows" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item active" aria-current="page" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">让 agent 做事</p>
+
+      <div class="du-title-row">
+        <h1>Flow：做过一次的事，以后一键重放</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        重复做的事存成 <span class="mark">flow</span>：按 App 分类、经过审阅的脚本，重放时不经过模型，不花 token。
+        agent 会自己找到某个 App 的 flow，一次调用跑完；在没有 flow 的 App 里做完一个多步任务后，它会问你要不要把刚才的操作存下来。
+      </p>
+
+      <h2>flow 是什么</h2>
+      <p>
+        flow 是一个格式严格的 JSON 文件（<code>version: 1</code>），步骤和 <code>phone_run_steps</code> 一样带保护
+        （按定位器点击、<code>launch_app</code>、输入、<code>wait_for</code> 检查点等），另外可以声明具名的字符串输入。
+        <code>iphone-use-mcp</code> 不需要任何模型就能校验并运行它。flow 遇到第一个失败的步骤就停下，从不重试。
+      </p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> MCP="$HOME/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+<span class="du-prompt">$</span> "$MCP" flow validate examples/flows/search-spotlight.json          <span class="du-cmt"># 离线校验</span>
+<span class="du-prompt">$</span> IPHONE_USE_TOKEN=… "$MCP" flow run examples/flows/search-spotlight.json --input 'query=coffee'</code></pre>
+      </div>
+
+      <h2>agent 怎么用 flow</h2>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🔎</span> 进入 App 时自动发现</div>
+          <p><code>launch_app</code> 的返回，或进入新 App 后第一次读屏，都带一个 <code>registry</code> 块，列出这个 App 已有的 flow。有合适的，agent 就用 <code>phone_flow_run</code> 跑：一次调用顶几十次。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">💾</span> 做完任务后主动询问</div>
+          <p class="du-say">要不要把这次操作存成 flow？</p>
+          <p>返回里带 <code>flow_suggestion</code>，或者做完一个没有 flow 覆盖的多步任务时，agent 会问你。步骤守护进程已经录好了草稿。</p>
+        </div>
+      </div>
+      <p>只有你同意才会保存：</p>
+      <ol class="du-steps">
+        <li><strong>拿草稿</strong>：agent 取出草稿（<code>phone_flow_draft</code>，或 <code>flow draft --out my-task.json</code>），附一个要修的 <code>todo</code> 列表。</li>
+        <li><strong>修好并验证</strong>：改完 todo，校验文件，在手机上跑一遍。</li>
+        <li><strong>经你同意再发布</strong>：发布会向 flow 源提一个公开 PR，所以 agent 会再问一次，才调用 <code>phone_flow_publish(confirm=true)</code>。</li>
+      </ol>
+      <p><code>IPHONE_USE_FLOWS_NO_SUGGEST=1</code> 可以关闭保存提示。</p>
+
+      <hr class="du-divider" />
+
+      <h2>在浏览器里录一个</h2>
+      <p>控制页的「流程」面板会把你在手机上的操作录成可重放的 flow 文件：</p>
+      <ul>
+        <li>只录已确认执行的操作。优先用精确的无障碍标签；按坐标的手势会标记为不稳定。</li>
+        <li>输入的文字会变成具名的运行时输入，原文被丢弃，不会写进下载的 JSON。</li>
+        <li>每一步之后，只有能确定出现了新的唯一标识或前台 App 变了，录制器才会插入一个可审阅的 <code>wait_for</code> 检查点；它不会把任意标签或值抄进检查点，因为那些可能是隐私。</li>
+        <li>可以审阅、调整顺序、删除、填输入，然后下载合法的 flow v1 JSON，或直接跑一遍。运行前必须填好所有输入，并明确勾选「没有不可撤销的操作」。</li>
+      </ul>
+
+      <h2>官方 flow 源</h2>
+      <p>
+        <a href="https://github.com/leeguooooo/iphone-use-flows">leeguooooo/iphone-use-flows</a> 是官方的、也是唯一受支持的
+        flow 源，收录经过审阅的按 App 分类的 flow。守护进程会自己保持它最新（<code>IPHONE_USE_FLOWS_NO_AUTO_UPDATE=1</code> 关闭）。
+        文件都是纯 JSON，安装 flow 源不会执行任何代码；任何一个校验和或格式校验失败，整次更新都会放弃，本地内容保持不变。
+      </p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> "$MCP" flow update                        <span class="du-cmt"># 同步到 ~/.iphone-use/flows：sha256 + 严格校验</span>
+<span class="du-prompt">$</span> "$MCP" flow list --category health        <span class="du-cmt"># id · 风险 · 验证 · 输入 · 名称</span>
+<span class="du-prompt">$</span> "$MCP" flow info health/export-all-zh-cn  <span class="du-cmt"># 元数据和步骤模板</span>
+<span class="du-prompt">$</span> "$MCP" flow run health/export-all-zh-cn   <span class="du-cmt"># 失败时会说卡在哪一步、为什么</span>
+<span class="du-prompt">$</span> "$MCP" flow draft --out my-task.json      <span class="du-cmt"># 刚才在手机上做的事，导出成草稿</span>
+<span class="du-prompt">$</span> "$MCP" flow add my.json --as myapp/daily  <span class="du-cmt"># 你自己的 flow，update 后仍保留</span>
+<span class="du-prompt">$</span> "$MCP" flow publish my.json --as myapp/daily --alias MyApp --note "iPhone 17 Pro Max, iOS 26"   <span class="du-cmt"># 通过 gh 提 PR</span>
+<span class="du-prompt">$</span> "$MCP" flow report health/export-all --result @run.json --note "profile button renamed"           <span class="du-cmt"># 提一个 flow-broken issue</span></code></pre>
+      </div>
+
+      <h3>风险等级</h3>
+      <table>
+        <thead><tr><th>risk</th><th>含义</th></tr></thead>
+        <tbody>
+          <tr><td><code>read_only</code></td><td>只读手机内容。</td></tr>
+          <tr><td><code>navigation</code></td><td>在 App 里跳转。</td></tr>
+          <tr><td><code>side_effect</code></td><td>会发送、发布、付款或删除。不加 <code>--confirm</code> / <code>confirm=true</code> 就拒绝运行。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>App 更新之后</h3>
+      <p>
+        每个 flow 都记着它在哪个 App（或 iOS）版本上验证过，CLI 会读取手机上实际安装的版本（<code>flow apps</code>），
+        每次列出时都给一个 <code>compat</code> 结论：<code>verified</code>、<code>untested-newer</code>、<code>incompatible</code>、
+        <code>broken</code>、<code>needs-verification</code>、<code>draft</code> 或 <code>unknown</code>。<code>flow run</code>
+        不加 <code>--force</code> 会拒绝 broken 和 incompatible 的 flow。每晚有一次巡检在真机上重跑已验证的只读 flow：
+        <strong>verified</strong> 刷新验证日期，<strong>failed</strong> 打上标记并提一个 <code>flow-broken</code> issue，
+        <strong>skipped</strong>（手机锁着、被别人占着、不可操作或结果不确定）则原样不动。
+      </p>
+
+      <h3>运行失败时</h3>
+      <p>
+        结果里会多一个 <code>diagnosis</code> 块：失败的步骤、屏幕能不能读、原因（例如 <code>locator_no_match</code>、
+        <code>locator_ambiguous</code>），以及最多五个候选元素。它只是运行后的一次有限读取：不会重发任何操作，也不会悄悄改 flow。
+        <code>--artifacts-dir DIR</code> 还会写一份机器可读的运行记录（只有结构，不写输入内容和屏幕文字）。
+      </p>
+
+      <div class="du-callout warn">
+        <div class="du-callout-title">⚠️ 输入里不要放秘密</div>
+        <code>--input KEY=VALUE</code> 只在本次运行生效，不会写回文件，但命令行参数可能留在 shell 历史里。flow 的输入不能带密码、验证码或私人内容；
+        发送、发布、付款、删除这类操作必须声明为 <code>side_effect</code>。
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>测试套件与定时运行</h2>
+      <p>有两样东西建立在 flow 之上，都和 <code>flow run</code> 走同一个引擎。</p>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🧪</span> 测试套件</div>
+          <p><code>iphone-use-mcp test suite.yaml</code> 把「打开、点几下、检查对不对」变成可重跑的文件。退出码 <code>0</code> 全部通过，<code>1</code> 有用例失败，<code>2</code> 套件无效或手机无法操作。<code>--junit FILE</code> 生成 JUnit XML，直接接 CI。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">⏰</span> 定时任务</div>
+          <p>守护进程按 cron 运行一个 flow 或一个套件。手机被别人占用时会等，运行失败、错过或跳过时会弹 macOS 通知。有副作用的目标在创建定时任务时需要加 <code>--confirm</code>。</p>
+        </div>
+      </div>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> iphone-use-mcp test examples/tests/settings-smoke.zh-CN.yaml --junit report.xml
+<span class="du-prompt">$</span> iphone-use-mcp schedule add --cron "0 9 * * 1-5" --test ~/suites/smoke.yaml --name "morning smoke"
+<span class="du-prompt">$</span> iphone-use-mcp schedule add --cron "@daily" --flow health/export-all-zh-cn
+<span class="du-prompt">$</span> iphone-use-mcp schedule list</code></pre>
+      </div>
+      <p>同样的定时任务列表在控制页的 <code>/schedules</code>。详见<a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/testing.zh-CN.md">测试与定时任务</a>。</p>
+
+      <p>接下来：<a href="/tasks">可以让 agent 做什么</a> · <a href="/connect">接上你的 agent</a>。</p><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/flows" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

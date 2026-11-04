@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>把 Claude Code、Codex 接到 iPhone · iphone-use</title>
+  <meta name="description" content="通过 iphone-use 的 MCP server、HTTP 接口或随附的 skill，把 Claude Code、Codex、Cursor 或任何 MCP 客户端接到真实 iPhone 上。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/connect" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/connect" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/connect" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/connect" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="把 Claude Code、Codex 接到 iPhone · iphone-use" />
+  <meta property="og:description" content="通过 iphone-use 的 MCP server、HTTP 接口或随附的 skill，把 Claude Code、Codex、Cursor 或任何 MCP 客户端接到真实 iPhone 上。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/connect" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="把 Claude Code、Codex 接到 iPhone · iphone-use" />
+  <meta name="twitter:description" content="通过 iphone-use 的 MCP server、HTTP 接口或随附的 skill，把 Claude Code、Codex、Cursor 或任何 MCP 客户端接到真实 iPhone 上。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/"},{"@type":"ListItem","position":2,"name":"接入方式","item":"https://iphone-use.leeguoo.com/phone-agent"},{"@type":"ListItem","position":3,"name":"接上你的 agent：MCP、HTTP API 与 skill","item":"https://iphone-use.leeguoo.com/connect"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"接上你的 agent：MCP、HTTP API 与 skill","description":"通过 iphone-use 的 MCP server、HTTP 接口或随附的 skill，把 Claude Code、Codex、Cursor 或任何 MCP 客户端接到真实 iPhone 上。","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/connect","mainEntityOfPage":"https://iphone-use.leeguoo.com/connect","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="connect" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item active" aria-current="page" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">接入方式</p>
+
+      <div class="du-title-row">
+        <h1>接上你的 agent：MCP、HTTP API 与 skill</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        Mac 上的守护进程负责操作手机，对外提供三种入口：<span class="mark">MCP server</span>，给 Claude Code、Codex、
+        Claude Desktop、Cursor 等 MCP 客户端用；<strong>HTTP 接口</strong>，给 agent 和脚本用（<code>/agent/*</code>）；
+        <strong>网页和 iOS 原生 App</strong>，给人用。
+      </p>
+
+      <h2>安装脚本已经帮你做好的</h2>
+      <p>
+        装了 Claude Code、Codex 的话，安装时会自动给它们注册 MCP server；装了 Cursor、Claude Desktop 也会一并注册
+        （<code>IPHONE_USE_NO_CLIENT_SETUP=1</code> 不动 Cursor 和 Claude Desktop）。agent skill 也会一起装好。
+        如果当前对话里还没有 <code>phone_*</code> 工具，新开一个对话。
+      </p>
+
+      <h2>其他 MCP 客户端</h2>
+      <p>只要填命令，在这台 Mac 上 server 会自己找到守护进程和令牌。填绝对路径（替换 <code>你的用户名</code>），把这一项合并进文件，保留里面已有的 server。</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">json · mcpServers</span>
+        </div>
+<pre><code>{
+  "mcpServers": {
+    "iphone-use": {
+      "command": "/Users/你的用户名/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+    }
+  }
+}</code></pre>
+      </div>
+      <table>
+        <thead><tr><th>客户端</th><th>配置文件</th><th>写法</th></tr></thead>
+        <tbody>
+          <tr><td>Cursor</td><td><code>~/.cursor/mcp.json</code>（或项目里的 <code>.cursor/mcp.json</code>）</td><td>上面的 <code>mcpServers</code> 写法</td></tr>
+          <tr><td>Claude Desktop</td><td><code>~/Library/Application Support/Claude/claude_desktop_config.json</code></td><td>上面的 <code>mcpServers</code> 写法；改完退出再重开 App</td></tr>
+          <tr><td>Gemini CLI</td><td><code>~/.gemini/settings.json</code>（或项目里的 <code>.gemini/settings.json</code>）</td><td>上面的 <code>mcpServers</code> 写法</td></tr>
+          <tr><td>Windsurf / Devin Desktop</td><td><code>~/.codeium/windsurf/mcp_config.json</code>（新版本是 <code>~/.config/devin/mcp_config.json</code>）</td><td>上面的 <code>mcpServers</code> 写法</td></tr>
+          <tr><td>VS Code / Copilot</td><td>工作区里的 <code>.vscode/mcp.json</code>，或用 <strong>MCP: Open User Configuration</strong></td><td>键名是 <code>servers</code>，<code>"type": "stdio"</code></td></tr>
+          <tr><td>opencode</td><td><code>~/.config/opencode/opencode.json</code>（或项目里的 <code>opencode.json</code>）</td><td>键名是 <code>mcp</code>，命令写成数组</td></tr>
+        </tbody>
+      </table>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">json · VS Code</span>
+        </div>
+<pre><code>{
+  "servers": {
+    "iphone-use": {
+      "type": "stdio",
+      "command": "/Users/你的用户名/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+    }
+  }
+}</code></pre>
+      </div>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">json · opencode</span>
+        </div>
+<pre><code>{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "iphone-use": {
+      "type": "local",
+      "command": ["/Users/你的用户名/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"],
+      "enabled": true
+    }
+  }
+}</code></pre>
+      </div>
+      <p>它在 MCP 注册表中的名字（见仓库里的 <code>server.json</code>）是 <code>io.github.leeguooooo/iphone-use</code>。</p>
+
+      <h3>Codex 和 Claude Code 插件</h3>
+      <p>插件带 skill 和 MCP server，但仍需先完成<a href="/install">安装</a>。</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">Codex · Claude Code</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> codex plugin marketplace add leeguooooo/iphone-use &amp;&amp; codex plugin add iphone-use@iphone-use
+<span class="du-cmt"># 在 Claude Code 里</span>
+<span class="du-prompt">&gt;</span> /plugin marketplace add leeguooooo/iphone-use
+<span class="du-prompt">&gt;</span> /plugin install iphone-use@iphone-use</code></pre>
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>MCP 工具</h2>
+      <table>
+        <thead><tr><th>分组</th><th>工具</th></tr></thead>
+        <tbody>
+          <tr><td>看</td><td><code>phone_status</code>、<code>phone_capabilities</code>、<code>phone_screenshot</code>、<code>phone_elements</code>（带一个 <code>registry</code> 块，列出当前 App 已安装的 flow）</td></tr>
+          <tr><td>操作</td><td><code>phone_tap</code>、<code>phone_tap_element</code>（绑定快照）、<code>phone_tap_label</code>（唯一的精确标签）、<code>phone_scroll</code>、<code>phone_type</code>、<code>phone_key</code>、<code>phone_shortcut</code></td></tr>
+          <tr><td>批量</td><td><code>phone_run_steps</code>（最多 24 步，可加 <code>wait_for</code>）、<code>phone_jev_run</code>（把整个目标交给手机上的快速 agent）</td></tr>
+          <tr><td>生命周期</td><td><code>phone_reconnect</code>、<code>phone_hold</code>、<code>phone_release_owner</code>、<code>phone_login</code>（在守护进程内用你自己的密码库登录 App）</td></tr>
+          <tr><td>Flow</td><td><code>phone_flow_list</code>、<code>phone_flow_info</code>、<code>phone_flow_run</code>、<code>phone_flow_draft</code>、<code>phone_flow_update</code>、<code>phone_flow_publish</code>、<code>phone_flow_report</code></td></tr>
+          <tr><td>统计</td><td><code>phone_run_start</code>、<code>phone_run_end</code></td></tr>
+          <tr><td>开发测试</td><td><code>phone_logs</code>、<code>phone_crashes</code>、<code>phone_record</code>、<code>phone_install_app</code>、<code>phone_set_location</code>、<code>phone_app_notes</code></td></tr>
+        </tbody>
+      </table>
+      <p>完整参数见 <a href="https://github.com/leeguooooo/iphone-use/blob/main/crates/mcp/README.md">crates/mcp/README.md</a>。</p>
+
+      <h3>怎么读结果</h3>
+      <ul>
+        <li><strong>文本块</strong>写给模型看，很紧凑：操作后稳定下来的变化、每个元素一行，或者一个批次的结论和结束时的画面。</li>
+        <li><strong><code>structuredContent</code></strong> 默认精简，只放程序要判断的字段（<code>ok</code>、<code>outcome</code>、<code>retry_safe</code>、<code>error</code>、<code>failed_step</code>、<code>snapshot</code> 等）。<code>IPHONE_USE_MCP_STRUCTURED=full</code> 发送守护进程的完整 JSON，<code>off</code> 不发送。</li>
+        <li>结果无法确认时，返回 <code>outcome: "unknown"</code> 和 <code>retry_safe: false</code>。只看 <code>retry_safe</code> 决定能否重试，不要看 <code>outcome</code>：先读屏，再决定下一步。</li>
+      </ul>
+
+      <h3>收窄工具、走 HTTP、选手机</h3>
+      <ul>
+        <li><code>IPHONE_USE_MCP_TOOLS=readonly</code> 只开放读取类工具；写一个逗号分隔的列表则只开放列出的工具。</li>
+        <li><code>iphone-use-mcp --listen 127.0.0.1:端口</code> 可以通过 HTTP 提供 MCP。监听 127.0.0.1 时只有本机能连；其他机器上的客户端应通过带认证的加密隧道访问。若监听非回环地址，必须设置 <code>IPHONE_USE_MCP_TOKEN</code>，并使用 TLS 反向代理或可信的加密隧道保护传输；明文 HTTP 会暴露 bearer 令牌。</li>
+        <li>装了多台手机时，<code>phone_instances</code> 只读列出实例，不重连；每次调用都可以用 <code>instance:"i13"</code> 选一台。省略参数仍使用启动时配置的守护进程，实例缺失时直接报错，不改选其他手机。</li>
+        <li>手边没有手机？<code>iphone-use simulator start "iPhone 16 Pro"</code>，再用 <code>claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp</code> 接上（预览功能，需要 Xcode）。</li>
+      </ul>
+
+      <hr class="du-divider" />
+
+      <h2>HTTP 接口</h2>
+      <table>
+        <thead><tr><th>请求头</th><th>什么时候带</th><th>作用</th></tr></thead>
+        <tbody>
+          <tr><td><code>Authorization: Bearer &lt;token&gt;</code></td><td>每个 <code>/agent/*</code> 请求</td><td>设置了 <code>IPHONE_USE_AGENT_TOKEN</code> 就用它，否则用守护进程密码</td></tr>
+          <tr><td><code>X-Phone-Control: 1</code></td><td>每个会改变状态的 POST</td><td>在鉴权之上再确认一次意图，不能代替鉴权</td></tr>
+          <tr><td><code>X-Phone-Owner: &lt;会话名&gt;</code></td><td>控制类请求</td><td>为这个会话占用手机；租约有效期间其他会话会收到 <code>409 phone_owned</code></td></tr>
+        </tbody>
+      </table>
+      <table>
+        <thead><tr><th>接口</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /agent/status</code></td><td>就绪状态和生命周期；<code>drivable:true</code> 时才操作，否则报告 <code>hint</code></td></tr>
+          <tr><td><code>GET /agent/elements</code></td><td>屏幕的扁平无障碍树，附一个 <code>snapshot</code> 令牌</td></tr>
+          <tr><td><code>GET /agent/screenshot</code></td><td>屏幕 PNG；禁止截屏的页面返回带标签的线框图</td></tr>
+          <tr><td><code>POST /agent/input</code></td><td>一个操作（点击、输入、滚动、<code>launch_app</code>、<code>set_value</code> 等）；加 <code>?return=delta</code> 一并返回界面变化</td></tr>
+          <tr><td><code>POST /agent/actions</code></td><td>最多 24 步整体校验，遇到第一个失败就停，并给出整批的 <code>retry_safe</code></td></tr>
+          <tr><td><code>POST /agent/mode</code></td><td><code>agent</code> 启动 runner；<code>human</code> 把手机交还给拿着它的人</td></tr>
+        </tbody>
+      </table>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> AUTH="Authorization: Bearer $TOKEN"; CTL="X-Phone-Control: 1"
+<span class="du-prompt">$</span> curl -s -H "$AUTH" $HOST/agent/elements                     <span class="du-cmt"># 屏幕读成文字，附一个快照令牌</span>
+<span class="du-prompt">$</span> curl -s -H "$AUTH" -H "$CTL" -X POST "$HOST/agent/input?return=delta" \
+    -d '{"type":"tap","element":7,"snapshot":"…"}'            <span class="du-cmt"># 点击，并返回界面变化</span></code></pre>
+      </div>
+      <p>守护进程默认监听 <code>127.0.0.1:44321</code>。完整参考见 <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/agent-api.html">Agent API</a>。</p>
+
+      <hr class="du-divider" />
+
+      <h2>skill</h2>
+      <p>安装脚本把 skill 装在 <code>~/.agents/skills/iphone-use</code>，并为 Claude Code 建好发现链接。它教 agent 按这个循环操作：</p>
+      <ol class="du-steps">
+        <li><strong>先探测</strong>：<code>phone_status</code>；读屏和输入都要求 <code>drivable:true</code>，否则报告 <code>hint</code> 并停下。只有当前任务确实需要手机时才重连一次。</li>
+        <li><strong>先找现成的 flow</strong>：<code>registry</code> 块里有能完成任务的，就用 <code>phone_flow_run</code> 跑。</li>
+        <li><strong>成批操作，不要一下一下点</strong>：读一次屏，把已经知道怎么做的步骤合成一个 <code>phone_run_steps</code> 批次发出去，每次换屏后加 <code>wait_for</code>。</li>
+        <li><strong>逐步验证</strong>：<code>ok:true</code> 只说明发出去了，不说明达到了目的。</li>
+        <li><strong>问要不要存成 flow</strong>，做完后用 <code>phone_release_owner</code> 释放手机。</li>
+      </ol>
+      <div class="du-cards">
+        <a class="du-card" href="/tasks">
+          <div class="du-card-title"><span class="du-card-ico">📱</span> 让 agent 用手机</div>
+          <p>示例说法，以及 agent 能在手机上做什么。</p>
+        </a>
+        <a class="du-card" href="/how-it-works">
+          <div class="du-card-title"><span class="du-card-ico">⚙️</span> 它怎么工作</div>
+          <p>守护进程、XCTest runner、USB 与 Wi-Fi。</p>
+        </a>
+      </div><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/connect" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

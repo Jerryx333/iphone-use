@@ -1,0 +1,204 @@
+{
+  "release": {
+    "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.25.6",
+    "published_at": "2026-10-27T04:51:13Z",
+    "checksums": {
+      "browser-use-bridge-macos-universal.tar.gz": "0161eaebe62b5740de12ffb30a252b5cd4a0d775112a53158e886b4c9ac93d72",
+      "iPhoneUse.app.zip": "96feac4e9f50083d784882b8bcd98c6ee34bc25b2f3b9c99147f1fa87ec49196",
+      "iphone-use-app.tar.gz": "7fd4d8cd5b0bf8e06e47c1e9926b2d30a5d031389768894a1556aa5077c1580a",
+      "iphone-use-mcp-macos-universal.tar.gz": "123254f542dc3b3e02aa2da5a1f1b3038197dc658527c960b343db3cc9087780",
+      "iphone-use-runner.tar.gz": "e2ced11b80989f8f2003d72da9bf32b24968e29ed543d33598f0a094e8a50156"
+    },
+    "app_version": "0.25.6",
+    "cli_version": "iphone-use 0.25.6",
+    "codesign_verified": true,
+    "notarized_developer_id": true,
+    "stapled_ticket_verified": true,
+    "architectures": {
+      "iphone-use": [
+        "x86_64",
+        "arm64"
+      ],
+      "iphone-use-mcp": [
+        "x86_64",
+        "arm64"
+      ],
+      "iphone-use-legacy-launch": [
+        "x86_64",
+        "arm64"
+      ]
+    },
+    "embedded_mcp": {
+      "version": "0.25.6",
+      "tools": 39,
+      "names": [
+        "phone_app_notes",
+        "phone_apps",
+        "phone_capabilities",
+        "phone_collect_list",
+        "phone_crashes",
+        "phone_elements",
+        "phone_flow_draft",
+        "phone_flow_info",
+        "phone_flow_list",
+        "phone_flow_publish",
+        "phone_flow_report",
+        "phone_flow_run",
+        "phone_flow_update",
+        "phone_hold",
+        "phone_home_layout",
+        "phone_install_app",
+        "phone_instances",
+        "phone_jev_run",
+        "phone_key",
+        "phone_login",
+        "phone_logs",
+        "phone_reconnect",
+        "phone_record",
+        "phone_release_owner",
+        "phone_run_end",
+        "phone_run_start",
+        "phone_run_steps",
+        "phone_screen",
+        "phone_screen_frame",
+        "phone_screenshot",
+        "phone_scroll",
+        "phone_scroll_find",
+        "phone_set_location",
+        "phone_shortcut",
+        "phone_status",
+        "phone_tap",
+        "phone_tap_element",
+        "phone_tap_label",
+        "phone_type"
+      ]
+    },
+    "standalone_mcp_matches": true,
+    "standalone_mcp_codesign_verified": true,
+    "standalone_mcp_architectures": [
+      "x86_64",
+      "arm64"
+    ],
+    "runner_sources_match_tag": {
+      "IPURBridge.h": "4f3af589eca4f8cf69519a36e890c773a472c4b96ea6e54d26cfa01ca3e31130",
+      "IPURBridge.m": "45805f81c6864b2e7bfa00e1902cc53fcd9d60f5d372d12d42c88d4dc5e2f66d",
+      "RunnerExitNotice.swift": "2159c2eca0ced5a9caee9c28f2bbf7e7ba082e05d0b07abcfeb1d52461d1deae",
+      "RunnerTests.swift": "c05f44a01264cce4e2512eb3f0e9bf5dc0dccd291dd3ccbc3a964483f230ba3a",
+      "RunnerActions.swift": "705ec97ae8a405c5c9800f72c6aa42a6d4f2a0b89bb8b21432a11dcc3e9af3a1",
+      "RunnerRoutes.swift": "7efa1018cd05db0fd74b8820ccdbb43e111fb6d7b1c937afd83146e9bab85a4e"
+    },
+    "auxiliary_payloads": {
+      "browser-use-bridge": {
+        "architectures": [
+          "arm64",
+          "x86_64"
+        ],
+        "codesign_verified": true
+      },
+      "app/bin/ipu-phone-host": {
+        "architectures": [
+          "arm64",
+          "x86_64"
+        ],
+        "codesign_verified": true
+      },
+      "app/native/libipu_phone_host.a": {
+        "architectures": [
+          "arm64"
+        ],
+        "codesign_verified": false
+      },
+      "app/apps/ios/SessionLibraries/iphoneos/libipu_browser_session.a": {
+        "architectures": [
+          "arm64"
+        ],
+        "codesign_verified": false
+      }
+    }
+  },
+  "installed": {
+    "app_version": "0.25.6",
+    "installed_binary_matches_download": true,
+    "runtime_instances": [
+      {
+        "instance": "default",
+        "version": "0.25.6",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": false,
+        "runner_parked": false,
+        "runner_parked_reason": null,
+        "drivable": false,
+        "runner_build_state": "stopped"
+      },
+      {
+        "instance": "i13",
+        "version": "0.25.6",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": false,
+        "runner_parked": false,
+        "runner_parked_reason": null,
+        "drivable": false,
+        "runner_build_state": "stopped"
+      }
+    ],
+    "iPhone17_target_preserved": true,
+    "i13_parking_marker_state_preserved": true,
+    "ui_setup_requested": false,
+    "host_runner_sources_match_tag": {
+      "RunnerActions.swift": "705ec97ae8a405c5c9800f72c6aa42a6d4f2a0b89bb8b21432a11dcc3e9af3a1",
+      "RunnerRoutes.swift": "7efa1018cd05db0fd74b8820ccdbb43e111fb6d7b1c937afd83146e9bab85a4e"
+    },
+    "device_runner_restarted": false
+  },
+  "installed_mcp": {
+    "installed_mcp_version": "0.25.6",
+    "tools": 39,
+    "environment_proxy_points_to_closed_port": true,
+    "real_instances_read_only": [
+      {
+        "instance": "default",
+        "version": "0.25.6",
+        "released": true,
+        "runner_parked": false,
+        "runner_parked_reason": null,
+        "drivable": false
+      },
+      {
+        "instance": "i13",
+        "version": "0.25.6",
+        "released": true,
+        "runner_parked": false,
+        "runner_parked_reason": null,
+        "drivable": false
+      }
+    ],
+    "i13_parking_marker_state_preserved": true,
+    "ui_input_sent": false,
+    "reconnect_requested": false
+  },
+  "mcp_registry_version": "0.25.6",
+  "plugin_marketplace_version": "0.25.6",
+  "physical_acceptance": false,
+  "empty_registry_probe": {
+    "scope": "isolated localhost daemon with a 3-second apps delay; no phone",
+    "baseline_version": "0.25.5",
+    "baseline_elapsed_seconds": 3.016,
+    "baseline_requests": [
+      "/agent/elements?image=auto",
+      "/agent/apps",
+      "/agent/status"
+    ],
+    "installed_version": "0.25.6",
+    "installed_elapsed_seconds": 0.002,
+    "installed_requests": [
+      "/agent/elements?image=auto"
+    ],
+    "read_success_before_and_after": true,
+    "real_app_startup_performance_claimed": false
+  },
+  "pull_request": 349,
+  "pull_request_head": "dff7a5d61ed52497fa2ac53d78a3008f98024d69",
+  "complete_pr_checks_passed": true
+}

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iphone-use 隐私与安全：本机运行，无遥测</title>
+  <meta name="description" content="iphone-use 的数据在哪：守护进程跑在你自己的 Mac 上，runner 请求要签名，遥测关闭，密码由你自己输入，agent 绕不过主人设的限制。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/privacy" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/privacy" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/privacy" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/privacy" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="iphone-use 隐私与安全：本机运行，无遥测" />
+  <meta property="og:description" content="iphone-use 的数据在哪：守护进程跑在你自己的 Mac 上，runner 请求要签名，遥测关闭，密码由你自己输入，agent 绕不过主人设的限制。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/privacy" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="iphone-use 隐私与安全：本机运行，无遥测" />
+  <meta name="twitter:description" content="iphone-use 的数据在哪：守护进程跑在你自己的 Mac 上，runner 请求要签名，遥测关闭，密码由你自己输入，agent 绕不过主人设的限制。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/"},{"@type":"ListItem","position":2,"name":"参考","item":"https://iphone-use.leeguoo.com/faq"},{"@type":"ListItem","position":3,"name":"隐私与安全","item":"https://iphone-use.leeguoo.com/privacy"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"隐私与安全","description":"iphone-use 的数据在哪：守护进程跑在你自己的 Mac 上，runner 请求要签名，遥测关闭，密码由你自己输入，agent 绕不过主人设的限制。","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/privacy","mainEntityOfPage":"https://iphone-use.leeguoo.com/privacy","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="privacy" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item active" aria-current="page" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">参考</p>
+
+      <div class="du-title-row">
+        <h1>隐私与安全</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        iphone-use 跑在<span class="mark">你自己的 Mac</span> 上，操作的是<strong>你自己的 iPhone</strong>。没有 iphone-use
+        账号，中间也没有开发者的服务器。本页说明数据留在哪里、agent 能做什么不能做什么，以及怎样安全地从外网连回手机。完整原文见
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/privacy.zh-CN.md">隐私政策</a>和
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/telemetry.md">遥测说明</a>。
+      </p>
+
+      <h2>默认只在本机</h2>
+      <ul>
+        <li>守护进程监听 <code>127.0.0.1:44321</code> 并要求密码。agent 用 bearer 令牌认证（<code>IPHONE_USE_AGENT_TOKEN</code>，没设时退回用密码），所有改变状态的请求还要带 <code>X-Phone-Control: 1</code>。</li>
+        <li>手机上的 runner 只接受签过名的请求：令牌由 setup 在每次启动 runner 时生成，用 HMAC-SHA256 签方法、路径、请求体、时间戳和一次性随机数。令牌只留在 Mac 上（权限 0600），从不随请求发送，截获的请求既不能重放也不能篡改。</li>
+        <li>USB 和 CoreDevice 的 Wi-Fi 隧道只有这台 Mac 能用。签名不等于加密：iOS 15/16 的局域网中继，以及显式打开的 <code>IPU_RUNNER_ALLOW_LAN=1</code> 中继是明文 HTTP，同一 Wi-Fi 上的人能看到画面，但没法操作手机。</li>
+        <li>能读你 Mac 用户文件的人也能读到令牌。请把守护进程的地址和密码当作凭据保管。</li>
+      </ul>
+
+      <h2>密码只在你手里</h2>
+      <ul>
+        <li>遇到登录、锁屏密码、Face ID，agent 会停下来请你在手机上完成，绝不向你要密码或验证码。</li>
+        <li>如果你用 <a href="https://github.com/leeguooooo/bitwarden-use">bitwarden-use</a>，<code>phone_login</code> 会在守护进程内部用你自己密码库里的条目填好 App 的登录表单。密码不会经过模型，返回结果只给出条目名和打码后的账号。</li>
+        <li>flow 的输入只对本次运行生效，不会写回 flow 文件。输入里不能放凭据、验证码或私人内容。</li>
+      </ul>
+
+      <h2>agent 绕不过去的限制</h2>
+      <p>手机主人在守护进程的环境变量里设置，不管 agent 的提示词怎么写都有效。</p>
+      <ul>
+        <li><code>IPHONE_USE_BLOCKED_APPS</code>（例如 <code>Wallet, Passwords</code>）：agent 不能打开、安装或卸载这些 App。</li>
+        <li><code>IPHONE_USE_MAX_ACTIONS</code>：限制每个任务的操作步数。</li>
+        <li>被拒绝时返回 <code>403</code> 和 <code>outcome:"not_sent"</code>：没有任何操作到达手机。</li>
+      </ul>
+      <p>详见 <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/agent-reference.md#owner-limits-and-the-activity-feed">Owner limits and the activity feed</a>。</p>
+
+      <h2>它做了什么你看得见</h2>
+      <ul>
+        <li>网页会在实时画面上用大白话显示每一步，例如「点按“无线局域网”」。输入的文字不会被记录，只记字数。</li>
+        <li>每个 <code>/agent/*</code> 请求的耗时记在 <code>~/.iphone-use/agent-timing.jsonl</code>，只有路由、使用者和耗时，从不记请求或屏幕内容。</li>
+        <li>一台手机同一时间只有一个使用者。你在操作时，agent 会等着，或被告知手机在谁手里。</li>
+      </ul>
+
+      <h2>遥测：关闭</h2>
+      <div class="du-callout tip">
+        <div class="du-callout-title">✅ 当前版本不发送任何使用数据</div>
+        守护进程里有匿名使用计数的代码，但发行版不带项目令牌，所以除非你自己设置 <code>IPHONE_USE_TELEMETRY_TOKEN</code>，
+        它什么也不发。如果将来某个版本打开它，会在
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/privacy.zh-CN.md">隐私政策</a>和
+        <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/telemetry.md">telemetry.md</a> 里写明。
+      </div>
+      <p>即使打开，每条事件也只包含调用了哪个 agent 接口、是否成功、固定列表里的失败类别、耗时、守护进程的版本和平台，以及一个随机安装 ID；绝不发送输入或读到的文字、元素标签、截图或视频、App bundle id、手机标识或名称、文件路径。下面任意一个都能彻底关掉它：</p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code>IPHONE_USE_TELEMETRY=0
+DO_NOT_TRACK=1</code></pre>
+      </div>
+
+      <h2>iOS App</h2>
+      <p>iOS App（Phone Use Remote）不收集任何数据，开发者也没有为它运行服务器：没有账号，没有统计、崩溃上报、广告或追踪 SDK。它只和你输入或扫码得到的那台 Mac 通信。Mac 地址存在 App 偏好设置里，密码或配对令牌存在 iOS 钥匙串里；相机只用来扫配对二维码，本地网络权限只用来连那台 Mac。在 App 设置里点「忘记这台 Mac」会删掉保存的密码和配对令牌。</p>
+
+      <h2>从外网连回来</h2>
+      <ul>
+        <li>通过带鉴权的 HTTPS 反向代理，或 Tailscale 这类可信 VPN 访问 <code>44321</code> 端口；绝不要把 runner 的端口暴露出去。</li>
+        <li>守护进程绑定 <code>0.0.0.0</code> 时必须设密码。不要在不可信的网络上这么做。</li>
+        <li><code>iphone-use-mcp --listen</code> 监听回环地址时只有本机能连；监听其他地址必须设置 <code>IPHONE_USE_MCP_TOKEN</code>。</li>
+        <li>使用者租约只是协作会话之间的协调，不是安全边界。开放访问时别把支付 App、私人聊天或二次验证页面开着；不用时停掉 LaunchAgent。</li>
+      </ul>
+
+      <h2>关于本网站</h2>
+      <p>iphone-use.leeguoo.com 是静态网站，加载了 Google Analytics 4（leeguoo.com 的统计流）和 blog.leeguoo.com 的访问统计脚本，用来统计访问量。网站没有广告。这些都和你 Mac 或手机上的 iphone-use 软件无关。</p><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/privacy" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

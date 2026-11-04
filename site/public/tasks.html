@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>让 AI agent 操作 iPhone 能做什么 · iphone-use</title>
+  <meta name="description" content="让 Claude Code 或 Codex 操作真实 iPhone 的例子：读健康数据、聊天 App、银行流水、长篇备忘录、App 测试、日志和崩溃报告。" />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/tasks" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/tasks" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/tasks" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/tasks" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="让 AI agent 操作 iPhone 能做什么 · iphone-use" />
+  <meta property="og:description" content="让 Claude Code 或 Codex 操作真实 iPhone 的例子：读健康数据、聊天 App、银行流水、长篇备忘录、App 测试、日志和崩溃报告。" />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/tasks" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:locale:alternate" content="en_US" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="让 AI agent 操作 iPhone 能做什么 · iphone-use" />
+  <meta name="twitter:description" content="让 Claude Code 或 Codex 操作真实 iPhone 的例子：读健康数据、聊天 App、银行流水、长篇备忘录、App 测试、日志和崩溃报告。" />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use：让 AI agent 操作你的真实 iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/"},{"@type":"ListItem","position":2,"name":"让 agent 用你的 iPhone","item":"https://iphone-use.leeguoo.com/tasks"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"让 agent 用你的 iPhone","description":"让 Claude Code 或 Codex 操作真实 iPhone 的例子：读健康数据、聊天 App、银行流水、长篇备忘录、App 测试、日志和崩溃报告。","inLanguage":"zh-Hans","url":"https://iphone-use.leeguoo.com/tasks","mainEntityOfPage":"https://iphone-use.leeguoo.com/tasks","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="tasks" data-lang="zh">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="文档"><div class="du-nav-group"><div class="du-nav-label">开始</div><a class="du-nav-item" href="/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">概览</span></a><a class="du-nav-item" href="/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">安装</span></a><a class="du-nav-item" href="/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">和其他方案对比</span></a></div><div class="du-nav-group"><div class="du-nav-label">让 agent 做事</div><a class="du-nav-item active" aria-current="page" href="/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">让 agent 用手机</span></a><a class="du-nav-item" href="/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flow 录制与重放</span></a></div><div class="du-nav-group"><div class="du-nav-label">接入方式</div><a class="du-nav-item" href="/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">手机自己操作自己</span></a><a class="du-nav-item" href="/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">远程控制</span></a><a class="du-nav-item" href="/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP、HTTP API 与 skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">底层</div><a class="du-nav-item" href="/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">它怎么工作</span></a></div><div class="du-nav-group"><div class="du-nav-label">参考</div><a class="du-nav-item" href="/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">常见问题</span></a><a class="du-nav-item" href="/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">隐私与安全</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">让 agent 做事</p>
+
+      <div class="du-title-row">
+        <h1>让 agent 用你的 iPhone</h1>
+        <button class="du-copy-page" type="button" aria-label="复制页面">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">复制页面</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        装好 iphone-use 之后，<span class="mark">你只要说想在手机上做什么</span>，agent 就去做：按名字打开 App，把屏幕读成文字，
+        点击、输入、滚动，并检查每一步。没有 API 的 App 也行，用的是手机上已有的登录状态。
+      </p>
+
+      <h2>可以这样说</h2>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">❤️</span> 健康</div>
+          <p class="du-say">打开健康，告诉我这周每天走了多少步。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">💬</span> 聊天 App</div>
+          <p class="du-say">在微信里找到妈妈发的最新一条消息，念给我听。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🏦</span> 银行流水</div>
+          <p class="du-say">把这个银行流水页面的每一笔交易都抄下来，一直翻到底。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">📝</span> 备忘录</div>
+          <p class="du-say">把这篇 2000 字的草稿写进备忘录，新建一条。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🧪</span> 你自己的 App</div>
+          <p class="du-say">在真机上跑一遍我们 App 的登录测试，告诉我哪一步失败了。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🔋</span> 设置</div>
+          <p class="du-say">打开设置查看电池电量。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🐞</span> 探索式测试</div>
+          <p class="du-say">把我们 App 的设置页都点一遍，找到的问题连同截图写成报告。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🏠</span> 主屏幕</div>
+          <p class="du-say">我的 Dock 和第一页文件夹里都有哪些 App？</p>
+        </div>
+      </div>
+
+      <h2>agent 能做什么</h2>
+      <ul>
+        <li><strong>按名字打开任意 App</strong>（<code>launch_app {"app": "健康"}</code>），不用找图标。</li>
+        <li><strong>把屏幕读成文字。</strong>手机的无障碍树以元素列表的形式返回，agent 根据标签和数值来判断，而不是看像素。需要看画面时也能截图。</li>
+        <li><strong>一次输入一长段文字</strong>，最长 2 万字，中文也没问题。</li>
+        <li><strong>读完整个列表。</strong>跨页读列表，并说明有没有读到底。</li>
+        <li><strong>操作禁止截屏的页面。</strong>银行和支付 App 会把截屏涂黑；agent 按元素操作，截图返回的是带标签的线框图，而不是一片空白。</li>
+        <li><strong>读主屏幕布局。</strong><code>phone_home_layout</code> 不打开文件夹、不截图，就能读出各页主屏幕、Dock、文件夹和小组件堆栈。</li>
+        <li><strong>成批操作。</strong>一次调用最多 24 步，屏幕切换之间可以等待，返回结果里就带着这批操作结束时的画面。</li>
+        <li><strong>复用做过的事。</strong>agent 进入某个 App 时，返回结果里列着这个 App 已保存的 flow；有合适的就一次调用跑完。见 <a href="/flows">Flow 录制与重放</a>。</li>
+      </ul>
+
+      <h2>登录、锁屏密码和验证码</h2>
+      <p>
+        遇到登录、锁屏密码、Face ID，agent 会停下来请你在手机上完成，绝不向你要密码或验证码。
+        如果账号存在你自己的 <a href="https://github.com/leeguooooo/bitwarden-use">bitwarden-use</a> 密码库里，
+        <code>phone_login</code> 会在守护进程内部填好并提交 App 的登录表单：数据从密码库直接到手机，密码不会经过模型，
+        返回结果只给出条目名和打码后的账号。App 要的验证码可以来自短信（message-use）、邮件（mail-use）或该条目的验证器，每次登录最多两次。
+      </p>
+
+      <h2>给开发和测试用</h2>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">📜</span> 日志和崩溃报告</div>
+          <p>抓取并过滤手机系统日志；列出崩溃报告并读取其中一份。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🎥</span> 录屏</div>
+          <p>把手机屏幕录成 MP4，保存在 Mac 上。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">📦</span> 安装测试包</div>
+          <p>Mac 上的 <code>.ipa</code>、<code>.app</code>，或一个 https 链接；可以先卸载再装。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">📍</span> 模拟定位</div>
+          <p>设置一个 GPS 位置，直到你清除为止。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🗒️</span> 按 App 的经验笔记</div>
+          <p>守护进程跨会话保存每个 App 的笔记，agent 进入该 App 时会自动读到。</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">✅</span> 测试套件</div>
+          <p>可重跑的 YAML 测试套件，退出码直接接 CI，也能定时运行。见 <a href="/flows">Flow 录制与重放</a>。</p>
+        </div>
+      </div>
+      <p>
+        <strong>iphone-use-qa</strong> skill 让 agent 对一个 App 做探索式测试：先列出要覆盖的部分，分批去点，每个问题都留证据
+        （截图、元素树、准确的复现步骤），最后写成 Markdown 报告。它从不付款、发送、发布或删除。
+      </p>
+
+      <h2>把一个目标交给守护进程</h2>
+      <p>调用方也可以不一步步操作，而是把一句话的目标交给守护进程（<code>POST /agent/task</code>），再轮询结果。守护进程在它的手机上这样执行：</p>
+      <ol class="du-steps">
+        <li><strong>先找已保存的 flow。</strong>有匹配目标的 flow 就一次调用跑完；执行 flow 本身不花模型 token。</li>
+        <li><strong>Jev</strong> 根据元素表选出每一步；Jev 卡住时，由更强的 <strong>assist</strong> 模型接手这一步。</li>
+        <li><strong>确认关卡。</strong>遇到会付款、发消息、删除、分享或提交订单的步骤，任务停下来先问。</li>
+        <li><strong>总结。</strong>用几句话告诉人做了什么、读到了哪些数值；没有验证到结果的目标会以 blocked 结束。</li>
+      </ol>
+      <p>每一步里屏幕上的文字都只当作不可信的数据，绝不当作指令。在 MCP 客户端里对应的是 <code>phone_jev_run</code>，需要先配置好模型凭据。</p>
+
+      <h2>你设的限制，和 iOS 的限制</h2>
+      <div class="du-callout note">
+        <div class="du-callout-title">ℹ️ agent 绕不过去的限制</div>
+        守护进程会拒绝你屏蔽的 App（<code>IPHONE_USE_BLOCKED_APPS</code>，例如 <code>Wallet, Passwords</code>），并限制每个任务的操作步数
+        （<code>IPHONE_USE_MAX_ACTIONS</code>），不管 agent 的提示词怎么写。
+      </div>
+      <ul>
+        <li>它过不了锁屏密码和 Face ID，需要有人解锁手机。</li>
+        <li>App 切换器和控制中心是 runner 够不到的系统手势。系统弹窗要用专门的动作应答，点按无效。</li>
+        <li><code>force_press</code> 需要 3D Touch；从 XR / 11 起的 iPhone 上会在碰屏幕之前被拒绝，改用长按（<code>menu</code>）。</li>
+        <li>结果不确定的操作会标成 <code>retry_safe:false</code>：agent 要先重新读屏，再决定下一步。</li>
+      </ul>
+      <p>接上你的 agent：<a href="/connect">MCP、HTTP API 与 skill</a>。隐私和安全限制：<a href="/privacy">隐私与安全</a>。</p><!-- seo:footer --><nav class="du-static-footer" aria-label="站点"><a href="/">iphone-use</a> · <a href="/">概览</a> · <a href="/install">安装</a> · <a href="/compare">和其他方案对比</a> · <a href="/tasks">让 agent 用手机</a> · <a href="/flows">Flow 录制与重放</a> · <a href="/phone-agent">手机自己操作自己</a> · <a href="/remote">远程控制</a> · <a href="/connect">MCP、HTTP API 与 skill</a> · <a href="/how-it-works">它怎么工作</a> · <a href="/faq">常见问题</a> · <a href="/privacy">隐私与安全</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">下载 / Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">官方 flow 源</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use/">博客：iphone-use 产品介绍</a> · <a href="https://blog.leeguoo.com/zh/posts/iphone-use-video/">博客：演示视频</a> · <a href="https://chrome-use.leeguoo.com/">chrome-use（让 agent 用你的 Chrome）</a> · <a href="https://leeguoo.com/about">作者</a> · <a href="/en/tasks" hreflang="en">English</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Record and replay iPhone flows with no model · iphone-use</title>
+  <meta name="description" content="Save an iPhone task as a flow: a reviewed per-app JSON script that replays in one call with no model and no tokens. Registry, test suites and schedules." />
+  <meta name="theme-color" content="#fcfbf4" />
+  <meta name="author" content="Guo Li (leeguoo)" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/assets/icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- seo:fonts --><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Permanent+Marker&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" /></noscript><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;display=swap&amp;text=%20%21%22%23%24%25%26%27%28%29%2A%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~" onload="this.onload=null;this.rel='stylesheet'" /><noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&amp;display=swap&amp;text=%20%21%22%23%24%25%26%27%28%29%2A%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~" /></noscript><!-- /seo:fonts -->
+  <link rel="stylesheet" href="/assets/docs/docs.css" />
+  <!-- seo:head -->
+  <link rel="canonical" href="https://iphone-use.leeguoo.com/en/flows" />
+  <link rel="alternate" hreflang="zh-Hans" href="https://iphone-use.leeguoo.com/flows" />
+  <link rel="alternate" hreflang="en" href="https://iphone-use.leeguoo.com/en/flows" />
+  <link rel="alternate" hreflang="x-default" href="https://iphone-use.leeguoo.com/en/flows" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="iphone-use" />
+  <meta property="og:title" content="Record and replay iPhone flows with no model · iphone-use" />
+  <meta property="og:description" content="Save an iPhone task as a flow: a reviewed per-app JSON script that replays in one call with no model and no tokens. Registry, test suites and schedules." />
+  <meta property="og:url" content="https://iphone-use.leeguoo.com/en/flows" />
+  <meta property="og:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="iphone-use: let AI agents use your real iPhone" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:locale:alternate" content="zh_CN" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Record and replay iPhone flows with no model · iphone-use" />
+  <meta name="twitter:description" content="Save an iPhone task as a flow: a reviewed per-app JSON script that replays in one call with no model and no tokens. Registry, test suites and schedules." />
+  <meta name="twitter:image" content="https://iphone-use.leeguoo.com/assets/og.png" />
+  <meta name="twitter:image:alt" content="iphone-use: let AI agents use your real iPhone" />
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"iphone-use","item":"https://iphone-use.leeguoo.com/en/"},{"@type":"ListItem","position":2,"name":"What Agents Can Do","item":"https://iphone-use.leeguoo.com/en/tasks"},{"@type":"ListItem","position":3,"name":"Flows: do a task once, replay it with no model","item":"https://iphone-use.leeguoo.com/en/flows"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"Flows: do a task once, replay it with no model","description":"Save an iPhone task as a flow: a reviewed per-app JSON script that replays in one call with no model and no tokens. Registry, test suites and schedules.","inLanguage":"en","url":"https://iphone-use.leeguoo.com/en/flows","mainEntityOfPage":"https://iphone-use.leeguoo.com/en/flows","image":"https://iphone-use.leeguoo.com/assets/og.png","dateModified":"2026-10-30","author":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"publisher":{"@id":"https://leeguoo.com/about#person","@type":"Person","name":"Guo Li (leeguoo)","url":"https://leeguoo.com/about"},"isPartOf":{"@type":"WebSite","name":"iphone-use","url":"https://iphone-use.leeguoo.com/"},"about":{"@id":"https://iphone-use.leeguoo.com/#software","@type":"SoftwareApplication","name":"iphone-use"}}</script>
+  <!-- /seo:head -->
+</head>
+<body data-page="flows" data-lang="en">
+
+  <div id="du-topbar" class="du-topbar"></div>
+
+  <div class="du-shell">
+
+    <nav id="du-sidebar" class="du-sidebar" aria-label="Documentation"><div class="du-nav-group"><div class="du-nav-label">Getting Started</div><a class="du-nav-item" href="/en/"><span class="du-nav-ico">🧭</span><span class="du-nav-text">Overview</span></a><a class="du-nav-item" href="/en/install"><span class="du-nav-ico">📦</span><span class="du-nav-text">Install</span></a><a class="du-nav-item" href="/en/compare"><span class="du-nav-ico">⚖️</span><span class="du-nav-text">vs Other Tools</span></a></div><div class="du-nav-group"><div class="du-nav-label">What Agents Can Do</div><a class="du-nav-item" href="/en/tasks"><span class="du-nav-ico">📱</span><span class="du-nav-text">Ask Your Agent</span></a><a class="du-nav-item active" aria-current="page" href="/en/flows"><span class="du-nav-ico">🔁</span><span class="du-nav-text">Flows &amp; Replay</span></a></div><div class="du-nav-group"><div class="du-nav-label">Connecting Agents</div><a class="du-nav-item" href="/en/phone-agent"><span class="du-nav-ico">🤖</span><span class="du-nav-text">Phone Drives Itself</span></a><a class="du-nav-item" href="/en/remote"><span class="du-nav-ico">📡</span><span class="du-nav-text">Remote Control</span></a><a class="du-nav-item" href="/en/connect"><span class="du-nav-ico">🔌</span><span class="du-nav-text">MCP, HTTP API &amp; Skill</span></a></div><div class="du-nav-group"><div class="du-nav-label">Under the Hood</div><a class="du-nav-item" href="/en/how-it-works"><span class="du-nav-ico">⚙️</span><span class="du-nav-text">How It Works</span></a></div><div class="du-nav-group"><div class="du-nav-label">Reference</div><a class="du-nav-item" href="/en/faq"><span class="du-nav-ico">❓</span><span class="du-nav-text">FAQ</span></a><a class="du-nav-item" href="/en/privacy"><span class="du-nav-ico">🔒</span><span class="du-nav-text">Privacy &amp; Security</span></a></div></nav>
+
+    <main class="du-main">
+
+      <p class="du-eyebrow">What Agents Can Do</p>
+
+      <div class="du-title-row">
+        <h1>Flows: do a task once, replay it with no model</h1>
+        <button class="du-copy-page" type="button" aria-label="Copy page">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+          <span class="du-copy-page-label">Copy page</span>
+        </button>
+      </div>
+
+      <p class="du-lede">
+        Tasks you repeat are kept as <span class="mark">flows</span>: reviewed per-app scripts that replay without a model,
+        so they cost no tokens. An agent finds the flows for an app on its own, runs one in a single call, and after a
+        multi-step task with no flow it asks whether you want to keep what it just did.
+      </p>
+
+      <h2>What a flow is</h2>
+      <p>
+        A flow is a strict JSON file (<code>version: 1</code>) with the same guarded steps as <code>phone_run_steps</code>
+        (taps by locator, <code>launch_app</code>, typing, <code>wait_for</code> checkpoints and so on) plus named string
+        inputs. The <code>iphone-use-mcp</code> binary validates and runs one without any model in the loop. A flow stops
+        at the first failed step and never retries.
+      </p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> MCP="$HOME/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp"
+<span class="du-prompt">$</span> "$MCP" flow validate examples/flows/search-spotlight.json          <span class="du-cmt"># offline</span>
+<span class="du-prompt">$</span> IPHONE_USE_TOKEN=… "$MCP" flow run examples/flows/search-spotlight.json --input 'query=coffee'</code></pre>
+      </div>
+
+      <h2>How agents use flows</h2>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🔎</span> Found on entering an app</div>
+          <p>A <code>launch_app</code> response, or the first screen read in a newly entered app, carries a <code>registry</code> block listing the saved flows for that app. If one does the task, the agent runs it with <code>phone_flow_run</code>: one call instead of dozens.</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">💾</span> Offered after a task</div>
+          <p class="du-say">Do you want me to save this as a flow?</p>
+          <p>When a response carries <code>flow_suggestion</code>, or a multi-step task finished with no flow, the agent asks you. The daemon has already recorded the steps as a draft.</p>
+        </div>
+      </div>
+      <p>Saving only happens when you agree:</p>
+      <ol class="du-steps">
+        <li><strong>Draft</strong>: the agent gets the draft (<code>phone_flow_draft</code>, or <code>flow draft --out my-task.json</code>), with a <code>todo</code> list of things to fix.</li>
+        <li><strong>Fix and check</strong>: it fixes the todo list, validates the file and runs it once on the phone.</li>
+        <li><strong>Publish, with your OK</strong>: publishing opens a public PR to the registry, so the agent asks again before <code>phone_flow_publish(confirm=true)</code>.</li>
+      </ol>
+      <p><code>IPHONE_USE_FLOWS_NO_SUGGEST=1</code> silences the save suggestions.</p>
+
+      <hr class="du-divider" />
+
+      <h2>Record one in the browser</h2>
+      <p>The <strong>Flow</strong> panel on the control page records what you do on the phone into a replayable flow file:</p>
+      <ul>
+        <li>Only acknowledged actions are recorded. Exact accessibility labels are preferred; coordinate gestures are marked fragile.</li>
+        <li>Typed text becomes a named runtime input. The literal value is discarded and never written to the downloaded JSON.</li>
+        <li>After each action the recorder may insert a reviewable <code>wait_for</code> checkpoint when a new unique identifier or a change of foreground app is provable; it never copies arbitrary labels or values into a checkpoint, because they may be private.</li>
+        <li>Review, reorder, delete and fill inputs, then download valid flow v1 JSON or run it once. Running requires every input filled and an explicit "no irreversible actions" check.</li>
+      </ul>
+
+      <h2>The official registry</h2>
+      <p>
+        <a href="https://github.com/leeguooooo/iphone-use-flows">leeguooooo/iphone-use-flows</a> is the official, and the only
+        supported, source of reviewed per-app flows. The daemon keeps it fresh by itself
+        (<code>IPHONE_USE_FLOWS_NO_AUTO_UPDATE=1</code> turns that off). Files are pure JSON, so installing the registry never
+        executes code; a checksum or validation failure aborts the whole update and leaves the store untouched.
+      </p>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> "$MCP" flow update                        <span class="du-cmt"># mirror into ~/.iphone-use/flows: sha256 + strict validation</span>
+<span class="du-prompt">$</span> "$MCP" flow list --category health        <span class="du-cmt"># id · risk · verified · inputs · name</span>
+<span class="du-prompt">$</span> "$MCP" flow info health/export-all-zh-cn  <span class="du-cmt"># metadata and step templates</span>
+<span class="du-prompt">$</span> "$MCP" flow run health/export-all-zh-cn   <span class="du-cmt"># failures say which step and why</span>
+<span class="du-prompt">$</span> "$MCP" flow draft --out my-task.json      <span class="du-cmt"># what you just did, as a draft flow</span>
+<span class="du-prompt">$</span> "$MCP" flow add my.json --as myapp/daily  <span class="du-cmt"># your own flow; survives update</span>
+<span class="du-prompt">$</span> "$MCP" flow publish my.json --as myapp/daily --alias MyApp --note "iPhone 17 Pro Max, iOS 26"   <span class="du-cmt"># opens the PR via gh</span>
+<span class="du-prompt">$</span> "$MCP" flow report health/export-all --result @run.json --note "profile button renamed"           <span class="du-cmt"># files a flow-broken issue</span></code></pre>
+      </div>
+
+      <h3>Risk levels</h3>
+      <table>
+        <thead><tr><th>risk</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>read_only</code></td><td>Reads the phone only.</td></tr>
+          <tr><td><code>navigation</code></td><td>Moves around the app.</td></tr>
+          <tr><td><code>side_effect</code></td><td>Sends, publishes, pays or deletes. Refuses to run without <code>--confirm</code> / <code>confirm=true</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>When the app updates</h3>
+      <p>
+        Each flow records the app (or iOS) version it was proved on, the CLI reads what the phone has installed
+        (<code>flow apps</code>), and every listing shows a <code>compat</code> verdict: <code>verified</code>,
+        <code>untested-newer</code>, <code>incompatible</code>, <code>broken</code>, <code>needs-verification</code>,
+        <code>draft</code> or <code>unknown</code>. <code>flow run</code> refuses broken or incompatible flows without
+        <code>--force</code>. A nightly canary re-runs the verified read-only flows on a real phone: <strong>verified</strong>
+        refreshes the date, <strong>failed</strong> tags the flow and files a <code>flow-broken</code> issue, and
+        <strong>skipped</strong> (phone locked, owned, not drivable, or outcome unknown) leaves the flow exactly as it was.
+      </p>
+
+      <h3>When a run fails</h3>
+      <p>
+        The result grows a <code>diagnosis</code> block: the failed step, whether the screen could be read at all, a
+        <code>reason</code> such as <code>locator_no_match</code> or <code>locator_ambiguous</code>, and up to five candidate
+        elements. It is one bounded read after the run: nothing is re-sent and the flow is never silently edited.
+        <code>--artifacts-dir DIR</code> also writes a machine-readable record of the run (structure only: typed input and
+        screen text are never written).
+      </p>
+
+      <div class="du-callout warn">
+        <div class="du-callout-title">⚠️ Keep secrets out of inputs</div>
+        <code>--input KEY=VALUE</code> resolves only for the current run and is never written back, but command-line values can
+        appear in shell history. Flow inputs must not carry credentials, codes or private content, and send, publish, pay and
+        delete actions must be declared <code>side_effect</code>.
+      </div>
+
+      <hr class="du-divider" />
+
+      <h2>Test suites and scheduled runs</h2>
+      <p>Two things build on flows. Both run through the same engine as <code>flow run</code>.</p>
+      <div class="du-cards">
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">🧪</span> Test suites</div>
+          <p><code>iphone-use-mcp test suite.yaml</code> turns "open it, tap around, check it's right" into a file you can rerun. Exit code <code>0</code> every case passed, <code>1</code> a case failed, <code>2</code> the suite is invalid or the phone cannot be driven. <code>--junit FILE</code> writes a JUnit XML report for CI.</p>
+        </div>
+        <div class="du-card">
+          <div class="du-card-title"><span class="du-card-ico">⏰</span> Schedules</div>
+          <p>The daemon runs a flow or a suite on a cron line. It waits when someone else is using the phone, and a failed, missed or skipped run raises a macOS notification. A side-effect target needs <code>--confirm</code> when you create the schedule.</p>
+        </div>
+      </div>
+      <div class="du-code">
+        <div class="du-code-head">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="du-code-name">bash</span>
+        </div>
+<pre><code><span class="du-prompt">$</span> iphone-use-mcp test examples/tests/settings-smoke.zh-CN.yaml --junit report.xml
+<span class="du-prompt">$</span> iphone-use-mcp schedule add --cron "0 9 * * 1-5" --test ~/suites/smoke.yaml --name "morning smoke"
+<span class="du-prompt">$</span> iphone-use-mcp schedule add --cron "@daily" --flow health/export-all-zh-cn
+<span class="du-prompt">$</span> iphone-use-mcp schedule list</code></pre>
+      </div>
+      <p>The same schedule list is on the control page at <code>/schedules</code>. Details: <a href="https://github.com/leeguooooo/iphone-use/blob/main/docs/testing.md">Testing and scheduled runs</a>.</p>
+
+      <p>Next: <a href="/en/tasks">what to ask your agent</a> · <a href="/en/connect">connect your agent</a>.</p><!-- seo:footer --><nav class="du-static-footer" aria-label="Site"><a href="/en/">iphone-use</a> · <a href="/en/">Overview</a> · <a href="/en/install">Install</a> · <a href="/en/compare">vs Other Tools</a> · <a href="/en/tasks">Ask Your Agent</a> · <a href="/en/flows">Flows &amp; Replay</a> · <a href="/en/phone-agent">Phone Drives Itself</a> · <a href="/en/remote">Remote Control</a> · <a href="/en/connect">MCP, HTTP API &amp; Skill</a> · <a href="/en/how-it-works">How It Works</a> · <a href="/en/faq">FAQ</a> · <a href="/en/privacy">Privacy &amp; Security</a> · <a href="https://github.com/leeguooooo/iphone-use">GitHub</a> · <a href="https://github.com/leeguooooo/iphone-use/releases">Releases</a> · <a href="https://github.com/leeguooooo/iphone-use-flows">Official flow registry</a> · <a href="https://blog.leeguoo.com/en/posts/iphone-use/">Blog: iphone-use guide</a> · <a href="https://blog.leeguoo.com/en/posts/iphone-use-video/">Blog: demo video</a> · <a href="https://chrome-use.leeguoo.com/en/">chrome-use (agents in your Chrome)</a> · <a href="https://leeguoo.com/about/en">Author</a> · <a href="/flows" hreflang="zh-Hans">中文</a></nav><!-- /seo:footer -->
+    </main>
+
+    <aside id="du-toc"></aside>
+
+  </div>
+
+  <script src="/assets/docs/docs.js" defer></script>
+</body>
+</html>

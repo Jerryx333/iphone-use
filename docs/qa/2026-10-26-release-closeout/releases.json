@@ -1,0 +1,138 @@
+{
+  "releases": [
+    {
+      "tag": "v0.24.0",
+      "commit": "65cfe844eb949227760ebad346492b2e64f29ec7",
+      "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.24.0",
+      "app_version": "0.24.0",
+      "checksums": {
+        "browser-use-bridge-macos-universal.tar.gz": "b2404b9f51081ed608684600070b08157f23f1eea92f88e80b1c24d0eb008c1e",
+        "iPhoneUse.app.zip": "40bef6418efb49ba9ae6a7f900f83a2e7dde6506f0f844669b7a3d210aba3223",
+        "iphone-use-app.tar.gz": "e2d043bf0e4e7f62c6e61c6d8923b2a92656b1cbc7da926ed74f8dc2a426ec6e",
+        "iphone-use-mcp-macos-universal.tar.gz": "65a87936e6db31230da751bb7c6e0eca7d04e5fd5d118599303031bf48c8eb9b",
+        "iphone-use-runner.tar.gz": "a81ee60e7561b381032470b9613a54817d0fea42d0a8a7dacce424f191442431"
+      },
+      "codesign_verified": true,
+      "notarized_developer_id": true,
+      "stapled_ticket_verified": true,
+      "mcp_version": "0.24.0",
+      "mcp_tools": 38,
+      "standalone_mcp_matches": true
+    },
+    {
+      "tag": "v0.24.1",
+      "commit": "1531bd5c0ab828884c7e177ecd0b6ce76f8666a2",
+      "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.24.1",
+      "app_version": "0.24.1",
+      "checksums": {
+        "browser-use-bridge-macos-universal.tar.gz": "0db2ce636cca4f944d20562ed7ab7e37d963b2c0c8e515ba3c21e3ac2e02969b",
+        "iPhoneUse.app.zip": "97bf9ed8c47ce73be7d07902908e5e5f89eb19d75585eb295ea18022744b1204",
+        "iphone-use-app.tar.gz": "147fc03256e97f53c3168917ed6e542a458f80536c8e96c8b67b5b9adcf1a503",
+        "iphone-use-mcp-macos-universal.tar.gz": "60355acb0d2804d413f70808e38afdc34c02d2b3c19f6ebbce6767d4e2f45cf5",
+        "iphone-use-runner.tar.gz": "b1ff1c6862a7a562bf5168385002efa310ca383422aec6ec6a2f56e4bc53777f"
+      },
+      "codesign_verified": true,
+      "notarized_developer_id": true,
+      "stapled_ticket_verified": true,
+      "mcp_version": "0.24.1",
+      "mcp_tools": 38,
+      "standalone_mcp_matches": true
+    },
+    {
+      "tag": "v0.25.1",
+      "commit": "e851137b98b08121994d18c6ae16a3f5fdf8d9c7",
+      "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.25.1",
+      "app_version": "0.25.1",
+      "checksums": {
+        "browser-use-bridge-macos-universal.tar.gz": "040df8b2dbbb9590211d666830095ee3b2705e3d687776f83396be4ffae71f0e",
+        "iPhoneUse.app.zip": "65a83cbe365f876327e1ca966fb8405114ba328d8ad8fe8f25e3b7cddc387a7e",
+        "iphone-use-app.tar.gz": "8f95880b58b4c0f6582ea8a86e323b7b66ed288a7c6b03da94060da8c09fbbcc",
+        "iphone-use-mcp-macos-universal.tar.gz": "e7c2e1a7d2584b3a1f0aa76782c94eade650f947e697f37c7bd649a8ae719b44",
+        "iphone-use-runner.tar.gz": "e361f92302d5d84b5df3ad101098d272937630124e9af0af1f25aad1de1ba688"
+      },
+      "codesign_verified": true,
+      "notarized_developer_id": true,
+      "stapled_ticket_verified": true,
+      "mcp_version": "0.25.1",
+      "mcp_tools": 39,
+      "standalone_mcp_matches": true
+    },
+    {
+      "tag": "v0.25.2",
+      "commit": "254c87940b51c16d82c344a4204cea6aa108c28f",
+      "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.25.2",
+      "app_version": "0.25.2",
+      "checksums": {
+        "browser-use-bridge-macos-universal.tar.gz": "79651a6dca8b1c12780135ce511fa1a3d6592b8aef7924a075c55c729847fcd0",
+        "iPhoneUse.app.zip": "fbdd7abada4dacea0b7711778302dc2dd55db88d8c9d054e98bfcfea07fbd2bb",
+        "iphone-use-app.tar.gz": "6d05ed2d0150765bc04f0afe8ccf71837981e75f7298a8d6aa91630717768654",
+        "iphone-use-mcp-macos-universal.tar.gz": "26476d70ea0052cfc9572e09f740e6cbfad2ad58b2d064241289aefbc1e0c8ac",
+        "iphone-use-runner.tar.gz": "24f5606092f832a3339032420a054d517691b73ae8cebe443e05743563b88832"
+      },
+      "codesign_verified": true,
+      "notarized_developer_id": true,
+      "stapled_ticket_verified": true,
+      "mcp_version": "0.25.2",
+      "mcp_tools": 39,
+      "standalone_mcp_matches": true
+    }
+  ],
+  "latest_install": {
+    "app_version": "0.25.2",
+    "installed_binary_matches_download": true,
+    "runtime_instances": [
+      {
+        "instance": "default",
+        "version": "0.25.2",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": false,
+        "drivable": false,
+        "runner_build_state": "stopped"
+      },
+      {
+        "instance": "i13",
+        "version": "0.25.2",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": true,
+        "drivable": false,
+        "runner_build_state": "stopped"
+      }
+    ],
+    "iPhone17_target_preserved": true,
+    "i13_phone_ended_marker_preserved": true,
+    "ui_setup_requested": false
+  },
+  "latest_live_mcp": {
+    "installed_mcp_version": "0.25.2",
+    "tools": 39,
+    "installed_mcp_matches_download": true,
+    "environment_proxy_points_to_closed_port": true,
+    "real_instances_read_only": [
+      {
+        "instance": "default",
+        "version": "0.25.2",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": false,
+        "drivable": false
+      },
+      {
+        "instance": "i13",
+        "version": "0.25.2",
+        "mode": "offline",
+        "released": true,
+        "ended_on_phone": true,
+        "drivable": false
+      }
+    ],
+    "i13_phone_ended_marker_preserved": true,
+    "ui_input_sent": false,
+    "reconnect_requested": false
+  },
+  "unpublished_attempt": {
+    "tag": "v0.25.0",
+    "reason": "release-only stale 38-tool assertion; replaced with shared 39-tool contract"
+  }
+}

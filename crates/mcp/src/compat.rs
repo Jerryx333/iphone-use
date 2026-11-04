@@ -194,7 +194,16 @@ fn write_cache(apps: &InstalledApps) {
 }
 
 fn is_loopback(url: &str) -> bool {
-    url.contains("://127.0.0.1") || url.contains("://localhost") || url.contains("://[::1]")
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str().map(|host| host.trim_matches(['[', ']'])),
+            Some("127.0.0.1" | "localhost" | "::1")
+        )
 }
 
 /// Run `xcrun devicectl` on this Mac. Only meaningful when the daemon (and
@@ -257,12 +266,17 @@ pub async fn installed_apps(daemon: &DaemonClient) -> Option<InstalledApps> {
     if !is_loopback(daemon.base_url()) {
         return None;
     }
-    let udid = daemon
+    let status = daemon
         .get_text("/agent/status")
         .await
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["udid"].as_str().map(str::to_string))?;
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())?;
+    // devicectl inventories physical devices; a Simulator must keep using its
+    // selected daemon. Failed Simulator metadata stays unknown, never retargeted.
+    if status["target"].as_str() == Some("simulator") {
+        return None;
+    }
+    let udid = status["udid"].as_str()?.to_string();
     let apps = tokio::task::spawn_blocking(move || devicectl_apps(&udid))
         .await
         .ok()?
@@ -558,6 +572,27 @@ mod tests {
                 && Compat::Incompatible.blocks_run()
                 && !Compat::UntestedNewer.blocks_run()
         );
+    }
+
+    #[test]
+    fn fallback_requires_a_real_loopback_endpoint_without_url_credentials() {
+        for url in [
+            "http://127.0.0.1:44321",
+            "https://localhost/panel",
+            "http://[::1]:44321",
+        ] {
+            assert!(is_loopback(url), "{url}");
+        }
+        for url in [
+            "http://127.0.0.1.example.com",
+            "http://localhost.example.com",
+            "http://localhost@remote.example",
+            "http://user:password@localhost",
+            "https://remote.example/path/http://127.0.0.1",
+            "not a url",
+        ] {
+            assert!(!is_loopback(url), "{url}");
+        }
     }
 
     #[test]

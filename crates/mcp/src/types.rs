@@ -143,7 +143,7 @@ pub enum InputMsg {
     Text { text: String },
     /// Device-native named key press.
     Key { name: String },
-    /// Supported iOS system shortcut: `home | spotlight`. App Switcher is not
+    /// Supported shortcuts: `home | spotlight | save_screenshot | volume_up | volume_down`. App Switcher is not
     /// available through runner and must not be advertised as supported.
     Shortcut { name: String },
     /// Begin a long-press at normalized coordinates.  Pair with an `Up` event
@@ -250,7 +250,8 @@ mod tests {
             "setup_blocked_on": "trust",
             "setup_phase": "building",
             "setup_message": "phone is locked — unlock it and keep it awake",
-            "viewer_count": 2
+            "viewer_count": 2,
+            "recovery": {"cause":"trust","actor":"person_on_phone","pause_screen_reads":true}
         }))
         .unwrap();
 
@@ -280,6 +281,9 @@ mod tests {
         let output = serde_json::to_value(&status).unwrap();
         assert_eq!(output["locked"], true);
         assert_eq!(output["viewer_count"], 2);
+        assert_eq!(output["recovery"]["cause"], "trust");
+        assert_eq!(output["recovery"]["actor"], "person_on_phone");
+        assert_eq!(output["recovery"]["pause_screen_reads"], true);
         assert!(output.get("runner_locked").is_none());
     }
 
@@ -428,7 +432,7 @@ mod tests {
 
     #[test]
     fn roundtrip_shortcut_variants() {
-        for name in &["home", "spotlight", "switcher"] {
+        for name in &["home", "spotlight", "volume_up", "volume_down", "switcher"] {
             let orig = InputMsg::Shortcut {
                 name: name.to_string(),
             };

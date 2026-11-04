@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
+include!("../fixtures/http_request.rs");
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
@@ -166,11 +167,10 @@ fn mock_runner_inner(
             stream
                 .set_read_timeout(Some(std::time::Duration::from_millis(500)))
                 .unwrap();
-            let mut request = [0_u8; 8_192];
-            let Ok(read) = stream.read(&mut request) else {
-                continue;
+            let request = match read_mock_request_until(&mut stream, || thread_stop.load(std::sync::atomic::Ordering::Acquire)) {
+                Ok(Some(request)) => request,
+                _ => continue,
             };
-            let request = String::from_utf8_lossy(&request[..read]).to_string();
             // Session setup writes runner's idle-wait settings. Answer them here,
             // outside the script and its request index, so each test scripts
             // only the traffic it is about.
@@ -232,8 +232,15 @@ fn mock_runner_inner(
             let response = if body.starts_with("HTTP/1.1 ") {
                 body
             } else {
+                let coverage = if request.contains("/source")
+                    || (request.starts_with("POST ") && request.contains("/elements "))
+                {
+                    "X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n"
+                } else {
+                    ""
+                };
                 format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{coverage}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
             };

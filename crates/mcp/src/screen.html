@@ -72,6 +72,7 @@
 
   /* ── i18n: English is the source; Chinese follows the viewer's browser. ── */
   const I18N_ZH = {
+    "Waiting for a new permitted frame.": "正在等待允许显示的新画面。",
     "iPhone screen": "iPhone 屏幕",
     "connecting…": "正在连接…",
     "waiting for the first frame…": "正在等待第一帧画面…",
@@ -97,6 +98,9 @@
     "sent Home": "已回到主屏幕",
     "this host did not answer ui/initialize": "宿主没有响应 ui/initialize",
     "frame tool failed": "截图工具出错",
+    "waiting for the selected phone": "等待选中的手机",
+    "ask the agent to open this phone's screen again": "请让 agent 重新打开这台手机的画面",
+    "panel has ended": "画面已关闭",
     "empty frame": "没有收到画面",
   };
   const ZH = (() => {
@@ -127,6 +131,20 @@
   let nextId = 1;
   const pending = new Map();
   let ready = false, disposed = false, inFlight = false, onScreen = true;
+  let routingInstance = null, bindingReady = false;
+  // Wait for the opening tool's target before polling or enabling Home. An
+  // unbound panel must never guess the configured phone for a named request.
+  homeButton.disabled = true;
+  statusText.textContent = t("waiting for the selected phone");
+  function bindInstance(value) {
+    if (value !== null && (typeof value !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(value))) return;
+    const selected = value;
+    if (bindingReady && routingInstance !== selected) return;
+    routingInstance = selected;
+    bindingReady = true;
+    homeButton.disabled = false;
+    kick(0);
+  }
   let timer = null, failures = 0, noteTimer = null;
 
   function send(message) { window.parent.postMessage(message, "*"); }
@@ -179,7 +197,19 @@
       return;
     }
     if (msg.method === "ui/notifications/host-context-changed") applyTheme(msg.params);
-    else if (msg.method === "ui/notifications/tool-result") kick(0);
+    else if (msg.method === "ui/notifications/tool-input") {
+      const args = msg.params && msg.params.arguments;
+      if (args && typeof args === "object" && !Array.isArray(args)) {
+        if (Object.prototype.hasOwnProperty.call(args, "instance")) {
+          if (typeof args.instance === "string") bindInstance(args.instance);
+        } else bindInstance(null);
+      }
+    } else if (msg.method === "ui/notifications/tool-result") {
+      const meta = msg.params && msg.params._meta;
+      if (meta && Object.prototype.hasOwnProperty.call(meta, "iphone-use/instance"))
+        bindInstance(meta["iphone-use/instance"]);
+      kick(0);
+    }
   });
 
   function setStatus(tone, text) {
@@ -212,6 +242,13 @@
     return parts.join(" · ");
   }
 
+  function clearFrame(message) {
+    image.hidden = true;
+    image.removeAttribute("src");
+    empty.textContent = message;
+    empty.hidden = false;
+  }
+
   function show(body) {
     if (!body || typeof body !== "object") throw new Error("empty frame");
     const tone = body.error && !body.frame ? "bad"
@@ -222,12 +259,11 @@
       const step = (ZH && body.next_step_zh) || body.next_step || body.hint;
       if (step) text += " — " + step;
     }
-    if (body.private_secs) {
-      setStatus("warn", describe(body));
-      image.hidden = true;
-      image.removeAttribute("src");
-      empty.textContent = t("Someone is signing in on the phone. The screen stays hidden until the agent continues.");
-      empty.hidden = false;
+    if (body.private_secs || body.clear_frame) {
+      setStatus(body.private_secs ? "warn" : tone, body.private_secs ? describe(body) : text);
+      clearFrame(body.private_secs
+        ? t("Someone is signing in on the phone. The screen stays hidden until the agent continues.")
+        : t("Waiting for a new permitted frame."));
       return false;
     }
     setStatus(tone, text);
@@ -245,7 +281,7 @@
     return !!frame && !body.released;
   }
 
-  function visible() { return !disposed && onScreen && !document.hidden; }
+  function visible() { return bindingReady && !disposed && onScreen && !document.hidden; }
   function stop() { if (timer) { clearTimeout(timer); timer = null; } }
   function kick(delay) {
     if (!visible() || timer) return;
@@ -265,8 +301,12 @@
   }
 
   async function callTool(name, args) {
+    if (disposed) throw new Error("panel has ended");
     if (!ready) await connect();
-    return request("tools/call", { name, arguments: args || {} });
+    if (disposed) throw new Error("panel has ended");
+    if (!bindingReady) throw new Error("ask the agent to open this phone's screen again");
+    return request("tools/call", { name, arguments: routingInstance === null
+      ? (args || {}) : { ...(args || {}), instance: routingInstance } });
   }
 
   async function poll(fresh) {
@@ -281,6 +321,7 @@
       failures = 0;
       delay = live ? Math.max(0, FRAME_INTERVAL_MS - (performance.now() - started)) : IDLE_INTERVAL_MS;
     } catch (error) {
+      clearFrame(t("Waiting for a new permitted frame."));
       failures += 1;
       delay = Math.min(5000, 1000 * failures);
       if (failures > 1) setStatus("bad", t("panel cannot reach iphone-use — {error}", { error: t(error.message) }));

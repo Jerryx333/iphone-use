@@ -1,0 +1,236 @@
+{
+  "version": "0.27.1",
+  "artifact_audit": {
+    "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.27.1",
+    "published_at": "2026-10-27T07:10:42Z",
+    "checksums": {
+      "browser-use-bridge-macos-universal.tar.gz": "ac9d6c2f6f8c8403f2b7a469a1f34407f67d931fcdf20f6ae91a9b021b3e9d6d",
+      "iPhoneUse.app.zip": "079f05c61199ad62c03cfc93005675b9271f8eaae9eef051c6479582100a2d42",
+      "iphone-use-app.tar.gz": "f26572a9e6e86618ae74206316dae44a888528bbef882c6cf708713a8d465771",
+      "iphone-use-mcp-macos-universal.tar.gz": "441a9f57a04cd752970ee63fdc90cb1e24bf4a78d364e7cd9963295389f44cc5",
+      "iphone-use-runner.tar.gz": "0b782abffac63d01631c877d91fc7680c53d481e562644df9009c29210c8f132"
+    },
+    "app_version": "0.27.1",
+    "cli_version": "iphone-use 0.27.1",
+    "codesign_verified": true,
+    "notarized_developer_id": true,
+    "stapled_ticket_verified": true,
+    "architectures": {
+      "iphone-use": [
+        "x86_64",
+        "arm64"
+      ],
+      "iphone-use-mcp": [
+        "x86_64",
+        "arm64"
+      ],
+      "iphone-use-legacy-launch": [
+        "x86_64",
+        "arm64"
+      ]
+    },
+    "embedded_mcp": {
+      "version": "0.27.1",
+      "tools": 40,
+      "names": [
+        "phone_app_notes",
+        "phone_apps",
+        "phone_capabilities",
+        "phone_collect_list",
+        "phone_crashes",
+        "phone_elements",
+        "phone_flow_draft",
+        "phone_flow_info",
+        "phone_flow_list",
+        "phone_flow_publish",
+        "phone_flow_report",
+        "phone_flow_run",
+        "phone_flow_update",
+        "phone_hold",
+        "phone_home_layout",
+        "phone_install_app",
+        "phone_instances",
+        "phone_jev_run",
+        "phone_key",
+        "phone_login",
+        "phone_logs",
+        "phone_read_value",
+        "phone_reconnect",
+        "phone_record",
+        "phone_release_owner",
+        "phone_run_end",
+        "phone_run_start",
+        "phone_run_steps",
+        "phone_screen",
+        "phone_screen_frame",
+        "phone_screenshot",
+        "phone_scroll",
+        "phone_scroll_find",
+        "phone_set_location",
+        "phone_shortcut",
+        "phone_status",
+        "phone_tap",
+        "phone_tap_element",
+        "phone_tap_label",
+        "phone_type"
+      ]
+    },
+    "standalone_mcp_matches": true,
+    "standalone_mcp_codesign_verified": true,
+    "standalone_mcp_architectures": [
+      "x86_64",
+      "arm64"
+    ],
+    "runner_sources_match_tag": {
+      "IPURBridge.h": "23d2bfe4fec73bd53004eb2cd691cf70722fabfaee53869f6aadb73ef8d79623",
+      "IPURBridge.m": "1caee3ff20ff7f297b09c50b2cc7750b15ae0aa0a372e8ab39a6b1be4e887230",
+      "RunnerExitNotice.swift": "2159c2eca0ced5a9caee9c28f2bbf7e7ba082e05d0b07abcfeb1d52461d1deae",
+      "RunnerTests.swift": "c05f44a01264cce4e2512eb3f0e9bf5dc0dccd291dd3ccbc3a964483f230ba3a",
+      "RunnerActions.swift": "705ec97ae8a405c5c9800f72c6aa42a6d4f2a0b89bb8b21432a11dcc3e9af3a1",
+      "RunnerRoutes.swift": "b50585c4c59502a9e508fb3cd64b526480ef51de50f8b01c1cdc696f570152e6"
+    },
+    "auxiliary_payloads": {
+      "browser-use-bridge": {
+        "architectures": [
+          "arm64",
+          "x86_64"
+        ],
+        "codesign_verified": true
+      },
+      "app/bin/ipu-phone-host": {
+        "architectures": [
+          "arm64",
+          "x86_64"
+        ],
+        "codesign_verified": true
+      },
+      "app/native/libipu_phone_host.a": {
+        "architectures": [
+          "arm64"
+        ],
+        "codesign_verified": false
+      },
+      "app/apps/ios/SessionLibraries/iphoneos/libipu_browser_session.a": {
+        "architectures": [
+          "arm64"
+        ],
+        "codesign_verified": false
+      }
+    },
+    "installed": false,
+    "physical_acceptance": false
+  },
+  "mcp_registry": {
+    "version": "0.27.1",
+    "url": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.leeguooooo%2Fiphone-use/versions/0.27.1"
+  },
+  "marketplace_snapshot": {
+    "version": "0.27.1",
+    "blob_sha": "9029551af03d5e401b9f50a7be6547d287c9f72c",
+    "verified_at": "2026-10-27T07:43:35.173162+00:00"
+  },
+  "physical_reader": {
+    "scope": "owned physical iPhone 13 fixture",
+    "server_version": "0.27.1",
+    "passed": true,
+    "typing_sent": false,
+    "cases": [
+      {
+        "case": "full-value-single-copy",
+        "passed": true,
+        "mode": "full",
+        "utf16_length": 6028,
+        "sha256": "d0177b782964afd6a3199c40860b478c6d844ee0b55ad2abe2f9c8441f1ef492"
+      },
+      {
+        "case": "full-value-single-copy",
+        "passed": true,
+        "mode": "slim",
+        "utf16_length": 6028,
+        "sha256": "d0177b782964afd6a3199c40860b478c6d844ee0b55ad2abe2f9c8441f1ef492"
+      },
+      {
+        "case": "full-value-single-copy",
+        "passed": true,
+        "mode": "off",
+        "utf16_length": 6028,
+        "sha256": "d0177b782964afd6a3199c40860b478c6d844ee0b55ad2abe2f9c8441f1ef492"
+      },
+      {
+        "case": "surrogate-boundary",
+        "passed": true,
+        "max_utf16": 1
+      },
+      {
+        "case": "surrogate-boundary",
+        "passed": true,
+        "max_utf16": 2
+      },
+      {
+        "case": "quoted-multiline-tab-label",
+        "passed": true
+      },
+      {
+        "case": "secure-refusal",
+        "passed": true
+      },
+      {
+        "case": "ambiguous-refusal",
+        "passed": true
+      },
+      {
+        "case": "missing-refusal",
+        "passed": true
+      },
+      {
+        "case": "boolean-value",
+        "passed": true
+      }
+    ],
+    "cleanup_errors": [],
+    "launch_acknowledged": true,
+    "foreground_verified": true,
+    "preview_utf16_length": 512,
+    "preview_marked_truncated": true,
+    "app_state_unchanged": true,
+    "focus_unchanged": true,
+    "edit_events": 0,
+    "owner_unchanged": true,
+    "owned_fixture_uninstalled": true,
+    "own_lease_released": true,
+    "owned_fixture_absence_verified": true,
+    "own_lease_release_verified": true,
+    "device": "iPhone 13",
+    "ios_version": "27.0",
+    "xcode_sdk": "iphoneos27.1",
+    "fixture_source_sha256": "8da6b283ba8f8a261f37bab8698bb449fdaf7867945bca34b71a100ce95c7880",
+    "fixture_executable_sha256": "630071f323262d70f4634d6abd3cb7a7e0a00da074061712c817cf5065755135",
+    "fixture_variant": "UIScene, build 2",
+    "before": {
+      "sha256": "d0177b782964afd6a3199c40860b478c6d844ee0b55ad2abe2f9c8441f1ef492",
+      "utf16_length": 6028,
+      "events": 0,
+      "focused": false,
+      "flag": true,
+      "fixture_variant": "scene",
+      "bundle_version": "2"
+    },
+    "after": {
+      "sha256": "d0177b782964afd6a3199c40860b478c6d844ee0b55ad2abe2f9c8441f1ef492",
+      "utf16_length": 6028,
+      "events": 0,
+      "focused": false,
+      "flag": true,
+      "fixture_variant": "scene",
+      "bundle_version": "2"
+    }
+  },
+  "installation_validation": {
+    "instance": "i13",
+    "version": "0.27.1",
+    "binaries_match_download": true,
+    "bundle_signature_verified": true,
+    "verified_after_physical_reader_run": true,
+    "verified_at": "2026-10-27T07:45:12.148934+00:00"
+  }
+}

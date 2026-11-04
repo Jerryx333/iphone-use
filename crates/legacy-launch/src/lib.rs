@@ -51,6 +51,19 @@ pub const DEFAULT_BUNDLE: &str = "com.leeguoo.iphone-use.runner.6zpxg4kvvs.xctru
 const LABEL: &str = "iphone-use-legacy-launch";
 const WIRELESS_DOMAIN: &str = "com.apple.mobile.wireless_lockdown";
 
+/// Only the allowlisted runtime settings enter the phone's test process.
+fn runner_environment(mut env: Dictionary, token: Option<&str>, source: impl Fn(&str) -> Option<String>) -> Dictionary {
+    if let Some(token) = token {
+        env.insert(ipu_core::runner_auth::TOKEN_ENV.into(), Value::String(token.into()));
+    }
+    for name in ["IPU_DAEMON_TOKEN", "IPU_DAEMON_PASSWORD", "IPU_DAEMON_HOST", "IPU_RUNNER_EXIT_NOTICE"] {
+        if let Some(value) = source(name).filter(|value| !value.is_empty()) {
+            env.insert(name.into(), Value::String(value));
+        }
+    }
+    env
+}
+
 /// Where the phone is and how to reach it.
 #[derive(Debug, Clone, Default)]
 pub struct Target {
@@ -442,20 +455,7 @@ pub async fn launch(t: &Target, o: &LaunchOptions) -> Result<(), String> {
     let token = std::env::var(ipu_core::runner_auth::TOKEN_ENV)
         .ok()
         .filter(|t| ipu_core::runner_auth::valid_token(t));
-    let mut env = o.env.clone();
-    if let Some(token) = &token {
-        env.insert(
-            ipu_core::runner_auth::TOKEN_ENV.into(),
-            plist::Value::String(token.clone()),
-        );
-    }
-    // The on-phone daemon's settings travel the same way (setup puts them in
-    // this process's environment; see `server::phone_daemon::runner_env`).
-    for name in ["IPU_DAEMON_TOKEN", "IPU_DAEMON_PASSWORD", "IPU_DAEMON_HOST"] {
-        if let Some(value) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
-            env.insert(name.into(), plist::Value::String(value));
-        }
-    }
+    let env = runner_environment(o.env.clone(), token.as_deref(), |name| std::env::var(name).ok());
     if !env.is_empty() {
         cfg.runner_env = Some(env);
     }
@@ -505,6 +505,21 @@ pub async fn launch(t: &Target, o: &LaunchOptions) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_settings_forward_explicit_notice_without_adding_a_permission_request() {
+        let empty = runner_environment(Dictionary::new(), None, |_| None);
+        assert!(!empty.contains_key("IPU_RUNNER_EXIT_NOTICE"));
+        let token = "a".repeat(64);
+        for value in ["auto", "0", "1"] {
+            let env = runner_environment(Dictionary::new(), Some(&token), |name| {
+                (name == "IPU_RUNNER_EXIT_NOTICE").then(|| value.to_owned())
+            });
+            assert_eq!(env.get("IPU_RUNNER_EXIT_NOTICE").and_then(Value::as_string), Some(value));
+            assert_eq!(env.get(ipu_core::runner_auth::TOKEN_ENV).and_then(Value::as_string), Some(token.as_str()));
+            assert_eq!(env.len(), 2);
+        }
+    }
 
     #[test]
     fn http_200_detection() {

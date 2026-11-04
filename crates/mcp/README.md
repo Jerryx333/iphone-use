@@ -2,8 +2,7 @@
 
 MCP stdio server that wraps the `iphone-use` daemon's agent HTTP API,
 giving MCP clients (Claude Desktop, Claude Code, etc.) native tool access
-to a real iPhone. The daemon drives the phone through WebDriverAgent running
-on it.
+to a real iPhone. The daemon drives the phone through its native XCTest Runner.
 
 ## Prerequisites
 
@@ -320,20 +319,22 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 |---|---|---|
 | `phone_status` | — | Query backend, canonical target, `drivable`, device-runner readiness, lifecycle, and recovery hints |
 | `phone_capabilities` | — | What this build supports for the configured backend, and whether the phone can be driven now. Read-only: wakes nothing, takes no owner lease |
-| `phone_reconnect` | — | Restart the daemon-managed device runner once, then poll `phone_status`; never changes backend or target |
+| `phone_metrics` | `limit?` | Latest performance aggregates for this client on the selected instance: recorded HTTP calls, p50/p95, batching, unknown outcomes and losses. Default 5 runs per section, max 20, shared 12 KiB row budget; omissions are explicit. No phone connection or lease. |
+| `phone_reconnect` | `wait_secs?` (1–300) | Restart the daemon-managed device runner once; with `wait_secs`, return when drivable, blocked (`setup_blocked_on`) or timed out, else poll `phone_status`; never changes backend or target |
 | `phone_hold` | `secs` | Keep the phone through a bounded human-in-the-loop pause (a PIN, a code): the idle watchdog does not release it for `secs` (0 clears, max 14400) |
 | `phone_release_owner` | — | Release this session's owner lease when the task is done |
 | `phone_login` | `item?`, `user?`, `submit?`, `vault?`, `code_via?`, `code_from?` | Sign the app on screen in from the user's own vault entry (1Password or bitwarden-use), inside the daemon; the password never reaches the model |
 | `phone_screenshot` | `max_side?`, `overlay?` | Capture current screen → PNG image content; `overlay=true` draws each interactive element's frame and `phone_elements` index on it |
+| `phone_instances` | — | List installed local instances and bounded read-only status; never reconnects or claims a phone. |
 | `phone_home_layout` | `page?` | Read all home pages, Dock, folder pages and widget stacks without UI input. `page` selects one zero-based page. Page indexes include hidden/Focus-filtered pages and differ from visible page-control numbers. Grid positions are derived from reported icon order and widget spans; `positions_complete=false` / null positions mean unknown. No pixel coordinates or layout restore. Requires a paired physical target reachable through usbmuxd; obeys private holds. |
 | `phone_elements` | `query?`, `limit?`, `ocr?`, `include_hidden?` | The UI as a flattened element list — prefer over screenshots for reasoning. `query` keeps rows whose label/identifier/value/placeholder contain the text; `limit` caps the rows. Kept rows keep their index and the snapshot, so taps still work. `include_hidden=true` expands off-screen/not-drawn rows with original indexes and a `hidden` marker instead of the five-label summary; scroll them into view and read again before acting. The 200-row / 32 KiB text budget still applies. `ocr=auto` adds text read from pixels (Vision) when the tree has no interactive rows, `ocr=force` always; those rows are listed under the tree with `phone_tap` coordinates |
 | `phone_tap` | `x`, `y` (0–1), `observe?` | Single tap at normalized position |
 | `phone_tap_element` | `element`, `snapshot`, `observe?` | Snapshot-bound indexed tap; stale trees are rejected without tapping |
 | `phone_tap_label` | `label`, `observe?` | Exact-label tap; requires one unique match and sends nothing on ambiguity |
 | `phone_scroll` | `x`, `y`, `dx`, `dy`, `observe?` | Scroll-wheel gesture; negative `dy` scrolls content up |
-| `phone_type` | `text`, `observe?` | Type text; any Unicode (incl. CJK) lands cleanly |
+| `phone_type` | `text` or `continue_token`, `clear?`, `budget_ms?`, `observe?` | Type Unicode; bounded input may return a single-use original-field continuation |
 | `phone_key` | `name`, `observe?` | Named key: `return`, `escape`, `space`, `tab`, `delete`, `up`, `down`, `left`, `right` |
-| `phone_shortcut` | `name`, `observe?` | iOS system shortcut: `home` or `spotlight`; App Switcher is unsupported |
+| `phone_shortcut` | `name`, `observe?` | System shortcut: `home`, `spotlight`, `save_screenshot`, `volume_up`, `volume_down`. Screenshot requests require a capable Runner and an independent saved-image check. Volume requires a physical device and a capable Runner; ACK confirms the request, not the volume level. Do not replay uncertain presses. App Switcher is unsupported |
 | `phone_run_steps` | `steps`, `observe?` | Run up to 24 guarded action/wait steps in one MCP call; includes long-press/swipe/drag (`points` supports 2–16 stops with `dwell_ms`, travel `duration_ms` per segment, total hold/travel/dwell <= 10s), strict `tap_locator`, bundle-id `launch_app`, `open_url` (links; non-http schemes need `IPHONE_USE_ALLOW_URL_SCHEMES` on the daemon), `alert`, `picker`, `perform` (toggle a switch, adjust a slider), full preflight, one device lock, and first-failure stop |
 | `phone_jev_run` | `goal`, `app?`, `max_steps?` | Hand a whole goal to the fast on-phone agent; returns `done` / `blocked` with its step history |
 | `phone_flow_list` | `category?`, `app?`, `verified?`, `detail?` | Installed registry flows, one row each (id · risk · compat · inputs — description); `detail=true` for every field. Check this before exploring an app step by step |
@@ -360,7 +361,7 @@ tools that act, `destructiveHint` and `idempotentHint`. Clients that honour
 them can auto-approve the read-only ones and confirm the rest. The read-only
 set is `phone_status`, `phone_capabilities`, `phone_apps`, `phone_screen`,
 `phone_screen_frame`, `phone_screenshot`, `phone_elements`, `phone_home_layout`, `phone_crashes`,
-`phone_flow_list` and `phone_flow_info`. `phone_flow_draft` is non-read-only in
+`phone_metrics`, `phone_flow_list` and `phone_flow_info`. `phone_flow_draft` is non-read-only in
 normal discovery because its optional `save_as` writes a new local file. The
 `readonly` profile retains its read-only draft mode: discovery marks it read-only
 and omits `save_as`; attempts to supply that argument are still refused by the
@@ -495,3 +496,30 @@ the current stage (for example an Xcode build after an update).
 - Logs to **stderr** at `INFO` level by default; set `RUST_LOG=debug` for
   verbose output.  Stderr is forwarded to the MCP client's diagnostics view
   and never mixed with the stdio protocol stream.
+
+### Selecting an installed instance per call
+
+Call `phone_instances` to list local installed daemons. Every other `phone_*`
+tool accepts an optional `instance` name, such as `i13` or `default`:
+`phone_status({"instance":"i13"})`, then
+`phone_tap({"instance":"i13","x":0.5,"y":0.5})`.
+Omitting it keeps the daemon configured when this MCP server started, including
+explicit remote URL/token configurations. An explicit name resolves only that
+instance's private LaunchAgent and local port; unavailable/unsafe configurations
+fail without fallback or reusing environment credentials. It does not change any
+daemon's target, restart a service, or grant permission to reconnect a parked phone.
+
+Use the same explicit instance throughout an operation. Each has separate
+snapshot, run and progress state; a concurrent call keeps its own pinned target.
+A batch or flow stays on one instance. The screen panel waits for its opening
+tool's target and sends that instance with frame and Home calls. Installed local
+LaunchAgents are supported; simulator-only records are not discovery targets.
+
+Local daemon calls bypass process/system HTTP proxies. Automatic credentials
+are loaded only for a parsed loopback URL matching the selected LaunchAgent's
+port and without URL userinfo. An explicit remote URL/token keeps its configured
+transport; a different local port requires its own explicit credentials.
+
+`phone_read_value` reads one exact identifier/label as a bounded full AX value,
+without focusing the field or claiming a lease. Completeness is explicit; secure
+fields and unsupported Runners refuse. The value appears once in tool text.

@@ -18,8 +18,8 @@ fn fold(label: &str) -> String {
         .collect()
 }
 
-/// Labels on screen that differ from `wanted` only by case, whitespace or
-/// full-width characters — "did you mean" candidates, at most three, in
+/// Labels differing by case/spacing/full-width characters, or adding a
+/// comma-separated accessibility suffix. At most three suggestions, in
 /// screen order. An exact match is not a near miss.
 pub fn near_misses<'a>(wanted: &str, labels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let target = fold(wanted);
@@ -31,7 +31,10 @@ pub fn near_misses<'a>(wanted: &str, labels: impl IntoIterator<Item = &'a str>) 
         if label == wanted || out.iter().any(|seen| seen == label) {
             continue;
         }
-        if fold(label) == target {
+        let folded = fold(label);
+        let suffixed = folded.strip_prefix(&target)
+            .is_some_and(|tail| tail.starts_with(',') && tail.len() > 1);
+        if folded == target || suffixed {
             out.push(label.to_string());
             if out.len() == 3 {
                 break;
@@ -49,7 +52,7 @@ pub fn did_you_mean<'a>(wanted: &str, labels: impl IntoIterator<Item = &'a str>)
     }
     let quoted: Vec<String> = close.iter().map(|l| format!("{l:?}")).collect();
     Some(format!(
-        "did you mean {}? (differs only by case, spaces or full-width characters)",
+        "did you mean {}? (use an exact label from the current screen)",
         quoted.join(" or ")
     ))
 }
@@ -83,7 +86,6 @@ pub use iu_core::progress::{Action, ProgressGuard, ProgressTracker};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn near_misses_fold_case_space_and_full_width() {
@@ -103,6 +105,19 @@ mod tests {
         assert!(near_misses("   ", labels).is_empty());
         assert!(did_you_mean("蓝牙", labels).is_none());
         assert!(did_you_mean("通用", labels).unwrap().contains("\"通 用\""));
+    }
+
+    #[test]
+    fn compound_tab_labels_are_bounded_advisory_candidates() {
+        let labels = ["Teclado, tab, 1 of 3", "Conversas, tab, 2 of 3", "Histórico, tab, 3 of 3"];
+        assert_eq!(near_misses("Conversas", labels), vec!["Conversas, tab, 2 of 3"]);
+        assert_eq!(near_misses(" conversas ", labels), vec!["Conversas, tab, 2 of 3"]);
+        assert!(near_misses("Conversa", labels).is_empty(), "a partial word is not a suffix boundary");
+        assert!(near_misses("Conversas, tab, 2 of 3", labels).is_empty());
+        assert_eq!(near_misses("A", ["A, 1", "A, 1", "A，2", "A, 3", "A, 4", "A,"]),
+            vec!["A, 1", "A，2", "A, 3"]);
+        let hint = did_you_mean("Conversas", labels).unwrap();
+        assert!(hint.contains("did you mean \"Conversas, tab, 2 of 3\""));
     }
 
     #[test]

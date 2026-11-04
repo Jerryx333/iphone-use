@@ -27,6 +27,7 @@ fn bounded_move_duration_ms(duration_ms: u64) -> u64 {
 /// *entire* observation vanish — a reachable runner then reported `runner:false`
 /// for the whole reconnect and setup-runner.sh's hand-off verdict failed on it.
 const ACTIONABILITY_PROBE_BUDGET: Duration = Duration::from_secs(10);
+const WINDOW_SIZE_TTL: Duration = Duration::from_secs(30);
 
 /// Budget for the session-less `GET /wda/locked` that precedes session
 /// creation in `probe_health`. It is a plain in-process read on the runner.
@@ -76,6 +77,40 @@ fn bounded_read_query() -> String {
     )
 }
 
+pub enum VolumeButton {
+    Up,
+    Down,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum VolumeButtonOutcome {
+    Unsupported,
+    ScopeChanged,
+    Requested,
+}
+
+/// Pre-dispatch refusal or an acknowledged request; post-dispatch uncertainty is an error.
+#[derive(Debug)]
+pub enum SystemCaptureOutcome {
+    Unsupported,
+    ScopeChanged,
+    Requested(serde_json::Value),
+}
+
+/// Session/settings and element lookups do not dispatch phone input. Shared
+/// with the transport fence so a refused setup preserves known no-write receipts.
+pub(crate) fn post_mutates_screen(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    !(path.ends_with("/session") || path.ends_with("/appium/settings")
+        || path.ends_with("/elements") || path.ends_with("/element"))
+}
+
+/// How many complete trees [`RunnerClient::served_tree`] can look back over.
+/// An agent acts on a tree it read moments ago; a few cover a batch.
+const SERVED_TREES_CAP: usize = 8;
+
+type ReadScope = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// A runner endpoint plus a lazily-created session id.
 pub struct RunnerClient {
     base: String, // e.g. "http://192.168.0.190:8100"
@@ -99,9 +134,28 @@ pub struct RunnerClient {
     /// `None` until asked, `Some(false)` after a 404 (WebDriverAgent, an older
     /// runner). Asked again whenever a new session starts (a new runner).
     device_settle: Option<bool>,
+    value_read: bool,
+    element_subtree: bool,
+    element_evidence: bool,
+    guarded_input: bool,
+    selected_input_target: bool,
+    input_continuation: bool,
+    pending_input: crate::input_continuation::Store,
+    volume_buttons: bool,
+    system_capture_request: bool,
     /// The last tree read and when: snapshot-bound actions reuse it instead
     /// of reading the whole tree again (see [`Self::recent_tree`]).
     last_tree: Option<(std::sync::Arc<Vec<ElementRow>>, std::time::Instant)>,
+    /// The last few complete trees read, newest last. A snapshot-bound action
+    /// whose token no longer matches the live tree looks its snapshot up here
+    /// to learn which element the index named (see [`Self::served_tree`]).
+    /// Each keeps the authorization it was read under, so a tree read before
+    /// an owner change or a privacy hold is never used afterwards.
+    served_trees: std::collections::VecDeque<(std::sync::Arc<Vec<ElementRow>>, Option<ReadScope>)>,
+    /// `(snapshot index, live index)` when the current snapshot-bound action
+    /// found its row in a changed tree; the response reports it.
+    pub rebound_row: Option<(usize, usize)>,
+    pub(crate) activity_rebound_rect: Option<[f64;4]>,
     /// Whether the last [`Self::elements`] kept the tree read without
     /// `isVisible` (see [`Self::bounded_source`]): its rows' `visible` is
     /// geometric, and the next read keeps that mode until the tree shrinks
@@ -117,6 +171,9 @@ pub struct RunnerClient {
     /// only so `/agent/screenshot` can answer without a new capture. Dropped
     /// by the next screen-changing POST.
     settled_frame: Option<(std::sync::Arc<Capture>, std::time::Instant)>,
+    settled_frame_generation: u64,
+    observation_scope: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    tree_scope: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Until when screenshots are not used to judge "settled" (a frame was
     /// slow or failed; see `settle_frame` in http.rs).
     settle_frames_paused_until: Option<std::time::Instant>,
@@ -343,11 +400,26 @@ impl RunnerClient {
             posted_at: None,
             no_alert_at: None,
             device_settle: None,
+            value_read: false,
+            element_subtree: false,
+            element_evidence: false,
+            guarded_input: false,
+            selected_input_target: false,
+            input_continuation: false,
+            pending_input: crate::input_continuation::Store::default(),
+            volume_buttons: false,
+            system_capture_request: false,
             last_tree: None,
+            served_trees: std::collections::VecDeque::new(),
+            rebound_row: None,
+            activity_rebound_rect: None,
             lite_source: false,
             probe: ProbeMemory::default(),
             full_visibility: full_visibility_requested(),
             settled_frame: None,
+            settled_frame_generation: 0,
+            observation_scope: None,
+            tree_scope: None,
             settle_frames_paused_until: None,
             actionability_budget: ACTIONABILITY_PROBE_BUDGET,
             last_actionable: false,
@@ -702,6 +774,23 @@ impl RunnerClient {
             self.session = Some(parse_session_id(&text)?);
             self.window = None;
             self.no_alert_at = None;
+            self.pending_input.clear();
+            self.input_continuation = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:inputContinuation").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.guarded_input = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:guardedInput").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.selected_input_target = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:selectedInputTarget").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.value_read = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:valueRead").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.element_subtree = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:elementSubtree").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.element_evidence = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:elementEvidence").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.volume_buttons = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:volumeButtons").and_then(serde_json::Value::as_bool)) == Some(true);
+            self.system_capture_request = serde_json::from_str::<serde_json::Value>(&text).ok()
+                .and_then(|value| value.pointer("/value/capabilities/ipu:systemCaptureRequest").and_then(serde_json::Value::as_bool)) == Some(true);
             self.device_settle = None;
             {
                 let sid = self.session.as_deref().unwrap().to_string();
@@ -770,7 +859,9 @@ impl RunnerClient {
     /// Source reads are read-only, so avoiding session creation also removes a
     /// source/session churn loop during relay recovery.
     pub async fn source(&mut self) -> Result<serde_json::Value> {
-        self.source_excluding(None).await
+        let mut tree=self.source_excluding(None).await?;
+        if let Some(root)=tree.as_object_mut(){root.remove("_ipu_tree_coverage");}
+        Ok(tree)
     }
 
     /// Can the runner read the screen right now? A light tree read (no
@@ -825,8 +916,11 @@ impl RunnerClient {
             .get("x-ipu-alert")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let coverage = SnapshotCoverage::from_headers(response.headers());
         let body = response.text().await.context("parse /source")?;
-        let value = parse_runner_value(&body, "GET /source")?;
+        let mut value = parse_runner_value(&body, "GET /source")?;
+        let root=value.as_object_mut().ok_or_else(||anyhow::anyhow!("/source must return a tree object"))?;
+        root.insert("_ipu_tree_coverage".into(),coverage.as_str().into());
         match alert.as_deref() {
             Some("0") => self.no_alert_at = Some(asked_at),
             Some("1") => self.no_alert_at = None,
@@ -930,6 +1024,11 @@ impl RunnerClient {
     /// element of a kind (e.g. the 3 columns of a date PickerWheel) when none
     /// has a usable label.
     pub async fn find_elements(&mut self, using: &str, value: &str) -> Result<Vec<String>> {
+        Ok(self.find_element_matches(using, value).await?.ids)
+    }
+
+    /// Live matches with producer coverage. A one-item prefix is not a unique target.
+    pub async fn find_element_matches(&mut self, using: &str, value: &str) -> Result<ElementMatches> {
         let sid = self.ensure_session().await?.to_string();
         let response = self
             .post_req(format!("{}/session/{}/elements", self.base, sid))
@@ -937,19 +1036,118 @@ impl RunnerClient {
             .send_signed(&self.auth)
             .await
             .context("POST /elements")?;
+        let coverage = SnapshotCoverage::from_headers(response.headers());
         let value = ensure_runner_success(response, "POST /elements").await?;
-        let elements = value
-            .as_array()
-            .ok_or_else(|| anyhow!("POST /elements returned non-array value: {value}"))?;
-        Ok(elements
-            .iter()
-            .filter_map(|e| {
-                e.get("ELEMENT")
-                    .or_else(|| e.get("element-6066-11e4-a52e-4f735466cecf"))
-                    .and_then(|x| x.as_str())
-                    .map(String::from)
-            })
-            .collect())
+        let elements = value.as_array()
+            .ok_or_else(|| anyhow!("POST /elements returned non-array value"))?;
+        let ids = elements.iter().map(|element| {
+            element.get("ELEMENT")
+                .or_else(|| element.get("element-6066-11e4-a52e-4f735466cecf"))
+                .and_then(|value| value.as_str()).filter(|value| !value.is_empty())
+                .map(String::from).ok_or_else(|| anyhow!("POST /elements returned an invalid element reference"))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(ElementMatches { ids, coverage })
+    }
+
+    /// Resolve a unique action target; singular /element remains a read API.
+    async fn find_unique_element(&mut self, using: &str, value: &str) -> Result<String> {
+        let matches = self.find_element_matches(using, value).await?;
+        if !matches.coverage.is_complete() { return Err(anyhow!("element target scope is not proven complete")); }
+        match matches.ids.as_slice() {
+            [id] => Ok(id.clone()),
+            _ => Err(anyhow!("element action needs exactly one proven match")),
+        }
+    }
+
+    /// One explicitly selected element's full AX value. Older runners refuse;
+    /// their bounded snapshot string is never promoted to a complete value.
+    pub async fn read_element_value(&mut self, id: &str, max_utf16: u32) -> Result<serde_json::Value> {
+        let sid=self.ensure_session().await?.to_string();
+        if !self.value_read {
+            return Err(RunnerHttpError {
+                operation: "GET element value".into(), status: reqwest::StatusCode::NOT_IMPLEMENTED,
+                code: Some("unsupported operation".into()), message: Some("runner lacks ipu:valueRead".into()),
+            }.into());
+        }
+        let response=self.http.get(format!("{}/session/{}/element/{}/value?complete=1",self.base,sid,id))
+            .query(&[("max_utf16",max_utf16)]).send_signed(&self.auth).await?;
+        ensure_runner_success(response,"GET element value").await
+    }
+
+    /// Fetch only the retained AX element's bounded subtree on the phone.
+    /// Rows are read-only local indices: they are NOT saved in the screen-token
+    /// cache. Keep the original snapshot/locator to address later actions.
+    /// Legacy runners explicitly refuse; never fetch /source as a substitute.
+    pub async fn element_subtree(
+        &mut self, element_id: &str, max_depth: u32, max_nodes: u32,
+    ) -> Result<ElementSubtree> {
+        if !(1..=64).contains(&max_depth) || !(1..=5000).contains(&max_nodes) {
+            return Err(anyhow!("subtree requires max_depth in 1..=64 and max_nodes in 1..=5000"));
+        }
+        let sid = self.ensure_session().await?.to_owned();
+        if !self.element_subtree {
+            return Err(unsupported_element_read("GET element subtree", "ipu:elementSubtree"));
+        }
+        let mut url = reqwest::Url::parse(&format!("{}/session/", self.base))?;
+        url.path_segments_mut().map_err(|_| anyhow!("runner base cannot hold path segments"))?
+            .pop_if_empty().extend([sid.as_str(), "element", element_id, "ipu", "subtree"]);
+        let response = self.http.get(url)
+            .query(&[("max_depth", max_depth), ("max_nodes", max_nodes)])
+            .send_signed(&self.auth).await.context("GET element subtree")?;
+        let coverage = SnapshotCoverage::from_headers(response.headers());
+        let root = ensure_runner_success(response, "GET element subtree").await?;
+        if !root.is_object() { return Err(anyhow!("element subtree must return a tree object")); }
+        let mut rows = Vec::new();
+        flatten_tree(&root, 0, &mut rows);
+        Ok(ElementSubtree { root, rows, coverage })
+    }
+
+    /// One shallow element read, or at most four frame samples polled inside
+    /// the phone. Missing attributes are None, never evidence of true/false.
+    /// Does not mutate, retry input, fetch a whole tree, or update screen tokens.
+    pub async fn element_evidence(
+        &mut self, element_id: &str, stability: bool,
+    ) -> Result<ElementEvidence> {
+        let sid = self.ensure_session().await?.to_owned();
+        if !self.element_evidence {
+            return Err(unsupported_element_read("GET element evidence", "ipu:elementEvidence"));
+        }
+        let mut url = reqwest::Url::parse(&format!("{}/session/", self.base))?;
+        url.path_segments_mut().map_err(|_| anyhow!("runner base cannot hold path segments"))?
+            .pop_if_empty().extend([sid.as_str(), "element", element_id, "ipu", "evidence"]);
+        let response = self.http.get(url).query(&[("stability", if stability { "1" } else { "0" })])
+            .send_signed(&self.auth).await.context("GET element evidence")?;
+        let value = ensure_runner_success(response, "GET element evidence").await?;
+        serde_json::from_value(value).context("parse element evidence")
+    }
+
+    /// Request one iOS system capture under a live screen/owner permit;
+    /// an acknowledged request still says nothing about Photos persistence.
+    pub async fn request_system_capture(&mut self, allowed: &(dyn Fn() -> bool + Sync)) -> Result<SystemCaptureOutcome> {
+        if !allowed() { return Ok(SystemCaptureOutcome::ScopeChanged); }
+        let sid = self.ensure_session().await?.to_string();
+        if !self.system_capture_request {
+            return Ok(SystemCaptureOutcome::Unsupported);
+        }
+        let (client, request) = self.post_req(format!("{}/session/{}/ipu/system-capture", self.base, sid))
+            .json(&serde_json::json!({})).build_split();
+        let mut request = request.context("build system capture")?;
+        crate::runner_token::sign_request(&self.auth, &mut request);
+        // Session creation and signing may outlive privacy/owner changes.
+        // Refuse before transport admission, never re-send after admission.
+        if !allowed() { return Ok(SystemCaptureOutcome::ScopeChanged); }
+        let response = crate::timing::execute_timed(client, request).await
+            .context("POST system capture")?;
+        let value = ensure_runner_success(response, "POST system capture").await?;
+        match (value.get("invoked").and_then(serde_json::Value::as_bool), value.get("acknowledged").and_then(serde_json::Value::as_bool)) {
+            (Some(false), Some(false)) => Ok(SystemCaptureOutcome::Unsupported),
+            (Some(true), Some(true)) => Ok(SystemCaptureOutcome::Requested(serde_json::json!({
+                "requested": true, "destination": "iPhone Photos", "saved_verified": false,
+                "verification_scope": "system_capture_request_acknowledged",
+                "hint": "If a full-screen preview is open, inspect it and save that existing image with Done/Save to Photos. Check Photos or its picker; never take another screenshot to finish a pending save."
+            }))),
+            _ => anyhow::bail!("system capture dispatch was not acknowledged; outcome unknown; do not repeat"),
+        }
     }
 
     /// Set a date/option PickerWheel to a target value (issue #23). A `scroll`
@@ -1000,6 +1198,45 @@ impl RunnerClient {
             .context("POST element/click")?;
         ensure_runner_success(response, "POST element/click").await?;
         Ok(())
+    }
+
+    /// A new endpoint binds the final event to the caller's checked frame.
+    /// Legacy route absence never permits an unguarded click fallback.
+    pub async fn checked_element_tap(&mut self, element_id: &str, expected: [f64; 4], point: Option<(f64, f64)>, expected_target: &impl serde::Serialize) -> Result<CheckedTapOutcome> {
+        if expected.iter().any(|value| !value.is_finite()) || expected[2] <= 0.0 || expected[3] <= 0.0
+            || point.is_some_and(|(x,y)| !x.is_finite() || !y.is_finite()) {
+            return Ok(CheckedTapOutcome::CheckFailed);
+        }
+        let sid = self.ensure_session().await?.to_string();
+        let mut body = serde_json::json!({"expected_rect":expected,"expected_target":expected_target});
+        if let Some((x,y)) = point { body["point"] = serde_json::json!([x,y]); }
+        let response = self.post_req(format!("{}/session/{}/element/{}/ipu/tap",self.base,sid,element_id))
+            .json(&body).send_signed(&self.auth).await.context("POST checked element tap")?;
+        let no_event = response.headers().get("x-ipu-tap-phase").is_some_and(|value| value.as_bytes() == b"not_sent");
+        match ensure_runner_success(response,"POST checked element tap").await {
+            Ok(_) => Ok(CheckedTapOutcome::Applied),
+            Err(error) => {
+                if let Some(http) = error.downcast_ref::<RunnerHttpError>() {
+                    if no_event && http.status == reqwest::StatusCode::BAD_REQUEST
+                        && http.code.as_deref() == Some("invalid argument")
+                        && http.message.as_deref() == Some("unknown checked tap field") {
+                        return Ok(CheckedTapOutcome::Unsupported);
+                    }
+                    if http.status == reqwest::StatusCode::CONFLICT && http.code.as_deref() == Some("target changed") {
+                        return Ok(CheckedTapOutcome::TargetChanged);
+                    }
+                    if http.status == reqwest::StatusCode::NOT_FOUND {
+                        match http.code.as_deref() {
+                            Some("unknown command") => return Ok(CheckedTapOutcome::Unsupported),
+                            Some("stale element reference" | "no such element") => return Ok(CheckedTapOutcome::TargetChanged),
+                            _ => {}
+                        }
+                    }
+                }
+                if no_event { return Ok(CheckedTapOutcome::CheckFailed); }
+                Err(error)
+            }
+        }
     }
 
     /// Type a literal string into an element (`POST .../element/:id/value`).
@@ -1481,6 +1718,32 @@ impl RunnerClient {
         Ok(())
     }
 
+    /// Confirms only the button request, never the audible volume level.
+    /// Scope is checked again after session setup and signing, before admission.
+    pub async fn request_volume_button(
+        &mut self,
+        button: VolumeButton,
+        allowed: &(dyn Fn() -> bool + Sync),
+    ) -> Result<VolumeButtonOutcome> {
+        if !allowed() { return Ok(VolumeButtonOutcome::ScopeChanged); }
+        let sid = self.ensure_session().await?.to_string();
+        if !self.volume_buttons { return Ok(VolumeButtonOutcome::Unsupported); }
+        let name = match button {
+            VolumeButton::Up => "volumeUp",
+            VolumeButton::Down => "volumeDown",
+        };
+        let (client, request) = self
+            .post_req(format!("{}/session/{}/wda/pressButton", self.base, sid))
+            .json(&serde_json::json!({"name": name})).build_split();
+        let mut request = request.context("build volume button request")?;
+        crate::runner_token::sign_request(&self.auth, &mut request);
+        if !allowed() { return Ok(VolumeButtonOutcome::ScopeChanged); }
+        let response = crate::timing::execute_timed(client, request).await
+            .context("POST /wda/pressButton volume")?;
+        ensure_runner_success(response, "POST /wda/pressButton volume").await?;
+        Ok(VolumeButtonOutcome::Requested)
+    }
+
     /// Press the Home button on-device (`POST /wda/pressButton` `{name:home}`).
     /// The reliable "go home".
     pub async fn press_home(&mut self) -> Result<()> {
@@ -1713,14 +1976,17 @@ impl RunnerClient {
         Ok(())
     }
 
-    /// Window (screen) size in runner points — needed to map our normalized
-    /// `[0,1]` agent coordinates onto [`Self::tap_point`]'s absolute points.
+    /// Authoritative cached runner dimensions, without a network request.
+    pub fn cached_window_size(&self) -> Option<(f64, f64)> {
+        self.window.filter(|(_, at)| at.elapsed() < WINDOW_SIZE_TTL).map(|(size, _)| size)
+    }
+
+    /// Window size in runner points for mapping normalized coordinates.
     pub async fn window_size(&mut self) -> Result<(f64, f64)> {
         // Every tree read refreshes this from the Application frame (see
         // `elements`), so the TTL only matters between reads; a rotation shows
         // up in the next read. Measured on real sessions: the 3 s TTL re-read
         // the size on almost every request (~0.24 s each, 6.8 % of runner time).
-        const WINDOW_SIZE_TTL: Duration = Duration::from_secs(30);
         if let Some((size, at)) = self.window {
             if at.elapsed() < WINDOW_SIZE_TTL {
                 return Ok(size);
@@ -1755,30 +2021,38 @@ impl RunnerClient {
     /// system app. Examples: Settings = `com.apple.Preferences`, Photos =
     /// `com.apple.mobileslideshow`.
     pub async fn launch_app(&mut self, bundle_id: &str) -> Result<()> {
-        let sid = self.ensure_session().await?.to_string();
-        let response = self
-            .post_req(format!("{}/session/{}/wda/apps/launch", self.base, sid))
-            .json(&serde_json::json!({ "bundleId": bundle_id }))
-            .send_signed(&self.auth)
-            .await
-            .context("POST /wda/apps/launch")?;
-        ensure_runner_success(response, "POST /wda/apps/launch").await?;
+        self.app_lifecycle_scoped("launch", bundle_id, &|| true).await?;
         Ok(())
     }
 
-    /// Quit an app (`POST /wda/apps/terminate`), so its next launch starts on
-    /// its first screen rather than the page it was left on. Answers whether
-    /// it was running.
+    /// Quit an app, returning whether it was running.
     pub async fn terminate_app(&mut self, bundle_id: &str) -> Result<bool> {
+        Ok(self.app_lifecycle_scoped("terminate", bundle_id, &|| true).await?
+            .and_then(|value| value.get("value").and_then(serde_json::Value::as_bool))
+            .unwrap_or(true))
+    }
+
+    /// None means authorization expired before admission. Recheck after async
+    /// session setup and signing; never mark a mutation before that final check.
+    pub(crate) async fn app_lifecycle_scoped(
+        &mut self,
+        action: &str,
+        bundle_id: &str,
+        allowed: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<serde_json::Value>> {
+        if !allowed() { return Ok(None); }
         let sid = self.ensure_session().await?.to_string();
-        let response = self
-            .post_req(format!("{}/session/{}/wda/apps/terminate", self.base, sid))
-            .json(&serde_json::json!({ "bundleId": bundle_id }))
-            .send_signed(&self.auth)
-            .await
-            .context("POST /wda/apps/terminate")?;
-        let value = ensure_runner_success(response, "POST /wda/apps/terminate").await?;
-        Ok(value.get("value").and_then(serde_json::Value::as_bool).unwrap_or(true))
+        let url = format!("{}/session/{}/wda/apps/{action}", self.base, sid);
+        let (client, request) = self.http.post(&url)
+            .json(&serde_json::json!({"bundleId": bundle_id})).build_split();
+        let mut request = request.context("build app lifecycle request")?;
+        crate::runner_token::sign_request(&self.auth, &mut request);
+        if !allowed() { return Ok(None); }
+        // Track admission using the same cache invalidation as other mutations.
+        self.mark_post(&url);
+        let response = crate::timing::execute_timed(client, request).await
+            .with_context(|| format!("POST /wda/apps/{action}"))?;
+        ensure_runner_success(response, &format!("POST /wda/apps/{action}")).await.map(Some)
     }
 
     /// Bundle id of the foreground app (`GET /session/:sid/wda/apps/list`,
@@ -1849,6 +2123,138 @@ impl RunnerClient {
             .await
             .context("POST /wda/keys")?;
         ensure_runner_success(response, "POST /wda/keys").await?;
+        Ok(())
+    }
+
+    pub(crate) fn supports_input_continuation(&self) -> bool {
+        self.guarded_input && self.input_continuation
+    }
+
+    pub(crate) fn discard_input_continuation(&mut self) {
+        self.pending_input.clear();
+    }
+
+    pub(crate) fn save_input_continuation(
+        &mut self,
+        scope: crate::input_continuation::Scope,
+        target: String,
+        remaining: String,
+        budget_ms: u64,
+    ) -> Option<String> {
+        if !self.supports_input_continuation() {
+            return None;
+        }
+        let session = self.session.clone()?;
+        self.pending_input.issue(
+            scope,
+            session,
+            target,
+            remaining,
+            budget_ms,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub(crate) fn take_input_continuation(
+        &mut self,
+        token: &str,
+        scope: &crate::input_continuation::Scope,
+    ) -> Option<crate::input_continuation::Pending> {
+        let session = self.session.clone()?;
+        self.pending_input
+            .take(token, scope, &session, std::time::Instant::now())
+    }
+
+    /// Bind text to the live focused field on a supporting runner. Once advertised,
+    /// failure to bind is an error, never permission to fall back to unguarded typing.
+    pub async fn input_target(&mut self) -> Result<Option<String>> {
+        self.input_target_for_text("").await
+    }
+
+    /// Bind the explicitly selected original, with at most one guarded initial
+    /// focus tap. Once advertised, failure never permits a legacy replacement.
+    pub async fn input_target_for_element(&mut self, id: &str, text: &str) -> Result<Option<String>> {
+        let sid = self.ensure_session().await?.to_string();
+        if !self.selected_input_target { return Ok(None); }
+        let response = self.post_req(format!("{}/session/{}/ipu/element/{}/input-target", self.base, sid, id))
+            .json(&serde_json::json!({"multiline":text.contains(['\n','\r'])}))
+            .send_signed(&self.auth).await.context("POST selected input target")?;
+        let value = ensure_runner_success(response, "POST selected input target").await?;
+        let token = value.get("token").and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty() && token.len() <= 128
+                && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            .context("selected input target response missing or invalid token")?;
+        Ok(Some(token.to_string()))
+    }
+
+    pub(crate) async fn input_target_for_text(&mut self, text: &str) -> Result<Option<String>> {
+        let sid = self.ensure_session().await?.to_string();
+        if !self.guarded_input {
+            return Ok(None);
+        }
+        let response = self
+            .http
+            .get(format!(
+                "{}/session/{}/wda/input-target{}",
+                self.base,
+                sid,
+                if text.contains('\n') || text.contains('\r') {
+                    "?multiline=1"
+                } else {
+                    ""
+                }
+            ))
+            .send_signed(&self.auth)
+            .await
+            .context("GET /wda/input-target")?;
+        let value = ensure_runner_success(response, "GET /wda/input-target").await?;
+        let token = value
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| {
+                !token.is_empty()
+                    && token.len() <= 128
+                    && token
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            .context("input target response missing or invalid token")?;
+        Ok(Some(token.to_string()))
+    }
+
+    /// Clear only the bound field; the runner checks focus without tapping to regain it.
+    pub async fn clear_input_target(&mut self, token: &str) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .post_req(format!(
+                "{}/session/{}/element/{}/clear",
+                self.base, sid, token
+            ))
+            .json(&serde_json::json!({"inputTarget":token}))
+            .send_signed(&self.auth)
+            .await
+            .context("POST guarded element/clear")?;
+        ensure_runner_success(response, "POST guarded element/clear").await?;
+        Ok(())
+    }
+
+    /// Each chunk is checked on the phone immediately before dispatch. A rejection must not
+    /// trigger target reselection, refocusing or fallback to ordinary keys.
+    pub async fn keys_to_target(
+        &mut self,
+        text: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let sid = self.ensure_session().await?.to_string();
+        let response = self
+            .post_req(format!("{}/session/{}/wda/keys", self.base, sid))
+            .timeout(timeout)
+            .json(&serde_json::json!({"value":[text],"inputTarget":token}))
+            .send_signed(&self.auth)
+            .await
+            .context("POST guarded /wda/keys")?;
+        ensure_runner_success(response, "POST guarded /wda/keys").await?;
         Ok(())
     }
 
@@ -1974,7 +2380,7 @@ impl RunnerClient {
         let predicate = format!(
             "type == 'XCUIElementTypeButton' AND (name IN {{{quoted}}} OR label IN {{{quoted}}})"
         );
-        if let Ok(eid) = self.find_element("predicate string", &predicate).await {
+        if let Ok(eid) = self.find_unique_element("predicate string", &predicate).await {
             // Do not retry or fall back after dispatching the click: if its
             // response is lost, replaying another dismiss action would violate
             // the at-most-once contract used by Direct control.
@@ -2057,8 +2463,38 @@ impl RunnerClient {
     /// it's text — an order of magnitude cheaper, and it carries the labels
     /// needed for [`Self::find_element`]/[`Self::click_element`].
     pub async fn elements(&mut self) -> Result<Vec<ElementRow>> {
+        Ok(self.element_snapshot().await?.rows)
+    }
+
+    pub async fn element_snapshot(&mut self) -> Result<ElementSnapshot> {
         let (tree, lite) = self.bounded_source().await?;
-        Ok(self.rows_from_tree(&tree, lite))
+        let coverage = SnapshotCoverage::from_tree(&tree);
+        Ok(ElementSnapshot {
+            rows: self.rows_from_tree(&tree, lite),
+            coverage,
+        })
+    }
+
+    /// One source request, without the optional full/lite pre-probe or retry.
+    /// Used by zero-timeout waits whose one observation must stay one read.
+    pub async fn element_snapshot_once(&mut self) -> Result<ElementSnapshot> {
+        let skip_probe =
+            std::env::var("IPHONE_USE_SOURCE_PROBE").is_ok_and(|value| value.trim() == "0");
+        let lite = !skip_probe && !self.full_visibility;
+        let tree = self
+            .source_excluding(if lite {
+                Some(PROBE_EXCLUDED_ATTRIBUTES)
+            } else {
+                None
+            })
+            .await?;
+        self.probe.record(&tree, full_source_max_nodes());
+        self.lite_source = lite;
+        let coverage = SnapshotCoverage::from_tree(&tree);
+        Ok(ElementSnapshot {
+            rows: self.rows_from_tree(&tree, lite),
+            coverage,
+        })
     }
 
     /// [`Self::elements`] over a depth- and node-capped read
@@ -2093,6 +2529,7 @@ impl RunnerClient {
         // The Application node's frame IS the window in points: keep the
         // window-size cache fresh for free instead of a GET /window/size.
         // Read it from the raw root (an unlabeled root is not emitted as a row).
+        self.window = None;
         if tree.get("type").and_then(|t| t.as_str()) == Some("XCUIElementTypeApplication") {
             let field = |name: &str| {
                 tree.get("rect")
@@ -2107,7 +2544,15 @@ impl RunnerClient {
                 }
             }
         }
-        self.last_tree = Some((std::sync::Arc::new(rows.clone()), std::time::Instant::now()));
+        self.last_tree = SnapshotCoverage::from_tree(tree).is_complete()
+            .then(|| (std::sync::Arc::new(rows.clone()), std::time::Instant::now()));
+        if let Some((tree, _)) = &self.last_tree {
+            let scope = self.tree_scope.clone().or_else(|| self.observation_scope.clone());
+            self.served_trees.push_back((tree.clone(), scope));
+            while self.served_trees.len() > SERVED_TREES_CAP {
+                self.served_trees.pop_front();
+            }
+        }
         rows
     }
 
@@ -2127,7 +2572,7 @@ impl RunnerClient {
     /// kinds of screen, and backing out of a WeChat chat lands on the list.
     async fn bounded_source(&mut self) -> Result<(serde_json::Value, bool)> {
         if std::env::var("IPHONE_USE_SOURCE_PROBE").is_ok_and(|value| value.trim() == "0") {
-            return Ok((self.source().await?, false));
+            return Ok((self.source_excluding(None).await?, false));
         }
         // Every read skips `isVisible` unless asked otherwise (the approach
         // callstack/agent-device takes: no per-node hit-testing, visibility
@@ -2168,7 +2613,7 @@ impl RunnerClient {
             };
         }
         if !self.probe.should_probe(limit, untouched, self.lite_source) {
-            let full = self.source().await?;
+            let full = self.source_excluding(None).await?;
             self.probe.record(&full, limit);
             if self.probe.last_nodes() > limit {
                 // Grew past the limit without a probe: it was read, but the
@@ -2193,7 +2638,7 @@ impl RunnerClient {
         // A small tree whose full read still fails points at runner itself, not
         // at the tree: report it like any failed read rather than hide it
         // behind the probe.
-        let full = self.source().await?;
+        let full = self.source_excluding(None).await?;
         Ok((full, false))
     }
 
@@ -2208,9 +2653,27 @@ impl RunnerClient {
     /// (a timer, a network load, a person's finger); callers must verify the
     /// element live before acting on it.
     pub fn recent_tree(&self, max_age: Duration) -> Option<std::sync::Arc<Vec<ElementRow>>> {
+        if self.tree_scope.as_ref().or(self.observation_scope.as_ref()).is_some_and(|allowed| !allowed()) { return None; }
         let (rows, read_at) = self.last_tree.as_ref()?;
         let untouched = self.posted_at.is_none_or(|posted| posted < *read_at);
         (untouched && read_at.elapsed() < max_age).then(|| rows.clone())
+    }
+
+    /// The newest recently read complete tree that `is_snapshot` accepts (the
+    /// caller matches its snapshot token). Unlike [`Self::recent_tree`] it may
+    /// predate later actions: it says which element an old index named, never
+    /// what the screen shows now.
+    pub fn served_tree(
+        &self,
+        is_snapshot: impl Fn(&[ElementRow]) -> bool,
+    ) -> Option<std::sync::Arc<Vec<ElementRow>>> {
+        if self.tree_scope.as_ref().or(self.observation_scope.as_ref()).is_some_and(|allowed| !allowed()) { return None; }
+        self.served_trees
+            .iter()
+            .rev()
+            .filter(|(_, scope)| scope.as_ref().is_none_or(|allowed| allowed()))
+            .find(|(rows, _)| is_snapshot(rows))
+            .map(|(rows, _)| rows.clone())
     }
 
     pub fn settle_frames_usable(&self) -> bool {
@@ -2222,6 +2685,15 @@ impl RunnerClient {
         self.settle_frames_paused_until = Some(std::time::Instant::now() + for_how_long);
     }
 
+    /// Discard frames from an earlier caller privacy generation without waiting
+    /// for a screen-changing native command or sacrificing normal cache reuse.
+    pub fn fence_settled_frame(&mut self, generation: u64) {
+        if self.settled_frame_generation != generation {
+            self.settled_frame = None;
+            self.settled_frame_generation = generation;
+        }
+    }
+
     /// Keep `frame` as the settled screen (see `settled_frame`).
     pub fn remember_settled_frame(&mut self, frame: Capture) {
         self.settled_frame = Some((std::sync::Arc::new(frame), std::time::Instant::now()));
@@ -2230,6 +2702,7 @@ impl RunnerClient {
     /// The settled screen, when it is younger than `max_age` and nothing that
     /// changes the screen was sent since it was captured.
     pub fn settled_frame(&self, max_age: Duration) -> Option<std::sync::Arc<Capture>> {
+        if !self.observation_scope_current() { return None; }
         let (frame, at) = self.settled_frame.as_ref()?;
         let untouched = self.posted_at.is_none_or(|posted| posted < *at);
         (untouched && at.elapsed() < max_age).then(|| frame.clone())
@@ -2238,6 +2711,36 @@ impl RunnerClient {
     /// Drop the reusable tree so the next snapshot-bound action reads afresh.
     pub fn forget_tree(&mut self) {
         self.last_tree = None;
+    }
+
+    pub fn bind_observation_scope(&mut self, allowed: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        // Trees already served stay: each lapses on its own scope, and a batch
+        // or an observed action must not forget the snapshot its steps name.
+        let mut served = std::mem::take(&mut self.served_trees);
+        served.retain(|(_, scope)| scope.is_some());
+        self.forget_observations();
+        self.served_trees = served;
+        self.tree_scope = None;
+        self.observation_scope = Some(allowed);
+    }
+
+    /// Attribute the next fresh element tree without changing frame/alert authorization.
+    pub fn begin_element_read(&mut self, allowed: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.forget_tree();
+        self.tree_scope = Some(allowed);
+    }
+
+    pub(crate) fn observation_scope_current(&self) -> bool {
+        self.observation_scope.as_ref().is_none_or(|allowed| allowed())
+    }
+
+    /// Discard screen-derived data after the caller's authorization scope changes.
+    pub fn forget_observations(&mut self) {
+        self.activity_rebound_rect=None;
+        self.last_tree = None;
+        self.served_trees.clear();
+        self.settled_frame = None;
+        self.no_alert_at = None;
     }
 
     /// Drop a reused "no alert" answer so the next probe asks runner.
@@ -2256,12 +2759,14 @@ impl RunnerClient {
     }
 
     fn post_req(&mut self, url: String) -> reqwest::RequestBuilder {
-        let path = url.split('?').next().unwrap_or(&url);
-        let read_only = path.ends_with("/session")
-            || path.ends_with("/appium/settings")
-            || path.ends_with("/elements")
-            || path.ends_with("/element");
-        if !read_only {
+        self.mark_post(&url);
+        self.http.post(url)
+    }
+
+    fn mark_post(&mut self, url: &str) {
+        let path = url.split('?').next().unwrap_or(url);
+        if post_mutates_screen(path) {
+            self.pending_input.clear();
             // A new app or the Home Screen is a screen of unknown size.
             if path.ends_with("/wda/apps/launch")
                 || path.ends_with("/wda/apps/activate")
@@ -2275,7 +2780,6 @@ impl RunnerClient {
             // Shows a screen that is about to change; free it now.
             self.settled_frame = None;
         }
-        self.http.post(url)
     }
 
     /// Find an element by its visible label and tap it. Tries the
@@ -2294,7 +2798,7 @@ impl RunnerClient {
         ];
         let mut last_err = None;
         for (using, value) in attempts {
-            match self.find_element(using, &value).await {
+            match self.find_unique_element(using, &value).await {
                 Ok(eid) => return self.click_element(&eid).await,
                 Err(e) => last_err = Some(e),
             }
@@ -2358,7 +2862,7 @@ impl RunnerClient {
     /// two runner round trips. Anything POSTed since, or 2 s passing, asks again.
     fn no_alert_known(&self) -> bool {
         const NO_ALERT_REUSE: Duration = Duration::from_secs(2);
-        self.no_alert_at.is_some_and(|at| {
+        self.observation_scope_current() && self.no_alert_at.is_some_and(|at| {
             at.elapsed() < NO_ALERT_REUSE && self.posted_at.is_none_or(|posted| posted < at)
         })
     }
@@ -2456,10 +2960,21 @@ impl RunnerClient {
     /// Drop the cached session (e.g. after an error that suggests it went
     /// stale); the next call re-creates one via [`Self::ensure_session`].
     pub fn invalidate_session(&mut self) {
+        self.activity_rebound_rect=None;
         self.session = None;
+        self.value_read = false;
+        self.element_subtree = false;
+        self.element_evidence = false;
+        self.guarded_input = false;
+        self.selected_input_target = false;
+        self.input_continuation = false;
+        self.pending_input.clear();
+        self.volume_buttons = false;
+        self.system_capture_request = false;
         self.window = None;
         self.no_alert_at = None;
         self.last_tree = None;
+        self.served_trees.clear();
     }
 
     /// Drop the cached window size, returning it: the next gesture reads the
@@ -2767,6 +3282,88 @@ fn snapshot_settings(
     (!settings.is_empty()).then_some(settings)
 }
 
+/// One source observation, with completeness kept beside the rows rather than
+/// inferred from count or lost when the provider's headers are consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCoverage {
+    Complete,
+    Truncated,
+    Unknown,
+}
+impl SnapshotCoverage {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        match (headers.get("x-ipu-truncated").map(|v| v.as_bytes()),
+               headers.get("x-ipu-tree-complete").map(|v| v.as_bytes())) {
+            (Some(b"1"), _) => Self::Truncated,
+            (Some(b"0"), Some(b"1")) => Self::Complete,
+            _ => Self::Unknown,
+        }
+    }
+    pub fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Truncated => "partial",
+            Self::Unknown => "unknown",
+        }
+    }
+    fn from_tree(tree: &serde_json::Value) -> Self {
+        match tree
+            .get("_ipu_tree_coverage")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("complete") => Self::Complete,
+            Some("partial") => Self::Truncated,
+            _ => Self::Unknown,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedTapOutcome { Applied, TargetChanged, Unsupported, CheckFailed }
+
+pub struct ElementMatches {
+    pub ids: Vec<String>,
+    pub coverage: SnapshotCoverage,
+}
+pub struct ElementSnapshot {
+    pub rows: Vec<ElementRow>,
+    pub coverage: SnapshotCoverage,
+}
+
+/// Indices in `rows` are local to this read, never actionable screen refs.
+pub struct ElementSubtree {
+    pub root: serde_json::Value,
+    pub rows: Vec<ElementRow>,
+    pub coverage: SnapshotCoverage,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ElementEvidence {
+    pub enabled: Option<bool>,
+    pub editable: Option<bool>,
+    pub stable: Option<bool>,
+    pub rect: ElementEvidenceRect,
+    pub samples: u32,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ElementEvidenceRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+fn unsupported_element_read(operation: &str, capability: &str) -> anyhow::Error {
+    RunnerHttpError {
+        operation: operation.into(), status: reqwest::StatusCode::NOT_IMPLEMENTED,
+        code: Some("unsupported operation".into()),
+        message: Some(format!("runner lacks {capability}; no whole-screen fallback")),
+    }.into()
+}
+
 /// One row of the flattened element tree.
 ///
 /// Serialized through [`ElementRowJson`], which prints whole-point
@@ -2795,6 +3392,14 @@ pub struct ElementRow {
     /// switches / sliders drivable without vision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Raw provider value could not be normalized to a supported scalar. Internal
+    /// only: query projection must not turn this into known value absence.
+    pub value_unavailable: bool,
+    /// Provider explicitly reported a truncated snapshot value; absence is not proof of completeness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_truncated: Option<bool>,
+    /// Preserve known enabled state internally for exact selectors. The wire
+    /// form omits true unless the caller explicitly filters by enabled.
     /// runner emits these flags for every source node. Keep the common healthy
     /// state sparse to avoid inflating every MCP response: `enabled:false` and
     /// `visible:false` are emitted only for exceptional nodes.
@@ -2802,8 +3407,8 @@ pub struct ElementRow {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible: Option<bool>,
-    /// Positive accessibility/focus state is useful for strict locators; false
-    /// is the common state and is omitted.
+    /// Positive accessibility state is useful for strict locators; false is
+    /// omitted. Focus retains known true/false internally; its wire form omits false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accessible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2857,6 +3462,8 @@ pub struct ElementRowJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    value_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     visible: Option<bool>,
@@ -2901,11 +3508,12 @@ impl From<ElementRow> for ElementRowJson {
             identifier: row.identifier,
             rect: row.rect.map(Coordinate),
             depth: row.depth,
-            value: row.value,
-            enabled: row.enabled,
-            visible: row.visible,
+            value: row.value.filter(|value| !value.is_empty()),
+            value_truncated: row.value_truncated,
+            enabled: row.enabled.filter(|enabled| !enabled),
+            visible: row.visible.filter(|visible| !visible),
             accessible: row.accessible,
-            focused: row.focused,
+            focused: row.focused.filter(|focused| *focused),
             placeholder: row.placeholder,
             actions: row.actions,
             selected: row.selected,
@@ -2953,6 +3561,12 @@ fn runner_bool(node: &serde_json::Value, key: &str) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+/// An accessibility identifier is opaque. Whitespace is part of its identity.
+fn accessibility_identifier(node: &serde_json::Value) -> Option<String> {
+    node.get("rawIdentifier").and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty()).map(str::to_string)
 }
 
 fn non_empty_string(node: &serde_json::Value, key: &str) -> Option<String> {
@@ -3145,9 +3759,11 @@ fn flatten_node(
         let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         // Current value/state (issue #20). runner reports `value` as a string
         // ("1"/"0" for a Switch), a number (Slider fraction), or a bool —
-        // normalize to a non-empty string, else None.
+        // preserve known strings (including empty) internally; the wire stays sparse.
+        let value_unavailable = node.get("value").is_some_and(|value|
+            matches!(value, serde_json::Value::Array(_) | serde_json::Value::Object(_)));
         let value = node.get("value").and_then(|v| match v {
-            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::String(s) => Some(s.clone()),
             serde_json::Value::Number(n) => Some(n.to_string()),
             serde_json::Value::Bool(b) => Some(b.to_string()),
             _ => None,
@@ -3157,7 +3773,7 @@ fn flatten_node(
         // placeholder (shown while empty) is not secret and stays.
         let placeholder = non_empty_string(node, "placeholderValue");
         let value = if kind == "SecureTextField" {
-            value.map(|v| {
+            value.filter(|value| !value.is_empty()).map(|v| {
                 if placeholder.as_deref() == Some(v.as_str()) {
                     v
                 } else {
@@ -3167,10 +3783,10 @@ fn flatten_node(
         } else {
             value
         };
-        let enabled = runner_bool(node, "isEnabled").filter(|value| !value);
-        let visible = runner_bool(node, "isVisible").filter(|value| !value);
+        let enabled = runner_bool(node, "isEnabled");
+        let visible = runner_bool(node, "isVisible");
         let accessible = runner_bool(node, "isAccessible").filter(|value| *value);
-        let focused = runner_bool(node, "isFocused").filter(|value| *value);
+        let focused = runner_bool(node, "isFocused");
         // Affordance extras (both env-gated; the default daemon parses none of
         // this and every field stays None → byte-identical serialized rows).
         let traits = if options.affordances || options.raw_traits {
@@ -3178,8 +3794,8 @@ fn flatten_node(
         } else {
             Vec::new()
         };
-        // The runner marks only selected nodes (`isSelected:"1"`): a picked
-        // photo in select mode, the current tab. Read on every tree.
+        // The runner reports known selection states. Compact rows retain only
+        // positive selection: a picked photo or current tab. Read on every tree.
         let selected_attribute = runner_bool(node, "isSelected").filter(|value| *value);
         let (actions, selected, min, max) = if options.affordances {
             let min = runner_number(node, "minValue");
@@ -3195,13 +3811,16 @@ fn flatten_node(
         };
         let selected = selected_attribute.or(selected);
         let traits = (options.raw_traits && !traits.is_empty()).then_some(traits);
+        let value_truncated = (kind != "SecureTextField").then(||runner_bool(node,"value_truncated").filter(|flag|*flag)).flatten();
         out.push(ElementRow {
             kind,
             label,
-            identifier: non_empty_string(node, "rawIdentifier"),
+            identifier: accessibility_identifier(node),
             rect: [g("x"), g("y"), g("width"), g("height")],
             depth,
+            value_truncated,
             value,
+            value_unavailable,
             enabled,
             visible,
             accessible,
@@ -3433,11 +4052,13 @@ impl RunnerHttpError {
     /// The runner said it refused the request before acting on the phone.
     /// Its `/actions` route checks every touch point against the screen
     /// before it synthesizes anything, and that refusal (HTTP 400, "invalid
-    /// argument") ends "nothing was sent". A 400 alone proves nothing: the
+    /// argument") ends "nothing was sent". Element actionability refusals
+    /// use "invalid element state" with the same explicit no-dispatch suffix.
+    /// A 400 alone proves nothing: the
     /// same status can follow touches already played.
     pub fn nothing_sent(&self) -> bool {
         self.status == reqwest::StatusCode::BAD_REQUEST
-            && self.code.as_deref() == Some("invalid argument")
+            && matches!(self.code.as_deref(), Some("invalid argument" | "invalid element state"))
             && self
                 .message
                 .as_deref()
@@ -3596,7 +4217,198 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    // Issue #257: a runner's error status keeps its own reason.
+    #[test]
+    fn unlabeled_app_root_still_supplies_cached_viewport() {
+        let mut client=RunnerClient::new("http://127.0.0.1:9").unwrap();
+        let rows=client.rows_from_tree(&serde_json::json!({"type":"XCUIElementTypeApplication","rect":{"x":0,"y":0,"width":440,"height":956},"children":[{"type":"XCUIElementTypeButton","label":"Done"}]}), false);
+        assert!(!rows.iter().any(|row|row.kind=="Application"));
+        assert_eq!(client.cached_window_size(),Some((440.0,956.0)));
+    }
+
+    #[test]
+    fn element_reads_require_explicit_session_capabilities() {
+        for capability in [serde_json::json!({}), serde_json::json!({"ipu:elementSubtree": false, "ipu:elementEvidence": false})] {
+            let (base, task) = mock_runner(2, move |request| {
+                if request.starts_with("POST /session ") {
+                    return serde_json::json!({"value":{"sessionId":"S","capabilities":capability}}).to_string();
+                }
+                assert!(request.starts_with("POST /session/S/appium/settings "), "{request}");
+                r#"{"value":null}"#.into()
+            });
+            let mut client = RunnerClient::new(base).unwrap();
+            let subtree = block(client.element_subtree("E", 2, 10)).err().unwrap();
+            let evidence = block(client.element_evidence("E", true)).err().unwrap();
+            for error in [subtree, evidence] {
+                let error = error.downcast_ref::<RunnerHttpError>().unwrap();
+                assert_eq!(error.status, reqwest::StatusCode::NOT_IMPLEMENTED);
+                assert_eq!(error.code.as_deref(), Some("unsupported operation"));
+            }
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn subtree_preserves_provider_coverage_without_screen_cache() {
+        for (headers, expected) in [
+            ("X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n", SnapshotCoverage::Complete),
+            ("X-IPU-Truncated: 1\r\nX-IPU-Tree-Complete: 1\r\n", SnapshotCoverage::Truncated),
+            ("", SnapshotCoverage::Unknown),
+        ] {
+            let (base, task) = mock_runner(1, move |request| {
+                assert!(request.starts_with("GET /session/S/element/E%2Fchild/ipu/subtree?max_depth=3&max_nodes=10 "), "{request}");
+                let body = r#"{"value":{"type":"XCUIElementTypeCell","rect":{"x":0,"y":0,"width":20,"height":20},"children":[{"type":"XCUIElementTypeButton","label":"Inside","rect":{"x":1,"y":1,"width":10,"height":10}}]}}"#;
+                format!("HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            });
+            let mut client = RunnerClient::new(base).unwrap();
+            client.session = Some("S".into());
+            client.element_subtree = true;
+            let result = block(client.element_subtree("E/child", 3, 10)).unwrap();
+            assert_eq!(result.coverage, expected);
+            assert_eq!(result.root["type"], "XCUIElementTypeCell");
+            assert!(result.rows.iter().any(|row| row.label == "Inside"));
+            assert!(client.last_tree.is_none());
+            assert!(client.served_trees.is_empty());
+            assert!(client.window.is_none());
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn element_evidence_retains_unknown_and_false() {
+        for stability in [false, true] {
+            let (base, task) = mock_runner(1, move |request| {
+                let expected = if stability { "1" } else { "0" };
+                assert!(request.starts_with(&format!("GET /session/S/element/E/ipu/evidence?stability={expected} ")), "{request}");
+                r#"{"value":{"enabled":false,"editable":null,"rect":{"x":1,"y":2,"width":3,"height":4},"samples":1}}"#.into()
+            });
+            let mut client = RunnerClient::new(base).unwrap();
+            client.session = Some("S".into()); client.element_evidence = true;
+            let result = block(client.element_evidence("E", stability)).unwrap();
+            assert_eq!(result.enabled, Some(false));
+            assert_eq!(result.editable, None); assert_eq!(result.stable, None);
+            assert_eq!(result.samples, 1);
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn element_read_failures_never_retry_or_fetch_source() {
+        for subtree in [false, true] {
+            let (base, task) = mock_runner(1, move |request| {
+                let endpoint = if subtree { "subtree" } else { "evidence" };
+                assert!(request.contains(&format!("/element/E/ipu/{endpoint}?")), "{request}");
+                http_400(r#"{"value":{"error":"unsupported operation","message":"AX unavailable"}}"#)
+            });
+            let mut client = RunnerClient::new(base).unwrap();
+            client.session = Some("S".into()); client.element_subtree = true; client.element_evidence = true;
+            if subtree { assert!(block(client.element_subtree("E", 2, 10)).is_err()); }
+            else { assert!(block(client.element_evidence("E", true)).is_err()); }
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_subtree_limits_do_not_contact_runner() {
+        let mut client = RunnerClient::new("http://127.0.0.1:1").unwrap();
+        for (depth, count) in [(0,10),(65,10),(2,0),(2,5001)] {
+            assert!(block(client.element_subtree("E",depth,count)).is_err());
+            assert!(client.session.is_none());
+        }
+    }
+
+    #[test]
+    fn native_actionability_refusal_requires_explicit_no_dispatch_proof() {
+        for (status, message, expected) in [
+            (400, "element is disabled; nothing was sent", true),
+            (400, "element frame is unstable or unavailable; nothing was sent", true),
+            (400, "element is not editable; nothing was sent", true),
+            (400, "invalid element state after input", false),
+            (500, "element is disabled; nothing was sent", false),
+        ] {
+            let error = RunnerHttpError {
+                operation: "POST element/click".into(),
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                code: Some("invalid element state".into()), message: Some(message.into()),
+            };
+            assert_eq!(error.nothing_sent(), expected, "{error}");
+        }
+    }
+
+    // Selected target capability failures never authorize an alternate input path.
+    #[test]
+    fn selected_target_negotiates_capability_and_preserves_literal_request() {
+        for supported in [false, true] {
+            let (base, task) = mock_runner(if supported { 3 } else { 2 }, move |request| {
+                if request.starts_with("POST /session ") {
+                    return serde_json::json!({"value":{"sessionId":"S","capabilities":{"ipu:selectedInputTarget":supported}}}).to_string();
+                }
+                if request.contains("/appium/settings ") { return r#"{"value":null}"#.into(); }
+                assert!(request.starts_with("POST /session/S/ipu/element/selected/input-target "), "{request}");
+                let body:serde_json::Value=serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(body,serde_json::json!({"multiline":true}));
+                r#"{"value":{"token":"bound-original"}}"#.into()
+            });
+            let mut client=RunnerClient::new(base).unwrap();
+            assert_eq!(block(client.input_target_for_element("selected","new\nline")).unwrap(),supported.then(||"bound-original".to_string()));
+            task.join().unwrap();
+            client.invalidate_session();assert!(!client.selected_input_target);
+        }
+    }
+
+    #[test]
+    fn selected_target_failure_never_tries_legacy_focusing_or_typing() {
+        let (base,task)=mock_runner(1,|request| {
+            assert!(request.starts_with("POST /session/S/ipu/element/selected/input-target "),"{request}");
+            r#"{"value":{"error":"unknown error","message":"focus outcome unknown"}}"#.into()
+        });
+        let mut client=RunnerClient::new(base).unwrap();client.session=Some("S".into());client.selected_input_target=true;
+        assert!(block(client.input_target_for_element("selected","literal")).is_err());
+        task.join().unwrap();
+    }
+
+    #[test]
+    fn continuation_survives_reads_but_not_mutation_or_session_reset() {
+        let scope = crate::input_continuation::Scope {
+            owner: "writer".into(),
+            epoch: 1,
+            privacy_epoch: 0,
+            lifecycle_stamp: 256,
+        };
+        for reset in [false, true] {
+            let mut client = RunnerClient::new("http://127.0.0.1:1").unwrap();
+            client.session = Some("SESSION".into());
+            client.guarded_input = true;
+            client.input_continuation = true;
+            let first = client
+                .save_input_continuation(scope.clone(), "field".into(), "remaining".into(), 6000)
+                .unwrap();
+            client.mark_post("http://127.0.0.1:1/session/SESSION/elements");
+            assert!(client.take_input_continuation(&first, &scope).is_some());
+            let next = client
+                .save_input_continuation(scope.clone(), "field".into(), "remaining".into(), 6000)
+                .unwrap();
+            if reset {
+                client.invalidate_session();
+                client.session = Some("SESSION".into());
+            } else {
+                client.mark_post("http://127.0.0.1:1/session/SESSION/wda/keys");
+            }
+            assert!(client.take_input_continuation(&next, &scope).is_none());
+        }
+    }
+
+    #[test]
+    fn value_truncation_survives_flattening_without_password_length_metadata() {
+        let source=serde_json::json!({"type":"XCUIElementTypeApplication","label":"Fixture","children":[
+            {"type":"XCUIElementTypeTextField","label":"Draft","value":"PREFIX","value_truncated":true},
+            {"type":"XCUIElementTypeSecureTextField","label":"Password","value":"secret","value_truncated":true}]});
+        let mut rows=Vec::new();flatten_tree(&source,0,&mut rows);
+        let field=rows.iter().find(|row|row.kind=="TextField").unwrap();assert_eq!(field.value_truncated,Some(true));
+        assert_eq!(serde_json::to_value(field).unwrap()["value_truncated"],true);
+        let secure=rows.iter().find(|row|row.kind=="SecureTextField").unwrap();assert_eq!(secure.value_truncated,None);
+        assert!(!serde_json::to_value(secure).unwrap().to_string().contains("secret"));
+    }
+
     #[test]
     fn runner_http_errors_keep_the_envelope_reason_and_status_text() {
         let refused = RunnerHttpError::from_body(
@@ -3759,6 +4571,114 @@ mod tests {
         assert_eq!(bounded_move_duration_ms(450), 450);
         assert_eq!(bounded_move_duration_ms(2_000), 2_000);
         assert_eq!(bounded_move_duration_ms(u64::MAX), 2_000);
+    }
+
+    #[test]
+    fn volume_scope_revoked_before_setup_does_not_contact_runner() {
+        let mut client = RunnerClient::new("http://127.0.0.1:1").unwrap();
+        block(async {
+            assert_eq!(client.request_volume_button(VolumeButton::Up, &|| false).await.unwrap(),
+                VolumeButtonOutcome::ScopeChanged);
+        });
+    }
+
+    #[test]
+    fn volume_scope_revoked_during_setup_never_posts_a_button() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let allowed = Arc::new(AtomicBool::new(true));
+        let revoked = allowed.clone();
+        let (base, task) = mock_runner(2, move |request| {
+            if request.starts_with("POST /session ") {
+                revoked.store(false, Ordering::SeqCst);
+                r#"{"value":{"sessionId":"S","capabilities":{"ipu:volumeButtons":true}}}"#.into()
+            } else {
+                assert!(request.contains("/appium/settings "), "button dispatched after revocation");
+                r#"{"value":null}"#.into()
+            }
+        });
+        let mut client = RunnerClient::new(base).unwrap();
+        block(async {
+            assert_eq!(client.request_volume_button(VolumeButton::Down,
+                &|| allowed.load(Ordering::SeqCst)).await.unwrap(), VolumeButtonOutcome::ScopeChanged);
+        });
+        task.join().unwrap();
+    }
+
+    #[test]
+    fn volume_buttons_require_an_explicit_current_session_capability() {
+        for capabilities in [
+            serde_json::json!({}),
+            serde_json::json!({"ipu:volumeButtons": false}),
+            serde_json::json!({"ipu:volumeButtons": "true"}),
+        ] {
+            let (base, task) = mock_runner(2, move |request| {
+                if request.starts_with("POST /session ") {
+                    serde_json::json!({"value":{"sessionId":"S","capabilities":capabilities}})
+                        .to_string()
+                } else {
+                    assert!(
+                        request.contains("/appium/settings "),
+                        "unsupported button was dispatched: {request}"
+                    );
+                    r#"{"value":null}"#.into()
+                }
+            });
+            let mut client = RunnerClient::new(base).unwrap();
+            // A previously capable session must not leak into a new one.
+            client.volume_buttons = true;
+            client.invalidate_session();
+            block(async {
+                assert_eq!(client.request_volume_button(VolumeButton::Up, &|| true).await.unwrap(), VolumeButtonOutcome::Unsupported);
+            });
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn volume_buttons_send_exactly_one_native_request_each() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let (base, task) = mock_runner(4, move |request| {
+            if request.starts_with("POST /session ") {
+                return r#"{"value":{"sessionId":"S","capabilities":{"ipu:volumeButtons":true}}}"#
+                    .into();
+            }
+            if !request.contains("/appium/settings ") {
+                assert!(request.starts_with("POST /session/S/wda/pressButton "));
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(body["name"].as_str().unwrap().to_string());
+            }
+            r#"{"value":null}"#.into()
+        });
+        let mut client = RunnerClient::new(base).unwrap();
+        block(async {
+            assert_eq!(client.request_volume_button(VolumeButton::Up, &|| true).await.unwrap(), VolumeButtonOutcome::Requested);
+            assert_eq!(client.request_volume_button(VolumeButton::Down, &|| true).await.unwrap(), VolumeButtonOutcome::Requested);
+        });
+        task.join().unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["volumeUp", "volumeDown"]);
+    }
+
+    #[test]
+    fn volume_button_lost_ack_does_not_trigger_a_fallback_or_replay() {
+        let (base, task) = mock_runner(1, |request| {
+            assert!(request.starts_with("POST /session/S/wda/pressButton "));
+            "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n".into()
+        });
+        let mut client = RunnerClient::new(base).unwrap();
+        client.session = Some("S".into());
+        client.volume_buttons = true;
+        block(async {
+            assert!(client
+                .request_volume_button(VolumeButton::Up, &|| true)
+                .await
+                .is_err());
+        });
+        task.join().unwrap();
     }
 
     fn mock_runner(
@@ -4361,17 +5281,96 @@ mod tests {
     }
 
     #[test]
+    fn checked_tap_classifies_only_explicit_pre_input_refusals_without_fallback() {
+        for (status, code, expected) in [
+            ("409 Conflict", "target changed", Some(CheckedTapOutcome::TargetChanged)),
+            ("404 Not Found", "unknown command", Some(CheckedTapOutcome::Unsupported)),
+            ("404 Not Found", "stale element reference", Some(CheckedTapOutcome::TargetChanged)),
+            ("500 Internal Server Error", "unknown error", None),
+        ] {
+            let (base, server) = mock_runner(1, move |request| {
+                assert!(request.starts_with("POST /session/S/element/E1/ipu/tap "), "{request}");
+                let body:serde_json::Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(body["expected_rect"], serde_json::json!([16.0,180.0,358.0,36.0]));
+                assert_eq!(body["point"], serde_json::json!([195.0,190.0]));
+                assert_eq!(body["expected_target"], serde_json::json!({"identifier":"primary"}));
+                let reply=serde_json::json!({"value":{"error":code,"message":"fixture"}}).to_string();
+                format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len())
+            });
+            let mut client=RunnerClient::new(base).unwrap();client.session=Some("S".into());
+            let result=block(client.checked_element_tap("E1",[16.0,180.0,358.0,36.0],Some((195.0,190.0)),&serde_json::json!({"identifier":"primary"})));
+            server.join().unwrap();
+            match expected { Some(value)=>assert_eq!(result.unwrap(),value),None=>assert!(result.is_err()) }
+        }
+    }
+
+    #[test]
+    fn semantic_checked_tap_detects_old_runner_without_sending_fallback() {
+        for (phase, message, expected) in [
+            (true,"unknown checked tap field",Some(CheckedTapOutcome::Unsupported)),
+            (true,"other argument error",Some(CheckedTapOutcome::CheckFailed)),
+            (false,"unknown checked tap field",None),
+        ] {
+            let (base, server)=mock_runner(1,move |_| {
+                let body=serde_json::json!({"value":{"error":"invalid argument","message":message}}).to_string();
+                let header=if phase {"X-IPU-Tap-Phase: not_sent\r\n"} else {""};
+                format!("HTTP/1.1 400 Bad Request\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())
+            });
+            let mut client=RunnerClient::new(base).unwrap();client.session=Some("S".into());
+            let result=block(client.checked_element_tap("E",[1.0,2.0,3.0,4.0],None,&serde_json::json!({"label":"Done"})));
+            server.join().unwrap();
+            match expected {Some(value)=>assert_eq!(result.unwrap(),value),None=>assert!(result.is_err())}
+        }
+    }
+
+    #[test]
+    fn checked_tap_honors_native_no_event_phase_and_rejects_nonfinite_input_locally() {
+        let (base, server)=mock_runner(1, |_| {
+            let body=r#"{"value":{"error":"unknown error","message":"precondition read failed"}}"#;
+            format!("HTTP/1.1 500 Internal Server Error\r\nX-IPU-Tap-Phase: not_sent\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())
+        });
+        let mut client=RunnerClient::new(base).unwrap();client.session=Some("S".into());
+        assert_eq!(block(client.checked_element_tap("E",[1.0,2.0,3.0,4.0],None,&serde_json::json!({"identifier":"primary"}))).unwrap(),CheckedTapOutcome::CheckFailed);
+        server.join().unwrap();
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
+        let mut client=RunnerClient::new(format!("http://{}",listener.local_addr().unwrap())).unwrap();
+        assert_eq!(block(client.checked_element_tap("E",[f64::NAN,2.0,3.0,4.0],None,&serde_json::json!({"identifier":"primary"}))).unwrap(),CheckedTapOutcome::CheckFailed);
+        assert_eq!(listener.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn action_singleton_query_requires_complete_valid_and_exactly_one_match() {
+        for (headers, body, allowed) in [
+            ("X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n", r#"{"value":[{"ELEMENT":"E1"}]}"#, true),
+            ("X-IPU-Truncated: 1\r\nX-IPU-Tree-Complete: 0\r\n", r#"{"value":[{"ELEMENT":"E1"}]}"#, false),
+            ("", r#"{"value":[{"ELEMENT":"E1"}]}"#, false),
+            ("X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n", r#"{"value":[{"ELEMENT":"E1"},{"ELEMENT":"E2"}]}"#, false),
+            ("X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n", r#"{"value":[{"ELEMENT":"E1"},{}]}"#, false),
+        ] {
+            let (base, server) = mock_runner(1, move |request| {
+                assert!(request.starts_with("POST /session/SESSION/elements "), "{request}");
+                format!("HTTP/1.1 200 OK\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            });
+            let mut client = RunnerClient::new(base).unwrap();
+            client.session = Some("SESSION".into());
+            let result = block(client.find_unique_element("accessibility id", "Done"));
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+        }
+    }
+
+    #[test]
     fn dismiss_only_never_looks_for_form_commit_or_submit_keys() {
         let (base, server) = mock_runner(2, |request| {
             let body: serde_json::Value =
                 serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-            if request.contains("/element ") {
+            if request.contains("/elements ") {
                 let predicate = body["value"].as_str().unwrap();
                 for key in ["Done", "完了", "return", "前往", "search"] {
                     assert!(!predicate.contains(key), "{predicate}");
                 }
-                return r#"{"value":{"error":"no such element","message":"no hide accessory"}}"#
-                    .into();
+                let body = r#"{"value":[]}"#;
+                return format!("HTTP/1.1 200 OK\r\nX-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
             assert!(request.contains("/wda/keyboard/dismiss "), "{request}");
             let names = body["keyNames"].as_array().unwrap();
@@ -4633,7 +5632,7 @@ mod tests {
         server.join().unwrap();
         assert!(rows.iter().any(|row| row.label == "Food"), "{rows:?}");
         assert!(client.visibility_is_geometric());
-        assert!(client.last_tree.is_some());
+        assert!(client.last_tree.is_none(), "bounded source cannot authorize uniqueness through cache reuse");
     }
 
     #[test]
@@ -4722,6 +5721,49 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn flatten_preserves_opaque_identifier_bytes_for_exact_name_and_identifier_selectors() {
+        for identifier in ["  opaque\nID  ", "\t", "\u{3000}标识\u{3000}"] {
+            let tree=serde_json::json!({"type":"XCUIElementTypeButton","label":"Literal control","rawIdentifier":identifier,
+                "placeholderValue":"  Search  ","rect":{"x":20,"y":80,"width":330,"height":70}});
+            let mut rows=Vec::new();flatten_tree(&tree,0,&mut rows);
+            assert_eq!(rows.len(),1);
+            assert_eq!(rows[0].identifier.as_deref(),Some(identifier));
+            // Placeholder normalization is a separate existing policy.
+            assert_eq!(rows[0].placeholder.as_deref(),Some("Search"));
+            let wire=serde_json::to_value(&rows[0]).unwrap();
+            assert_eq!(wire["identifier"],identifier);
+            for field in ["identifier","name"] {
+                let selector:core::element_selector::ElementSelector=serde_json::from_value(serde_json::json!({(field):identifier})).unwrap();
+                assert!(selector.validate().is_ok());assert!(selector.matches(&wire));
+                let trimmed:core::element_selector::ElementSelector=serde_json::from_value(serde_json::json!({(field):identifier.trim()})).unwrap();
+                assert!(!trimmed.matches(&wire));
+            }
+        }
+        for raw in [serde_json::Value::Null,serde_json::json!(""),serde_json::json!(false)] {
+            let mut rows=Vec::new();flatten_tree(&serde_json::json!({"type":"XCUIElementTypeButton","label":"Fallback","rawIdentifier":raw,"rect":{"x":20,"y":80,"width":330,"height":70}}),0,&mut rows);
+            assert_eq!(rows[0].identifier,None);
+            let selector:core::element_selector::ElementSelector=serde_json::from_value(serde_json::json!({"name":"Fallback"})).unwrap();
+            assert!(selector.matches(&serde_json::to_value(&rows[0]).unwrap()));
+        }
+    }
+
+    #[test]
+    fn flatten_preserves_boolean_knowledge_while_wire_stays_sparse() {
+        for reported in [None, Some(serde_json::json!(true)), Some(serde_json::json!(false)), Some(serde_json::json!({"invalid":true}))] {
+            let known=reported.as_ref().and_then(serde_json::Value::as_bool);
+            let mut tree=serde_json::json!({"type":"XCUIElementTypeButton","label":"Control"});
+            if let Some(value)=reported { for key in ["isEnabled","isVisible","isFocused"] {tree[key]=value.clone();} }
+            let mut rows=Vec::new();flatten_tree(&tree,0,&mut rows);
+            assert_eq!(rows[0].enabled,known);assert_eq!(rows[0].visible,known);assert_eq!(rows[0].focused,known);
+            let wire=serde_json::to_value(&rows[0]).unwrap();
+            assert_eq!(wire.get("enabled").cloned(),known.filter(|value| !value).map(serde_json::Value::Bool));
+            assert_eq!(wire.get("visible").cloned(),known.filter(|value| !value).map(serde_json::Value::Bool));
+            assert_eq!(wire.get("focused").cloned(),known.filter(|value| *value).map(serde_json::Value::Bool));
+        }
+    }
+
     #[test]
     fn flatten_keeps_labels_and_interactive_skips_noise() {
         let tree: serde_json::Value = serde_json::from_str(
@@ -4751,10 +5793,10 @@ mod tests {
         assert_eq!(rows[0].label, "新备忘录");
         assert_eq!(rows[0].identifier.as_deref(), Some("new-note-button"));
         assert_eq!(rows[0].rect, [369.0, 885.0, 38.0, 38.0]);
-        assert_eq!(rows[0].enabled, None);
-        assert_eq!(rows[0].visible, None);
+        assert_eq!(rows[0].enabled, Some(true));
+        assert_eq!(rows[0].visible, Some(true));
         assert_eq!(rows[0].accessible, Some(true));
-        assert_eq!(rows[0].focused, None);
+        assert_eq!(rows[0].focused, Some(false));
         assert_eq!(rows[1].label, "你好世界");
         assert_eq!(rows[1].visible, Some(false));
         // Plain button has no value

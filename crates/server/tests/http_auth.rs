@@ -60,19 +60,109 @@ fn assert_no_runner_connection(listener: &TcpListener) {
     }
 }
 
+enum RequestBudget { Exact(usize), AtMost(usize) }
+
 fn mock_runner(
     requests: usize,
     responder: impl Fn(&str, usize) -> Option<(std::time::Duration, String)> + Send + 'static,
 ) -> (String, std::thread::JoinHandle<()>) {
+    mock_runner_with_budget(RequestBudget::Exact(requests), responder)
+}
+
+fn mock_runner_at_most(
+    requests: usize,
+    responder: impl Fn(&str, usize) -> Option<(std::time::Duration, String)> + Send + 'static,
+) -> (String, std::thread::JoinHandle<()>) {
+    mock_runner_with_budget(RequestBudget::AtMost(requests), responder)
+}
+
+include!("fixtures/http_request.rs");
+
+#[test]
+fn mock_request_reader_waits_for_fragmented_headers_and_utf8_body() {
+    struct Fragments {
+        bytes: std::io::Cursor<Vec<u8>>,
+        calls: usize,
+    }
+    impl Read for Fragments {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 3 {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.bytes.read(&mut buffer[..1])
+        }
+    }
+    let body = r#"{"value":"こんにちは"}"#;
+    let request = format!(
+        "POST /session/S/element/FIELD/value HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut reader = Fragments {
+        bytes: std::io::Cursor::new(request.as_bytes().to_vec()),
+        calls: 0,
+    };
+    assert_eq!(read_mock_request(&mut reader).unwrap(), Some(request));
+    assert_eq!(
+        read_mock_request(&mut std::io::Cursor::new(Vec::<u8>::new())).unwrap(),
+        None
+    );
+    assert!(read_mock_request(&mut std::io::Cursor::new(b"GET / HTTP/1.1\r\n".to_vec())).is_err());
+}
+
+#[test]
+fn a_stopped_mock_aborts_an_open_partial_request() {
+    struct Partial { stopped: std::sync::Arc<std::sync::atomic::AtomicBool>, sent_header: bool }
+    impl Read for Partial {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent_header {
+                let partial=b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n{";
+                buffer[..partial.len()].copy_from_slice(partial);
+                self.sent_header=true;
+                return Ok(partial.len());
+            }
+            self.stopped.store(true, Ordering::Release);
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+    let stopped=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut reader=Partial{stopped:stopped.clone(),sent_header:false};
+    let result=read_mock_request_until(&mut reader,||stopped.load(Ordering::Acquire));
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+}
+
+fn mock_runner_with_budget(
+    budget: RequestBudget,
+    responder: impl Fn(&str, usize) -> Option<(std::time::Duration, String)> + Send + 'static,
+) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
     let task = std::thread::spawn(move || {
+        let (requests, exact) = match budget { RequestBudget::Exact(n) => (n, true), RequestBudget::AtMost(n) => (n, false) };
         let mut index = 0;
+        let mut last_request = std::time::Instant::now();
         while index < requests {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 8_192];
-            let read = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_request.elapsed() >= std::time::Duration::from_secs(60) {
+                        assert!(!exact, "mock runner expected {requests} requests, received {index}; a refused operation must not hang server.join()");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("mock runner accept failed: {error}"),
+            };
+            last_request = std::time::Instant::now();
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+            let request = match read_mock_request(&mut stream) {
+                Ok(Some(request)) => request,
+                Ok(None) => continue,
+                Err(error) => panic!("mock runner request failed: {error}"),
+            };
             // Session setup writes runner's idle-wait settings; answer them here,
             // outside the scripted count and index.
             if request.starts_with("POST ") && request.contains("/appium/settings") {
@@ -92,10 +182,14 @@ fn mock_runner(
                 continue; // close without a response: ambiguous transport loss
             };
             std::thread::sleep(delay);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            // Ordinary fixtures describe an exhaustive source/query result;
+            // explicit raw HTTP responses can model unknown or partial coverage.
+            let response = if body.starts_with("HTTP/1.1 ") { body } else {
+                let coverage = if request.contains("/source") || (request.starts_with("POST ") && request.contains("/elements ")) {
+                    "X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n"
+                } else { "" };
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{coverage}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
             let _ = stream.write_all(response.as_bytes());
         }
     });
@@ -1019,15 +1113,16 @@ fn direct_browser_control_timeout_before_dispatch_is_retry_safe_408() {
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
+        let legacy: serde_json::Value = serde_json::json!({
                 "ok": false,
                 "error": "not_sent",
                 "outcome": "not_sent",
                 "retry_safe": true
-            })
-        );
+            });
+        for (key, value) in legacy.as_object().unwrap() {
+            assert_eq!(&json[key], value, "legacy field {key}");
+        }
+        assert_eq!(json["action_evidence"]["delivery"]["status"], "not_sent");
     });
 }
 
@@ -1050,7 +1145,7 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
             } else {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Some((
-                    std::time::Duration::from_millis(400),
+                    std::time::Duration::from_millis(1_500),
                     r#"{"value":null}"#.to_string(),
                 ))
             }
@@ -1064,7 +1159,7 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
                     .uri("/control")
                     .header("x-phone-control", "1")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"type":"tap","x":1.0,"y":1.0,"ttl_ms":150}"#))
+                    .body(Body::from(r#"{"type":"tap","x":1.0,"y":1.0,"ttl_ms":1000}"#))
                     .unwrap(),
             )
             .await
@@ -1075,15 +1170,16 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
+        let legacy: serde_json::Value = serde_json::json!({
                 "ok": false,
                 "error": "outcome_unknown",
                 "outcome": "unknown",
                 "retry_safe": false
-            })
-        );
+            });
+        for (key, value) in legacy.as_object().unwrap() {
+            assert_eq!(&json[key], value, "legacy field {key}");
+        }
+        assert_eq!(json["action_evidence"]["delivery"]["status"], "uncertain");
         assert_eq!(action_count.load(Ordering::SeqCst), 1);
     });
 }
@@ -1556,6 +1652,119 @@ fn indexed_browser_tap_rejects_a_stale_snapshot_without_tapping() {
 }
 
 #[test]
+fn an_index_from_an_older_snapshot_still_taps_its_row_after_the_clock_ticks() {
+    block(async {
+        let source_count = Arc::new(AtomicUsize::new(0));
+        let observed_sources = source_count.clone();
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let observed_clicks = clicks.clone();
+        let (base, _server) = mock_runner_at_most(40, move |request, _| {
+            let ok = |body: &str| Some((std::time::Duration::ZERO, body.to_string()));
+            let mutation = !request.starts_with("GET ")
+                && !request.starts_with("POST /session ")
+                && !(request.starts_with("POST") && request.contains("/elements"));
+            if mutation && !request.contains("/click") {
+                observed_clicks.lock().unwrap().push(request.lines().next().unwrap_or("").to_string());
+            }
+            if request.starts_with("POST /session ") {
+                ok(r#"{"value":{"sessionId":"SESSION"}}"#)
+            } else if request.contains("/source?format=json") {
+                // The first read is what the agent indexes; later reads show
+                // the same screen a minute on, with a row added above.
+                let clock = if observed_sources.fetch_add(1, Ordering::SeqCst) == 0 { "10:41" } else { "10:42" };
+                let extra = if clock == "10:41" { "" } else {
+                    r#"{"type":"XCUIElementTypeStaticText","label":"新消息","rect":{"x":20,"y":10,"width":80,"height":20},"children":[]},"#
+                };
+                ok(&format!(
+                    r#"{{"value":{{"type":"XCUIElementTypeApplication","label":"备忘录","children":[{extra}{{"type":"XCUIElementTypeStaticText","label":"{clock}","rect":{{"x":0,"y":0,"width":60,"height":20}},"children":[]}},{{"type":"XCUIElementTypeStaticText","label":"所有备忘录","rect":{{"x":20,"y":20,"width":200,"height":20}},"children":[]}},{{"type":"XCUIElementTypeButton","label":"文件夹","rect":{{"x":300,"y":20,"width":60,"height":20}},"children":[]}},{{"type":"XCUIElementTypeButton","label":"菜单","rect":{{"x":20,"y":40,"width":80,"height":44}},"children":[]}},{{"type":"XCUIElementTypeButton","label":"更多","rect":{{"x":20,"y":100,"width":80,"height":44}},"children":[]}},{{"type":"XCUIElementTypeButton","label":"新建","rect":{{"x":20,"y":160,"width":80,"height":44}},"children":[]}},{{"type":"XCUIElementTypeButton","label":"共享","rect":{{"x":20,"y":220,"width":80,"height":44}},"children":[]}}]}}}}"#
+                ))
+            } else if request.contains("/window/size") {
+                ok(r#"{"value":{"width":390,"height":844}}"#)
+            } else if request.contains("/alert/text") {
+                // A rebind asks runner live whether an alert is up: none is.
+                let body = r#"{"value":{"error":"no such alert","message":"no alert"}}"#;
+                Some((std::time::Duration::ZERO, format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())))
+            } else if request.starts_with("POST") && request.contains("/elements") {
+                let id = if request.contains("label == '更多'") { "MORE" } else { "MENU" };
+                ok(&format!(r#"{{"value":[{{"ELEMENT":"{id}"}}]}}"#))
+            } else if let Some(rest) = request.split("/element/").nth(1).filter(|_| request.contains("/click")) {
+                observed_clicks.lock().unwrap().push(rest.split('/').next().unwrap_or("").to_string());
+                ok(r#"{"value":null}"#)
+            } else {
+                ok(r#"{"value":null}"#)
+            }
+        });
+        let app = http::router(build_state_with_runner(&base));
+        let read = |app: axum::Router| async move {
+            let response = app
+                .oneshot(Request::builder().uri("/agent/elements").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let first = read(app.clone()).await;
+        let snapshot = first["snapshot"].as_str().unwrap().to_string();
+        let more = first["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|row| row["label"] == "更多")
+            .unwrap();
+        // Another read moves the daemon's tree on: the old token is now stale
+        // as a whole-screen hash.
+        let second = read(app.clone()).await;
+        assert_ne!(second["snapshot"].as_str().unwrap(), snapshot);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control")
+                    .header("x-phone-control", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"type": "tap", "element": more, "snapshot": snapshot, "ttl_ms": 2000})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(*clicks.lock().unwrap(), vec!["MORE".to_string()]);
+        // The caller is told its index was resolved on a changed screen.
+        let live = second["elements"].as_array().unwrap().iter().position(|row| row["label"] == "更多").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["rebound"], serde_json::json!({"from": more, "to": live}));
+
+        // The tap was posted, so the next index from the same old snapshot
+        // reads the tree afresh and still finds its row.
+        let menu = first["elements"].as_array().unwrap().iter().position(|row| row["label"] == "菜单").unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control")
+                    .header("x-phone-control", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"type": "tap", "element": menu, "snapshot": snapshot, "ttl_ms": 2000})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*clicks.lock().unwrap(), vec!["MORE".to_string(), "MENU".to_string()]);
+    });
+}
+
+#[test]
 fn webrtc_routes_are_gone() {
     // iPhone Mirroring and its WebRTC transport were removed in v0.9.
     block(async {
@@ -1791,13 +2000,14 @@ fn agent_actions_taps_one_strict_semantic_locator() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed_actions = action_count.clone();
-        let (base, server) = mock_runner(4, move |request, _| {
+        let (base, server) = mock_runner(6, move |request, _| {
             let body = if request.starts_with("POST /session ") {
                 r#"{"value":{"sessionId":"SESSION"}}"#.to_string()
             } else if request.contains("/source?format=json") {
                 r#"{"value":{
                     "type":"XCUIElementTypeApplication",
                     "label":"测试应用",
+                    "rect":{"x":0,"y":0,"width":390,"height":844},
                     "children":[{
                         "type":"XCUIElementTypeButton",
                         "label":"搜索",
@@ -1815,9 +2025,13 @@ fn agent_actions_taps_one_strict_semantic_locator() {
                     "strict locator state must reach the native runner query: {request}"
                 );
                 r#"{"value":[{"ELEMENT":"SEARCH"}]}"#.to_string()
+            } else if request.contains("/window/size") {
+                r#"{"value":{"width":390,"height":844}}"#.to_string()
+            } else if request.contains("/element/SEARCH/rect") {
+                r#"{"value":{"x":160,"y":700,"width":70,"height":40}}"#.to_string()
             } else {
                 assert!(
-                    request.contains("/element/SEARCH/click"),
+                    request.contains("/element/SEARCH/ipu/tap"),
                     "unexpected runner request: {request}"
                 );
                 observed_actions.fetch_add(1, Ordering::SeqCst);
@@ -2052,13 +2266,14 @@ fn delayed_cold_runner_session_eventually_becomes_actionable() {
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        // Keep polling the runtime until the cold-session probe actually
+        // completes; a fixed sleep followed by a blocking thread join can
+        // starve the async settings/lock/apps-list reads on a loaded host.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !state.runner_health.lock().unwrap().actionable {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-        })
-        .await
-        .expect("background health probe completed");
+        }).await.expect("cold runner should become actionable within its probe budget");
         server.join().unwrap();
 
         let health = *state.runner_health.lock().unwrap();
@@ -3559,6 +3774,16 @@ fn app_trades_a_code_once_for_a_session_and_a_device_token() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(cookie_pair(&resp).starts_with("phone_session="));
+        // Renewal slides: a fresh device token comes back, so a paired phone
+        // that keeps connecting never has to be paired again.
+        let fresh = body_json(resp).await["device_token"].as_str().unwrap_or_default().to_string();
+        assert!(!fresh.is_empty(), "renewal must return a fresh device token");
+        let resp = app
+            .clone()
+            .oneshot(pair_json_request(serde_json::json!({"device_token": fresh})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the renewed token works");
         let resp = app
             .oneshot(
                 Request::builder()
@@ -3743,7 +3968,7 @@ fn agent_answers_carry_runner_timing_in_body_and_server_timing() {
         // Answer whatever /agent/elements asks runner; the source read is slow on
         // purpose so it stands out in the breakdown. The server thread is left
         // waiting for requests that never come and ends with the process.
-        let (base, _server) = mock_runner(16, move |request, _| {
+        let (base, _server) = mock_runner_at_most(16, move |request, _| {
             if request.contains("/source") {
                 Some((
                     std::time::Duration::from_millis(50),
@@ -3817,7 +4042,7 @@ fn tap_with_duplicate_labels(
         let clicked = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = clicked.clone();
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"关闭","rect":{"x":24,"y":66,"width":36,"height":36},"children":[]},{"type":"XCUIElementTypeButton","label":"关闭","rect":{"x":300,"y":700,"width":60,"height":44},"children":[]}]}}"#;
-        let (base, _server) = mock_runner(32, move |request, _| {
+        let (base, _server) = mock_runner_at_most(32, move |request, _| {
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
             if request.starts_with("POST /session ") {
                 ok(r#"{"value":{"sessionId":"SESSION"}}"#.to_string())
@@ -3972,7 +4197,7 @@ fn screenshot_of_blank_capture(
     .unwrap();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&blank);
     block(async move {
-        let (base, _server) = mock_runner(16, move |request, _| {
+        let (base, _server) = mock_runner_at_most(16, move |request, _| {
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
             if request.starts_with("POST /session ") {
                 ok(r#"{"value":{"sessionId":"SESSION"}}"#.to_string())
@@ -4082,10 +4307,20 @@ fn control_against(
     with_snapshot: bool,
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value, Vec<String>) {
+    control_against_clear(source, value_now, with_snapshot, body, false)
+}
+
+fn control_against_clear(
+    source: &'static str,
+    value_now: &'static str,
+    with_snapshot: bool,
+    body: serde_json::Value,
+    fail_clear: bool,
+) -> (StatusCode, serde_json::Value, Vec<String>) {
     block(async move {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let log = seen.clone();
-        let (base, _server) = mock_runner(64, move |request, _| {
+        let (base, _server) = mock_runner_at_most(64, move |request, _| {
             let line = request.lines().next().unwrap_or("").to_string();
             log.lock().unwrap().push(line.clone());
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
@@ -4099,6 +4334,11 @@ fn control_against(
                 ok(r#"{"value":{"error":"no such alert","message":"no alert"}}"#.to_string())
             } else if line.starts_with("POST") && line.contains("/elements") {
                 ok(r#"{"value":[{"ELEMENT":"FIELD"}]}"#.to_string())
+            } else if source == ONE_TEXT_FIELD && line.starts_with("GET") && line.contains("/element/FIELD/rect ") {
+                ok(r#"{"value":{"x":20,"y":700,"width":300,"height":40}}"#.to_string())
+            } else if fail_clear && line.starts_with("POST") && line.contains("/clear ") {
+                let body = r#"{"value":{"error":"unknown error","message":"clear interrupted; outcome unknown"}}"#;
+                ok(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()))
             } else if line.starts_with("GET") && line.contains("/attribute/value") {
                 ok(format!(r#"{{"value":"{value_now}"}}"#))
             } else {
@@ -4200,27 +4440,51 @@ fn a_label_tap_under_a_fixed_header_is_refused_unless_allowed() {
 const ONE_TEXT_FIELD: &str = r#"{"value":{"type":"XCUIElementTypeApplication","label":"PayPay","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeTextField","label":"メッセージ","rect":{"x":20,"y":700,"width":300,"height":40}}]}}"#;
 
 #[test]
+fn set_value_stops_after_clear_failure_without_writing_replacement() {
+    let (status, json, lines) = control_against_clear(
+        ONE_TEXT_FIELD,
+        "old content",
+        true,
+        serde_json::json!({"type":"set_value","element":1,"value":"replacement","ttl_ms":2000}),
+        true,
+    );
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{json}");
+    assert_eq!(json["retry_safe"], false, "{json}; requests={lines:?}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("POST") && line.contains("/clear "))
+            .count(),
+        1
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("POST")
+            && (line.contains("/value ") || line.contains("/wda/keys "))),
+        "{lines:?}"
+    );
+}
+#[test]
 fn set_value_that_does_not_stick_is_reported_not_applied() {
-    let (status, json, _) = control_against(
+    let (status, json, lines) = control_against(
         ONE_TEXT_FIELD,
         "",
         true,
         serde_json::json!({"type":"set_value","element":1,"value":"こんにちは","ttl_ms":2000}),
     );
-    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(status, StatusCode::CONFLICT, "{json}; requests={lines:?}");
     assert_eq!(json["error"], "value_not_applied");
     assert_eq!(json["outcome"], "no_effect");
 }
 
 #[test]
 fn set_value_that_reads_back_formatted_is_applied() {
-    let (status, json, _) = control_against(
+    let (status, json, lines) = control_against(
         ONE_TEXT_FIELD,
         "090-1234-5678",
         true,
         serde_json::json!({"type":"set_value","element":1,"value":"09012345678","ttl_ms":2000}),
     );
-    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(status, StatusCode::OK, "{json}; requests={lines:?}");
 }
 
 #[test]
@@ -4264,7 +4528,7 @@ fn tap_after_read_with(
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = log.clone();
         let source = r#"{"value":{"type":"XCUIElementTypeApplication","label":"Chat","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeButton","label":"发送","rect":{"x":300,"y":700,"width":60,"height":44}}]}}"#;
-        let (base, _server) = mock_runner(64, move |request, _| {
+        let (base, _server) = mock_runner_at_most(64, move |request, _| {
             let line = request.lines().next().unwrap_or("").to_string();
             seen.lock().unwrap().push(line.clone());
             let ok = |body: String| Some((std::time::Duration::ZERO, body));
@@ -4327,7 +4591,7 @@ fn tap_after_read_with(
         let sources = lines.iter().filter(|l| l.contains("/source")).count();
         let clicked = lines
             .iter()
-            .filter(|l| l.contains("/click") || l.contains("/actions"))
+            .filter(|l| l.contains("/click") || l.contains("/actions") || l.contains("/ipu/tap"))
             .map(|l| l.to_string())
             .collect();
         (status, json, sources, clicked)

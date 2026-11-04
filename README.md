@@ -23,6 +23,8 @@ Claude Code, Codex or any MCP client reads the screen as text, taps, types and s
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center"><strong>Website and docs: <a href="https://iphone-use.leeguoo.com/en/">iphone-use.leeguoo.com</a></strong></p>
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 ```
@@ -54,6 +56,11 @@ Need help setting up a real iPhone, connecting your agent or creating an iOS app
 Want to support ongoing maintenance? Email us to discuss a one-time or recurring contribution.
 
 Community bug reports and feature requests remain welcome on GitHub. Please keep credentials and private account data out of inquiries.
+
+MCP calls can choose an installed local instance with `instance:"i13"` (including
+`phone_status` and input tools); `phone_instances` lists them without reconnecting.
+Omit it to keep the configured daemon. Missing instances fail without selecting a
+different phone. See [per-call instance routing](crates/mcp/README.md#selecting-an-installed-instance-per-call).
 
 ## Why iphone-use
 
@@ -156,6 +163,11 @@ The same daemon that serves agents lets you drive the phone yourself:
 Nothing on the Mac moves while you do it: no window takes focus and the cursor stays put.
 
 ## Use it from an agent
+
+To save a screenshot on the phone for use in another app, call
+`phone_shortcut {"name":"save_screenshot"}`. It requests an iOS system capture
+in Photos; check the new image before claiming it saved. `phone_screenshot`
+returns an image to the caller. Saving requires an updated native Runner.
 
 A daemon on your Mac drives the phone and offers the same control in three forms:
 
@@ -318,3 +330,17 @@ install its skill, since the right way differs per project and per release.
 ## Author
 
 Built by **郭立 (Guo Li / leeguoo)** — [leeguoo.com](https://leeguoo.com/about) · [GitHub](https://github.com/leeguooooo) · [X](https://x.com/leeguooooo) · more tools in the [*-use family](https://github.com/leeguooooo/plugins).
+
+### Focused reads and action receipts
+
+`phone_subtree` reads one native element’s descendants with explicit coverage;
+its local positions are read-only. Action responses separate delivery from UI
+verification and include structured recovery strategies. `phone_run_start` with
+`trace=true` enables a bounded, redacted timeline, available through
+`phone_run_trace`; it contains no typed values or screenshots. These native
+checks and subtree reads require an updated runner. See the
+[agent reference](docs/agent-reference.md#action-evidence-and-recovery).
+
+Activity history never stores click geometry, input identifiers or keypad keys.
+Green feedback uses only the latest nonsensitive named target, bound to the live
+owner/privacy scope, erased after 1.5 seconds and excluded from history.

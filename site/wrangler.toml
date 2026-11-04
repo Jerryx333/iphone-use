@@ -1,0 +1,13 @@
+# iphone-use.leeguoo.com: a static-assets-only Worker (no script).
+# Deploy from this directory; see README.md.
+name = "iphone-use-site"
+compatibility_date = "2026-10-01"
+routes = [{ pattern = "iphone-use.leeguoo.com", custom_domain = true }]
+
+[assets]
+directory = "./public"
+# /install.html is served at /install (and /install.html redirects there);
+# /en redirects to /en/.
+html_handling = "auto-trailing-slash"
+# Missing paths get the nearest 404.html (/en/404.html under /en/) with status 404.
+not_found_handling = "404-page"

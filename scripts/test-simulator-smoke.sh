@@ -61,6 +61,17 @@ done
 [ "$(printf '%s' "$status" | json 'd.get("drivable")')" = "True" ] || bad "not drivable: $status"
 ok_t "the daemon drives the simulator (target simulator, drivable)"
 
+# A real Simulator session must explicitly refuse physical volume buttons.
+for button in volume_up volume_down; do
+    body="$(curl -sS -m 30 "${H[@]}" -X POST "$B/agent/input" \
+        -d "{\"type\":\"shortcut\",\"name\":\"$button\",\"observe\":false}")"
+    [ "$(printf '%s' "$body" | json 'd.get("error")')" = "volume_buttons_unsupported" ] || bad "volume refusal: $body"
+    [ "$(printf '%s' "$body" | json 'd.get("outcome")')" = "not_sent" ] || bad "volume outcome: $body"
+    [ "$(printf '%s' "$body" | json 'd.get("retry_safe")')" = "True" ] || bad "volume retry boundary: $body"
+done
+ok_t "physical volume shortcuts refuse before dispatch on Simulator"
+
+
 body="$(curl -fsS -m 60 "$B/agent/elements")"
 [ "$(printf '%s' "$body" | json 'len(d.get("elements") or [])')" -gt 0 ] || bad "no elements: ${body:0:300}"
 ok_t "the screen reads as elements"
@@ -87,6 +98,13 @@ body="$(curl -fsS -m 60 "${H[@]}" -X POST "$B/agent/record" -d '{"action":"stop"
 bytes="$(printf '%s' "$body" | json 'd["summary"]["bytes"]')" || bad "record stop: $body"
 [ "$bytes" -gt 0 ] || bad "empty recording: $body"
 ok_t "recording via simctl recordVideo saved $bytes bytes"
+
+# Complete-value reads use a separate seeded App and must not acquire a lease.
+curl -fsS -m 30 "${H[@]}" -X POST "$B/agent/owner" -d '{"release":true}' >/dev/null || bad "release owner before value reads"
+python3 "$ROOT/scripts/test-value-read-simulator.py" --base "$B" --udid "$SIM" \
+    --owner smoke --mcp "$BIN/iphone-use-mcp" --runner-record "$STATE/simulator.json" \
+    --out "$STATE/value-read" || bad "complete value read conformance failed"
+ok_t "complete AX values, scalar clipping, secure refusal and real MCP preserve App state"
 
 # Verify UIKit-observed input, including timed hover and a no-hover control.
 python3 "$ROOT/scripts/test-drag-simulator.py" --base "$B" --udid "$SIM" \

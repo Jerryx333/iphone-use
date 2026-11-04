@@ -11,6 +11,7 @@ mod support;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -71,43 +72,74 @@ fn spawn_daemon_with(
     home: &std::path::Path,
     extra: &[(&str, &str)],
 ) -> Daemon {
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_iphone-use"))
-        .arg("serve")
-        .env_clear()
-        .envs(extra.iter().copied())
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", home)
-        .env("TMPDIR", state)
-        .env("IPHONE_USE_HOST", "127.0.0.1")
-        .env("IPHONE_USE_PORT", port.to_string())
-        .env("IPHONE_USE_STATE_DIR", state)
-        .env("IPHONE_USE_INSTANCE", "e2e")
-        .env("IPHONE_USE_BACKEND", "direct")
-        .env("IPHONE_USE_RUNNER_URL", runner)
-        .env("IPHONE_USE_RUNNER_MJPEG_URL", runner)
-        .env("IPHONE_USE_RUNNER_MANAGED", "0")
-        .env("IPHONE_USE_UDID", "00000000-0000000000000000")
-        .env("IPHONE_USE_AGENT_TOKEN", TOKEN)
-        // With no password, reads are open to the browser by design; set one
-        // so a wrong token is really refused.
-        .env("IPHONE_USE_PASSWORD", "e2e-password-not-the-token")
-        .env("IPHONE_USE_NO_UPDATE_CHECK", "1")
-        .env("TOKIO_WORKER_THREADS", "2")
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(state.join("daemon.err")).unwrap())
-        .spawn()
-        .expect("spawn iphone-use serve");
-    let daemon = Daemon { child, port, error_log: state.join("daemon.err") };
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return daemon;
+    spawn_daemon_with_port_picker(runner, state, home, extra, free_port)
+}
+
+fn spawn_daemon_with_port_picker(
+    runner: &str,
+    state: &std::path::Path,
+    home: &std::path::Path,
+    extra: &[(&str, &str)],
+    mut pick_port: impl FnMut() -> u16,
+) -> Daemon {
+    // Probing an unused port cannot reserve it for the child. Retry only a
+    // confirmed bind collision, before any test request/action is dispatched.
+    let pid_path = state.join(format!("iphone-use-{}-e2e", state.metadata().unwrap().uid()))
+        .join("iphone-use.pid");
+    'startup: for attempt in 0..4 {
+        let port = pick_port();
+        let child = Command::new(env!("CARGO_BIN_EXE_iphone-use"))
+            .arg("serve")
+            .env_clear()
+            .envs(extra.iter().copied())
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home)
+            .env("TMPDIR", state)
+            .env("IPHONE_USE_HOST", "127.0.0.1")
+            .env("IPHONE_USE_PORT", port.to_string())
+            .env("IPHONE_USE_STATE_DIR", state)
+            .env("IPHONE_USE_INSTANCE", "e2e")
+            .env("IPHONE_USE_BACKEND", "direct")
+            .env("IPHONE_USE_RUNNER_URL", runner)
+            .env("IPHONE_USE_RUNNER_MJPEG_URL", runner)
+            .env("IPHONE_USE_RUNNER_MANAGED", "0")
+            .env("IPHONE_USE_UDID", "00000000-0000000000000000")
+            .env("IPHONE_USE_AGENT_TOKEN", TOKEN)
+            // With no password, reads are open to the browser by design; set one
+            // so a wrong token is really refused.
+            .env("IPHONE_USE_PASSWORD", "e2e-password-not-the-token")
+            .env("IPHONE_USE_NO_UPDATE_CHECK", "1")
+            .env("TOKIO_WORKER_THREADS", "2")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(state.join("daemon.err")).unwrap())
+            .spawn()
+            .expect("spawn iphone-use serve");
+        let mut daemon = Daemon { child, port, error_log: state.join("daemon.err") };
+        // Unattended `serve` backs off for 30 seconds after a bind failure.
+        // Keep polling long enough to observe its exit and classify the failure.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            if let Some(status) = daemon.child.try_wait().expect("poll daemon startup") {
+                let log = std::fs::read_to_string(&daemon.error_log).unwrap_or_default();
+                if attempt < 3 && log.contains("Address already in use") {
+                    continue 'startup;
+                }
+                panic!("daemon exited before readiness ({status}):\n{log}");
+            }
+            // The daemon writes its own PID record only AFTER binding. A TCP
+            // connection alone may have reached the process that stole this port.
+            let owns_listener = std::fs::read(&pid_path).ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|record| record["pid"].as_u64() == Some(daemon.child.id() as u64));
+            if owns_listener && TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return daemon;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        let log = std::fs::read_to_string(state.join("daemon.err")).unwrap_or_default();
+        panic!("daemon did not listen on {port}:\n{log}");
     }
-    let log = std::fs::read_to_string(state.join("daemon.err")).unwrap_or_default();
-    panic!("daemon did not listen on {port}:\n{log}");
+    unreachable!("startup either returns or reports a bounded failure")
 }
 
 /// One HTTP/1.1 request; returns (status, JSON body).
@@ -876,10 +908,9 @@ fn an_explicit_run_through_the_mcp_tools() {
     let run = &summary["run"];
     assert_eq!(run["key"]["run_id"], "mcp-task", "{run}");
     assert_eq!(run["key"]["owner"], "e2e-mcp", "{run}");
-    // elements, /agent/apps (the first read in a newly entered app carries a
-    // registry block, whose compat check reads the installed apps), tap,
-    // flow draft, elements after the refused end
-    assert_eq!(run["tool_calls"], 5, "{run}");
+    // elements, tap, flow draft, elements after the refused end. Empty
+    // registry hints must not add an unrelated /agent/apps request.
+    assert_eq!(run["tool_calls"], 4, "{run}");
     assert_eq!(run["observed_calls"], 1, "{run}");
     assert_eq!(run["model_round_trips"], 3, "{run}");
     // After the end, the session's calls no longer carry the run.
@@ -947,6 +978,8 @@ fn a_refused_run_end_keeps_the_run_active_in_the_mcp_client() {
         .env("IPHONE_USE_TOKEN", TOKEN)
         .env("IPHONE_USE_OWNER", "e2e-mcp")
         .env("IPHONE_USE_MCP_PREWARM", "0")
+        // The scripted daemon answers in order; this test is about run headers.
+        .env("IPHONE_USE_MCP_RECONNECT_ON_USE", "0")
         .env("IPHONE_USE_NO_UPDATE_CHECK", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1198,4 +1231,28 @@ fn live_metrics_report_open_until_the_run_ends() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[test]
+fn occupied_port_is_not_mistaken_for_the_child_listener() {
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    occupied.set_nonblocking(true).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let runner = runner();
+    let state = private_dir();
+    let home = private_dir();
+    let mut picks = 0;
+    let daemon = spawn_daemon_with_port_picker(
+        runner.url(), &state.path().canonicalize().unwrap(),
+        &home.path().canonicalize().unwrap(), &[], || {
+            picks += 1;
+            if picks == 1 { occupied_port } else { free_port() }
+        },
+    );
+    assert_eq!(picks, 2, "only the confirmed startup collision is retried");
+    assert_ne!(daemon.port, occupied_port);
+    assert!(matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the readiness check must not connect to the unrelated listener");
+    let (status, _) = http(daemon.port, "GET", "/agent/status", TOKEN, &[], "");
+    assert_eq!(status, 200);
 }

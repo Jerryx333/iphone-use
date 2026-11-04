@@ -1,0 +1,133 @@
+{
+  "release": "https://github.com/leeguooooo/iphone-use/releases/tag/v0.26.1",
+  "published_at": "2026-10-27T06:27:25Z",
+  "checksums": {
+    "browser-use-bridge-macos-universal.tar.gz": "8284c4025b9252241054d38004914a3c482007375b07d18ceb32e1c8ba5844b7",
+    "iPhoneUse.app.zip": "4b3a6deefc83297b61644d4fe1469275fcd52c5aecb5b06684e3384ab73e22fc",
+    "iphone-use-app.tar.gz": "8801555b27db7c3d37c9d76a63ce84ec521f7aefce06fa181fc0b2d578ba2d71",
+    "iphone-use-mcp-macos-universal.tar.gz": "871dc70af66ed50b17cf819a9dde2babdc13d5732d645d08853b35c1e2ee073c",
+    "iphone-use-runner.tar.gz": "d5adb7e5765bfff50025b3a4ff4f2a3e8635bcb7a9bdd0ed7b40ab369dd9264d"
+  },
+  "app_version": "0.26.1",
+  "cli_version": "iphone-use 0.26.1",
+  "codesign_verified": true,
+  "notarized_developer_id": true,
+  "stapled_ticket_verified": true,
+  "architectures": {
+    "iphone-use": [
+      "x86_64",
+      "arm64"
+    ],
+    "iphone-use-mcp": [
+      "x86_64",
+      "arm64"
+    ],
+    "iphone-use-legacy-launch": [
+      "x86_64",
+      "arm64"
+    ]
+  },
+  "embedded_mcp": {
+    "version": "0.26.1",
+    "tools": 39,
+    "names": [
+      "phone_app_notes",
+      "phone_apps",
+      "phone_capabilities",
+      "phone_collect_list",
+      "phone_crashes",
+      "phone_elements",
+      "phone_flow_draft",
+      "phone_flow_info",
+      "phone_flow_list",
+      "phone_flow_publish",
+      "phone_flow_report",
+      "phone_flow_run",
+      "phone_flow_update",
+      "phone_hold",
+      "phone_home_layout",
+      "phone_install_app",
+      "phone_instances",
+      "phone_jev_run",
+      "phone_key",
+      "phone_login",
+      "phone_logs",
+      "phone_reconnect",
+      "phone_record",
+      "phone_release_owner",
+      "phone_run_end",
+      "phone_run_start",
+      "phone_run_steps",
+      "phone_screen",
+      "phone_screen_frame",
+      "phone_screenshot",
+      "phone_scroll",
+      "phone_scroll_find",
+      "phone_set_location",
+      "phone_shortcut",
+      "phone_status",
+      "phone_tap",
+      "phone_tap_element",
+      "phone_tap_label",
+      "phone_type"
+    ]
+  },
+  "standalone_mcp_matches": true,
+  "standalone_mcp_codesign_verified": true,
+  "standalone_mcp_architectures": [
+    "x86_64",
+    "arm64"
+  ],
+  "runner_sources_match_tag": {
+    "IPURBridge.h": "4f3af589eca4f8cf69519a36e890c773a472c4b96ea6e54d26cfa01ca3e31130",
+    "IPURBridge.m": "45805f81c6864b2e7bfa00e1902cc53fcd9d60f5d372d12d42c88d4dc5e2f66d",
+    "RunnerExitNotice.swift": "2159c2eca0ced5a9caee9c28f2bbf7e7ba082e05d0b07abcfeb1d52461d1deae",
+    "RunnerTests.swift": "c05f44a01264cce4e2512eb3f0e9bf5dc0dccd291dd3ccbc3a964483f230ba3a",
+    "RunnerActions.swift": "705ec97ae8a405c5c9800f72c6aa42a6d4f2a0b89bb8b21432a11dcc3e9af3a1",
+    "RunnerRoutes.swift": "7efa1018cd05db0fd74b8820ccdbb43e111fb6d7b1c937afd83146e9bab85a4e"
+  },
+  "auxiliary_payloads": {
+    "browser-use-bridge": {
+      "architectures": [
+        "arm64",
+        "x86_64"
+      ],
+      "codesign_verified": true
+    },
+    "app/bin/ipu-phone-host": {
+      "architectures": [
+        "arm64",
+        "x86_64"
+      ],
+      "codesign_verified": true
+    },
+    "app/native/libipu_phone_host.a": {
+      "architectures": [
+        "arm64"
+      ],
+      "codesign_verified": false
+    },
+    "app/apps/ios/SessionLibraries/iphoneos/libipu_browser_session.a": {
+      "architectures": [
+        "arm64"
+      ],
+      "codesign_verified": false
+    }
+  },
+  "installed": false,
+  "physical_acceptance": false,
+  "release_tag_commit": "ff96bfc8",
+  "merged_prs": [
+    356,
+    357
+  ],
+  "release_build_run": 40459158331,
+  "acceptance_scope": "downloaded artifacts only; installation and device execution are separate",
+  "registry_verified": true,
+  "marketplace_verified": true,
+  "registry_version": "0.26.1",
+  "registry_url": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.leeguooooo%2Fiphone-use/versions/0.26.1",
+  "marketplace_version": "0.26.1",
+  "marketplace_blob_sha": "b6b071ff1ac03db2441123253e9b561063d29de9",
+  "indices_verified_at": "2026-10-27T06:32:54.639032+00:00"
+}

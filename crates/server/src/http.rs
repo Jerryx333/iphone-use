@@ -202,6 +202,11 @@ impl RunnerLifecycle {
         Self::decode(self.state.load(std::sync::atomic::Ordering::Acquire)).1
     }
 
+    fn active_stamp(&self) -> Option<u64> {
+        let state = self.state.load(std::sync::atomic::Ordering::Acquire);
+        (Self::decode(state).1 == RunnerLifecycleTransition::Active).then_some(state)
+    }
+
     fn try_begin(&self, transition: RunnerLifecycleTransition) -> Option<RunnerTransitionToken> {
         debug_assert_ne!(transition, RunnerLifecycleTransition::Active);
         let mut observed = self.state.load(std::sync::atomic::Ordering::Acquire);
@@ -271,6 +276,12 @@ impl RunnerLifecycle {
             return None;
         }
         Some(publish())
+    }
+
+    fn publish_if_active_stamp<R>(&self, stamp: Option<u64>, publish: impl FnOnce() -> R) -> Option<R> {
+        let (generation, phase) = Self::decode(stamp?);
+        if phase != RunnerLifecycleTransition::Active { return None; }
+        self.publish_if_current(RunnerTransitionToken {generation,phase}, publish)
     }
 
     fn try_begin_releasing(&self) -> Option<RunnerTransitionToken> {
@@ -447,6 +458,7 @@ pub struct AppState {
     /// only ever diffs against its own last read or two, and a miss degrades
     /// gracefully to the full tree.
     pub element_snapshots: Arc<Mutex<ElementSnapshotCache>>,
+    pub action_traces: Arc<Mutex<crate::action_trace::TraceStore>>,
     /// The last snapshot each named owner (`X-Phone-Owner`) was handed. An
     /// observed action that names no baseline diffs against it, so a client
     /// gets only what changed without having to carry the token itself.
@@ -467,6 +479,7 @@ pub struct AppState {
     /// and the element tree are refused and open streams end. Ends with the
     /// hold. See [`AppState::screen_private_secs`].
     pub private_until: Arc<Mutex<Option<Instant>>>,
+    pub privacy_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Who is driving the phone right now (issue #72). A client that names
     /// itself with `X-Phone-Owner` takes this lease on its first control
     /// request and refreshes it on every one; other clients' control requests
@@ -476,6 +489,8 @@ pub struct AppState {
     pub owner: Arc<Mutex<Option<PhoneOwner>>>,
     /// How long an owner's lease outlives its last control request.
     pub owner_lease_secs: u64,
+    /// Ownership incarnation, including release and same-name reacquisition.
+    pub owner_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// How a reconnect brings the managed supervisor up: `(setup_sh, log,
     /// udid) -> started`. Blocking. The daemon uses
     /// [`write_and_bootstrap_runner_agent`]; tests substitute a fake so a
@@ -624,10 +639,26 @@ fn claim_phone_owner(state: &AppState, headers: &HeaderMap) -> Result<bool, Resp
     let claim = owner_claim_from_headers(headers)?;
     let lease = std::time::Duration::from_secs(state.owner_lease_secs);
     let now = Instant::now();
+    let mut traces = recover(state.action_traces.lock());
     let mut slot = recover(state.owner.lock());
     let previous = slot.clone();
     let outcome = arbitrate_owner(&mut slot, claim, now, lease);
+    if outcome.is_ok() {
+        let before = previous.as_ref().filter(|o| now.saturating_duration_since(o.last_seen) < lease).map(|o| &o.name);
+        let after = slot.as_ref().map(|o| &o.name);
+        let access_changed=before != after;
+        if access_changed {
+            state.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            crate::activity::clear_live();
+        }
+        // Removing an already-lapsed slot does not revoke owner-less reads
+        // started after expiry. It still must release that slot's old trace.
+        if access_changed || (previous.is_some() && slot.is_none()) {
+            if let Some(previous) = previous.as_ref() { traces.end_owner(&previous.name); }
+        }
+    }
     drop(slot);
+    drop(traces);
     match outcome {
         Ok(()) => {
             if let (OwnerClaim::Takeover(name), Some(prev)) = (claim, previous.as_ref()) {
@@ -663,17 +694,50 @@ fn claim_phone_owner(state: &AppState, headers: &HeaderMap) -> Result<bool, Resp
     }
 }
 
+/// The owner name the iOS app's remote viewer sends (`DaemonClient.ownerName`).
+const HUMAN_VIEWER_OWNER: &str = "ios-remote";
+
+/// Give up a lease held by the app's remote viewer or its startup launch, and
+/// only those: another agent's lease still wins.
+fn yield_viewer_lease(state: &AppState) {
+    if matches!(owner_status(state).0.as_deref(), Some(HUMAN_VIEWER_OWNER | "iphone-local-startup")) {
+        state.release_owner_lease();
+    }
+}
+
 /// The current owner name and the seconds left on its lease (0 when none).
 fn owner_status(state: &AppState) -> (Option<String>, u64) {
+    let (owner, remaining, _) = owner_status_versioned(state);
+    (owner, remaining)
+}
+
+fn owner_status_versioned(state: &AppState) -> (Option<String>, u64, u64) {
     let lease = std::time::Duration::from_secs(state.owner_lease_secs);
     let now = Instant::now();
-    match recover(state.owner.lock()).as_ref() {
+    let slot = recover(state.owner.lock());
+    let epoch = state.owner_epoch.load(std::sync::atomic::Ordering::Acquire);
+    match slot.as_ref() {
         Some(owner) if now.saturating_duration_since(owner.last_seen) < lease => (
             Some(owner.name.clone()),
             lease_remaining(owner.last_seen, now, lease).as_secs(),
+            epoch,
         ),
-        _ => (None, 0),
+        _ => (None, 0, epoch),
     }
+}
+
+/// Correlates status checkpoints; this is not an atomic file-publication fence.
+fn control_lease_status(state: &AppState, owner: Option<&str>, epoch: u64) -> serde_json::Value {
+    let Some(owner) = owner else { return serde_json::Value::Null; };
+    let scope = ScreenReadScope::capture(state);
+    let Some(instance) = crate::lease_identity::daemon_instance() else { return serde_json::Value::Null; };
+    // Reuse the same owner/privacy/lifecycle checks as protected screen reads.
+    if scope.owner.as_deref() != Some(owner) || scope.epoch != epoch || !scope.current(state) {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({"daemon_instance":instance,"owner":owner,
+        "owner_epoch":scope.epoch.to_string(),"privacy_epoch":scope.privacy_epoch.to_string(),
+        "lifecycle_stamp":scope.lifecycle_stamp.map(|stamp|stamp.to_string()),"private":false})
 }
 
 /// `POST /agent/owner {"release":true}` — give up the lease. Only the current
@@ -744,10 +808,25 @@ async fn agent_owner_inner(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     }
-    *recover(state.owner.lock()) = None;
+    // A lapsed lease still names who held it last: only that session ending
+    // its task may end it after the lapse (its own reads do not renew the
+    // lease). Another client that drove the phone since holds the lease
+    // itself, so its release is the one that counts.
+    let lapsed_own = match claim {
+        OwnerClaim::Named(name) | OwnerClaim::Takeover(name) => {
+            recover(state.owner.lock()).as_ref().is_some_and(|owner| owner.name == name)
+        }
+        OwnerClaim::Anonymous => false,
+    };
+    state.release_owner_lease();
     // While a lease is live the idle watchdog leaves the phone alone; the
     // idle window starts when it is given back, not at the last action.
     state.touch_activity();
+    // The task is over: the watchdog releases the phone now. A session ends
+    // its task even when its own lease already lapsed (a long think).
+    if current.is_some() || lapsed_own {
+        note_task_end();
+    }
     let mut released = serde_json::json!({"ok": true, "owner": null});
     let (apps, followed) = recover(state.flow_trail.lock()).take_learning();
     if let Some(block) =
@@ -772,6 +851,14 @@ pub type ElementSnapshotCache =
     std::collections::VecDeque<(String, Arc<Vec<crate::runner::ElementRow>>)>;
 
 impl AppState {
+    fn release_owner_lease(&self) {
+        let mut traces = recover(self.action_traces.lock());
+        let mut owner = recover(self.owner.lock());
+        if let Some(previous) = owner.take() { traces.end_owner(&previous.name); }
+        self.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        crate::activity::clear_live();
+    }
+
     /// Stamp "remote driving happened just now" for the idle-release watchdog.
     /// Called by every `/agent` action and live-view request (NOT `/agent/status`,
     /// which the web client polls constantly — counting it would pin the phone
@@ -973,7 +1060,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/logout", get(logout))
         .route("/pair", get(pair_page).post(pair_submit))
         .route("/schedules", get(crate::schedules::page));
-    let api = api_routes().layer(axum::middleware::from_fn(crate::timing::layer));
+    let api = api_routes()
+        .layer(axum::middleware::from_fn(crate::timing::layer))
+        .layer(axum::middleware::from_fn(privacy_read_body_layer));
     let base = state.base_path.clone();
     let app = if base.is_empty() {
         pages.merge(api)
@@ -1025,7 +1114,9 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/agent/h264", get(agent_h264))
         .route("/agent/h264/keyframe", post(agent_h264_keyframe))
         .route("/agent/elements", get(agent_elements))
+        .route("/agent/subtree", post(agent_subtree))
         .route("/agent/activity", get(agent_activity))
+        .route("/agent/value", post(agent_value))
         .route("/agent/collect", post(agent_collect))
         .route("/agent/scroll_find", post(agent_scroll_find))
         .route("/agent/flow/draft", get(agent_flow_draft))
@@ -1049,7 +1140,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         // existing `/agent/inbox`; the registry file — not the phone — is the
         // capability list.
         .route("/agent/apps", get(agent_apps))
-        .route("/agent/home-layout", get(agent_home_layout))
+        .route("/agent/home-layout", get(agent_home_layout).post(agent_home_layout_write))
         .route("/agent/intents", get(agent_intents))
         .route("/agent/intent", post(agent_intent))
         .route("/agent/hold", post(agent_hold))
@@ -1062,6 +1153,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/agent/capabilities", get(agent_capabilities))
         .route("/agent/metrics", get(agent_metrics))
         .route("/agent/run", post(agent_run))
+        .route("/agent/trace", get(agent_trace))
         // Device diagnostics over lockdown (`syslog`, `crash`, `location`),
         // screen recording (`recording`) and per-app notes (`flows`).
         .route("/agent/logs", get(agent_logs_get).post(agent_logs_post))
@@ -1817,7 +1909,14 @@ async fn pair_submit(
                 serde_json::json!({"ok": false, "error": "device_token_invalid", "hint": "the pairing expired or the control password changed; scan a new QR code"}),
             );
         }
-        None
+        // Sliding: every renewal hands back a fresh token, so a phone that
+        // connects at least once per token lifetime stays paired for good
+        // (remote control is often needed when nobody can reach the phone).
+        Some(core::auth::make_token(
+            &device_key(&state),
+            crate::pairing::DEVICE_TOKEN_TTL_SECS,
+            now_secs(),
+        ))
     } else {
         return pair_json(
             StatusCode::BAD_REQUEST,
@@ -2717,6 +2816,10 @@ async fn agent_status(
     let human_handoff = released && human_handoff_active();
     let ended_on_phone =
         ended_on_phone(released, human_handoff, &crate::instance::current().state_dir);
+    let runner_parked = crate::phone_exit::parked(&crate::instance::current().state_dir);
+    let runner_parked_reason_json = serde_json::to_string(
+        &crate::phone_exit::reason(&crate::instance::current().state_dir).map(|reason| reason.as_str())
+    ).unwrap_or_else(|_| "null".into());
     // L2 health — action-level, not just /status (which lies: it reports
     // `ready` even when every UI action fails Code=41 because the phone is
     // locked or the test session was severed). `runner` stays "runner reachable"
@@ -2838,6 +2941,18 @@ async fn agent_status(
         || setup_in_flight(&crate::instance::current().state_dir),
     );
     let reconnecting = reconnecting || setup_working.is_some();
+    // The KeepAlive supervisor's next automatic attempt after a failed setup
+    // round (#403): a blocker it is about to retry may clear without anyone
+    // touching the phone, so a waiting caller must not treat it as final.
+    let setup_retry = if state.managed_runner && !runner_actionable && !releasing {
+        setup_retry_json(
+            &crate::instance::current().state_dir,
+            setup_status.as_ref().map(|status| status.phase.as_str()),
+            crate::setup::retry::now(),
+        )
+    } else {
+        serde_json::Value::Null
+    };
     // Death attribution (#26 §2). Only meaningful while runner is actually down;
     // a stale cause next to a healthy runner would read as a live problem.
     let death = *recover(state.runner_death.lock());
@@ -2870,7 +2985,7 @@ async fn agent_status(
         ("releasing", "direct device service is being released after inactivity — wait for confirmation before reconnecting")
     } else if !runner {
         if state.managed_runner_pending {
-            ("unconfigured", "no canonical iPhone target is configured — run iphone-use setup to persist IPHONE_USE_UDID; until then the daemon will not stop or start the local device runner")
+            ("unconfigured", "no canonical iPhone target is configured — inspect paired devices with xcrun devicectl list devices and run iphone-use doctor on this Mac; ask which phone if ambiguous, then use IPU_RUNNER_UDID=<UDID> iphone-use setup for the confirmed target; phone_instances lists installed instances, not paired phones; do not reconnect an unconfigured target")
         } else if let Some(blocker_hint) = setup_hint.as_deref() {
             ("blocker", blocker_hint)
         } else if let Some(advice) = setup_working {
@@ -2883,6 +2998,8 @@ async fn agent_status(
             ("handoff", "the phone was handed to a person (mode=human) and the device runner is stopped so they can use it in hand — POST /agent/mode {mode:agent} takes it back")
         } else if ended_on_phone {
             ("ended_on_phone", "the session was ended on the iPhone (both volume keys) and nothing restarts the device runner on its own — ask the person before taking it back; the next action or reconnect starts it again")
+        } else if released && runner_parked {
+            ("session_parked", "the XCTest session ended with uncertain intent; the runner stays parked until a new explicit agent or web request")
         } else if released {
             ("released", "direct device service was released after inactivity — reconnect to restart the device runner, then keep the phone unlocked and awake")
         } else if !state.managed_runner {
@@ -2928,6 +3045,13 @@ async fn agent_status(
     // Hints name commands and ports for the default instance; a second
     // phone has its own relay ports and needs `--instance NAME`.
     let hint = hint_for_this_daemon(hint, crate::instance::current(), &relay_ports_label());
+    let hint = match setup_retry.get("next_in_secs").and_then(serde_json::Value::as_u64) {
+        Some(secs) if advice == "blocker" => format!(
+            "{hint} — the supervisor retries on its own in {secs}s (attempt {}); wait for that retry before asking a person to act",
+            setup_retry["attempt"]
+        ),
+        _ => hint.to_string(),
+    };
     let self_runner = if !state.managed_runner && !state.managed_runner_pending && !drivable {
         match &state.selfrunner_gateway {
             Some(gateway) => Some(gateway.status().await),
@@ -2945,6 +3069,7 @@ async fn agent_status(
         .map(|value| format!(",\"self_runner\":{value}"))
         .unwrap_or_default();
     let hint_json = serde_json::to_string(&hint).unwrap_or_else(|_| "\"\"".into());
+    let recovery = setup_recovery(advice, &setup_blocked_on);
     let next_step_json = guidance
         .or_else(|| human_next_step(advice, &setup_blocked_on, runner_died_reason))
         .map(|(zh, en)| {
@@ -3047,15 +3172,14 @@ async fn agent_status(
     let agent_focus = recover(state.agent_focus.lock()).status_json();
     // The daemon inside the runner on the phone, as its last /status said.
     let phone_daemon = crate::phone_daemon::status_json(runner);
+    let (status_owner, status_owner_remaining, status_owner_epoch) = owner_status_versioned(&state);
+    let control_lease_json = control_lease_status(&state, status_owner.as_deref(), status_owner_epoch).to_string();
     let body = format!(
-        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"ended_on_phone":{ended_on_phone},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}{self_runner_field}}}"#,
+        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"control_lease":{control_lease_json},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"ended_on_phone":{ended_on_phone},"runner_parked":{runner_parked},"runner_parked_reason":{runner_parked_reason_json},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"recovery":{recovery},"setup_blocked_on":"{setup_blocked_on}","setup_retry":{setup_retry},"setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}{self_runner_field}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&status_udid).unwrap_or_else(|_| "null".into()),
-        {
-            let (owner, _) = owner_status(&state);
-            serde_json::to_string(&owner).unwrap_or_else(|_| "null".into())
-        },
-        owner_status(&state).1,
+        serde_json::to_string(&status_owner).unwrap_or_else(|_| "null".into()),
+        status_owner_remaining,
         status_udid.is_some(),
         state.managed_runner,
         state.managed_runner_pending,
@@ -3463,6 +3587,28 @@ fn setup_working_advice(phase: &str, message: &str) -> Option<(&'static str, &'s
     })
 }
 
+fn setup_recovery(advice: &str, blocked_on: &str) -> serde_json::Value {
+    match (advice, blocked_on) {
+        ("unconfigured", _) => serde_json::json!({
+            "cause": "target_unconfigured", "actor": "agent",
+            "action": "discover_devices_then_doctor",
+            "discovery_command": "xcrun devicectl list devices",
+            "doctor_command": for_instance("iphone-use doctor", crate::instance::current()),
+            "setup_command": for_instance("IPU_RUNNER_UDID=<UDID> iphone-use setup", crate::instance::current()),
+            "requires_unambiguous_target": true, "requires_task_authorization": true,
+            "pause_screen_reads": true, "verify": "phone_status.drivable=true"
+        }),
+        ("blocker", "trust" | "needs_passcode_on_phone" | "locked_after_restart" | "automation_mode_disabled") => serde_json::json!({
+            "cause": blocked_on, "actor": "person_on_phone",
+            "action": "follow_next_step_then_check_status",
+            "pause_screen_reads": true, "disclose_passcode": false,
+            "retry_reconnect": false, "verify": "phone_status.drivable=true",
+            "prompt_detection": "not_confirmed"
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn human_next_step(
     advice: &str,
     blocked_on: &str,
@@ -3491,8 +3637,8 @@ fn human_next_step(
         ),
         "releasing" => ("正在释放设备，请稍候", "Releasing the phone — one moment"),
         "unconfigured" => (
-            "连接、解锁并信任 iPhone，然后在这台 Mac 上运行 iphone-use setup",
-            "Connect, unlock and trust the iPhone, then run iphone-use setup on this Mac",
+            "尚未选择目标手机。请告诉代理要使用哪台 iPhone，并把它连接到这台 Mac、解锁；如果有「信任此电脑」提示，请在手机上确认。",
+            "No target phone is selected. Tell the agent which iPhone to use, connect it to this Mac and unlock it; confirm Trust This Computer on the phone if prompted.",
         ),
         "blocker" => match blocked_on {
             "warp" => (
@@ -3512,8 +3658,8 @@ fn human_next_step(
                 "Plug this iPhone in over USB (or keep it on this Mac's Wi-Fi; with IPU_RUNNER_TRANSPORT=usb only the cable works), unlock it and keep it awake — connecting resumes on its own",
             ),
             "trust" => (
-                "在 iPhone 上解锁并点「信任」，保持亮屏，连接会自动恢复",
-                "Unlock the iPhone and tap Trust, keep it awake — connecting resumes on its own",
+                "若 iPhone 显示「信任此电脑」，请在手机上解锁并确认；若提示 Apple Development 开发者证书未信任，请打开 设置 › 通用 › VPN 与设备管理，选择对应证书并信任。两者是不同步骤。没有对应证书或提示时，请把当前情况告诉代理。之后仍可能出现密码或 UI 自动化授权，请只在手机上处理，不要透露密码，完成后告诉代理继续。",
+                "If the iPhone shows Trust This Computer, unlock it and confirm on the phone. For an untrusted Apple Development certificate, open Settings > General > VPN & Device Management and trust the matching certificate. These are separate steps. If no certificate or prompt appears, tell the agent. A passcode/UI automation prompt may appear later: handle it only on the phone, never disclose the passcode, and tell the agent when finished.",
             ),
             "ddi" => (
                 "手机保持连接，打开 Xcode 等设备准备完成，连接会自动恢复",
@@ -3528,8 +3674,8 @@ fn human_next_step(
                 "This iPhone restarted and has not been unlocked since: someone needs to enter the passcode on the phone once, then it connects on its own.",
             ),
             "needs_passcode_on_phone" => (
-                "连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。",
-                "Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt if one appears; if already authorized, inspect the CoreDevice connection and runner log.",
+                "连接记录提示可能需要手机授权。若出现密码或允许提示，请只在手机上处理，不要透露密码，完成后告诉代理继续；若没有提示或已处理，请告诉代理检查连接。",
+                "Setup recorded a possible on-phone authorization requirement. Handle a passcode or Allow prompt only on the phone if one appears; never disclose the passcode. Tell the agent when finished; if already authorized or no prompt appears, ask the agent to check the connection.",
             ),
             "automation_mode_disabled" => (
                 "自动化模式未就绪。请检查 设置 › 开发者 › 启用 UI 自动化，并处理实际出现的授权提示；若已启用并授权，检查连接和日志。",
@@ -3584,6 +3730,10 @@ fn human_next_step(
         "ended_on_phone" => (
             "已在手机上退出，这台 Mac 不会自动重连；需要远程操作时点「连接手机」",
             "Ended on the phone; this Mac will not reconnect on its own — choose Connect to control it again",
+        ),
+        "session_parked" => (
+            "测试会话已结束，控制保持停驻；需要远程操作时点「连接手机」",
+            "The test session ended and remains parked; choose Connect when remote control is needed",
         ),
         "released" => (
             "一段时间没人操作，连接已暂停；点「连接手机」继续（手机需解锁亮屏）",
@@ -3698,7 +3848,7 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the configured iPhone is not available over USB or its encrypted CoreDevice Wi-Fi tunnel — connect that phone, or (unless IPU_RUNNER_TRANSPORT=usb, which allows only the cable; setup_message says when) keep it unlocked on this Mac's network; keep it awake while the managed service retries",
         ),
         "trust" => Some(
-            "the configured iPhone needs trust or developer-signing approval — unlock the phone, accept the prompt, then keep it awake while the managed service retries",
+            "trust can mean computer pairing or developer-certificate approval. For a Trust This Computer prompt, have the person unlock and confirm on the iPhone. If setup_message reports an untrusted Apple Development certificate, use iPhone Settings > General > VPN & Device Management for the matching certificate. If no certificate or prompt appears, run iphone-use doctor and inspect runner logs. A separate passcode/UI automation prompt may appear later: never request the passcode, pause screenshots and screen reads during entry, then check phone_status. Do not loop reconnect.",
         ),
         "ddi" => Some(
             "the iPhone Developer Disk Image is unavailable — open Xcode with the phone connected, let device preparation finish, then poll status",
@@ -3710,7 +3860,7 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
             "the configured iPhone is on USB but usbmuxd does not list it: it restarted and has not been unlocked since (Before First Unlock), and iOS keeps it off usbmuxd until its passcode is entered once — this is not an Xcode problem; have a person enter the passcode on the phone, and the managed service connects on its own after that, so do not send another reconnect request",
         ),
         "needs_passcode_on_phone" => Some(
-            "Setup recorded a possible on-phone authorization requirement. If a passcode or Allow prompt appears, handle it on the unlocked phone. If already authorized, inspect the CoreDevice connection and runner log; this historical blocker does not prove that a prompt was ignored. keep_runner_alive avoids unnecessary relaunches; do not send another reconnect request",
+            "Setup recorded a possible on-phone authorization requirement. If a passcode or Allow prompt appears, handle it on the unlocked phone. If already authorized, inspect the CoreDevice connection and runner log; this historical blocker does not prove that a prompt was ignored. Never ask for the passcode; pause screenshots and screen reads during entry, then check phone_status. keep_runner_alive avoids unnecessary relaunches; do not send another reconnect request",
         ),
         "automation_mode_disabled" => Some(
             "The device runner did not become ready for UI automation. On the unlocked iPhone, check Settings › Developer › Enable UI Automation and handle a passcode or Allow automation prompt if one appears; if already enabled and authorized, inspect the CoreDevice connection and runner log; the managed service retries on its own backoff, so do not send another reconnect request",
@@ -3822,7 +3972,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<RunnerSetupStatus> {
 /// "go look".
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunnerBuild {
-    /// `ready` | `building` | `failed` | `stalled` | `unknown`.
+    /// `ready` | `building` | `failed` | `stalled` | `parked` | `stopped` | `unknown`.
     state: &'static str,
     /// The helper's own phase string, verbatim (`building`, `ddi-wait`, …).
     phase: String,
@@ -3882,6 +4032,10 @@ fn classify_build_state(phase: &str, age_secs: u64) -> &'static str {
     }
     if phase == "parked" {
         return "parked";
+    }
+    // A deliberately stopped helper is terminal, even after its status ages.
+    if phase == "stopped" {
+        return "stopped";
     }
     if phase.ends_with("-fail") {
         return "failed";
@@ -4186,6 +4340,28 @@ fn setup_owner_alive(pid: u32, owner_start: &str) -> bool {
 /// Kept in one place because the daemon must clear exactly this file — and
 /// nothing else — when a caller explicitly asks for the phone.
 const RUNNER_RETRY_STATE_FILE: &str = "runner-retry-state.v1";
+
+/// How long after its scheduled time a retry still counts as pending: the
+/// supervisor relaunches through launchd and checks the phone before it
+/// rewrites the setup status.
+const SETUP_RETRY_GRACE_SECS: u64 = 30;
+
+/// `{kind, attempt, next_in_secs}` while a failed setup round has an automatic
+/// retry scheduled, else null. Only a finished, failed round counts: while a
+/// round runs, `reconnecting` already says the daemon is working.
+fn setup_retry_json(state_dir: &std::path::Path, phase: Option<&str>, now: u64) -> serde_json::Value {
+    if state_dir.as_os_str().is_empty() || !phase.is_some_and(|phase| phase.ends_with("-fail") || phase == "waiting" || phase == "lock-backoff") {
+        return serde_json::Value::Null;
+    }
+    match crate::setup::retry::read(&state_dir.join(RUNNER_RETRY_STATE_FILE)) {
+        Ok(Some(retry)) if retry.next_at.saturating_add(SETUP_RETRY_GRACE_SECS) >= now => serde_json::json!({
+            "kind": retry.kind.name(),
+            "attempt": retry.attempt,
+            "next_in_secs": retry.next_at.saturating_sub(now),
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
 
 /// Drop the supervisor's persisted retry backoff.
 ///
@@ -4631,6 +4807,63 @@ fn prepare_idle_runner_probe(state: &AppState) -> bool {
 /// bounce (which must not reset the idle clock). See issue #66.
 const COLD_START_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// When a session last gave its lease back (`POST /agent/owner {release}`):
+/// the task ended, so the watchdog releases the phone right away instead of
+/// waiting out the idle window.
+static TASK_ENDED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+/// Wakes the watchdog when a task ends, so the release does not wait a poll.
+static TASK_END_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// `IPHONE_USE_TASK_END_RELEASE=0` keeps the old behaviour: a task end only
+/// gives the lease back and the phone is released by the idle window.
+fn task_end_release_enabled() -> bool {
+    std::env::var("IPHONE_USE_TASK_END_RELEASE").map_or(true, |v| v.trim() != "0")
+}
+
+fn note_task_end() {
+    *recover(TASK_ENDED_AT.lock()) = Some(Instant::now());
+    TASK_END_WAKE.notify_one();
+}
+
+fn clear_task_end() {
+    *recover(TASK_ENDED_AT.lock()) = None;
+}
+
+/// Whether the last task is over and nobody has driven the phone since: its
+/// session gave the lease back, or its lease lapsed (a session that never
+/// released it). Releasing then is what the person asked for — the phone
+/// leaves automation mode after each task — and it overrides
+/// [`crate::keep_runner`]: on a passcode phone the next task's reconnect waits
+/// for the passcode instead of the runner staying up between tasks.
+fn task_ended(
+    ended_at: Option<Instant>,
+    last_activity: Instant,
+    owner_seen: Option<Instant>,
+    lease: std::time::Duration,
+) -> bool {
+    let released = ended_at.is_some_and(|ended| last_activity <= ended);
+    // Only while nobody drove the phone after the owner's last request: a
+    // person reconnecting from the panel later is not that task.
+    let lapsed = owner_seen.is_some_and(|seen| {
+        seen.elapsed() >= lease && last_activity <= seen + std::time::Duration::from_secs(1)
+    });
+    released || lapsed
+}
+
+impl AppState {
+    fn task_ended(&self) -> bool {
+        // A recording outlives the requests that started it: releasing the
+        // runner under it would cut the video short without saying so.
+        if !task_end_release_enabled() || crate::recording::Recorder::global().is_recording() {
+            return false;
+        }
+        let ended_at = *recover(TASK_ENDED_AT.lock());
+        let last_activity = *recover(self.last_activity.lock());
+        let owner_seen = recover(self.owner.lock()).as_ref().map(|owner| owner.last_seen);
+        task_ended(ended_at, last_activity, owner_seen, std::time::Duration::from_secs(self.owner_lease_secs))
+    }
+}
+
 /// Idle window before the watchdog releases the phone when
 /// `IPHONE_USE_IDLE_RELEASE_SECS` is unset. Five minutes: while a runner is
 /// up iOS shows its "Automation Running" overlay, so an idle phone should not
@@ -4748,11 +4981,18 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
         let mut release_failures: u32 = 0;
         let mut kept_runner: Option<crate::keep_runner::Because> = None;
         loop {
-            tokio::time::sleep(POLL).await;
-            window = effective_idle_window(base_window);
+            tokio::select! {
+                _ = tokio::time::sleep(POLL) => {}
+                _ = TASK_END_WAKE.notified() => {}
+            }
             if state.released.load(Ordering::Relaxed) {
+                clear_task_end();
                 continue; // already let go — reconnect is on-demand (agent_input)
             }
+            // A finished task releases at once and past the keep-runner
+            // exception; anything else waits out the idle window.
+            let task_end = state.task_ended();
+            window = if task_end { std::time::Duration::ZERO } else { effective_idle_window(base_window) };
             if state.runner_lifecycle.is_transitioning() {
                 continue;
             }
@@ -4819,9 +5059,10 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 // A passcode phone is NOT kept here: its runner is down, and
                 // stopping the supervisor stops the relaunches that would each
                 // ask for the passcode (see `crate::keep_runner`).
-                if keep_runner_reason(&state)
-                    .await
-                    .is_some_and(crate::keep_runner::Because::keeps_down_runner)
+                if !task_end
+                    && keep_runner_reason(&state)
+                        .await
+                        .is_some_and(crate::keep_runner::Because::keeps_down_runner)
                 {
                     continue;
                 }
@@ -4856,8 +5097,9 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                     state.released.store(true, Ordering::Release);
                     recover(state.flow_trail.lock()).reset();
-                    *recover(state.owner.lock()) = None;
+                    state.release_owner_lease();
                     note_idle_release();
+                    clear_task_end();
                     release_backoff_until = None;
                     release_failures = 0;
                     tracing::info!("phone released: supervisor stopped while runner was already down");
@@ -4888,10 +5130,13 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     .map(|since| since.elapsed() >= COLD_START_AFTER)
                     .unwrap_or(true);
                 down_since = None;
-                if cold_start {
-                    state.touch_activity();
+                // A task that just ended is not a cold start to protect.
+                if !task_end {
+                    if cold_start {
+                        state.touch_activity();
+                    }
+                    continue;
                 }
-                continue;
             }
             down_since = None;
             if state.viewer_busy() {
@@ -4919,7 +5164,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
             if release_backoff_until.is_some_and(|until| std::time::Instant::now() < until) {
                 continue; // a recent stop did not take; wait out the backoff
             }
-            if let Some(because) = keep_runner_reason(&state).await {
+            if let Some(because) = if task_end { None } else { keep_runner_reason(&state).await } {
                 if kept_runner != Some(because) {
                     kept_runner = Some(because);
                     match because {
@@ -4947,10 +5192,14 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 state.runner_lifecycle.finish_releasing(release_token);
                 continue;
             }
-            tracing::info!(
-                "idle {}s with no viewer — releasing the phone (stopping runner)",
-                state.idle_for().as_secs()
-            );
+            if task_end {
+                tracing::info!("task ended — releasing the phone (stopping runner)");
+            } else {
+                tracing::info!(
+                    "idle {}s with no viewer — releasing the phone (stopping runner)",
+                    state.idle_for().as_secs()
+                );
+            }
             // While runner is still up: give Do Not Disturb back first.
             release_agent_focus(&state).await;
             let script = setup_sh.clone();
@@ -4970,8 +5219,9 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 note_idle_release();
+                clear_task_end();
                 was_up = false;
                 release_backoff_until = None;
                 release_failures = 0;
@@ -5303,7 +5553,7 @@ fn persist_human_handoff(active: bool) -> std::io::Result<()> {
 /// Status `ended_on_phone`: released after an end on the phone, and not
 /// handed over (a hand-off says more).
 fn ended_on_phone(released: bool, human_handoff: bool, state_dir: &std::path::Path) -> bool {
-    released && !human_handoff && crate::phone_exit::parked(state_dir)
+    released && !human_handoff && crate::phone_exit::reason(state_dir) == Some(crate::phone_exit::Reason::Exited)
 }
 
 /// Follow the phone's end-of-session markers (see [`crate::phone_exit`]):
@@ -5341,7 +5591,7 @@ fn spawn_phone_exit_watch(state: Arc<AppState>) {
                 *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 tracing::info!("the session was ended on the iPhone; phone released until the next request");
             }
             state.runner_lifecycle.finish_releasing(release_token);
@@ -5643,6 +5893,8 @@ async fn agent_metrics(
 struct AgentActivityQuery {
     since: Option<u64>,
     limit: Option<usize>,
+    #[serde(default)]
+    live: bool,
 }
 
 /// `GET /agent/activity?since=<seq>&limit=<n>` — what the agent did, in plain
@@ -5666,8 +5918,17 @@ async fn agent_activity(
         }
         AgentAuth::Ok => {}
     }
+    if let Some(refusal)=screen_private_refusal(&state) { return refusal; }
+    let scope=ScreenReadScope::capture(&state);
     let limit = query.limit.unwrap_or(20).min(crate::activity::CAPACITY);
     let mut body = crate::activity::recent(query.since.unwrap_or(0), limit);
+    if query.live && scope.current(&state) {
+        if let (Some(owner),Some(stamp))=(scope.owner.as_deref(),scope.lifecycle_stamp) {
+            if let Some(target)=crate::activity::live_target(query.since.unwrap_or(0),owner,crate::activity::LiveScope {
+                owner_epoch:scope.epoch,privacy_epoch:scope.privacy_epoch,lifecycle_stamp:stamp,
+            }) {body["live_target"]=target;}
+        }
+    }
     if let Some(budget) = crate::guard::budget_status(
         crate::guard::Policy::get(),
         &guard_owner(&headers),
@@ -5675,7 +5936,13 @@ async fn agent_activity(
     ) {
         body["budget"] = budget;
     }
-    json_response(StatusCode::OK, body)
+    let mut response=json_response(StatusCode::OK,body);
+    response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));
+    if query.live {
+        response.extensions_mut().insert(ValueReadFence {state:state.clone(),scope:scope.clone(),max_bytes:ADVICE_MAX_BODY,
+            failure:serde_json::json!({"ok":false,"error":"activity_scope_changed"})});
+    }
+    finish_private_read(&state,scope.privacy_epoch,response)
 }
 
 /// `POST /agent/run` — mark a run boundary for the caller (`X-Phone-Owner`):
@@ -5715,16 +5982,32 @@ async fn agent_run(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
     if !crate::metrics::valid_id(&owner) || !crate::metrics::valid_id(run_id) {
         return invalid("owner and run_id: 1–64 characters of A-Z a-z 0-9 . _ : @ -");
     }
-    // A run boundary: the no_progress tracker and the action budget start over.
-    crate::advice::reset(&owner);
-    crate::guard::reset(&owner);
     match value.get("action").and_then(serde_json::Value::as_str) {
         Some("start") => {
             let complete = value.get("complete_trace") == Some(&serde_json::Value::Bool(true));
-            if !crate::metrics::start_run(Some(owner), run_id.to_string(), complete) {
+            let trace = match value.get("trace") {
+                None => false,
+                Some(serde_json::Value::Bool(trace)) => *trace,
+                Some(_) => return invalid("trace must be boolean"),
+            };
+            let previous_trace = recover(state.action_traces.lock()).active_handle(&owner);
+            if trace && !recover(state.action_traces.lock()).start(&owner, run_id) {
+                return invalid("another trace is active or trace capacity is full; end the previous run first");
+            }
+            if !crate::metrics::start_run(Some(owner.clone()), run_id.to_string(), complete) {
                 return invalid("the run could not be started");
             }
-            json_response(StatusCode::OK, serde_json::json!({"ok": true}))
+            if !trace {
+                if let Some(previous) = previous_trace.as_ref().filter(|previous| previous.run_id != run_id) {
+                    recover(state.action_traces.lock()).end(&owner, &previous.run_id);
+                }
+            }
+            if previous_trace.as_ref().is_none_or(|previous| previous.run_id != run_id) {
+                crate::advice::reset(&owner);
+                crate::guard::reset(&owner);
+            }
+            let trace_enabled = recover(state.action_traces.lock()).active_handle(&owner).is_some_and(|handle| handle.run_id == run_id);
+            json_response(StatusCode::OK, serde_json::json!({"ok": true,"trace_enabled":trace_enabled}))
         }
         Some("end") => {
             let turns = value.get("turn_ids").and_then(|ids| {
@@ -5734,11 +6017,12 @@ async fn agent_run(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
                         .collect::<Vec<_>>()
                 })
             });
-            match crate::metrics::end_run(Some(owner), run_id.to_string(), turns) {
-                Some(summary) => json_response(
-                    StatusCode::OK,
-                    serde_json::json!({"ok": true, "run": summary}),
-                ),
+            // Trace storage has its own bound; metrics may have expired first.
+            recover(state.action_traces.lock()).end(&owner, run_id);
+            match crate::metrics::end_run(Some(owner.clone()), run_id.to_string(), turns) {
+                Some(summary) => {
+                    json_response(StatusCode::OK, serde_json::json!({"ok": true, "run": summary}))
+                },
                 None => json_response(
                     StatusCode::NOT_FOUND,
                     serde_json::json!({"ok": false, "error": "no_such_run"}),
@@ -5747,6 +6031,118 @@ async fn agent_run(State(state): State<Arc<AppState>>, headers: HeaderMap, body:
         }
         _ => invalid("action must be start or end"),
     }
+}
+
+#[derive(Deserialize)]
+struct TraceQuery { run_id: String, format: Option<String> }
+
+async fn agent_trace(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(query): Query<TraceQuery>) -> Response {
+    if !matches!(agent_auth(&state, &headers), AgentAuth::Ok) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(owner) = named_owner(&headers) else { return StatusCode::BAD_REQUEST.into_response(); };
+    if let Some(refusal) = screen_private_refusal(&state) { return refusal; }
+    if query.format.as_deref().is_some_and(|format| !matches!(format, "json" | "jsonl")) {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok":false,"error":"invalid_trace_format"}));
+    }
+    let traces = recover(state.action_traces.lock());
+    if query.format.as_deref() == Some("jsonl") {
+        return match traces.export_jsonl(owner, &query.run_id) {
+            Some(body) => with_security_headers(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    match traces.export(owner, &query.run_id) {
+        Some(trace) => json_response(StatusCode::OK, serde_json::json!({"ok":true,"trace":trace})),
+        None => json_response(StatusCode::NOT_FOUND, serde_json::json!({"ok":false,"error":"trace_not_found"})),
+    }
+}
+
+/// Bind a request to the trace that was active when it entered the handler.
+fn action_trace_handle(state: &AppState, headers: &HeaderMap) -> Option<crate::action_trace::TraceHandle> {
+    let owner = named_owner(headers)?;
+    let handle = recover(state.action_traces.lock()).active_handle(owner)?;
+    if headers.get("x-agent-run").and_then(|header| header.to_str().ok()).is_some_and(|run| run != handle.run_id) {
+        return None;
+    }
+    Some(handle)
+}
+
+fn record_action_trace(
+    state: &AppState, headers: &HeaderMap, action: &serde_json::Value,
+    handle: Option<&crate::action_trace::TraceHandle>, generation: u64,
+    observation_scope: Option<&ScreenReadScope>, result: &serde_json::Value,
+) {
+    let Some(handle) = handle else { return; };
+    let Some(owner) = trusted_bearer_owner(state, headers) else { return; };
+    let mut traces = recover(state.action_traces.lock());
+    // Keep the owner and private-hold locks until the metadata append finishes,
+    // so entering private mode while this request waits cannot race the append.
+    let owner_lease = recover(state.owner.lock());
+    let private_until = recover(state.private_until.lock());
+    let now = Instant::now();
+    let current_owner = owner_lease.as_ref()
+        .filter(|lease| now.saturating_duration_since(lease.last_seen) < std::time::Duration::from_secs(state.owner_lease_secs))
+        .map(|lease| lease.name.as_str());
+    // Install/uninstall ACKs may have no runner delivery receipt. Unless a
+    // refusal proves otherwise, unknown delivery still needs the current owner.
+    let dispatched = result["error"] != "phone_owned"
+        && result.pointer("/action_evidence/delivery/status").and_then(serde_json::Value::as_str) != Some("not_sent");
+    let private = (dispatched && current_owner != Some(owner.as_str()))
+        || private_until.is_some_and(|until| until > now)
+        || generation != state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire)
+        || observation_scope.is_some_and(|scope| {
+            scope.epoch != state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+                || scope.owner.as_deref() != current_owner
+                || scope.privacy_epoch != generation
+                || state.released.load(std::sync::atomic::Ordering::Acquire)
+                || scope.lifecycle_stamp.is_none()
+                || scope.lifecycle_stamp != state.runner_lifecycle.active_stamp()
+        });
+    if let Some(steps) = action.get("steps").and_then(serde_json::Value::as_array) {
+        let receipts = result.get("steps").and_then(serde_json::Value::as_array);
+        if let Some(receipts) = receipts {
+            for receipt in receipts {
+                if let Some(step) = receipt.get("index").and_then(serde_json::Value::as_u64).and_then(|i| steps.get(i as usize)) {
+                    traces.record_for(&owner, handle, step.get("action").unwrap_or(step), receipt, crate::metrics::now_ms(), private);
+                }
+            }
+        }
+        if let Some(failed) = result.get("failed_step").and_then(serde_json::Value::as_u64) {
+            if !receipts.is_some_and(|receipts| receipts.iter().any(|receipt| receipt["index"].as_u64() == Some(failed))) {
+                if let Some(step) = steps.get(failed as usize) {
+                    traces.record_for(&owner, handle, step.get("action").unwrap_or(step), result, crate::metrics::now_ms(), private);
+                }
+            }
+        }
+        if result["ok"] != true {
+            traces.record_for(&owner, handle, &serde_json::json!({"type":"batch"}), result, crate::metrics::now_ms(), private);
+        }
+    } else {
+        traces.record_for(&owner, handle, action, result, crate::metrics::now_ms(), private);
+    }
+}
+
+/// Enrich the final receipt, preserving outer publication fences. Trace data
+/// is whitelisted metadata bound to both the original run and request scope.
+async fn action_receipt(
+    state: &AppState, headers: &HeaderMap, action: &serde_json::Value, generation: u64,
+    handle: Option<crate::action_trace::TraceHandle>, response: Response,
+) -> Response {
+    let observation_scope = response.extensions().get::<ActionRequestScope>().map(|scope| scope.0.clone())
+        .or_else(|| response.extensions().get::<ActionObservationFence>().map(|fence| fence.scope.clone()))
+        .or_else(|| response.extensions().get::<BatchPrivacyFence>().map(|fence| fence.scope.clone()));
+    let (response, json) = read_json_response(response).await;
+    let Some(mut json) = json.filter(serde_json::Value::is_object) else {
+        record_action_trace(state, headers, action, handle.as_ref(), generation, observation_scope.as_ref(),
+            &serde_json::json!({"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false}));
+        return response;
+    };
+    crate::action_feedback::enrich(&mut json);
+    record_action_trace(state, headers, action, handle.as_ref(), generation, observation_scope.as_ref(), &json);
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(json.to_string()))
 }
 
 async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -5800,7 +6196,13 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
             // device: an unlisted name is refused without reaching the phone.
             "perform_actions": perform,
             "element_tree": true,
-            "home_layout": {"source":"springboardservices","read_only":true,
+            "element_subtree": {"requires_runner_capability":"ipu:elementSubtree", "action_refs":false},
+            "element_evidence": {"requires_runner_capability":"ipu:elementEvidence"},
+            "action_evidence": true,
+            "structured_action_recovery": true,
+            "action_trace": {"opt_in":true,"storage":"bounded_memory","screenshots":false},
+            "wait_absent_after_present": true,
+            "home_layout": {"source":"springboardservices","read_only":false,"write_actions":["backup","preview","apply","restore"],"write_needs_confirm":true,
                 "physical_only":true,"target_required":true,"positions":"derived_from_icon_state_order"},
             "drag_path": {
                 "requires_runner_capability": "ipu:timedDragPath",
@@ -6303,7 +6705,7 @@ async fn agent_mode_inner(
                 state
                     .released
                     .store(true, std::sync::atomic::Ordering::Release);
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 if let Err(error) = persist_human_handoff(true) {
                     tracing::error!(%error, "phone stopped but human handoff could not be persisted");
                     persisted = false;
@@ -6699,6 +7101,11 @@ enum RunnerControlOutcome {
     /// (issue #257: a scroll point outside the runner's screen). Its reason
     /// is in the `runner_error` detail.
     RunnerRejected,
+    /// Terminate was acknowledged; launch was not applied (scope or explicit refusal).
+    AppLaunchInterrupted,
+    /// Authorization stopped a compound action before its next transport request.
+    /// Earlier requests may have acted; this is not a Runner health failure.
+    ScopeInterrupted,
     Failed,
 }
 
@@ -6907,7 +7314,19 @@ fn diff_element_rows(
     baseline: &[crate::runner::ElementRow],
     current: &[crate::runner::ElementRow],
 ) -> ElementRowsDelta {
-    core::control::diff_rows(baseline, current, |row| {
+    // Deltas follow the compact wire view, like snapshot hashes. Known true
+    // remains available internally to selectors but is absent from that view.
+    let sparse = |rows: &[crate::runner::ElementRow]| rows.iter().cloned().map(|mut row| {
+        row.enabled = row.enabled.filter(|enabled| !enabled);
+        row.visible = row.visible.filter(|visible| !visible);
+        row.focused = row.focused.filter(|focused| *focused);
+        row.value = row.value.filter(|value| !value.is_empty());
+        row.value_unavailable = false;
+        row
+    }).collect::<Vec<_>>();
+    let baseline = sparse(baseline);
+    let current = sparse(current);
+    core::control::diff_rows(&baseline, &current, |row| {
         (
             row.kind.as_str(),
             row.label.as_str(),
@@ -7048,7 +7467,12 @@ fn snapshot_element_outcome(
     result: Result<(), SnapshotElementTapError>,
     w: &mut crate::runner::RunnerClient,
     context: &str,
+    detail: &mut Option<serde_json::Value>,
 ) -> Result<anyhow::Result<()>, RunnerControlOutcome> {
+    let rebound = w.rebound_row.take();
+    if let (Some((from, to)), Ok(()) | Err(SnapshotElementTapError::AfterDispatch(_))) = (rebound, &result) {
+        detail.get_or_insert_with(||serde_json::json!({}))["rebound"] = serde_json::json!({"from":from,"to":to});
+    }
     match result {
         Ok(()) => Ok(Ok(())),
         Err(SnapshotElementTapError::Invalid) => Err(RunnerControlOutcome::InvalidElementSnapshot),
@@ -7098,12 +7522,13 @@ fn snapshot_row_locator(row: &crate::runner::ElementRow) -> Option<AgentElementL
     }
 
     Some(AgentElementLocator {
+        label_contains: None,
         label,
         identifier,
         kind,
-        value: row.value.clone(),
+        value: row.value.clone().filter(|value| !value.is_empty()),
         focused: row.focused,
-        enabled: row.enabled,
+        enabled: row.enabled.filter(|enabled| !enabled),
         visible: row.visible,
     })
 }
@@ -7126,19 +7551,305 @@ async fn fetch_snapshot_row(
         .filter(|snapshot| !snapshot.is_empty())
         .ok_or(SnapshotElementTapError::Invalid)?;
 
-    let rows = w
-        .elements()
+    w.rebound_row = None;
+    w.activity_rebound_rect=None;
+    // Taken before the fresh read: that read joins the bounded history and
+    // could push the caller's snapshot out of it.
+    let served = w.served_tree(|served| {
+        element_snapshot_id(served).is_ok_and(|id| id == expected_snapshot)
+    });
+    let snapshot = w
+        .element_snapshot()
         .await
         .map_err(SnapshotElementTapError::BeforeDispatch)?;
+    let rows = snapshot.rows;
     let current_snapshot =
         element_snapshot_id(&rows).map_err(SnapshotElementTapError::BeforeDispatch)?;
     if current_snapshot != expected_snapshot {
-        return Err(SnapshotElementTapError::Stale);
+        // The screen changed somewhere (a clock tick, a badge, a keyboard
+        // suggestion). That alone does not make the caller's row unknowable:
+        // if the snapshot it read is still remembered and that row is still
+        // the one element of its identity here, act on it in the live tree.
+        let Some(served) = served else {
+            return Err(SnapshotElementTapError::Refused(
+                "stale_element_snapshot",
+                SNAPSHOT_FORGOTTEN_HINT,
+            ));
+        };
+        if index >= served.len() {
+            return Err(SnapshotElementTapError::Invalid);
+        }
+        // A cut-off tree can hide a second look-alike of the row.
+        if !snapshot.coverage.is_complete() {
+            return Err(SnapshotElementTapError::Refused(
+                "target_scope_unproven",
+                TARGET_SCOPE_UNPROVEN_HINT,
+            ));
+        }
+        return match rebind_snapshot_row(&served, index, &rows) {
+            RowRebind::Index(live) => {
+                // A system alert may not show in the tree at all, and a click
+                // under it is acknowledged without effect: ask runner live.
+                w.forget_alert_probe();
+                if w
+                    .alert_summary()
+                    .await
+                    .map_err(SnapshotElementTapError::BeforeDispatch)?
+                    .is_some()
+                {
+                    return Err(SnapshotElementTapError::Stale);
+                }
+                tracing::info!(
+                    "snapshot row {index} rebound to live row {live} after the screen changed"
+                );
+                w.rebound_row = Some((index, live));
+                w.activity_rebound_rect=Some(rows[live].rect);
+                Ok((rows, live))
+            }
+            RowRebind::Ambiguous => Err(SnapshotElementTapError::Ambiguous),
+            RowRebind::Stale => Err(SnapshotElementTapError::Stale),
+        };
     }
     if index >= rows.len() {
         return Err(SnapshotElementTapError::Invalid);
     }
     Ok((rows, index))
+}
+
+/// The screen changed and the snapshot the caller named is no longer kept
+/// (older than the last few reads, or from before a restart or a privacy
+/// change), so its row cannot be recognized again.
+const SNAPSHOT_FORGOTTEN_HINT: &str = "the screen changed and that snapshot is no longer remembered; refresh /agent/elements and choose the element again";
+
+/// Where an old snapshot row lives in a newer tree of the same screen.
+#[derive(Debug, PartialEq, Eq)]
+enum RowRebind {
+    Index(usize),
+    /// Gone, a different app, or a row with nothing durable to recognize it by.
+    Stale,
+    /// More than one live row carries its identity and nothing tells them apart.
+    Ambiguous,
+}
+
+/// A row's type, accessibility identifier and stable label (see [`row_identity`]).
+type RowIdentity<'a> = Option<(&'a str, &'a str, &'a str)>;
+
+/// What recognizes a row across two reads of a changing screen: its type,
+/// accessibility identifier and label. Never its value — a text field's
+/// contents, a switch position or a slider fraction change under the same
+/// control — nor its frame, which a banner or a keyboard moves. A text input
+/// whose label is just its contents has no stable label. `None` when nothing
+/// durable is left; such a row is only ever addressed by its exact snapshot.
+fn row_identity(row: &crate::runner::ElementRow) -> RowIdentity<'_> {
+    let identifier = row.identifier.as_deref().unwrap_or("");
+    let volatile_label = TEXT_INPUT_KINDS.contains(&row.kind.as_str())
+        && row.value.as_deref().is_some_and(|value| value == row.label);
+    let label = if volatile_label { "" } else { row.label.as_str() };
+    if row.kind.is_empty() || row.kind == "Application" || (identifier.is_empty() && label.is_empty()) {
+        return None;
+    }
+    Some((row.kind.as_str(), identifier, label))
+}
+
+/// The identities of the rows enclosing `index`, outermost first: the
+/// section, cell or sheet a duplicated control sits in.
+fn row_ancestry(
+    rows: &[crate::runner::ElementRow],
+    index: usize,
+) -> Vec<RowIdentity<'_>> {
+    let mut depth = rows[index].depth;
+    let mut chain = Vec::new();
+    for row in rows[..index].iter().rev() {
+        if row.depth < depth {
+            depth = row.depth;
+            chain.push(row_identity(row));
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+/// Share of the old screen's recognizable rows that must still be there for a
+/// fresh tree to count as the same screen. A clock tick, a badge or a keyboard
+/// keeps nearly all of them; a push to another page keeps almost none.
+const SAME_SCREEN_MIN_RETAINED: f64 = 0.75;
+
+/// Whether `new` still shows the screen `old` was read from, not another page
+/// of the same app with look-alike controls (every page has a `返回`). The
+/// navigation bars must agree and most recognizable rows must remain.
+fn same_screen(old: &[crate::runner::ElementRow], new: &[crate::runner::ElementRow]) -> bool {
+    fn bars(rows: &[crate::runner::ElementRow]) -> Vec<RowIdentity<'_>> {
+        rows.iter()
+            .filter(|row| row.kind == "NavigationBar")
+            .map(row_identity)
+            .collect()
+    }
+    if bars(old) != bars(new) {
+        return false;
+    }
+    // An alert or sheet that came up covers the screen the index was read
+    // from: the caller has to see it, not have its tap land underneath.
+    // Matched by title AND contents: a same-titled sheet for another item
+    // ("删除这条备忘录？") is a different question.
+    fn overlays(rows: &[crate::runner::ElementRow]) -> Vec<Vec<RowIdentity<'_>>> {
+        (0..rows.len())
+            .filter(|&i| matches!(rows[i].kind.as_str(), "Alert" | "Sheet"))
+            .map(|i| {
+                std::iter::once(&rows[i])
+                    .chain(rows[i + 1..].iter().take_while(|row| row.depth > rows[i].depth))
+                    .map(row_identity)
+                    .collect()
+            })
+            .collect()
+    }
+    let mut old_overlays = overlays(old);
+    for overlay in overlays(new) {
+        match old_overlays.iter().position(|old| overlay[0].is_some() && *old == overlay) {
+            Some(position) => {
+                old_overlays.swap_remove(position);
+            }
+            None => return false,
+        }
+    }
+    // The selected tab says which page is up; the rest of the bar does not.
+    fn selected_tabs(rows: &[crate::runner::ElementRow]) -> Vec<RowIdentity<'_>> {
+        (0..rows.len())
+            .filter(|&i| rows[i].kind == "TabBar")
+            .flat_map(|i| rows[i + 1..].iter().take_while(move |row| row.depth > rows[i].depth))
+            .filter(|row| row.selected == Some(true))
+            .map(row_identity)
+            .collect()
+    }
+    if selected_tabs(old) != selected_tabs(new) {
+        return false;
+    }
+    // Bars survive a tab switch or a push; only the page's own rows say the
+    // page is the same.
+    let mut remaining: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+    for identity in page_rows(new).filter_map(row_identity) {
+        *remaining.entry(identity).or_default() += 1;
+    }
+    let (mut known, mut retained) = (0_usize, 0_usize);
+    for identity in page_rows(old).filter_map(row_identity) {
+        known += 1;
+        if let Some(count) = remaining.get_mut(&identity).filter(|count| **count > 0) {
+            *count -= 1;
+            retained += 1;
+        }
+    }
+    known > 0 && retained as f64 >= known as f64 * SAME_SCREEN_MIN_RETAINED
+}
+
+/// Rows outside the navigation, tab and tool bars.
+fn page_rows(
+    rows: &[crate::runner::ElementRow],
+) -> impl Iterator<Item = &crate::runner::ElementRow> {
+    let mut bar_depth: Option<u32> = None;
+    rows.iter().filter(move |row| {
+        if bar_depth.is_some_and(|depth| row.depth <= depth) {
+            bar_depth = None;
+        }
+        if bar_depth.is_none() && matches!(row.kind.as_str(), "NavigationBar" | "TabBar" | "Toolbar") {
+            bar_depth = Some(row.depth);
+        }
+        bar_depth.is_none()
+    })
+}
+
+/// Find the row an old snapshot's `index` named in a fresh tree, failing
+/// closed. The row must be the only one of its identity in BOTH trees — or,
+/// failing that, the only one of its identity and ancestry in both — so a
+/// duplicate that appeared, or one that was already there, never lets the
+/// action land on its twin. Both trees must come from the same app.
+fn rebind_snapshot_row(
+    old: &[crate::runner::ElementRow],
+    index: usize,
+    new: &[crate::runner::ElementRow],
+) -> RowRebind {
+    let (Some(old_app), Some(new_app)) = (active_application(old), active_application(new)) else {
+        return RowRebind::Stale;
+    };
+    if old_app != new_app || !same_screen(old, new) {
+        return RowRebind::Stale;
+    }
+    let Some(identity) = old.get(index).and_then(row_identity) else {
+        return RowRebind::Stale;
+    };
+    let same = |rows: &[crate::runner::ElementRow]| -> Vec<usize> {
+        (0..rows.len())
+            .filter(|&i| row_identity(&rows[i]) == Some(identity))
+            .collect()
+    };
+    // An unlabeled cell is a list item nothing tells apart from the next one:
+    // after a scroll, the same button in another item has the same ancestry.
+    let mut depth = old[index].depth;
+    let mut anonymous_item = false;
+    for row in old[..index].iter().rev() {
+        if row.depth < depth {
+            depth = row.depth;
+            anonymous_item |= row.kind == "Cell" && row_identity(row).is_none();
+        }
+    }
+    if anonymous_item {
+        return RowRebind::Stale;
+    }
+    let (old_same, new_same) = (same(old), same(new));
+    let ancestry = row_ancestry(old, index);
+    let found = match (old_same.as_slice(), new_same.as_slice()) {
+        (_, []) => return RowRebind::Stale,
+        // Unique, but under another row (a list that scrolled: one 删除 for
+        // a different item) is a different element.
+        ([_], [live]) if row_ancestry(new, *live) != ancestry => return RowRebind::Stale,
+        ([_], [live]) => *live,
+        _ => {
+            let placed = |rows: &[crate::runner::ElementRow], same: &[usize]| -> Vec<usize> {
+                same.iter()
+                    .copied()
+                    .filter(|&i| row_ancestry(rows, i) == ancestry)
+                    .collect()
+            };
+            match (placed(old, &old_same).as_slice(), placed(new, &new_same).as_slice()) {
+                ([_], [live]) => *live,
+                (_, []) => return RowRebind::Stale,
+                _ => return RowRebind::Ambiguous,
+            }
+        }
+    };
+    // Unlabeled containers are not rows, so a list item built from them
+    // leaves no ancestor to tell one item's 删除 from the next. The rows
+    // around it (the item's title, its neighbours) do.
+    if row_neighbours(old, index) != row_neighbours(new, found) {
+        return RowRebind::Stale;
+    }
+    RowRebind::Index(found)
+}
+
+/// How many identified rows on each side of a rebound row must read the same.
+const REBIND_NEIGHBOURS: usize = 2;
+
+/// The identities of the nearest identified rows before and after `index`.
+/// Unidentified rows are skipped, not compared: two of them always read the
+/// same, so a `删除` button between blank rows would otherwise match the
+/// `删除` of another list item. Fewer rows on a side (the tree's end) keeps
+/// that side short, so a row that became first or last does not match.
+fn row_neighbours(
+    rows: &[crate::runner::ElementRow],
+    index: usize,
+) -> (Vec<RowIdentity<'_>>, Vec<RowIdentity<'_>>) {
+    let before = rows[..index]
+        .iter()
+        .rev()
+        .map(row_identity)
+        .filter(Option::is_some)
+        .take(REBIND_NEIGHBOURS)
+        .collect();
+    let after = rows[index + 1..]
+        .iter()
+        .map(row_identity)
+        .filter(Option::is_some)
+        .take(REBIND_NEIGHBOURS)
+        .collect();
+    (before, after)
 }
 
 /// How long a tree read stays reusable for a snapshot-bound action.
@@ -7156,6 +7867,7 @@ async fn fetch_snapshot_row_reusing(
     w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
 ) -> Result<(Vec<crate::runner::ElementRow>, usize, bool), SnapshotElementTapError> {
+    w.rebound_row = None;
     let index = value
         .get("element")
         .and_then(serde_json::Value::as_u64)
@@ -7311,13 +8023,14 @@ async fn tap_snapshot_element(
     // target clear and click it there, else tap the part it leaves clear.
     let off_screen = center_off_screen(&rows, index);
     if off_screen || (!allows_occluded(value) && center_covered(&rows, index)) {
-        if let Some(clicked) = reveal_and_click(w, row, off_screen).await {
+        if let Some(clicked) = reveal_and_click(w, row).await {
             return clicked.map_err(|error| match error {
+                RevealError::ScopeUnproven => SnapshotElementTapError::Refused("target_scope_unproven", TARGET_SCOPE_UNPROVEN_HINT),
                 RevealError::Occluded => {
-                    SnapshotElementTapError::Refused("element_occluded", ELEMENT_OCCLUDED_HINT)
+                    SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("element_occluded after reveal; no tap sent"))
                 }
                 RevealError::OffScreen => {
-                    SnapshotElementTapError::Refused("element_not_visible", ELEMENT_OFF_SCREEN_HINT)
+                    SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("element_not_visible after reveal; no tap sent"))
                 }
                 RevealError::Dispatch(error) => SnapshotElementTapError::AfterDispatch(error),
             });
@@ -7344,10 +8057,11 @@ async fn tap_snapshot_element(
         // that row and require exactly one native element before dispatching.
         // Never fall back to the suspect rectangle when semantic lookup fails.
         let (using, value) = locator_runner_query(&locator).ok_or(SnapshotElementTapError::Invalid)?;
-        let element_ids = w
-            .find_elements(using, &value)
-            .await
-            .map_err(SnapshotElementTapError::BeforeDispatch)?;
+        let matches = w.find_element_matches(using, &value).await.map_err(SnapshotElementTapError::BeforeDispatch)?;
+        if !matches.coverage.is_complete() {
+            return Err(SnapshotElementTapError::Refused("target_scope_unproven", TARGET_SCOPE_UNPROVEN_HINT));
+        }
+        let element_ids = matches.ids;
         let element_id =
             pick_snapshot_element(w, &rows, index, (using, &value), element_ids).await?;
         if reused && !verify_reused_row(w, &element_id, row).await? {
@@ -7378,6 +8092,8 @@ const TEXT_INPUT_KINDS: [&str; 4] = ["TextField", "SecureTextField", "SearchFiel
 async fn set_value_snapshot_element(
     w: &mut crate::runner::RunnerClient,
     value: &serde_json::Value,
+    allowed: &(dyn Fn() -> bool + Sync),
+    detail: &mut Option<serde_json::Value>,
 ) -> Result<(), SnapshotElementTapError> {
     let text = value
         .get("value")
@@ -7389,7 +8105,7 @@ async fn set_value_snapshot_element(
     let element_id = if snapshot_row_locator(row).is_some() {
         let element_id = resolve_snapshot_row_element(w, &rows, index).await?;
         if reused && !verify_reused_row(w, &element_id, row).await? {
-            return Box::pin(set_value_snapshot_element(w, value)).await;
+            return Box::pin(set_value_snapshot_element(w, value, allowed, detail)).await;
         }
         element_id
     } else if TEXT_INPUT_KINDS.contains(&row.kind.as_str()) {
@@ -7400,6 +8116,19 @@ async fn set_value_snapshot_element(
     } else {
         return Err(SnapshotElementTapError::InvalidTarget);
     };
+    let secure = row.kind == "SecureTextField";
+    if !allowed() { return Err(SnapshotElementTapError::BeforeDispatch(anyhow::anyhow!("replacement scope ended before binding"))); }
+    if !secure {
+        if let Some(target) = w.input_target_for_element(&element_id, &text).await.map_err(set_value_dispatch_error)? {
+            let mut receipt = ReplacementReceipt::new(&text);
+            let result = guarded_replacement(w, &element_id, &text, target, allowed, &mut receipt).await;
+            receipt.store(detail);
+            if result.is_ok() {
+                set_value_verification(detail, true, "element_value");
+            }
+            return result;
+        }
+    }
     if text.is_empty() {
         // Clearing IS the requested mutation — report its real outcome.
         return w.clear_element(&element_id).await.map_err(|error| {
@@ -7410,21 +8139,20 @@ async fn set_value_snapshot_element(
             }
         });
     }
-    let secure = row.kind == "SecureTextField";
     let before = if secure {
         None
     } else {
         w.element_value(&element_id).await.ok().flatten()
     };
-    // Clear-then-type is one intentional compound action (same contract as
-    // `text` with `clear:true`): the clear is best-effort, the type is still
-    // dispatched at most once.
-    if let Err(error) = w.clear_element(&element_id).await {
-        tracing::warn!("runner clear_element before set_value: {error:#}");
-    }
+    // Replacement must stop if clearing is refused or uncertain. Appending
+    // after a failed clear would violate the requested set-value operation.
+    w.clear_element(&element_id)
+        .await
+        .map_err(set_value_dispatch_error)?;
     let typed = w.type_into(&element_id, &text).await;
     if secure {
         // A secure field reads back as bullets; nothing to compare.
+        set_value_verification(detail, false, "secure_field");
         return typed.map_err(set_value_dispatch_error);
     }
     // Read the field back. Web inputs (WKWebView, Chrome) and some custom
@@ -7433,21 +8161,254 @@ async fn set_value_snapshot_element(
     // e-NAVI number field answered outcome_unknown, neither changed).
     let after = w.element_value(&element_id).await.ok().flatten();
     match (&typed, after.as_deref()) {
-        (_, Some(now)) if same_text(now, &text) => Ok(()),
+        (_, Some(now)) if same_text(now, &text) => {
+            set_value_readback_verification(detail, now, &text);
+            Ok(())
+        },
+        // A long value read back as its own beginning: the accessibility value
+        // is capped (Notes stops at 512 characters), not the field. Typed and
+        // changed, so not "no effect" — but not proven whole either.
+        (Ok(()), Some(now)) if readback_truncated(now, &text) => {
+            set_value_verification(detail, false, "readback_truncated");
+            Ok(())
+        }
         // The write failed and the field still holds what it held: not applied.
         (Err(_), Some(now)) if before.as_deref().is_some_and(|was| was == now) => Err(
             SnapshotElementTapError::NoEffect("value_not_applied", SET_VALUE_NOT_APPLIED_HINT),
         ),
-        (Ok(()), Some(_)) => Err(SnapshotElementTapError::NoEffect(
-            "value_not_applied",
-            SET_VALUE_NOT_APPLIED_HINT,
-        )),
+        // Acknowledged, yet the field reads as it did: not applied.
+        (Ok(()), Some(now)) if before.as_deref().is_none_or(|was| was == now) => Err(
+            SnapshotElementTapError::NoEffect("value_not_applied", SET_VALUE_NOT_APPLIED_HINT),
+        ),
+        // The field changed into something else: text reached it, so this is
+        // not safe to type again — inspect the field first.
+        (Ok(()), Some(_)) => Err(SnapshotElementTapError::AfterDispatch(anyhow::anyhow!(
+            "set_value: the field changed but does not read back as the requested value; inspect it before typing again"
+        ))),
         // No readback: keep the dispatch outcome as runner reported it.
         _ => typed.map_err(set_value_dispatch_error),
     }
 }
 
-const SET_VALUE_NOT_APPLIED_HINT: &str = "runner acknowledged the write but the field reads back a different value — web inputs and some custom fields ignore direct value writes, and autocorrect can rewrite text. Tap the field to focus it, send {\"type\":\"text\",\"text\":…}, then read the field again";
+/// What a guarded `set_value` replacement delivered, published as the
+/// `replacement` block (#399): the clear phase, each segment's characters
+/// (Unicode scalars, as `text` counts them) and whether the runner
+/// acknowledged it, and where it stopped. A segment is `delivered` only when
+/// the runner acknowledged it on the bound field; the one that failed after
+/// dispatch is `uncertain`, and later ones are `not_sent`.
+#[derive(Debug, Clone)]
+struct ReplacementReceipt {
+    phase: &'static str,
+    clear: serde_json::Value,
+    segments: Vec<(usize, &'static str)>,
+    stopped_at: Option<usize>,
+}
+
+impl ReplacementReceipt {
+    fn new(text: &str) -> Self {
+        let segments = crate::text_input::split(text, crate::text_input::CHUNK_CHARS)
+            .into_iter()
+            .map(|chunk| (crate::text_input::char_count(chunk), "not_sent"))
+            .collect();
+        ReplacementReceipt { phase: "clear", clear: serde_json::json!({"status": "pending"}), segments, stopped_at: None }
+    }
+
+    /// Stop at `index` (0-based): that segment is `status`, later ones stay unsent.
+    fn stop(&mut self, index: usize, status: &'static str) {
+        if let Some(segment) = self.segments.get_mut(index) {
+            segment.1 = status;
+        }
+        self.stopped_at = Some(index);
+    }
+
+    fn delivered(&mut self, index: usize) {
+        if let Some(segment) = self.segments.get_mut(index) {
+            segment.1 = "delivered";
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let sum = |status: &str| self.segments.iter().filter(|s| s.1 == status).map(|s| s.0).sum::<usize>();
+        serde_json::json!({
+            "path": "guarded",
+            "phase": self.phase,
+            "clear": self.clear,
+            "segments_total": self.segments.len(),
+            "segments_delivered": self.segments.iter().filter(|s| s.1 == "delivered").count(),
+            "characters_confirmed": sum("delivered"),
+            "characters_uncertain": sum("uncertain"),
+            "characters_total": self.segments.iter().map(|s| s.0).sum::<usize>(),
+            // 1-based, like the segment numbers below.
+            "stopped_at_segment": self.stopped_at.map(|i| i + 1),
+            "segments": self.segments.iter().enumerate()
+                .map(|(i, (chars, status))| serde_json::json!({"segment": i + 1, "characters": chars, "status": status}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn store(&self, detail: &mut Option<serde_json::Value>) {
+        detail.get_or_insert_with(|| serde_json::json!({}))["replacement"] = self.to_json();
+    }
+}
+
+/// The selected field's full value, when the runner can read it completely.
+async fn bound_field_value(w: &mut crate::runner::RunnerClient, element_id: &str) -> Option<String> {
+    let read = w.read_element_value(element_id, 32768).await.ok()?;
+    if read.get("complete").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    read.get("value").and_then(serde_json::Value::as_str).map(str::to_string)
+}
+
+/// What a failed guarded clear left in the field, by comparison with what it
+/// held before (never the contents themselves: they are the person's).
+fn cleared_field_state(before: Option<&str>, after: Option<&str>) -> &'static str {
+    match (before, after) {
+        (_, Some("")) => "empty",
+        (Some(before), Some(after)) if before == after => "unchanged",
+        (_, Some(_)) => "partially_cleared",
+        (_, None) => "unknown",
+    }
+}
+
+const REPLACEMENT_CLEAR_NOT_APPLIED_HINT: &str = "the field could not be cleared after its focus or selection was lost, so no replacement text was typed and the field still holds its earlier value (see replacement.clear). Bring the field back on screen, read /agent/elements again and send set_value with the fresh snapshot";
+
+/// Clear the bound field, recovering once when focus or selection is lost
+/// mid-clear (#399). A refused clear changed nothing; an interrupted one is
+/// judged by reading the field back: empty means the clear did its job,
+/// unchanged means nothing was deleted. Either way the field is bound again
+/// (at most one guarded focus tap) and the replacement goes on — an unchanged
+/// field is cleared once more. A field left partly cleared, or one that
+/// cannot be read, stops the replacement without typing: nothing can finish
+/// it safely.
+async fn clear_bound_with_recovery(
+    w: &mut crate::runner::RunnerClient,
+    element_id: &str,
+    text: &str,
+    target: String,
+    before: Option<&str>,
+    allowed: &(dyn Fn() -> bool + Sync),
+    receipt: &mut ReplacementReceipt,
+) -> Result<String, SnapshotElementTapError> {
+    let mut target = target;
+    for attempt in 0..2 {
+        if !allowed() {
+            return Err(SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("replacement scope ended before the clear; do not retry")));
+        }
+        let error = match w.clear_input_target(&target).await {
+            Ok(()) => {
+                receipt.clear = if attempt == 0 {
+                    serde_json::json!({"status": "cleared"})
+                } else {
+                    serde_json::json!({"status": "recovered", "field": "unchanged", "rebound": true})
+                };
+                return Ok(target);
+            }
+            Err(error) => error,
+        };
+        if error_never_reached_runner(&error) {
+            receipt.clear = serde_json::json!({"status": "not_sent"});
+            return Err(SnapshotElementTapError::AfterDispatch(error));
+        }
+        let runner_message = crate::runner::runner_http_error(&error).and_then(|runner| runner.message.clone());
+        let refused = crate::runner::runner_http_error(&error).is_some_and(|runner| runner.nothing_sent());
+        let field = if refused {
+            "unchanged"
+        } else {
+            cleared_field_state(before, bound_field_value(w, element_id).await.as_deref())
+        };
+        let unchanged_stop = || SnapshotElementTapError::NoEffect("replacement_not_applied", REPLACEMENT_CLEAR_NOT_APPLIED_HINT);
+        if !matches!(field, "empty" | "unchanged") || attempt == 1 || !allowed() {
+            receipt.clear = serde_json::json!({
+                "status": "failed", "field": field, "attempts": attempt + 1, "runner_message": runner_message,
+            });
+            tracing::warn!("set_value clear did not recover (field {field}): {error:#}");
+            return Err(if field == "unchanged" {
+                unchanged_stop()
+            } else {
+                SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("replacement clear interrupted; the field was left {field}; do not retry"))
+            });
+        }
+        tracing::info!("set_value clear lost the field (left {field}); binding it again once");
+        target = match w.input_target_for_element(element_id, text).await {
+            Ok(Some(target)) => target,
+            Ok(None) | Err(_) => {
+                receipt.clear = serde_json::json!({
+                    "status": "failed", "field": field, "attempts": attempt + 1, "rebind": "failed", "runner_message": runner_message,
+                });
+                return Err(if field == "unchanged" {
+                    unchanged_stop()
+                } else {
+                    SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("the field was cleared but could not be bound again; nothing was typed; do not retry"))
+                });
+            }
+        };
+        if field == "empty" {
+            receipt.clear = serde_json::json!({"status": "recovered", "field": "empty", "rebound": true});
+            return Ok(target);
+        }
+    }
+    Err(SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("replacement clear did not finish; do not retry")))
+}
+
+/// The guarded replacement after binding: clear (with recovery), each
+/// segment through the bound target, then an exact read-back.
+async fn guarded_replacement(
+    w: &mut crate::runner::RunnerClient,
+    element_id: &str,
+    text: &str,
+    target: String,
+    allowed: &(dyn Fn() -> bool + Sync),
+    receipt: &mut ReplacementReceipt,
+) -> Result<(), SnapshotElementTapError> {
+    if !allowed() {
+        return Err(SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("replacement scope ended after focus")));
+    }
+    // What the field held, so an interrupted clear can be judged by its result.
+    let before = bound_field_value(w, element_id).await;
+    let target = clear_bound_with_recovery(w, element_id, text, target, before.as_deref(), allowed, receipt).await?;
+    receipt.phase = "type";
+    for (index, chunk) in crate::text_input::split(text, crate::text_input::CHUNK_CHARS).into_iter().enumerate() {
+        if !allowed() {
+            receipt.stop(index, "not_sent");
+            return Err(SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("replacement scope ended; do not retry")));
+        }
+        if let Err(error) = w
+            .keys_to_target(chunk, &target, crate::text_input::chunk_timeout(crate::text_input::char_count(chunk)))
+            .await
+        {
+            let nothing_sent = error_never_reached_runner(&error)
+                || crate::runner::runner_http_error(&error).is_some_and(|runner| runner.nothing_sent());
+            receipt.stop(index, if nothing_sent { "not_sent" } else { "uncertain" });
+            return Err(set_value_dispatch_error(error));
+        }
+        receipt.delivered(index);
+    }
+    receipt.phase = "verify";
+    let read = w.read_element_value(&target, (text.encode_utf16().count() + 1) as u32)
+        .await.map_err(set_value_dispatch_error)?;
+    if !allowed() || read.get("complete").and_then(serde_json::Value::as_bool) != Some(true)
+        || read.get("value").and_then(serde_json::Value::as_str) != Some(text) {
+        return Err(SnapshotElementTapError::AfterDispatch(anyhow::anyhow!("selected replacement exact value was not confirmed; do not retry")));
+    }
+    receipt.phase = "done";
+    Ok(())
+}
+
+const SET_VALUE_NOT_APPLIED_HINT: &str ="runner acknowledged the write but the field reads back a different value — web inputs and some custom fields ignore direct value writes, and autocorrect can rewrite text. Tap the field to focus it, send {\"type\":\"text\",\"text\":…}, then read the field again";
+
+fn set_value_readback_verification(detail: &mut Option<serde_json::Value>, actual: &str, expected: &str) {
+    let exact = actual == expected;
+    set_value_verification(detail, exact, if exact { "element_value" } else { "formatted_value" });
+}
+
+fn set_value_verification(detail: &mut Option<serde_json::Value>, verified: bool, reason: &str) {
+    let detail = detail.get_or_insert_with(|| serde_json::json!({}));
+    detail["verification"] = serde_json::json!({
+        "status": if verified { "verified" } else { "unverified" },
+        "scope": "element_value", "reason": reason, "application_commit": "not_verified"
+    });
+}
 
 fn set_value_dispatch_error(error: anyhow::Error) -> SnapshotElementTapError {
     if runner_error_is_missing_element(&error) {
@@ -7461,6 +8422,12 @@ fn set_value_dispatch_error(error: anyhow::Error) -> SnapshotElementTapError {
 /// separators the caller did not type (a phone field that shows 090-1234-5678
 /// for 09012345678, an amount field that shows 1,000). A character the caller
 /// typed is never ignored, so "1.5" vs "15" or "-5" vs "5" stay different.
+/// A readback that is a long, strict beginning of the value: a capped
+/// accessibility value, not a field that kept its old contents.
+fn readback_truncated(read_back: &str, wanted: &str) -> bool {
+    read_back.chars().count() >= 256 && read_back.len() < wanted.len() && wanted.starts_with(read_back)
+}
+
 fn same_text(read_back: &str, wanted: &str) -> bool {
     const FIELD_FORMATTING: &[char] = &[' ', '\u{3000}', '-', ',', '/', '(', ')', '・'];
     let added = |c: &char| FIELD_FORMATTING.contains(c) && !wanted.contains(*c);
@@ -8321,6 +9288,16 @@ enum UniqueLabelTapError {
     AfterDispatch(anyhow::Error),
 }
 
+const TARGET_SCOPE_UNPROVEN_HINT: &str = "Nothing was sent: a complete accessibility scope is required to prove this locator unique. Read again after the screen settles; update the Native Runner if coverage is unknown.";
+
+async fn unique_target_rows(w: &mut crate::runner::RunnerClient) -> Result<Vec<crate::runner::ElementRow>, UniqueLabelTapError> {
+    let snapshot = w.element_snapshot().await.map_err(UniqueLabelTapError::BeforeDispatch)?;
+    if !snapshot.coverage.is_complete() {
+        return Err(UniqueLabelTapError::Refused("target_scope_unproven", TARGET_SCOPE_UNPROVEN_HINT));
+    }
+    Ok(snapshot.rows)
+}
+
 async fn tap_unique_label(
     w: &mut crate::runner::RunnerClient,
     label: &str,
@@ -8354,20 +9331,18 @@ async fn tap_unique_label(
         }
         w.forget_tree();
     }
-    let rows = w
-        .elements()
-        .await
-        .map_err(UniqueLabelTapError::BeforeDispatch)?;
+    let rows = unique_target_rows(w).await?;
     let (index, x, y) = label_tap_target(&rows, label, kind, request)?;
     let off_screen = center_off_screen(&rows, index);
     if off_screen || (!allows_occluded(request) && center_covered(&rows, index)) {
-        if let Some(clicked) = reveal_and_click(w, &rows[index], off_screen).await {
+        if let Some(clicked) = reveal_and_click(w, &rows[index]).await {
             return clicked.map_err(|error| match error {
+                RevealError::ScopeUnproven => UniqueLabelTapError::Refused("target_scope_unproven", TARGET_SCOPE_UNPROVEN_HINT),
                 RevealError::Occluded => {
-                    UniqueLabelTapError::Refused("element_occluded", ELEMENT_OCCLUDED_HINT)
+                    UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("element_occluded after reveal; no tap sent"))
                 }
                 RevealError::OffScreen => {
-                    UniqueLabelTapError::Refused("element_not_visible", ELEMENT_OFF_SCREEN_HINT)
+                    UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("element_not_visible after reveal; no tap sent"))
                 }
                 RevealError::Dispatch(error) => UniqueLabelTapError::AfterDispatch(error),
             });
@@ -8488,10 +9463,11 @@ async fn reused_row_is_live(w: &mut crate::runner::RunnerClient, row: &crate::ru
     else {
         return false;
     };
-    let Ok(ids) = w.find_elements(using, &value).await else {
+    let Ok(matches) = w.find_element_matches(using, &value).await else {
         return false;
     };
-    let [id] = ids.as_slice() else {
+    if !matches.coverage.is_complete() { return false; }
+    let [id] = matches.ids.as_slice() else {
         return false;
     };
     matches!(w.element_rect(id).await, Ok(rect) if rects_match(rect, row.rect))
@@ -8511,10 +9487,13 @@ fn tap_target_refusal(
     index: usize,
     request: &serde_json::Value,
 ) -> Option<(&'static str, &'static str)> {
+    let target = rows.get(index)?;
+    if target.enabled == Some(false) {
+        return Some(("element_disabled", "the target is disabled; wait for it to become enabled before acting"));
+    }
     if allows_occluded(request) {
         return None;
     }
-    let target = rows.get(index)?;
     if target.visible == Some(false) && !center_off_screen(rows, index) {
         tracing::info!("tap refused: row {index} '{}' is not drawn", target.label);
         return Some(("element_not_visible", ELEMENT_NOT_VISIBLE_HINT));
@@ -8865,15 +9844,15 @@ const ELEMENT_OFF_SCREEN_HINT: &str = "nothing was sent: the element is outside 
 async fn reveal_and_click(
     w: &mut crate::runner::RunnerClient,
     row: &crate::runner::ElementRow,
-    was_off_screen: bool,
 ) -> Option<Result<(), RevealError>> {
     let (using, value) = snapshot_row_locator(row)
         .as_ref()
         .and_then(locator_runner_query)?;
-    let ids = w.find_elements(using, &value).await.ok()?;
-    let [id] = ids.as_slice() else {
-        return None;
+    let matches = match w.find_element_matches(using, &value).await {
+        Ok(matches) if matches.coverage.is_complete() => matches,
+        _ => return Some(Err(RevealError::ScopeUnproven)),
     };
+    let [id] = matches.ids.as_slice() else { return Some(Err(RevealError::ScopeUnproven)); };
     reveal_element(w, id).await;
     // The scroll can fail, or the row can have nowhere to go (last row of a
     // list): look again before touching. A click on a centre that is still
@@ -8881,9 +9860,10 @@ async fn reveal_and_click(
     // (agent-loop A/B, iPhone 13: "tapped 通用", stayed on Settings).
     // A target that was off the screen must be proven on screen now; without
     // that proof the click would touch nothing and still answer ok.
-    match w.elements().await {
-        Ok(rows) => match same_row(&rows, row) {
+    match w.element_snapshot().await {
+        Ok(snapshot) if snapshot.coverage.is_complete() => match same_row(&snapshot.rows, row) {
             Some(index) => {
+                let rows = snapshot.rows;
                 if center_off_screen(&rows, index) {
                     return Some(Err(RevealError::OffScreen));
                 }
@@ -8897,23 +9877,22 @@ async fn reveal_and_click(
                     });
                 }
             }
-            None if was_off_screen => return Some(Err(RevealError::OffScreen)),
-            None => {}
+            None => return Some(Err(RevealError::Dispatch(anyhow::anyhow!("target no longer unique after reveal; no further tap sent")))),
         },
-        Err(_) if was_off_screen => return Some(Err(RevealError::OffScreen)),
-        Err(_) => {}
+        _ => return Some(Err(RevealError::Dispatch(anyhow::anyhow!("target scope unproven after reveal; no further tap sent")))),
     }
     Some(w.click_element(id).await.map_err(RevealError::Dispatch))
 }
 
 /// Why a covered or off-screen target was not clicked after revealing it.
 enum RevealError {
-    /// Still fully covered after the scroll: nothing was sent.
+    /// The live lookup cannot establish a complete unique target, before reveal.
+    ScopeUnproven,
+    /// The reveal was attempted, but the intended tap remains blocked.
     Occluded,
-    /// Still off the screen (or not provably on it) after the scroll:
-    /// nothing was sent.
+    /// The reveal was attempted, but the target remains off screen or unproven.
     OffScreen,
-    /// The click (or clear-point tap) was sent and failed.
+    /// A reveal or tap was attempted; a later failure cannot authorize replay.
     Dispatch(anyhow::Error),
 }
 
@@ -8957,73 +9936,65 @@ async fn reveal_element(w: &mut crate::runner::RunnerClient, id: &str) {
     }
 }
 
+fn unique_locator_index(rows: &[crate::runner::ElementRow], locator: &AgentElementLocator) -> Result<usize, UniqueLabelTapError> {
+    let mut known = Vec::new();
+    let mut unproven = false;
+    for (index, row) in rows.iter().enumerate() {
+        match agent_locator_assessment(row, locator) {
+            Some(true) => known.push(index),
+            None => unproven = true,
+            Some(false) => {}
+        }
+        if known.len() > 1 { return Err(UniqueLabelTapError::Ambiguous(None)); }
+    }
+    if unproven {
+        return Err(UniqueLabelTapError::Refused("target_state_unproven", "Nothing was sent: another row may match this locator because its requested value or state is unavailable."));
+    }
+    known.first().copied().ok_or(UniqueLabelTapError::NotFound)
+}
+
+async fn send_checked_target_tap(
+    w: &mut crate::runner::RunnerClient, id: &str, expected: [f64; 4], point: Option<(f64,f64)>, revealed: bool, locator: &AgentElementLocator,
+) -> Result<(), UniqueLabelTapError> {
+    use crate::runner::CheckedTapOutcome;
+    match w.checked_element_tap(id, expected, point, locator).await {
+        Ok(CheckedTapOutcome::Applied) => Ok(()),
+        Ok(CheckedTapOutcome::TargetChanged) if !revealed => Err(UniqueLabelTapError::Refused("target_changed", "Target no longer matches its checked frame or locator; no tap sent. Read again before a new action.")),
+        Ok(CheckedTapOutcome::CheckFailed) if !revealed => Err(UniqueLabelTapError::Refused("target_check_failed", "Native target preconditions could not be established; no tap sent.")),
+        Ok(CheckedTapOutcome::Unsupported) if !revealed => Err(UniqueLabelTapError::Refused("runner_update_required", "Update the Native Runner to support checked target taps; no tap sent.")),
+        Ok(CheckedTapOutcome::Unsupported) => Err(UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("runner_update_required after reveal: scrolling may already have been delivered; update the Native Runner; no further tap sent"))),
+        Ok(_) => Err(UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("checked target refused after reveal; no further tap sent"))),
+        Err(error) => Err(UniqueLabelTapError::AfterDispatch(error)),
+    }
+}
+
 async fn tap_unique_locator(
     w: &mut crate::runner::RunnerClient,
     locator: &AgentElementLocator,
     via_point: bool,
 ) -> Result<(), UniqueLabelTapError> {
-    // Same reuse as label taps: a recent untouched tree may prove uniqueness,
-    // and the live lookup below (exactly one element, same frame) proves the
-    // target; otherwise read afresh.
-    // The unique match's index in `rows`; `Err(true)` when several match.
-    fn unique_match(
-        rows: &[crate::runner::ElementRow],
-        locator: &AgentElementLocator,
-    ) -> Result<usize, bool> {
-        let mut matches = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| agent_locator_matches(row, locator));
-        match (matches.next(), matches.next()) {
-            (Some((index, _)), None) => Ok(index),
-            (None, _) => Err(false),
-            _ => Err(true),
-        }
-    }
     let reused = w.recent_tree(SNAPSHOT_TREE_REUSE).and_then(|rows| {
-        unique_match(&rows, locator).ok().map(|index| {
-            (
-                rows[index].rect,
-                needs_reveal(&rows, index),
-                center_off_screen(&rows, index),
-            )
-        })
+        unique_locator_index(&rows, locator).ok().map(|index| (rows, index))
     });
-    let (reused_rect, covered, off_screen) = match reused {
-        Some((rect, covered, off_screen)) => (Some(rect), covered, off_screen),
+    let (mut proof_rows, mut proof_index, reused_rect) = match reused {
+        Some((rows, index)) => {
+            let rect = rows[index].rect;
+            (rows, index, Some(rect))
+        }
         None => {
             w.forget_tree();
-            let rows = w
-                .elements()
-                .await
-                .map_err(UniqueLabelTapError::BeforeDispatch)?;
-            match unique_match(&rows, locator) {
-                Ok(index) => (
-                    None,
-                    needs_reveal(&rows, index),
-                    center_off_screen(&rows, index),
-                ),
-                Err(false) => return Err(UniqueLabelTapError::NotFound),
-                Err(true) => return Err(UniqueLabelTapError::Ambiguous(None)),
-            }
+            let rows = unique_target_rows(w).await?;
+            let index = unique_locator_index(&rows, locator)?;
+            (std::sync::Arc::new(rows), index, None)
         }
     };
-
-    // `/source?format=json` can report stale/wrong rectangles for elements in
-    // system-owned sheets (hardware-reproduced with the iOS share sheet's
-    // "Save to Files" cell). A coordinate tap at that rectangle returns a runner
-    // success envelope while landing elsewhere. Re-resolve the already-proven
-    // unique locator through runner's live element query and invoke XCUIElement's
-    // click action instead. Requiring exactly one returned element preserves
-    // the fail-closed uniqueness contract across the second lookup.
     let (using, value) = locator_runner_query(locator).ok_or(UniqueLabelTapError::InvalidTarget)?;
-    let element_ids = w
-        .find_elements(using, &value)
-        .await
-        .map_err(UniqueLabelTapError::BeforeDispatch)?;
-    let element_id = match element_ids.as_slice() {
-        [element_id] => element_id,
-        // The reused tree is the doubt, not the locator: read afresh.
+    let matches = w.find_element_matches(using, &value).await.map_err(UniqueLabelTapError::BeforeDispatch)?;
+    if !matches.coverage.is_complete() {
+        return Err(UniqueLabelTapError::Refused("target_scope_unproven", TARGET_SCOPE_UNPROVEN_HINT));
+    }
+    let mut element_id = match matches.ids.as_slice() {
+        [id] => id.clone(),
         _ if reused_rect.is_some() => {
             w.forget_tree();
             return Box::pin(tap_unique_locator(w, locator, via_point)).await;
@@ -9031,102 +10002,80 @@ async fn tap_unique_locator(
         [] => return Err(UniqueLabelTapError::NotFound),
         _ => return Err(UniqueLabelTapError::Ambiguous(None)),
     };
-    if let Some(rect) = reused_rect {
-        if !matches!(w.element_rect(element_id).await, Ok(live) if rects_match(live, rect)) {
-            w.forget_tree();
-            return Box::pin(tap_unique_locator(w, locator, via_point)).await;
-        }
+    // Both dispatch modes act at the live frame. Source rectangles can be
+    // stale in system sheets; they cannot exempt a target from occlusion checks.
+    let mut live = w.element_rect(&element_id).await.map_err(UniqueLabelTapError::BeforeDispatch)?;
+    if reused_rect.is_some_and(|rect| !rects_match(rect, live)) {
+        w.forget_tree();
+        return Box::pin(tap_unique_locator(w, locator, via_point)).await;
     }
-    // A floating bar over the target's centre (iOS 26's search pill) eats
-    // XCUIElement's click there too: reveal it first, like snapshot and label
-    // taps do.
-    if covered {
-        reveal_element(w, element_id).await;
-        // Look again, as `reveal_and_click` does: a centre still under the
-        // pill must not be clicked, and one still off the screen (or not
-        // provably on it) must not be either — the click would touch nothing
-        // and answer ok.
-        let off_screen_refusal = || {
-            Err(UniqueLabelTapError::Refused(
-                "element_not_visible",
-                ELEMENT_OFF_SCREEN_HINT,
-            ))
-        };
-        match w.elements().await {
-            Ok(rows) => match unique_match(&rows, locator) {
-                Ok(index) => {
-                    if center_off_screen(&rows, index) {
-                        return off_screen_refusal();
-                    }
-                    if center_covered(&rows, index) {
-                        return match clear_tap_point(&rows, index) {
-                            Some((x, y)) if point_on_screen(&rows, x, y) => w
-                                .tap_point(x, y)
-                                .await
-                                .map_err(UniqueLabelTapError::AfterDispatch),
-                            Some(_) => off_screen_refusal(),
-                            None => Err(UniqueLabelTapError::Refused(
-                                "element_occluded",
-                                ELEMENT_OCCLUDED_HINT,
-                            )),
-                        };
-                    }
-                }
-                Err(_) if off_screen => return off_screen_refusal(),
-                Err(_) => {}
-            },
-            Err(_) if off_screen => return off_screen_refusal(),
-            Err(_) => {}
+    std::sync::Arc::make_mut(&mut proof_rows)[proof_index].rect = live;
+    let revealed = needs_reveal(&proof_rows, proof_index);
+    if revealed {
+        reveal_element(w, &element_id).await;
+        let snapshot = w.element_snapshot().await.map_err(UniqueLabelTapError::AfterDispatch)?;
+        if !snapshot.coverage.is_complete() {
+            return Err(UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("target scope unproven after reveal; no tap sent")));
         }
+        proof_index = unique_locator_index(&snapshot.rows, locator).map_err(|_| UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("target no longer unique after reveal; no tap sent")))?;
+        proof_rows = std::sync::Arc::new(snapshot.rows);
+        // A reveal can replace the AX object. Resolve it again rather than
+        // applying a fresh row's geometry proof to an older element handle.
+        let matches = w.find_element_matches(using, &value).await.map_err(UniqueLabelTapError::AfterDispatch)?;
+        if !matches.coverage.is_complete() || matches.ids.len() != 1 {
+            return Err(UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("live target scope unproven after reveal; no tap sent")));
+        }
+        element_id = matches.ids[0].clone();
+        live = w.element_rect(&element_id).await.map_err(UniqueLabelTapError::AfterDispatch)?;
+        std::sync::Arc::make_mut(&mut proof_rows)[proof_index].rect = live;
     }
-    if via_point {
-        // `"via":"point"`: some custom controls ignore XCUIElement's click
-        // (hardware: Xiaohongshu's 30×30 back button ACKed two clicks and
-        // stayed put; a coordinate tap at its centre worked). Tap the centre
-        // of the element's LIVE frame — from runner's element query, not the
-        // possibly stale /source rect the default path avoids.
-        let [x, y, width, height] = w
-            .element_rect(element_id)
-            .await
-            .map_err(UniqueLabelTapError::BeforeDispatch)?;
-        if !(width > 0.0 && height > 0.0) {
-            return Err(UniqueLabelTapError::InvalidTarget);
-        }
-        let (cx, cy) = (x + width / 2.0, y + height / 2.0);
-        if let Ok((screen_w, screen_h)) = w.window_size().await {
-            if !(0.0..=screen_w).contains(&cx) || !(0.0..=screen_h).contains(&cy) {
-                return Err(UniqueLabelTapError::Refused(
-                    "element_not_visible",
-                    ELEMENT_OFF_SCREEN_HINT,
-                ));
+    let refuse = |code, hint| {
+        if revealed { UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("{code} after reveal; no tap sent")) }
+        else { UniqueLabelTapError::Refused(code, hint) }
+    };
+    let [x, y, width, height] = live;
+    if !live.iter().all(|v| v.is_finite()) || width <= 0.0 || height <= 0.0 {
+        return Err(if revealed { UniqueLabelTapError::AfterDispatch(anyhow::anyhow!("invalid target after reveal")) } else { UniqueLabelTapError::InvalidTarget });
+    }
+    let (screen_w, screen_h) = w.window_size().await.map_err(|error| {
+        if revealed { UniqueLabelTapError::AfterDispatch(error) } else { UniqueLabelTapError::BeforeDispatch(error) }
+    })?;
+    let on_screen = |(px, py): (f64, f64)| (0.0..=screen_w).contains(&px) && (0.0..=screen_h).contains(&py);
+    let center = (x + width / 2.0, y + height / 2.0);
+    if !on_screen(center) { return Err(refuse("element_not_visible", ELEMENT_OFF_SCREEN_HINT)); }
+    if center_covered(&proof_rows, proof_index) {
+        // The default action retains its clear-part fallback after a reveal;
+        // explicit point mode continues to mean the live centre itself.
+        if revealed && !via_point {
+            if let Some(point) = clear_tap_point(&proof_rows, proof_index).filter(|point| on_screen(*point)) {
+                return send_checked_target_tap(w, &element_id, live, Some(point), revealed, locator).await;
             }
         }
-        return w
-            .tap_point(cx, cy)
-            .await
-            .map_err(UniqueLabelTapError::AfterDispatch);
+        return Err(refuse("element_occluded", ELEMENT_OCCLUDED_HINT));
     }
-    w.click_element(element_id).await.map_err(|error| {
-        if runner_error_is_missing_element(&error) {
-            UniqueLabelTapError::NotFound
-        } else {
-            UniqueLabelTapError::AfterDispatch(error)
-        }
-    })
+    if via_point {
+        return send_checked_target_tap(w, &element_id, live, Some(center), revealed, locator).await;
+    }
+    send_checked_target_tap(w, &element_id, live, None, revealed, locator).await
 }
 
 fn runner_predicate_literal(value: &str) -> String {
-    // NSPredicate rejects literal line breaks inside quoted strings. Source
-    // values can contain them (for example a multiline SwiftUI composer).
-    format!(
-        "'{}'",
-        value
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
-    )
+    let mut literal = String::from("'");
+    for character in value.chars() {
+        match character {
+            '\\' => literal.push_str("\\\\"),
+            '\'' => literal.push_str("\\'"),
+            character
+                if character.is_ascii_control() || matches!(character, '\u{2028}' | '\u{2029}') =>
+            {
+                use std::fmt::Write;
+                let _ = write!(literal, "\\u{:04x}", u32::from(character));
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push('\'');
+    literal
 }
 
 /// Build a fresh runner element lookup for a strict agent locator.
@@ -9136,6 +10085,9 @@ fn runner_predicate_literal(value: &str) -> String {
 /// only condition: a namesake without that identifier must not replace a
 /// target that disappeared after the source precheck.
 fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, String)> {
+    if !locator_has_condition(locator) {
+        return None;
+    }
     let mut clauses = Vec::new();
     if let Some(kind) = &locator.kind {
         clauses.push(format!(
@@ -9147,8 +10099,15 @@ fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, 
         let label = runner_predicate_literal(label);
         clauses.push(format!("(label == {label} OR name == {label})"));
     }
+    if let Some(fragment) = &locator.label_contains {
+        let fragment = runner_predicate_literal(fragment);
+        clauses.push(format!("(label CONTAINS {fragment} OR ((label == nil OR label == '') AND name CONTAINS {fragment}))"));
+    }
     if let Some(identifier) = &locator.identifier {
-        clauses.push(format!("identifier == {}", runner_predicate_literal(identifier)));
+        clauses.push(format!(
+            "identifier == {}",
+            runner_predicate_literal(identifier)
+        ));
     }
     if let Some(value) = &locator.value {
         clauses.push(format!("value == {}", runner_predicate_literal(value)));
@@ -9165,14 +10124,33 @@ fn locator_runner_query(locator: &AgentElementLocator) -> Option<(&'static str, 
     (!clauses.is_empty()).then(|| ("predicate string", clauses.join(" AND ")))
 }
 
+fn is_capture_or_volume(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("shortcut")
+        && value.get("name").and_then(serde_json::Value::as_str)
+            .is_some_and(|name| matches!(name, "save_screenshot" | "volume_up" | "volume_down"))
+}
+
+fn system_request_private_refusal(state: &AppState, value: &serde_json::Value) -> Option<Response> {
+    (is_capture_or_volume(value) && screen_private_now(&state.private_until)).then(||
+        ControlRefusal::new(StatusCode::LOCKED, "screen_private", false)
+            .with("hint", serde_json::json!("the screen is private; no capture or volume request was sent"))
+            .into_response())
+}
+
+fn capture_scope_refusal() -> RunnerControlOutcome {
+    RunnerControlOutcome::Refused("capture_scope_changed", "screen privacy, control ownership or request lifetime changed; no capture was dispatched")
+}
+
 async fn runner_control_with_client(
     w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
     v: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
     guard_alert: bool,
+    dispatch_allowed: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
+    w.activity_rebound_rect=None;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let r: anyhow::Result<()> = match typ {
         "tap" if v.get("label").is_some() => {
@@ -9208,14 +10186,18 @@ async fn runner_control_with_client(
         }
         "tap" if v.get("element").is_some() => {
             let result = tap_snapshot_element(w, v).await;
-            match snapshot_element_outcome(result, w, "control snapshot tap") {
+            match snapshot_element_outcome(result, w, "control snapshot tap", detail) {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
             }
         }
         "set_value" => {
-            let result = set_value_snapshot_element(w, v).await;
-            match snapshot_element_outcome(result, w, "control set_value") {
+            // A cold daemon starts unactionable until an action succeeds, so only
+            // a drop to unactionable during this replacement ends its scope.
+            let was_actionable = actionable.load(Ordering::Acquire);
+            let allowed = || (!was_actionable || actionable.load(Ordering::Acquire)) && dispatch_allowed.is_none_or(|allowed| allowed());
+            let result = set_value_snapshot_element(w, v, &allowed, detail).await;
+            match snapshot_element_outcome(result, w, "control set_value", detail) {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
             }
@@ -9231,7 +10213,7 @@ async fn runner_control_with_client(
                 return RunnerControlOutcome::UnsupportedPerformAction;
             }
             let result = perform_snapshot_element(w, v).await;
-            match snapshot_element_outcome(result, w, "control perform") {
+            match snapshot_element_outcome(result, w, "control perform", detail) {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
             }
@@ -9309,7 +10291,7 @@ async fn runner_control_with_client(
         }
         "scroll" if v.get("element").is_some() => {
             let result = scroll_snapshot_element(w, v, guard_alert, detail).await;
-            match snapshot_element_outcome(result, w, "control element scroll") {
+            match snapshot_element_outcome(result, w, "control element scroll", detail) {
                 Ok(result) => result,
                 Err(outcome) => return outcome,
             }
@@ -9434,10 +10416,36 @@ async fn runner_control_with_client(
         "back" => w.back().await,
         "shortcut" => match v.get("name").and_then(|n| n.as_str()) {
             Some("home") => w.press_home().await,
+            Some(name @ ("volume_up" | "volume_down")) => {
+                let button = if name == "volume_up" { crate::runner::VolumeButton::Up } else { crate::runner::VolumeButton::Down };
+                let scope_changed = || RunnerControlOutcome::Refused("volume_scope_changed",
+                    "privacy, control ownership or request lifetime changed; no volume button request was sent");
+                let Some(allowed) = dispatch_allowed else { return scope_changed(); };
+                match w.request_volume_button(button, allowed).await {
+                    Ok(crate::runner::VolumeButtonOutcome::Requested) => Ok(()),
+                    Ok(crate::runner::VolumeButtonOutcome::Unsupported) => return RunnerControlOutcome::Refused("volume_buttons_unsupported",
+                        "volume buttons require a physical device and a capable native Runner; no button request was sent"),
+                    Ok(crate::runner::VolumeButtonOutcome::ScopeChanged) => return scope_changed(),
+                    Err(error) => Err(error),
+                }
+            },
             // Spotlight's Search pill acknowledges coordinate taps without
             // always opening. Resolve and click its accessibility element, then
             // verify the search field before reporting success.
             Some("spotlight") => w.open_spotlight().await,
+            Some("save_screenshot") => {
+                let Some(allowed) = dispatch_allowed else { return capture_scope_refusal(); };
+                match w.request_system_capture(allowed).await {
+                    Ok(crate::runner::SystemCaptureOutcome::Requested(receipt)) => {
+                        *detail = Some(serde_json::json!({"system_capture": receipt}));
+                        Ok(())
+                    }
+                    Ok(crate::runner::SystemCaptureOutcome::Unsupported) => return RunnerControlOutcome::Refused("system_capture_unsupported",
+                        "the native Runner cannot request a system screenshot; update it; nothing was captured"),
+                    Ok(crate::runner::SystemCaptureOutcome::ScopeChanged) => return capture_scope_refusal(),
+                    Err(error) => Err(error),
+                }
+            },
             // App switcher: the swipe-up-from-the-home-indicator is a system
             // gesture runner can't synthesize (hardware-verified: from Home it goes
             // Home, from an app the swipe is absorbed — the switcher never opens).
@@ -9554,6 +10562,30 @@ async fn runner_control_with_client(
 /// the runner measures, so the daemon's size disagreed with it). Anything
 /// else fails closed as an unknown outcome. Either way the runner's own
 /// reason rides along in `detail.runner_error`.
+/// The runner's "no single focused text field" refusal, under a name an
+/// agent can act on. Typing used to report `ok · applied` with no field
+/// focused while the text went nowhere (#391).
+fn input_target_refusal(error: &anyhow::Error) -> Option<RunnerControlOutcome> {
+    let runner = crate::runner::runner_http_error(error)?;
+    if !runner.nothing_sent() {
+        return None;
+    }
+    let message = runner.message.as_deref().unwrap_or_default();
+    if message.starts_with("input_target_ambiguous_or_missing") {
+        Some(RunnerControlOutcome::Refused(
+            "no_focused_field",
+            "no single text field has keyboard focus, so nothing was typed; tap the field you mean (or use set_value with its element) and type again",
+        ))
+    } else if message.starts_with("newline_requires_multiline_field") {
+        Some(RunnerControlOutcome::Refused(
+            "newline_requires_multiline_field",
+            "the focused field is single-line, so text with a line break was not typed; send one line, or use key return where Return is intended",
+        ))
+    } else {
+        None
+    }
+}
+
 fn runner_failure_outcome(
     w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
@@ -9601,6 +10633,10 @@ const AGENT_ACTIONS_MAX_STEPS: usize = 24;
 /// deadline ([`AGENT_ACTIONS_DEADLINE`]) are deliberately unchanged, so a
 /// longer single wait cannot lengthen a batch.
 const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 30_000;
+/// Longest an OCR `wait_for` may be given: a game's splash screen loads for
+/// 20–40 s, and it is the only wait in its batch (the declared-wait cap and
+/// the batch deadline still bound the whole batch).
+const AGENT_ACTIONS_MAX_OCR_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_MAX_PAUSE_MS: u64 = 3_000;
 const AGENT_ACTIONS_MAX_DECLARED_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
@@ -9671,6 +10707,39 @@ fn runner_failed_after_dispatch_response_with(detail: Option<&serde_json::Value>
     with_security_headers((StatusCode::BAD_GATEWAY, axum::Json(body)).into_response())
 }
 
+fn copy_app_lifecycle_receipt(body: &mut serde_json::Value, detail: Option<&serde_json::Value>) {
+    if let Some(receipt) = detail.and_then(|d| d.get("app_lifecycle")) {
+        body["app_lifecycle"] = receipt.clone();
+    }
+}
+
+async fn with_app_lifecycle_receipt(response: Response, detail: Option<&serde_json::Value>) -> Response {
+    if detail.and_then(|d| d.get("app_lifecycle")).is_none() { return response; }
+    let (response, body) = read_json_response(response).await;
+    let Some(mut body) = body else { return response; };
+    copy_app_lifecycle_receipt(&mut body, detail);
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(body.to_string()))
+}
+
+fn control_scope_interrupted_response() -> Response {
+    with_security_headers((StatusCode::CONFLICT, axum::Json(serde_json::json!({
+        "ok":false,"error":"control_scope_changed","outcome":"unknown","retry_safe":false,
+        "hint":"Control authorization or request lifetime changed during the action; later Runner requests were stopped. Do not replay; coordinate with the current owner before new work."
+    }))).into_response())
+}
+
+fn app_launch_interrupted_response(detail: Option<&serde_json::Value>) -> Response {
+    let mut body = serde_json::json!({"ok":false,"error":"app_launch_interrupted",
+        "outcome":"partial","retry_safe":false});
+    copy_app_lifecycle_receipt(&mut body, detail);
+    if let Some(error) = detail.and_then(|d| d.get("runner_error")) {
+        body["runner_error"] = error.clone();
+    }
+    with_security_headers((StatusCode::CONFLICT, axum::Json(body)).into_response())
+}
+
 const RUNNER_REJECTED_HINT: &str = "the device runner refused this action before touching the screen (see runner_error); nothing was sent, so fix what it names and send it again";
 
 /// The runner refused the action and said nothing reached the screen.
@@ -9728,7 +10797,7 @@ fn stale_element_snapshot_response() -> Response {
             .status(StatusCode::CONFLICT)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"ok":false,"error":"stale_element_snapshot","outcome":"not_sent","retry_safe":true,"hint":"refresh /agent/elements and choose the element again"}"#,
+                r#"{"ok":false,"error":"stale_element_snapshot","outcome":"not_sent","retry_safe":true,"hint":"the screen changed too much to find that row again (another page, a new alert, or the row is gone); refresh /agent/elements and choose the element again"}"#,
             ))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
@@ -9886,6 +10955,14 @@ fn reject_unknown_single_step_action(value: &serde_json::Value) -> Result<(), Re
 /// could turn the answer into `outcome_unknown`.
 const TEXT_CHUNK_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+struct TextPlan<'a> {
+    clear: bool,
+    target: Option<String>,
+    scope: Option<&'a crate::input_continuation::Scope>,
+    budget_ms: Option<u64>,
+}
+
+
 /// Type a long text in grapheme-safe chunks, each its own runner request with
 /// a timeout scaled to its length and clamped to what is left of `deadline`.
 ///
@@ -9897,42 +10974,150 @@ async fn type_text_chunked(
     w: &mut crate::runner::RunnerClient,
     actionable: &std::sync::atomic::AtomicBool,
     text: &str,
-    clear: bool,
+    plan: TextPlan<'_>,
     deadline: tokio::time::Instant,
+    detail: &mut Option<serde_json::Value>,
+    dispatch_allowed: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> RunnerControlOutcome {
     use crate::text_input::{char_count, chunk_timeout, split, typing_time, CHUNK_CHARS};
     use std::sync::atomic::Ordering;
-    let deadline = deadline
-        .checked_sub(TEXT_CHUNK_DEADLINE_MARGIN)
+    let TextPlan {
+        clear,
+        target,
+        scope,
+        budget_ms,
+    } = plan;
+    if budget_ms.is_some() && scope.is_none() {
+        return RunnerControlOutcome::Refused(
+            "input_owner_required",
+            "bounded text requires a named current owner",
+        );
+    }
+    let margin = if char_count(text) > CHUNK_CHARS {
+        TEXT_CHUNK_DEADLINE_MARGIN
+    } else {
+        std::time::Duration::ZERO
+    };
+    let deadline = deadline.checked_sub(margin).unwrap_or(deadline);
+    if tokio::time::Instant::now() >= deadline || dispatch_allowed.is_some_and(|allowed| !allowed())
+    {
+        return RunnerControlOutcome::NotSent;
+    }
+    let target = match target {
+        Some(target) => Some(target),
+        None => match w.input_target_for_text(text).await {
+            Ok(target) => target,
+            Err(error) => {
+                if let Some(refusal) = input_target_refusal(&error) {
+                    if let Some(runner) = crate::runner::runner_http_error(&error) {
+                        *detail = Some(serde_json::json!({ "runner_error": runner.to_json() }));
+                    }
+                    return refusal;
+                }
+                return runner_failure_outcome(w, actionable, &error, "text", detail);
+            }
+        },
+    };
+    if budget_ms.is_some() && (target.is_none() || !w.supports_input_continuation()) {
+        return RunnerControlOutcome::Refused(
+            "input_continuation_unsupported",
+            "bounded text requires a Runner advertising inputContinuation; nothing was typed",
+        );
+    }
+    let deadline = budget_ms
+        .map(|ms| deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(ms)))
         .unwrap_or(deadline);
+    // Binding is a blocking read; an expired action cannot proceed to clear.
+    if tokio::time::Instant::now() >= deadline {
+        return RunnerControlOutcome::NotSent;
+    }
     if clear {
-        // As for short text: the clear is best-effort, the text is sent once.
-        if let Err(error) = w.clear_active().await {
-            tracing::warn!("runner clear_active before chunked text: {error:#}");
+        if dispatch_allowed.is_some_and(|allowed| !allowed()) {
+            return RunnerControlOutcome::NotSent;
+        }
+        // Replacement requires an acknowledged clear. A failure can follow a
+        // partial deletion, so stop without appending or replaying the action.
+        let result = match target.as_deref() {
+            Some(token) => w.clear_input_target(token).await,
+            None => w.clear_active().await,
+        };
+        if let Err(error) = result {
+            return runner_failure_outcome(w, actionable, &error, "text", detail);
         }
     }
     let mut confirmed = 0;
     for piece in split(text, CHUNK_CHARS) {
+        if dispatch_allowed.is_some_and(|allowed| !allowed()) {
+            return if confirmed == 0 && !clear {
+                RunnerControlOutcome::NotSent
+            } else {
+                RunnerControlOutcome::TextPartial {
+                    confirmed,
+                    uncertain: 0,
+                }
+            };
+        }
         let n = char_count(piece);
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left < typing_time(n) + std::time::Duration::from_millis(500) {
             // Not enough time to type this chunk: stop before sending it.
             tracing::warn!("chunked text stopped at the deadline after {confirmed} characters");
             if confirmed == 0 && !clear {
-                return RunnerControlOutcome::NotSent;
+                return if budget_ms.is_some() {
+                    RunnerControlOutcome::Refused("input_budget_exhausted", "no complete chunk fits this typing budget; nothing was typed; inspect the original field before starting new input")
+                } else {
+                    RunnerControlOutcome::NotSent
+                };
+            }
+            if let (Some(target), Some(scope)) = (target.as_ref(), scope) {
+                if dispatch_allowed.is_none_or(|allowed| allowed()) {
+                    let remaining: String = text.chars().skip(confirmed).collect();
+                    let next_budget = budget_ms.unwrap_or(15000);
+                    let token = if text_chunks_fit_budget(&remaining, next_budget) {
+                        w.save_input_continuation(
+                            scope.clone(),
+                            target.clone(),
+                            remaining,
+                            next_budget,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(token) = token {
+                        if dispatch_allowed.is_some_and(|allowed| !allowed()) {
+                            w.discard_input_continuation();
+                        } else {
+                            detail.get_or_insert_with(|| serde_json::json!({}))["continue_token"] =
+                                token.into();
+                        }
+                    }
+                }
             }
             return RunnerControlOutcome::TextPartial {
                 confirmed,
                 uncertain: 0,
             };
         }
-        if let Err(error) = w.keys_with_timeout(piece, chunk_timeout(n).min(left)).await {
-            actionable.store(false, Ordering::Release);
-            w.invalidate_session();
-            tracing::warn!("chunked text failed after {confirmed} characters: {error:#}");
+        let result = match target.as_deref() {
+            Some(token) => {
+                w.keys_to_target(piece, token, chunk_timeout(n).min(left))
+                    .await
+            }
+            None => w.keys_with_timeout(piece, chunk_timeout(n).min(left)).await,
+        };
+        if let Err(error) = result {
+            let not_sent = crate::runner::runner_http_error(&error)
+                .is_some_and(crate::runner::RunnerHttpError::nothing_sent);
+            if confirmed == 0
+                && !clear
+                && (not_sent || crate::text_input::char_count(text) <= CHUNK_CHARS)
+            {
+                return runner_failure_outcome(w, actionable, &error, "text", detail);
+            }
+            let _ = runner_failure_outcome(w, actionable, &error, "text", detail);
             return RunnerControlOutcome::TextPartial {
                 confirmed,
-                uncertain: n,
+                uncertain: if not_sent { 0 } else { n },
             };
         }
         confirmed += n;
@@ -9941,8 +11126,92 @@ async fn type_text_chunked(
     RunnerControlOutcome::Applied
 }
 
-/// The body that tells an agent how far a long text got and how to finish it:
-/// append `remaining_text` with `clear:false` after reading the field.
+fn is_input_continuation(action: &serde_json::Value) -> bool {
+    action.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        && action.get("continue_token").is_some()
+}
+
+fn validate_text_request(
+    action: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), &'static str> {
+    if let Some(token) = action.get("continue_token") {
+        if action.len() != 2
+            || !token.as_str().is_some_and(|token| {
+                token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        {
+            return Err("continue_token must be 64 lowercase hex characters, alone with type:text");
+        }
+        return Ok(());
+    }
+    if action
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|text| crate::text_input::char_count(text) > crate::text_input::MAX_TEXT_CHARS)
+        || action.get("clear").is_some_and(|v| !v.is_boolean())
+        || action
+            .get("budget_ms")
+            .is_some_and(|v| v.as_u64().is_none_or(|ms| !(6000..=15000).contains(&ms)))
+    {
+        return Err("text needs a string up to 20000 characters, optional bool clear, and optional budget_ms from 6000 to 15000");
+    }
+    let text = action["text"].as_str().unwrap();
+    if action
+        .get("budget_ms")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|budget| !text_chunks_fit_budget(text, budget))
+    {
+        return Err("budget_ms is too small for an indivisible text cluster; increase the budget or choose unbudgeted input before typing");
+    }
+    Ok(())
+}
+
+fn text_chunks_fit_budget(text: &str, budget_ms: u64) -> bool {
+    let budget = std::time::Duration::from_millis(budget_ms);
+    crate::text_input::split(text, crate::text_input::CHUNK_CHARS)
+        .iter()
+        .all(|piece| {
+            crate::text_input::typing_time(crate::text_input::char_count(piece))
+                + std::time::Duration::from_millis(500)
+                < budget
+        })
+}
+
+fn text_partial_with_detail(
+    action: &serde_json::Value,
+    confirmed: usize,
+    uncertain: usize,
+    detail: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = detail
+        .and_then(|d| d.get("partial_text_receipt"))
+        .cloned()
+        .unwrap_or_else(|| text_partial_body(action, confirmed, uncertain));
+    if let Some(detail) = detail {
+        let mut extra = detail.clone();
+        let Some(object) = extra.as_object_mut() else {
+            body["detail"] = extra;
+            return body;
+        };
+        object.remove("partial_text_receipt");
+        if let Some(token) = object.remove("continue_token").filter(|_| uncertain == 0) {
+            body["continue_token"] = token;
+            body["continuation_safe"] = true.into();
+            body["continuation_expires_in_ms"] = crate::input_continuation::TTL_MS.into();
+            body["hint"] = "Continue only with type:text and continue_token, without text or clear. The single-use token is valid for at most 60 seconds and only while the original field, owner, privacy, lifecycle and session remain valid; intervening actions invalidate it.".into();
+        }
+        if !object.is_empty() {
+            body["detail"] = extra;
+        }
+    }
+    body
+}
+
+/// Report acknowledged and uncertain scalar counts without authorizing a replay
+/// or assuming that the original input field still has focus.
 fn text_partial_body(
     action: &serde_json::Value,
     confirmed: usize,
@@ -9963,23 +11232,32 @@ fn text_partial_body(
         "characters_total": crate::text_input::char_count(text),
         "remaining_text": remaining,
         "hint": if uncertain == 0 {
-            "the deadline stopped typing between chunks: the first characters_confirmed characters are typed, nothing after them was sent. Send remaining_text as a new text action with clear=false; never resend the whole text"
+            "typing stopped between chunks: characters_confirmed were acknowledged and no later text was sent. Inspect the original field and restore its authorized input context before explicitly continuing with only the missing text and clear=false; never resend the whole text"
         } else {
-            "typing failed part-way: the first characters_confirmed characters are typed; the next characters_uncertain may be partly on screen. Read the field's value, then send only what is missing (from remaining_text) with clear=false; never resend the whole text"
+            "typing failed part-way: characters_confirmed were acknowledged; characters_uncertain may be partly on screen. Inspect the original field and restore its authorized input context before explicitly continuing with only the missing text and clear=false; never resend the whole text"
         },
     })
 }
 
-/// Typing a long text can outlast the owner lease and the idle-release
-/// window, both measured from when the request arrived. Count its end as
-/// activity and renew the caller's lease, so the follow-up (an append of the
-/// rest, a tap on Send) is not refused or met by a released phone.
-fn renew_after_long_text(state: &AppState, headers: &HeaderMap, action: &serde_json::Value) {
-    if crate::text_input::action_allowance(action).is_zero() {
-        return;
+/// Renew only the still-current original lease after long typing. Never run
+/// takeover arbitration again: a newer owner may have arrived during the action.
+fn renew_after_long_text(state: &AppState, headers: &HeaderMap, action: &serde_json::Value, scope: &ScreenReadScope) {
+    if (crate::text_input::action_allowance(action).is_zero() && !is_input_continuation(action)) || !scope.current(state) { return; }
+    let now = Instant::now();
+    let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+    let mut slot = recover(state.owner.lock());
+    if scope.epoch != state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+        || scope.privacy_epoch != state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire)
+        || state.released.load(std::sync::atomic::Ordering::Acquire)
+        || scope.lifecycle_stamp != state.runner_lifecycle.active_stamp()
+        || named_owner(headers) != scope.owner.as_deref()
+        || slot.as_ref().map(|owner| owner.name.as_str()) != scope.owner.as_deref()
+    { return; }
+    if let Some(owner) = slot.as_mut() {
+        if lease_remaining(owner.last_seen, now, lease).is_zero() { return; }
+        owner.last_seen = owner.last_seen.max(now);
     }
     state.touch_activity();
-    let _ = claim_phone_owner(state, headers);
 }
 
 /// A `text` action longer than the daemon types, refused before anything is
@@ -10106,13 +11384,17 @@ async fn direct_agent_action(
     value: &serde_json::Value,
     detail: &mut Option<serde_json::Value>,
     deadline: tokio::time::Instant,
+    dispatch_allowed: Option<&(dyn Fn() -> bool + Sync)>,
+    input_scope: Option<&crate::input_continuation::Scope>,
 ) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
+    w.activity_rebound_rect=None;
 
     let typ = value
         .get("type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
+    if !is_input_continuation(value) { w.discard_input_continuation(); }
     let custom_result: Option<anyhow::Result<()>> = match typ {
         "launch_app" => {
             let bundle = value
@@ -10129,17 +11411,46 @@ async fn direct_agent_action(
             let Some(bundle) = bundle else {
                 return RunnerControlOutcome::Unsupported;
             };
-            // `fresh`: quit it first, so it opens on its first screen and not
-            // the page it was left on (recorded flows start there).
+            let allowed = || dispatch_allowed.is_some_and(|allowed| allowed())
+                && tokio::time::Instant::now() < deadline;
+            let scope_refusal = || RunnerControlOutcome::Refused("app_scope_changed",
+                "control ownership, privacy or request lifetime changed; no app request was sent");
             let fresh = value.get("fresh").and_then(serde_json::Value::as_bool) == Some(true);
+            let mut terminate_acknowledged = false;
             if fresh {
-                if let Err(error) = w.terminate_app(&bundle).await {
-                    tracing::warn!("fresh launch: terminate {bundle} failed, launching as is: {error:#}");
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                match w.app_lifecycle_scoped("terminate", &bundle, &allowed).await {
+                    Ok(None) => return scope_refusal(),
+                    Ok(Some(_)) => {
+                        terminate_acknowledged = true;
+                        *detail = Some(serde_json::json!({"app_lifecycle":{"terminate_acknowledged":true}}));
+                    },
+                    // An uncertain termination must never be followed by launch.
+                    Err(error) => return runner_failure_outcome(w, actionable, &error, typ, detail),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let launch_mark = w.last_post();
+            match w.app_lifecycle_scoped("launch", &bundle, &allowed).await {
+                Ok(Some(_)) => Some(Ok(())),
+                Ok(None) if !terminate_acknowledged => return scope_refusal(),
+                Ok(None) => {
+                    *detail = Some(serde_json::json!({"app_lifecycle":{"terminate_acknowledged":true,"launch_attempted":false}}));
+                    return RunnerControlOutcome::AppLaunchInterrupted;
+                }
+                Err(error) => {
+                    let outcome = runner_failure_outcome(w, actionable, &error, typ, detail);
+                    if terminate_acknowledged {
+                        let receipt = serde_json::json!({"terminate_acknowledged":true,"launch_attempted":w.last_post() != launch_mark});
+                        detail.get_or_insert_with(|| serde_json::json!({}))["app_lifecycle"] = receipt;
+                        if outcome == RunnerControlOutcome::RunnerRejected {
+                            return RunnerControlOutcome::AppLaunchInterrupted;
+                        }
+                        actionable.store(false, Ordering::Release);
+                        return RunnerControlOutcome::Failed;
+                    }
+                    return outcome;
                 }
             }
-            Some(w.launch_app(&bundle).await)
         }
         // The handlers refuse a disallowed scheme with a 403 before this;
         // checked again here so no path can dial or message by accident.
@@ -10192,7 +11503,7 @@ async fn direct_agent_action(
         }
         "tap" if value.get("element").is_some() => {
             let result = tap_snapshot_element(w, value).await;
-            match snapshot_element_outcome(result, w, "agent snapshot tap") {
+            match snapshot_element_outcome(result, w, "agent snapshot tap", detail) {
                 Ok(result) => Some(result),
                 Err(outcome) => return outcome,
             }
@@ -10241,53 +11552,38 @@ async fn direct_agent_action(
                 .unwrap_or(0);
             Some(w.set_picker(column, target).await)
         }
-        // Long text goes out in chunks so a failure can say how much landed.
-        // Text up to one chunk takes the paths below, unchanged.
-        "text"
-            if value
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| {
-                    crate::text_input::char_count(text) > crate::text_input::CHUNK_CHARS
-                }) =>
-        {
-            let text = value
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let clear = value
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            return type_text_chunked(w, actionable, text, clear, deadline).await;
-        }
-        "text"
-            if value
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false) =>
-        {
-            let Some(text) = value.get("text").and_then(serde_json::Value::as_str) else {
-                return RunnerControlOutcome::Unsupported;
+        "text" => {
+            let pending = if let Some(token) = value.get("continue_token").and_then(serde_json::Value::as_str) {
+                let Some(scope) = input_scope else {
+                    return RunnerControlOutcome::Refused("input_owner_required", "continuation requires the original named owner");
+                };
+                let Some(pending) = w.take_input_continuation(token, scope) else {
+                    return RunnerControlOutcome::Refused("input_continuation_expired", "continuation is expired, consumed or belongs to another owner, privacy, lifecycle or session; nothing was typed; inspect the original field before planning new input; do not retry this token");
+                };
+                Some(pending)
+            } else { None };
+            let text = pending.as_ref().map(|pending| pending.remaining.as_str())
+                .or_else(|| value.get("text").and_then(serde_json::Value::as_str));
+            let Some(text) = text else { return RunnerControlOutcome::Unsupported; };
+            let plan = TextPlan {
+                clear: pending.is_none() && value.get("clear").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                target: pending.as_ref().map(|pending| pending.target.clone()),
+                budget_ms: pending.as_ref().map(|pending| pending.budget_ms).or_else(|| value.get("budget_ms").and_then(serde_json::Value::as_u64)),
+                scope: input_scope,
             };
-            Some(
-                async {
-                    // Clearing and typing are one intentional compound action.
-                    // A clear error is best-effort, but the text insertion is
-                    // still dispatched at most once.
-                    if let Err(error) = w.clear_active().await {
-                        tracing::warn!("runner clear_active before text: {error:#}");
-                    }
-                    w.keys(text).await
+            let outcome = type_text_chunked(w, actionable, text, plan, deadline, detail, dispatch_allowed).await;
+            if pending.is_some() {
+                if let RunnerControlOutcome::TextPartial { confirmed, uncertain } = outcome {
+                    detail.get_or_insert_with(|| serde_json::json!({}))["partial_text_receipt"] = text_partial_body(&serde_json::json!({"text":text}), confirmed, uncertain);
                 }
-                .await,
-            )
+            }
+            return outcome;
         }
         _ => None,
     };
 
     let Some(result) = custom_result else {
-        return runner_control_with_client(w, actionable, value, detail, true).await;
+        return runner_control_with_client(w, actionable, value, detail, true, dispatch_allowed).await;
     };
     match result {
         Ok(()) => {
@@ -10347,6 +11643,7 @@ async fn direct_control(
     if let Err(refused) = claim_phone_owner(&state, &headers) {
         return refused;
     }
+    let capture_scope = ScreenReadScope::capture(&state);
     if state.managed_runner_pending {
         return target_not_configured_response();
     }
@@ -10362,6 +11659,7 @@ async fn direct_control(
             );
         }
     };
+    if let Some(refused) = system_request_private_refusal(&state, &value) { return refused; }
     let deadline = match direct_control_deadline(&value, tokio::time::Instant::now()) {
         Ok(deadline) => deadline,
         Err(ControlFreshnessError::Missing | ControlFreshnessError::Invalid) => {
@@ -10448,14 +11746,15 @@ async fn direct_control(
             None
         };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        let outcome = runner_control_with_client(
+        let dispatch_allowed = || capture_scope.current(&state) && tokio::time::Instant::now() < deadline;
+        let outcome = scoped_runner_action(&state, &capture_scope, deadline, runner_control_with_client(
             &mut client,
             &state.runner_actionable,
             &value,
             &mut detail,
             false,
-        )
-        .await;
+            Some(&dispatch_allowed),
+        )).await;
         Some((outcome, recorded_locator))
     })
     .await;
@@ -10481,14 +11780,24 @@ async fn direct_control(
             actionable: true,
             locked,
         };
+        let mut body = serde_json::json!({"ok":true});
+        if let Some(capture) = detail.as_ref().and_then(|value| value.get("system_capture")) {
+            body["system_capture"] = capture.clone();
+        }
+        if let Some(rebound) = detail.as_ref().and_then(|value| value.get("rebound")) {
+            body["rebound"] = rebound.clone();
+        }
         return with_security_headers(
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"ok":true}"#))
+                .body(Body::from(body.to_string()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     }
 
+    if outcome == RunnerControlOutcome::ScopeInterrupted {
+        return with_app_lifecycle_receipt(control_scope_interrupted_response(), detail.as_ref()).await;
+    }
     if outcome == RunnerControlOutcome::Failed {
         let locked = recover(state.runner_health.lock()).locked;
         *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {
@@ -10601,33 +11910,56 @@ enum AgentActionStep {
     Pause { ms: u64 },
 }
 
+type AgentWaitSelector = core::wait_selector::WaitSelector<AgentElementLocator>;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentUiExpectation {
     #[serde(default)]
     application: Option<String>,
     #[serde(default)]
-    present: Vec<AgentElementLocator>,
+    present: Vec<AgentWaitSelector>,
     #[serde(default)]
-    absent: Vec<AgentElementLocator>,
+    absent: Vec<AgentWaitSelector>,
+    /// Text that must be on screen, read by OCR from screenshots: for canvas
+    /// screens (games, Flutter/Unity) whose element tree has no labels. Each
+    /// entry matches a recognized line containing it, ignoring case and spaces.
+    #[serde(default)]
+    ocr_present: Vec<String>,
+    /// Text that must NOT be on screen (a loading caption), read by OCR.
+    #[serde(default)]
+    ocr_absent: Vec<String>,
+    /// Require each negative target to have been observed before its absence
+    /// can complete this wait. Prevents passing before a loader appears.
+    #[serde(default)]
+    absent_after_present: bool,
 }
 
-#[derive(Debug, Deserialize)]
+impl AgentUiExpectation {
+    fn uses_ocr(&self) -> bool {
+        !self.ocr_present.is_empty() || !self.ocr_absent.is_empty()
+    }
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct AgentElementLocator {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
-    #[serde(default)]
+    /// Case-sensitive literal substring of the normalized label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     identifier: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     value: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     focused: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     visible: Option<bool>,
 }
 
@@ -10771,41 +12103,50 @@ fn should_unlock_before_action(
 /// when a passcode is set. Best effort: on failure the action runs as it
 /// always did and the lock is reported the usual way.
 async fn unlock_before_action(
-    state: &AppState,
+    state: &Arc<AppState>,
     client: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
-) {
+    scope: &ScreenReadScope,
+) -> Result<(), crate::timing::ControlInterruption> {
+    let weak = Arc::downgrade(state);
+    let original = scope.clone();
+    let allowed: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move ||
+        tokio::time::Instant::now() < deadline
+            && weak.upgrade().is_some_and(|state| original.current(&state)));
+    if !allowed() { return Err(crate::timing::ControlInterruption {mutations_admitted:false}); }
     let cached = recover(state.runner_health.lock()).locked;
-    if !should_unlock_before_action(cached, crate::keep_awake::lock_report()) {
-        return;
-    }
-    // Leave the action most of its budget: the unlock takes ~2.5 s.
-    let budget = deadline
-        .saturating_duration_since(tokio::time::Instant::now())
+    if !should_unlock_before_action(cached, crate::keep_awake::lock_report()) { return Ok(()); }
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now())
         .saturating_sub(std::time::Duration::from_secs(6))
         .min(std::time::Duration::from_secs(5));
     if budget.is_zero() {
-        return;
+        return if allowed() {Ok(())} else {Err(crate::timing::ControlInterruption {mutations_admitted:false})};
     }
-    match tokio::time::timeout(budget, client.unlock()).await {
-        Ok(Ok(())) => {
+    let result = crate::timing::with_control_permit(allowed.clone(),
+        tokio::time::timeout(budget, client.unlock())).await;
+    match result {
+        Err(interrupted) => return Err(interrupted),
+        Ok(Ok(Ok(()))) => {
+            if !allowed() { return Err(crate::timing::ControlInterruption {mutations_admitted:true}); }
             tracing::info!("the phone was locked; unlocked it (no passcode) before the action");
-            crate::keep_awake::note_unlocked();
-            apply_runner_health_probe(
-                &state.runner_health,
-                &state.runner_actionable,
-                &state.released,
-                crate::runner::RunnerHealth {
+            // Publish under the lifecycle gate; an old ACK cannot overwrite
+            // health belonging to a newer generation or clear a release.
+            let committed = state.runner_lifecycle.publish_if_active_stamp(scope.lifecycle_stamp, || {
+                if state.released.load(std::sync::atomic::Ordering::Acquire) { return false; }
+                crate::keep_awake::note_unlocked();
+                *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {
                     updated_at: std::time::Instant::now(),
-                    up: true,
-                    actionable: true,
-                    locked: Some(false),
-                },
-            );
+                    up: true, actionable: true, locked: Some(false),
+                };
+                state.runner_actionable.store(true, std::sync::atomic::Ordering::Release);
+                true
+            }).unwrap_or(false);
+            if !committed { return Err(crate::timing::ControlInterruption {mutations_admitted:true}); }
         }
-        Ok(Err(error)) => tracing::info!("the phone is locked and could not be unlocked: {error:#}"),
-        Err(_) => tracing::info!("unlocking the phone took longer than {}s", budget.as_secs()),
+        Ok(Ok(Err(error))) => tracing::info!("the phone is locked and could not be unlocked: {error:#}"),
+        Ok(Err(_)) => tracing::info!("unlocking the phone took longer than {}s", budget.as_secs()),
     }
+    if allowed() {Ok(())} else {Err(crate::timing::ControlInterruption {mutations_admitted:true})}
 }
 
 async fn stale_action_lock_refusal(state: &AppState) -> Option<ControlRefusal> {
@@ -10935,13 +12276,28 @@ fn agent_actions_invalid(detail: impl Into<String>) -> Response {
 }
 
 fn locator_has_condition(locator: &AgentElementLocator) -> bool {
-    locator.label.is_some()
-        || locator.identifier.is_some()
-        || locator.kind.is_some()
-        || locator.value.is_some()
-        || locator.focused.is_some()
-        || locator.enabled.is_some()
-        || locator.visible.is_some()
+    [
+        locator.label.as_deref(),
+        locator.label_contains.as_deref(),
+        locator.identifier.as_deref(),
+        locator.kind.as_deref(),
+        locator.value.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|text| !text.contains('\0'))
+        && locator
+            .label_contains
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.chars().count() <= 1000)
+        && (locator.label_contains.is_some()
+            || locator.label.is_some()
+            || locator.identifier.is_some()
+            || locator.kind.is_some()
+            || locator.value.is_some()
+            || locator.focused.is_some()
+            || locator.enabled.is_some()
+            || locator.visible.is_some())
 }
 
 fn finite_unit(value: Option<f64>) -> bool {
@@ -11156,20 +12512,7 @@ fn validate_agent_action_value(
             }
         }
         "text" => {
-            if action
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|text| {
-                    crate::text_input::char_count(text) > crate::text_input::MAX_TEXT_CHARS
-                })
-                || action
-                    .get("clear")
-                    .is_some_and(|clear| clear.as_bool().is_none())
-            {
-                return invalid(
-                    "text needs a string up to 20000 characters and optional bool clear",
-                );
-            }
+            if let Err(error) = validate_text_request(action) { return invalid(error); }
         }
         "key" => {
             if !action
@@ -11202,9 +12545,9 @@ fn validate_agent_action_value(
             if !action
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|name| matches!(name, "home" | "spotlight"))
+                .is_some_and(|name| matches!(name, "home" | "spotlight" | "save_screenshot" | "volume_up" | "volume_down"))
             {
-                return invalid("shortcut must be home or spotlight");
+                return invalid("shortcut must be home, spotlight, save_screenshot, volume_up or volume_down");
             }
         }
         "drag" if action.contains_key("points") => {
@@ -11455,14 +12798,41 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
                 timeout_ms,
                 poll_ms,
             } => {
-                if expect.application.is_none()
-                    && expect.present.is_empty()
-                    && expect.absent.is_empty()
-                {
+                let tree = expect.application.is_some()
+                    || !expect.present.is_empty()
+                    || !expect.absent.is_empty();
+                if !tree && !expect.uses_ocr() {
                     return Err(format!(
-                        "steps[{index}].expect must include application, present, or absent"
+                        "steps[{index}].expect must include application, present, absent, ocr_present, or ocr_absent"
                     ));
                 }
+                if tree && expect.uses_ocr() {
+                    return Err(format!(
+                        "steps[{index}].expect mixes element locators with ocr_present/ocr_absent; use two wait_for steps"
+                    ));
+                }
+                if expect
+                    .ocr_present
+                    .iter()
+                    .chain(expect.ocr_absent.iter())
+                    .any(|text| {
+                        crate::app_lookup::normalize(text).is_empty() || text.chars().count() > 200
+                    })
+                {
+                    return Err(format!(
+                        "steps[{index}] ocr_present/ocr_absent entries must be 1 to 200 characters of visible text"
+                    ));
+                }
+                if expect.absent_after_present
+                    && (expect.absent.is_empty() && expect.ocr_absent.is_empty() || *timeout_ms == 0)
+                {
+                    return Err(format!("steps[{index}]: absent_after_present needs absent/ocr_absent and a nonzero timeout"));
+                }
+                let max_wait = if expect.uses_ocr() {
+                    AGENT_ACTIONS_MAX_OCR_WAIT_MS
+                } else {
+                    AGENT_ACTIONS_MAX_WAIT_MS
+                };
                 if expect
                     .application
                     .as_ref()
@@ -11480,9 +12850,9 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
                 {
                     return Err(format!("steps[{index}] contains an empty element locator"));
                 }
-                if *timeout_ms == 0 || *timeout_ms > AGENT_ACTIONS_MAX_WAIT_MS {
+                if (expect.uses_ocr() && *timeout_ms == 0) || *timeout_ms > max_wait {
                     return Err(format!(
-                        "steps[{index}].timeout_ms must be between 1 and {AGENT_ACTIONS_MAX_WAIT_MS}"
+                        "steps[{index}].timeout_ms must be between {} and {max_wait}; zero selects one bounded tree read", if expect.uses_ocr() {1} else {0}
                     ));
                 }
                 if !(50..=1_000).contains(poll_ms) {
@@ -11490,7 +12860,7 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
                         "steps[{index}].poll_ms must be between 50 and 1000"
                     ));
                 }
-                declared_wait_ms = declared_wait_ms.saturating_add(*timeout_ms);
+                declared_wait_ms = declared_wait_ms.saturating_add(if *timeout_ms == 0 {core::SINGLE_READ_WAIT_BUDGET_MS} else {*timeout_ms});
             }
             AgentActionStep::Pause { ms } => {
                 if *ms == 0 || *ms > AGENT_ACTIONS_MAX_PAUSE_MS {
@@ -11510,29 +12880,32 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn agent_locator_matches(row: &crate::runner::ElementRow, locator: &AgentElementLocator) -> bool {
-    locator
-        .label
-        .as_ref()
-        .is_none_or(|value| &row.label == value)
-        && locator
-            .identifier
-            .as_ref()
-            .is_none_or(|value| row.identifier.as_ref() == Some(value))
-        && locator.kind.as_ref().is_none_or(|value| &row.kind == value)
-        && locator
-            .value
-            .as_ref()
-            .is_none_or(|value| row.value.as_ref() == Some(value))
-        && locator
-            .focused
-            .is_none_or(|value| row.focused.unwrap_or(false) == value)
-        && locator
-            .enabled
-            .is_none_or(|value| row.enabled.unwrap_or(true) == value)
-        && locator
-            .visible
-            .is_none_or(|value| row.visible.unwrap_or(true) == value)
+/// Missing requested booleans and unavailable/protected value previews are
+/// unknown. A known mismatch still rules out a row with other unknown fields.
+fn agent_locator_assessment(row: &crate::runner::ElementRow, locator: &AgentElementLocator) -> Option<bool> {
+    if locator.label.as_ref().is_some_and(|value| &row.label != value)
+        || locator.label_contains.as_ref().is_some_and(|value| !row.label.contains(value.as_str()))
+        || locator.identifier.as_ref().is_some_and(|value| row.identifier.as_ref() != Some(value))
+        || locator.kind.as_ref().is_some_and(|value| &row.kind != value)
+    { return Some(false); }
+    let mut unknown = false;
+    if let Some(expected) = &locator.value {
+        if row.value_unavailable || row.value_truncated == Some(true) || row.kind == "SecureTextField" {
+            unknown = true;
+        } else if row.value.as_ref() != Some(expected) {
+            return Some(false);
+        }
+    }
+    for (actual, expected) in [(row.focused, locator.focused), (row.enabled, locator.enabled), (row.visible, locator.visible)] {
+        if let Some(expected) = expected {
+            match actual {
+                Some(actual) if actual != expected => return Some(false),
+                None => unknown = true,
+                _ => {}
+            }
+        }
+    }
+    if unknown { None } else { Some(true) }
 }
 
 /// Label of the frontmost app as the flattened tree reports it: the single
@@ -11568,38 +12941,51 @@ fn app_changed_json(
 fn agent_expectation_observation(
     rows: &[crate::runner::ElementRow],
     expect: &AgentUiExpectation,
+    coverage: crate::runner::SnapshotCoverage,
 ) -> (bool, serde_json::Value) {
     let application = active_application(rows);
     let application_matches = expect
         .application
         .as_ref()
         .is_none_or(|expected| application.as_ref() == Some(expected));
-    let missing_present: Vec<usize> = expect
-        .present
-        .iter()
-        .enumerate()
-        .filter_map(|(index, locator)| {
-            (!rows.iter().any(|row| agent_locator_matches(row, locator))).then_some(index)
-        })
-        .collect();
-    let violated_absent: Vec<usize> = expect
-        .absent
-        .iter()
-        .enumerate()
-        .filter_map(|(index, locator)| {
-            rows.iter()
-                .any(|row| agent_locator_matches(row, locator))
-                .then_some(index)
-        })
-        .collect();
-    // Empty or container-only: readable as a response, but not usable as
-    // evidence that something is NOT there.
     let sparse = settle_tree_is_sparse(rows);
-    let absent_unproven: Vec<usize> = if sparse {
-        (0..expect.absent.len()).collect()
-    } else {
-        Vec::new()
+    let complete = coverage.is_complete() && !sparse;
+    let assess = |selector: &AgentWaitSelector| {
+        let mut known = 0usize;
+        let mut unknown = 0usize;
+        for row in rows {
+            match agent_locator_assessment(row, selector) {
+                Some(true) => known += 1,
+                None => unknown += 1,
+                Some(false) => {}
+            }
+        }
+        (
+            selector.index.assess(known, unknown, complete),
+            serde_json::json!({
+                "required_matches":selector.index.required_matches(),"known_matches":known,
+                "unproven_matches":unknown,"complete":complete
+            }),
+        )
     };
+    let present: Vec<_> = expect.present.iter().map(assess).collect();
+    let absent: Vec<_> = expect.absent.iter().map(assess).collect();
+    let select = |values: &[(Option<bool>, serde_json::Value)],
+                  wanted: Option<bool>,
+                  include_unknown: bool|
+     -> Vec<usize> {
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (value, _))| {
+                (*value == wanted || (include_unknown && value.is_none())).then_some(index)
+            })
+            .collect()
+    };
+    let missing_present = select(&present, Some(false), true);
+    let present_unproven = select(&present, None, false);
+    let violated_absent = select(&absent, Some(true), false);
+    let absent_unproven = select(&absent, None, false);
     let matches = application_matches
         && missing_present.is_empty()
         && violated_absent.is_empty()
@@ -11607,20 +12993,41 @@ fn agent_expectation_observation(
     (
         matches,
         serde_json::json!({
-            "application": application,
-            "application_matches": application_matches,
-            "missing_present": missing_present,
-            "violated_absent": violated_absent,
-            // Additive evidence about the READ itself, so a caller can tell a
-            // condition that was genuinely not met from a screen nobody could
-            // see. `read: true` here means this observation came from an actual
-            // tree read (see the failure body for the never-read case).
-            "read": true,
-            "rows": rows.len(),
-            "sparse": sparse,
-            "absent_unproven": absent_unproven
+            "application":application,"application_matches":application_matches,
+            "missing_present":missing_present,"present_unproven":present_unproven,
+            "violated_absent":violated_absent,"absent_unproven":absent_unproven,
+            "read":true,"rows":rows.len(),"sparse":sparse,"partial":coverage==crate::runner::SnapshotCoverage::Truncated,"coverage":coverage.as_str(),
+            "present_counts":present.into_iter().map(|(_,counts)|counts).collect::<Vec<_>>(),
+            "absent_counts":absent.into_iter().map(|(_,counts)|counts).collect::<Vec<_>>()
         }),
     )
+}
+
+/// Gate a negative wait on prior positive evidence, separately for each
+/// negative selector. Unknown reads never count as seeing a target.
+fn disappearance_observed(
+    expect: &AgentUiExpectation,
+    seen: &mut [bool],
+    observation: &mut serde_json::Value,
+) -> bool {
+    if !expect.absent_after_present { return true; }
+    if expect.uses_ocr() {
+        if let Some(rows) = observation.get("ocr_absent").and_then(serde_json::Value::as_array) {
+            for (seen, row) in seen.iter_mut().zip(rows) {
+                *seen |= row.get("seen").and_then(serde_json::Value::as_bool) == Some(true);
+            }
+        }
+    } else if observation.get("application_matches").and_then(serde_json::Value::as_bool) == Some(true) {
+        if let Some(indices) = observation.get("violated_absent").and_then(serde_json::Value::as_array) {
+            for index in indices.iter().filter_map(serde_json::Value::as_u64) {
+                if let Some(seen) = seen.get_mut(index as usize) { *seen = true; }
+            }
+        }
+    }
+    let unseen: Vec<_> = seen.iter().enumerate().filter_map(|(i, seen)| (!seen).then_some(i)).collect();
+    let ready = unseen.is_empty();
+    observation["unseen_absent"] = serde_json::json!(unseen);
+    ready
 }
 
 /// The observation a failing `wait_for` reports, in the caller's terms rather
@@ -11632,7 +13039,154 @@ fn agent_expectation_observation(
 /// * `read:true, stale:true` — the screen was read at least once, but the last
 ///   read failed, so this is the last valid observation, not the current one.
 ///   A late failure must never erase the reads that did succeed.
-/// * `read:true` — the screen was read and the condition simply was not met.
+/// * `read:true` — a current tree was read; unproven indexes distinguish
+///   missing metadata from a condition known not to match.
+enum OcrWait {
+    Matched(serde_json::Value),
+    TimedOut(serde_json::Value),
+    Private,
+}
+
+/// Lines of recognized text a timed-out OCR wait reports, so the agent sees
+/// what IS on screen without another screenshot.
+const OCR_WAIT_REPORTED_LINES: usize = 20;
+
+/// Whether `needle` is in some recognized line, ignoring case and spacing
+/// (Vision may split or join CJK words with spaces).
+fn ocr_text_present(lines: &[String], needle: &str) -> bool {
+    let needle = crate::app_lookup::normalize(needle);
+    !needle.is_empty() && lines.iter().any(|line| line.contains(&needle))
+}
+
+/// `(matches, observation)` for one OCR read of the screen.
+fn ocr_expectation_observation(
+    texts: &[String],
+    expect: &AgentUiExpectation,
+) -> (bool, serde_json::Value) {
+    let lines: Vec<String> = texts.iter().map(|t| crate::app_lookup::normalize(t)).collect();
+    let present: Vec<serde_json::Value> = expect
+        .ocr_present
+        .iter()
+        .map(|text| serde_json::json!({"text": text, "seen": ocr_text_present(&lines, text)}))
+        .collect();
+    let absent: Vec<serde_json::Value> = expect
+        .ocr_absent
+        .iter()
+        .map(|text| serde_json::json!({"text": text, "seen": ocr_text_present(&lines, text)}))
+        .collect();
+    let matches = present.iter().all(|row| row["seen"] == true)
+        && absent.iter().all(|row| row["seen"] == false);
+    (
+        matches,
+        serde_json::json!({
+            "read": true,
+            "ocr_present": present,
+            "ocr_absent": absent,
+            "lines": texts.iter().take(OCR_WAIT_REPORTED_LINES).collect::<Vec<_>>(),
+            "line_count": texts.len(),
+        }),
+    )
+}
+
+/// One screenshot through the held runner client, recognized by Vision.
+async fn agent_ocr_read(
+    w: &mut crate::runner::RunnerClient,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<String>, String> {
+    let read = async {
+        let reservation = crate::ocr::reserve_background().map_err(|error| format!("{error:#}"))?;
+        let (width, _) = w
+            .window_size()
+            .await
+            .map_err(|error| format!("screen size: {error:#}"))?;
+        let png = w
+            .screenshot_png()
+            .await
+            .map_err(|error| format!("screenshot: {error:#}"))?;
+        let pixels = png_width(&png).ok_or("the screenshot is not a PNG")?;
+        if width <= 0.0 {
+            return Err("the screen size is unknown".to_string());
+        }
+        // Detached: when the wait window ends first, a cold recognizer keeps
+        // running to completion and warms Vision for the next read instead
+        // of being killed half-way.
+        let scale = f64::from(pixels) / width;
+        let rows = crate::ocr::recognize_background(reservation, png, scale)
+            .await.map_err(|error| format!("{error:#}"))?;
+        Ok(rows.into_iter().map(|row| row.text).collect())
+    };
+    tokio::time::timeout_at(deadline, read)
+        .await
+        .map_err(|_| "the OCR read did not finish inside the wait window".to_string())?
+}
+
+/// Poll screenshots + OCR until the expectation's text conditions hold.
+/// Read-only: nothing is sent to the phone but screenshot requests.
+async fn agent_wait_ocr(
+    state: &AppState,
+    w: &mut crate::runner::RunnerClient,
+    expect: &AgentUiExpectation,
+    generation: u64,
+    wait_deadline: tokio::time::Instant,
+    poll_ms: u64,
+) -> OcrWait {
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0_u64;
+    let mut reads = 0_u64;
+    let mut last_observation = serde_json::Value::Null;
+    let mut last_error: Option<String>;
+    let mut seen = vec![false; expect.ocr_absent.len()];
+    loop {
+        if private_read_refusal(state, generation).is_some() {
+            return OcrWait::Private;
+        }
+        attempts += 1;
+        let Some(read) = unless_private(&state.private_until, &state.privacy_epoch, generation,
+            agent_ocr_read(w, wait_deadline)).await else { return OcrWait::Private; };
+        match read {
+            Ok(texts) => {
+                if private_read_refusal(state, generation).is_some() {
+                    return OcrWait::Private;
+                }
+                reads += 1;
+                last_error = None;
+                let (matches, mut observation) = ocr_expectation_observation(&texts, expect);
+                observation["attempts"] = attempts.into();
+                observation["reads"] = reads.into();
+                observation["waited_ms"] =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).into();
+                let appeared = disappearance_observed(expect, &mut seen, &mut observation);
+                if matches && appeared {
+                    return OcrWait::Matched(observation);
+                }
+                last_observation = observation;
+            }
+            Err(error) => last_error = Some(error),
+        }
+        if private_read_refusal(state, generation).is_some() { return OcrWait::Private; }
+        if tokio::time::Instant::now() >= wait_deadline {
+            let mut observation = if last_observation.is_null() {
+                serde_json::json!({
+                    "read": false,
+                    "hint": "no screenshot was recognized; nothing here proves the text is absent"
+                })
+            } else {
+                last_observation
+            };
+            observation["source"] = "ocr".into();
+            observation["attempts"] = attempts.into();
+            observation["reads"] = reads.into();
+            if let Some(error) = last_error {
+                observation["read_error"] = error.into();
+            }
+            return OcrWait::TimedOut(observation);
+        }
+        let remaining = wait_deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(std::cmp::min(std::time::Duration::from_millis(poll_ms), remaining))
+            .await;
+    }
+}
+
 fn agent_wait_observation(
     last_observation: serde_json::Value,
     attempts: u64,
@@ -11643,6 +13197,7 @@ fn agent_wait_observation(
     // happens to be around.
     last_read_failed: bool,
     read_error: Option<&str>,
+    single_read: bool,
 ) -> serde_json::Value {
     let mut value = if last_observation.is_null() {
         serde_json::json!({
@@ -11652,6 +13207,7 @@ fn agent_wait_observation(
     } else {
         last_observation
     };
+    value["single_read"] = single_read.into();
     value["attempts"] = attempts.into();
     value["reads"] = reads.into();
     if last_read_failed && value["read"] == serde_json::Value::Bool(true) {
@@ -11698,7 +13254,9 @@ fn wait_probe_predicates(expect: &AgentUiExpectation) -> Option<Vec<String>> {
         .present
         .iter()
         .map(|locator| {
-            if locator.value.is_some()
+            if !locator.index.is_zero()
+                || locator.label_contains.is_some()
+                || locator.value.is_some()
                 || locator.focused.is_some()
                 || locator.enabled.is_some()
                 || locator.visible.is_some()
@@ -11707,8 +13265,7 @@ fn wait_probe_predicates(expect: &AgentUiExpectation) -> Option<Vec<String>> {
             {
                 return None;
             }
-            let quote =
-                |text: &str| format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"));
+            let quote = runner_predicate_literal;
             let mut clauses = Vec::new();
             if let Some(kind) = &locator.kind {
                 clauses.push(format!(
@@ -11756,8 +13313,9 @@ fn alert_only_expectation(expect: &AgentUiExpectation) -> bool {
         && expect.absent.is_empty()
         && !expect.present.is_empty()
         && expect.present.iter().all(|locator| {
-            locator.kind.as_deref() == Some("Alert")
+            locator.index.is_zero() && locator.kind.as_deref() == Some("Alert")
                 && locator.identifier.is_none()
+                && locator.label_contains.is_none()
                 && locator.value.is_none()
                 && locator.focused.is_none()
                 && locator.enabled.is_none()
@@ -11768,16 +13326,30 @@ fn alert_only_expectation(expect: &AgentUiExpectation) -> bool {
 async fn agent_wait_alert(
     w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
-) -> Result<Vec<crate::runner::ElementRow>, AgentWaitReadError> {
+) -> Result<crate::runner::ElementSnapshot, AgentWaitReadError> {
     match tokio::time::timeout_at(deadline, w.alert_text_fresh()).await {
-        Ok(Ok(alert)) => Ok(alert
-            .into_iter()
-            .map(|text| crate::runner::ElementRow {
-                kind: "Alert".into(),
-                label: text,
-                ..Default::default()
-            })
-            .collect()),
+        Ok(Ok(alert)) => Ok(crate::runner::ElementSnapshot {
+            rows: alert
+                .into_iter()
+                .map(|text| crate::runner::ElementRow {
+                    kind: "Alert".into(),
+                    label: text,
+                    ..Default::default()
+                })
+                .collect(),
+            coverage: crate::runner::SnapshotCoverage::Complete,
+        }),
+        Ok(Err(error)) => Err(AgentWaitReadError::Failed(error)),
+        Err(_) => Err(AgentWaitReadError::TimedOut),
+    }
+}
+
+async fn agent_wait_elements_once(
+    w: &mut crate::runner::RunnerClient,
+    deadline: tokio::time::Instant,
+) -> Result<crate::runner::ElementSnapshot, AgentWaitReadError> {
+    match tokio::time::timeout_at(deadline, w.element_snapshot_once()).await {
+        Ok(Ok(rows)) => Ok(rows),
         Ok(Err(error)) => Err(AgentWaitReadError::Failed(error)),
         Err(_) => Err(AgentWaitReadError::TimedOut),
     }
@@ -11786,14 +13358,17 @@ async fn agent_wait_alert(
 async fn agent_wait_elements(
     w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
-) -> Result<Vec<crate::runner::ElementRow>, AgentWaitReadError> {
-    match tokio::time::timeout_at(deadline, w.elements()).await {
+) -> Result<crate::runner::ElementSnapshot, AgentWaitReadError> {
+    match tokio::time::timeout_at(deadline, w.element_snapshot()).await {
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(first_error)) => {
             // Source reads are idempotent. A WebView transition can invalidate
             // one runner session, so rebuild once within the same wait deadline.
+            if !w.observation_scope_current() {
+                return Err(AgentWaitReadError::TimedOut);
+            }
             w.invalidate_session();
-            match tokio::time::timeout_at(deadline, w.elements()).await {
+            match tokio::time::timeout_at(deadline, w.element_snapshot()).await {
                 Ok(Ok(rows)) => Ok(rows),
                 Ok(Err(second_error)) => Err(AgentWaitReadError::Failed(anyhow::anyhow!(
                     "source retry failed: {second_error:#}; first attempt: {first_error:#}"
@@ -11914,7 +13489,13 @@ async fn agent_actions(
     if let Some(owner) = trusted_bearer_owner(&state, &headers) {
         crate::advice::reset(&owner);
     }
-    agent_actions_inner(state, headers, body).await
+    let generation = state.0.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let trace_state = state.0.clone();
+    let trace_headers = headers.clone();
+    let trace_handle = action_trace_handle(&trace_state, &trace_headers);
+    let trace_action = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let response = agent_actions_inner(state, headers, body).await;
+    action_receipt(&trace_state, &trace_headers, &trace_action, generation, trace_handle, response).await
 }
 
 /// A tap right after a swipe or scroll — pauses between them included — lands
@@ -11938,16 +13519,38 @@ fn needs_scroll_settle(earlier: &[AgentActionStep], current: &serde_json::Value)
 /// No screen text survives a privacy refusal, but prior dispatch counts and
 /// retry safety remain visible so an interrupted batch cannot be replayed.
 fn private_batch_refusal(index: usize, completed: usize, applied: usize) -> Response {
-    agent_actions_failure(
-        StatusCode::LOCKED, index, completed, applied, "screen_private",
-        "not_sent", applied == 0, &[], None,
-    )
+    private_batch_refusal_with_steps(index, completed, applied, &[])
+}
+fn private_batch_refusal_with_steps(index: usize, completed: usize, applied: usize, steps: &[serde_json::Value]) -> Response {
+    agent_actions_failure(StatusCode::LOCKED, index, completed, applied, "screen_private",
+        "not_sent", applied == 0, steps, None)
+}
+
+fn batch_needs_private_scope(request: &AgentActionsRequest) -> bool {
+    request.observe || request.steps.iter().any(|step|
+        matches!(step, AgentActionStep::WaitFor { .. })
+            || matches!(step, AgentActionStep::Action { action, .. } if is_capture_or_volume(action) || action.get("type").and_then(serde_json::Value::as_str) == Some("set_value")))
 }
 
 async fn agent_actions_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: String,
+) -> Response {
+    let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    agent_actions_generation(State(state), headers, body, generation).await
+}
+
+fn batch_privacy_revoked(state: &AppState, observes_screen: bool, generation: u64, scope: &ScreenReadScope) -> bool {
+    observes_screen && (!scope.current(state) || screen_private_now(&state.private_until)
+        || state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation)
+}
+
+async fn agent_actions_generation(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+    privacy_generation: u64,
 ) -> Response {
     match agent_auth(&state, &headers) {
         AgentAuth::Locked => {
@@ -11965,36 +13568,71 @@ async fn agent_actions_inner(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
-    match claim_phone_owner(&state, &headers) {
-        Err(refused) => return refused,
-        Ok(true) => prewarm_on_new_lease(&state, &headers),
-        Ok(false) => {}
-    }
     if body.len() > AGENT_ACTIONS_MAX_BODY_BYTES {
         return agent_actions_invalid(format!(
             "request body exceeds {AGENT_ACTIONS_MAX_BODY_BYTES} bytes"
         ));
     }
-    let mut request: AgentActionsRequest = match serde_json::from_str(&body) {
+    let request: AgentActionsRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(error) => return agent_actions_invalid(format!("invalid JSON shape: {error}")),
     };
     if let Err(error) = validate_agent_actions(&request) {
         return agent_actions_invalid(error);
     }
-    let observes_screen = request.observe || request.steps.iter().any(|step| {
-        matches!(step, AgentActionStep::WaitFor { .. })
-    });
-    if observes_screen && state.screen_private_secs() > 0 {
+    if named_owner(&headers).is_none() && request.steps.iter().any(|step| matches!(step,
+        AgentActionStep::Action { action, .. } if is_input_continuation(action) || action.get("budget_ms").is_some())) {
+        return agent_actions_invalid("bounded text and continuation require a named X-Phone-Owner");
+    }
+    let single_read_only = matches!(
+        request.steps.as_slice(),
+        [AgentActionStep::WaitFor { timeout_ms: 0, .. }]
+    );
+    let observes_screen = batch_needs_private_scope(&request);
+    match claim_phone_owner(&state, &headers) {
+        Err(refused) => return refused,
+        Ok(true) if !single_read_only && !request.steps.iter().any(|step| matches!(step, AgentActionStep::Action { action, .. } if is_input_continuation(action))) => prewarm_on_new_lease(&state, &headers),
+        Ok(_) => {}
+    }
+    let mut capture_scope = ScreenReadScope::capture(&state);
+    capture_scope.privacy_epoch = privacy_generation;
+    let mut response = agent_actions_scoped(
+        state.clone(),
+        headers,
+        body,
+        request,
+        privacy_generation,
+        capture_scope.clone(),
+    )
+    .await;
+    response.extensions_mut().insert(ActionRequestScope(capture_scope.clone()));
+    if observes_screen {
+        response.extensions_mut().insert(BatchPrivacyFence {
+            state,
+            scope: capture_scope,
+        });
+    }
+    response
+}
+
+async fn agent_actions_scoped(
+    state: Arc<AppState>, headers: HeaderMap, body: String, mut request: AgentActionsRequest,
+    privacy_generation: u64, capture_scope: ScreenReadScope,
+) -> Response {
+    let observes_screen = batch_needs_private_scope(&request);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
         return private_batch_refusal(0, 0, 0);
     }
     // `launch_app {"app": …}` becomes a bundle before the first step runs, so
     // a name that does not resolve refuses the whole batch with nothing sent.
-    for step in &mut request.steps {
+    let mut launch_resolutions: Vec<(usize, serde_json::Value)> = Vec::new();
+    for (step_index, step) in request.steps.iter_mut().enumerate() {
         if let AgentActionStep::Action { action, .. } = step {
             fresh_launch_while_recording(&state, action);
-            if let Err(refusal) = resolve_launch_app_action(&state, action).await {
-                return refusal;
+            match resolve_launch_app_action(&state, action).await {
+                Ok(Some(resolved)) => launch_resolutions.push((step_index, resolved)),
+                Ok(None) => {}
+                Err(refusal) => return refusal,
             }
         }
     }
@@ -12058,7 +13696,11 @@ async fn agent_actions_inner(
     // Control priority first: a health probe must not hold the runner while
     // the focus step (or the action after it) waits for it.
     let _priority = state.begin_runner_control();
-    engage_agent_focus(&state, runner, first_launch.flatten(), true).await;
+    let single_read_only = matches!(request.steps.as_slice(), [AgentActionStep::WaitFor {timeout_ms: 0, ..}]);
+    let system_request_only = request.steps.iter().any(|step| matches!(step, AgentActionStep::Action { action, .. } if is_capture_or_volume(action)))
+        && !request.steps.iter().any(|step| matches!(step, AgentActionStep::Action { action, .. } if !is_capture_or_volume(action)));
+    let has_continuation = request.steps.iter().any(|step| matches!(step, AgentActionStep::Action { action, .. } if is_input_continuation(action)));
+    if !system_request_only && !single_read_only && !has_continuation { engage_agent_focus(&state, runner, first_launch.flatten(), true).await; }
     // Long text steps add their typing time (zero for text up to one chunk).
     let typing_allowance: std::time::Duration = request
         .steps
@@ -12068,7 +13710,12 @@ async fn agent_actions_inner(
             _ => std::time::Duration::ZERO,
         })
         .sum();
-    let batch_deadline = tokio::time::Instant::now() + AGENT_ACTIONS_DEADLINE + typing_allowance;
+    // A standalone single-read wait also bounds waiting for the runner mutex.
+    // In a longer batch its read window starts when that step is reached.
+    let batch_budget = if single_read_only {
+        std::time::Duration::from_millis(core::SINGLE_READ_WAIT_BUDGET_MS)
+    } else { AGENT_ACTIONS_DEADLINE + typing_allowance };
+    let batch_deadline = tokio::time::Instant::now() + batch_budget;
     let mut w = match tokio::time::timeout_at(batch_deadline, runner.lock()).await {
         Ok(client) => client,
         Err(_) => {
@@ -12086,12 +13733,17 @@ async fn agent_actions_inner(
         }
     };
 
+    let weak_state = Arc::downgrade(&state);
+    let read_scope = capture_scope.clone();
+    w.bind_observation_scope(Arc::new(move ||
+        weak_state.upgrade().is_some_and(|state| read_scope.current(&state))));
+
     let mut completed = 0_usize;
     let mut applied_actions = 0_usize;
     let mut step_results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
-        if observes_screen && state.screen_private_secs() > 0 {
-            return private_batch_refusal(index, completed, applied_actions);
+        if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
+            return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
         }
         if state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
@@ -12138,7 +13790,7 @@ async fn agent_actions_inner(
                     .await;
                 }
 
-                if let Err(refusal) = guard_foreground(&mut w, action).await {
+                if let Err(refusal) = scoped_observation(&state, &capture_scope, guard_foreground(&mut w, action)).await {
                     let mut body = agent_actions_failure_body(
                         index,
                         completed,
@@ -12166,15 +13818,17 @@ async fn agent_actions_inner(
                 // not be replayed automatically.
                 let post_mark = w.last_post();
                 let mut step_detail = None;
+                let dispatch_allowed = || capture_scope.current(&state) && tokio::time::Instant::now() < batch_deadline;
                 let outcome = match tokio::time::timeout_at(
                     batch_deadline,
-                    direct_agent_action(
+                    scoped_runner_action(&state, &capture_scope, batch_deadline, direct_agent_action(
                         &mut w,
                         &state.runner_actionable,
                         action,
                         &mut step_detail,
                         batch_deadline,
-                    ),
+                        Some(&dispatch_allowed),
+                    capture_scope.text_scope(named_owner(&headers)).as_ref(), )),
                 )
                 .await
                 {
@@ -12194,7 +13848,7 @@ async fn agent_actions_inner(
                                     false,
                                 )
                             };
-                        return agent_actions_failure(
+                        return with_app_lifecycle_receipt(agent_actions_failure(
                             status,
                             index,
                             completed,
@@ -12204,7 +13858,7 @@ async fn agent_actions_inner(
                             retry_safe,
                             &step_results,
                             None,
-                        );
+                        ), step_detail.as_ref()).await;
                     }
                 };
                 // An optional alert step ({"if_present":true}) that found no
@@ -12235,7 +13889,7 @@ async fn agent_actions_inner(
                     completed += 1;
                     continue;
                 }
-                renew_after_long_text(&state, &headers, action);
+                renew_after_long_text(&state, &headers, action, &capture_scope);
                 if let RunnerControlOutcome::TextPartial {
                     confirmed,
                     uncertain,
@@ -12244,7 +13898,7 @@ async fn agent_actions_inner(
                     if uncertain > 0 {
                         mark_runner_read_path_unactionable(&state);
                     }
-                    let partial = text_partial_body(action, confirmed, uncertain);
+                    let partial = text_partial_with_detail(action, confirmed, uncertain, step_detail.as_ref());
                     let mut body = agent_actions_failure_body(
                         index,
                         completed,
@@ -12260,9 +13914,9 @@ async fn agent_actions_inner(
                         "characters_uncertain",
                         "characters_total",
                         "remaining_text",
-                        "hint",
+                        "hint", "continue_token", "continuation_safe", "continuation_expires_in_ms", "detail",
                     ] {
-                        body[key] = partial[key].clone();
+                        if let Some(value) = partial.get(key) { body[key] = value.clone(); }
                     }
                     return agent_actions_json(StatusCode::BAD_GATEWAY, body);
                 }
@@ -12352,6 +14006,10 @@ async fn agent_actions_inner(
                             "not_sent",
                             true,
                         ),
+                        RunnerControlOutcome::ScopeInterrupted =>
+                            (StatusCode::CONFLICT, "control_scope_changed", "unknown", false),
+                        RunnerControlOutcome::AppLaunchInterrupted =>
+                            (StatusCode::CONFLICT, "app_launch_interrupted", "partial", false),
                         RunnerControlOutcome::Failed => {
                             (StatusCode::BAD_GATEWAY, "outcome_unknown", "unknown", false)
                         }
@@ -12375,6 +14033,10 @@ async fn agent_actions_inner(
                         &step_results,
                         None,
                     );
+                    copy_app_lifecycle_receipt(&mut body, step_detail.as_ref());
+                    if let Some(replacement) = step_detail.as_ref().and_then(|d| d.get("replacement")) {
+                        body["replacement"] = replacement.clone();
+                    }
                     if let RunnerControlOutcome::Refused(_, hint) = outcome {
                         body["hint"] = serde_json::json!(hint);
                     }
@@ -12391,7 +14053,30 @@ async fn agent_actions_inner(
                     .await;
                 }
                 applied_actions += 1;
-                record_activity(&state, &headers, action);
+                let rebound_rect=w.activity_rebound_rect.take();
+                record_activity(&state, &headers, action, w.cached_window_size(), &capture_scope, rebound_rect);
+                let mut receipt = serde_json::json!({
+                    "index": index,
+                    "kind": "action",
+                    "ok": true
+                });
+                if let Some((_, resolved)) = launch_resolutions.iter().find(|(step, _)| *step == index) {
+                    receipt["resolved"] = resolved.clone();
+                }
+                if let Some(capture) = step_detail.as_ref().and_then(|value| value.get("system_capture")) {
+                    receipt["system_capture"] = capture.clone();
+                }
+                if let Some(rebound) = step_detail.as_ref().and_then(|value| value.get("rebound")) {
+                    receipt["rebound"] = rebound.clone();
+                }
+                if let Some(verification) = step_detail.as_ref().and_then(|detail| detail.get("verification")) {
+                    receipt["verification"] = verification.clone();
+                }
+                if let Some(replacement) = step_detail.as_ref().and_then(|detail| detail.get("replacement")) {
+                    receipt["replacement"] = replacement.clone();
+                }
+                crate::action_feedback::enrich(&mut receipt);
+                step_results.push(receipt);
                 if *after_ms > 0
                     && tokio::time::timeout_at(
                         batch_deadline,
@@ -12400,6 +14085,8 @@ async fn agent_actions_inner(
                     .await
                     .is_err()
                 {
+                    // The action is confirmed even though its requested pause was interrupted.
+                    step_results.last_mut().unwrap()["after_ms_omitted"] = true.into();
                     return agent_actions_failure(
                         StatusCode::GATEWAY_TIMEOUT,
                         index,
@@ -12412,11 +14099,6 @@ async fn agent_actions_inner(
                         None,
                     );
                 }
-                step_results.push(serde_json::json!({
-                    "index": index,
-                    "kind": "action",
-                    "ok": true
-                }));
             }
             AgentActionStep::Pause { ms } => {
                 if tokio::time::timeout_at(
@@ -12449,11 +14131,44 @@ async fn agent_actions_inner(
                 timeout_ms,
                 poll_ms,
             } => {
+                let single_read = *timeout_ms == 0;
+                let wait_budget_ms = if single_read {core::SINGLE_READ_WAIT_BUDGET_MS} else {*timeout_ms};
                 let wait_started = tokio::time::Instant::now();
                 let wait_deadline = std::cmp::min(
                     batch_deadline,
-                    wait_started + std::time::Duration::from_millis(*timeout_ms),
+                    wait_started + std::time::Duration::from_millis(wait_budget_ms),
                 );
+                if expect.uses_ocr() {
+                    match scoped_observation(&state, &capture_scope, agent_wait_ocr(&state, &mut w, expect, privacy_generation, wait_deadline, *poll_ms)).await {
+                        OcrWait::Matched(observation) => {
+                            step_results.push(serde_json::json!({
+                                "index": index,
+                                "kind": "wait_for",
+                                "ok": true,
+                                "source": "ocr",
+                                "observation": observation
+                            }));
+                            completed += 1;
+                            continue;
+                        }
+                        OcrWait::Private => {
+                            return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
+                        }
+                        OcrWait::TimedOut(observation) => {
+                            return agent_actions_failure(
+                                StatusCode::CONFLICT,
+                                index,
+                                completed,
+                                applied_actions,
+                                "expectation_timeout",
+                                "not_sent",
+                                applied_actions == 0,
+                                &step_results,
+                                Some(observation),
+                            );
+                        }
+                    }
+                }
                 // Narrow probes are an optimization, not evidence. Reserve
                 // at least half the actual remaining window for full reads:
                 // a source read can take seconds, far longer than poll_ms.
@@ -12469,12 +14184,13 @@ async fn agent_actions_inner(
                 // erase history.
                 let mut reads = 0_u64;
                 let alert_only = alert_only_expectation(expect);
-                let probes = if alert_only { None } else { wait_probe_predicates(expect) };
+                let probes = if alert_only || single_read || expect.absent_after_present { None } else { wait_probe_predicates(expect) };
+                let mut seen_absent = vec![false; expect.absent.len()];
                 let mut probe_misses = 0_u64;
                 let mut probes_answered = 0_u64;
                 loop {
-                    if state.screen_private_secs() > 0 {
-                        return private_batch_refusal(index, completed, applied_actions);
+                    if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
+                        return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                     }
                     attempts += 1;
                     // While the targets are not there yet, ask runner for just
@@ -12484,7 +14200,7 @@ async fn agent_actions_inner(
                     if let Some(probes) = &probes {
                         let poll = std::time::Duration::from_millis(*poll_ms);
                         let miss = if tokio::time::Instant::now() + poll < probe_deadline {
-                            let answer = wait_probe_missed(&mut w, probes, probe_deadline).await;
+                            let answer = scoped_observation(&state, &capture_scope, wait_probe_missed(&mut w, probes, probe_deadline)).await;
                             if answer.is_some() {
                                 probes_answered += 1;
                             }
@@ -12501,15 +14217,17 @@ async fn agent_actions_inner(
                         }
                     }
                     let read = if alert_only {
-                        agent_wait_alert(&mut w, wait_deadline).await
+                        scoped_observation(&state, &capture_scope, agent_wait_alert(&mut w, wait_deadline)).await
+                    } else if single_read {
+                        scoped_observation(&state, &capture_scope, agent_wait_elements_once(&mut w, wait_deadline)).await
                     } else {
-                        agent_wait_elements(&mut w, wait_deadline).await
+                        scoped_observation(&state, &capture_scope, agent_wait_elements(&mut w, wait_deadline)).await
                     };
-                    if state.screen_private_secs() > 0 {
-                        return private_batch_refusal(index, completed, applied_actions);
+                    if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
+                        return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                     }
-                    let rows = match read {
-                        Ok(rows) => rows,
+                    let snapshot = match read {
+                        Ok(snapshot) => snapshot,
                         Err(AgentWaitReadError::Failed(error)) => {
                             last_read_error = Some(format!("{error:#}"));
                             // System sheets can briefly restart the runner relay or
@@ -12518,7 +14236,7 @@ async fn agent_actions_inner(
                             // so keep rebuilding the read-only session inside that
                             // window instead of failing on the first two quick
                             // connection refusals. No mutation is replayed.
-                            if tokio::time::Instant::now() >= wait_deadline {
+                            if single_read || tokio::time::Instant::now() >= wait_deadline {
                                 tracing::warn!(
                                     "runner batch wait_for source never recovered: {error:#}"
                                 );
@@ -12546,6 +14264,7 @@ async fn agent_actions_inner(
                                             reads,
                                             true,
                                             Some(&error),
+                                            single_read,
                                         ),
                                     )),
                                 );
@@ -12565,7 +14284,7 @@ async fn agent_actions_inner(
                                     "runner batch wait_for source timed out after retries: {error}"
                                 );
                             }
-                            w.invalidate_session();
+                            if !single_read { w.invalidate_session(); }
                             // The read that ended the window is this timeout,
                             // whether or not an earlier attempt also failed.
                             let timeout_error = match last_read_error.as_deref() {
@@ -12576,11 +14295,11 @@ async fn agent_actions_inner(
                                 None => "element read timed out inside the wait window".to_string(),
                             };
                             return agent_actions_failure(
-                                StatusCode::CONFLICT,
+                                if single_read {StatusCode::GATEWAY_TIMEOUT} else {StatusCode::CONFLICT},
                                 index,
                                 completed,
                                 applied_actions,
-                                "expectation_timeout",
+                                if single_read {"single_read_timeout"} else {"expectation_timeout"},
                                 "not_sent",
                                 applied_actions == 0,
                                 &step_results,
@@ -12593,30 +14312,35 @@ async fn agent_actions_inner(
                                         reads,
                                         true,
                                         Some(&timeout_error),
+                                        single_read,
                                     ),
                                 )),
                             );
                         }
                     };
                     reads += 1;
-                    let (matches, mut observation) = agent_expectation_observation(&rows, expect);
+                    let (matches, mut observation) = agent_expectation_observation(&snapshot.rows, expect, snapshot.coverage);
                     if alert_only {
                         observation["source"] = serde_json::json!("alert");
-                        observation["alert"] = rows.first().map(|row| row.label.clone()).into();
+                        observation["alert"] = snapshot.rows.first().map(|row| row.label.clone()).into();
                     }
+                    observation["single_read"] = single_read.into();
+                    let appeared = disappearance_observed(expect, &mut seen_absent, &mut observation);
                     last_observation = observation;
-                    if matches {
+                    if matches && appeared {
                         step_results.push(serde_json::json!({
                             "index": index,
                             "kind": "wait_for",
                             "ok": true,
                             "attempts": attempts,
+                            "reads": reads,
+                            "single_read": single_read,
                             "probe_misses": probe_misses,
                             "observation": last_observation
                         }));
                         break;
                     }
-                    if tokio::time::Instant::now() >= wait_deadline {
+                    if single_read || tokio::time::Instant::now() >= wait_deadline {
                         return agent_actions_failure(
                             StatusCode::CONFLICT,
                             index,
@@ -12635,6 +14359,7 @@ async fn agent_actions_inner(
                                 reads,
                                 false,
                                 last_read_error.as_deref(),
+                                single_read,
                             )),
                         );
                     }
@@ -12651,8 +14376,8 @@ async fn agent_actions_inner(
         completed += 1;
     }
 
-    if observes_screen && state.screen_private_secs() > 0 {
-        return private_batch_refusal(completed, completed, applied_actions);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
+        return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
     }
     state.touch_activity();
     // A read-only wait (including /alert/text) proves no input capability.
@@ -12671,9 +14396,9 @@ async fn agent_actions_inner(
         // Observation only: the batch's verdict is already fixed above.
         let budget = std::time::Duration::from_millis(AGENT_INPUT_SETTLE_DEFAULT_MS);
         let (observed, report) =
-            settle_and_read_elements(&mut w, budget, DEVICE_SETTLE_DEFAULT_CAP).await;
-        if state.screen_private_secs() > 0 {
-            return private_batch_refusal(completed, completed, applied_actions);
+            scoped_observation(&state, &capture_scope, settle_and_read_elements(&mut w, budget, DEVICE_SETTLE_DEFAULT_CAP)).await;
+        if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
+            return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
         }
         if let Some((snapshot, rows)) = observed {
             let rows = Arc::new(rows);
@@ -12708,8 +14433,8 @@ async fn agent_actions_inner(
             }
         }
         result["settle"] = report.to_json();
-        if let Some(alert) = alert_json(probe_alert(&mut w).await) {
-            result["alert"] = alert;
+        if capture_scope.current(&state) {
+            if let Some(alert) = alert_json(scoped_observation(&state, &capture_scope, probe_alert(&mut w)).await) { result["alert"] = alert; }
         }
     }
     for (key, block) in flow_after_actions(&state, &headers, &recorded_body) {
@@ -12720,10 +14445,263 @@ async fn agent_actions_inner(
     }
     // A person can start a private hold while a read is in flight. Discard
     // every observation, including earlier step text, before returning it.
-    if observes_screen && state.screen_private_secs() > 0 {
-        return private_batch_refusal(completed, completed, applied_actions);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
+        return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
     }
     agent_actions_json(StatusCode::OK, result)
+}
+
+#[derive(Clone)]
+struct ScreenReadScope { epoch: u64, privacy_epoch: u64, lifecycle_stamp: Option<u64>, owner: Option<String> }
+impl ScreenReadScope {
+    fn text_scope(&self, caller: Option<&str>) -> Option<crate::input_continuation::Scope> {
+        let owner = caller.filter(|caller| self.owner.as_deref() == Some(*caller))?;
+        Some(crate::input_continuation::Scope { owner: owner.to_string(), epoch: self.epoch,
+            privacy_epoch: self.privacy_epoch, lifecycle_stamp: self.lifecycle_stamp? })
+    }
+    fn capture(state: &AppState) -> Self {
+        let owner = recover(state.owner.lock());
+        let now = Instant::now();
+        let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+        Self {
+            lifecycle_stamp: state.runner_lifecycle.active_stamp(),
+            epoch: state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),
+            privacy_epoch: state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire),
+            owner: owner.as_ref().filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                .map(|owner| owner.name.clone()),
+        }
+    }
+    fn current(&self, state: &AppState) -> bool {
+        let owner_matches = {
+            let owner = recover(state.owner.lock());
+            let now = Instant::now();
+            let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+            self.epoch == state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+                && self.owner.as_deref() == owner.as_ref()
+                    .filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                    .map(|owner| owner.name.as_str())
+        };
+        let privacy_matches = {
+            let until = recover(state.private_until.lock());
+            self.privacy_epoch == state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire)
+                && !until.is_some_and(|until| until > Instant::now())
+        };
+        owner_matches
+            && privacy_matches
+            && !state.released.load(std::sync::atomic::Ordering::Acquire)
+            && self.lifecycle_stamp.is_some()
+            && self.lifecycle_stamp == state.runner_lifecycle.active_stamp()
+    }
+}
+fn control_interruption_outcome(interrupted: crate::timing::ControlInterruption) -> RunnerControlOutcome {
+    if interrupted.mutations_admitted { RunnerControlOutcome::ScopeInterrupted }
+    else { RunnerControlOutcome::Refused("control_scope_changed",
+        "Control authorization or request lifetime changed before any action request was dispatched; check status with the current owner before new work") }
+}
+
+async fn scoped_runner_action(
+    state: &Arc<AppState>, scope: &ScreenReadScope, deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output=RunnerControlOutcome>,
+) -> RunnerControlOutcome {
+    let weak = Arc::downgrade(state);
+    let scope = scope.clone();
+    crate::timing::with_control_permit(Arc::new(move ||
+        tokio::time::Instant::now() < deadline
+            && weak.upgrade().is_some_and(|state| scope.current(&state))), work)
+        .await.unwrap_or_else(control_interruption_outcome)
+}
+
+async fn scoped_observation<T>(state: &Arc<AppState>, scope: &ScreenReadScope,
+    work: impl std::future::Future<Output = T>) -> T {
+    let weak = Arc::downgrade(state);
+    let scope = scope.clone();
+    crate::timing::with_request_permit(Arc::new(move ||
+        weak.upgrade().is_some_and(|state| scope.current(&state))), work).await
+}
+
+async fn scoped_value_read<T>(state: &AppState, scope: &ScreenReadScope, work: impl std::future::Future<Output=T>) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        if !scope.current(state) { return None; }
+        if let Ok(value) = tokio::time::timeout(std::time::Duration::from_millis(250), &mut work).await {
+            return scope.current(state).then_some(value);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ValueReadFence {
+    state: Arc<AppState>,
+    scope: ScreenReadScope,
+    failure: serde_json::Value,
+    max_bytes: usize,
+}
+fn value_scope_failure() -> serde_json::Value {
+    serde_json::json!({"ok":false,"error":"value_read_scope_changed","value_omitted":true,"hint":"The value was withheld after owner/privacy changed; check current status before a fresh read"})
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueReadRequest {
+    identifier: Option<String>,
+    label: Option<String>,
+    kind: Option<String>,
+    max_utf16: Option<u32>,
+}
+fn unavailable_value_read(reason: &'static str, hint: &'static str) -> Response {
+    json_response(StatusCode::NOT_IMPLEMENTED,
+        serde_json::json!({"ok":false,"error":"full_value_unavailable","reason":reason,"hint":hint}))
+}
+
+fn unsupported_value_read(error: &crate::runner::RunnerHttpError) -> Response {
+    let (reason, hint) = match error.message.as_deref() {
+        Some("runner lacks ipu:valueRead") => ("runner_capability_missing",
+            "The selected Runner does not advertise ipu:valueRead. Select a capable Native Runner or use another permitted read; no preview was promoted to a complete value."),
+        Some("full AX value attribute unavailable") => ("ax_attribute_unavailable",
+            "The full AX value request for the selected element did not return the requested attribute. This does not establish an empty or null value, or a missing Runner API. Use another permitted read without inferring the value."),
+        Some("full AX value is not scalar") => ("ax_value_not_scalar",
+            "The selected AX value is not a scalar supported by this read. Use another permitted view; no complete string or null value was inferred."),
+        Some("full AX value read failed" | "full AX value read raised an exception") => ("ax_read_failed",
+            "The Native AX read failed for this request. Use another permitted read; no empty or null value was inferred."),
+        Some(message) if matches!(message, "full AX value read unavailable" | "full AX value selector argument count unavailable")
+            || message.starts_with("full AX value selector shape unavailable (") => ("ax_bridge_unavailable",
+            "The Native AX bridge was unavailable for this request. Use another permitted read; this failure does not establish an empty or null value."),
+        _ => ("runner_endpoint_unavailable",
+            "The selected Runner did not provide a usable complete-value endpoint. Check the selected Runner's capabilities or use another permitted read; no preview was promoted to a complete value."),
+    };
+    unavailable_value_read(reason, hint)
+}
+
+async fn agent_value(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let scope = ScreenReadScope::capture(&state);
+    match agent_auth(&state, &headers) {
+        AgentAuth::Ok => {}
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+    }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    if state.released.load(std::sync::atomic::Ordering::Acquire)
+        || state.runner_lifecycle.is_transitioning()
+    {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok":false,"error":"device_unavailable"}),
+        );
+    }
+    let request = match serde_json::from_str::<ValueReadRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return invalid_list_request("invalid value-read request".into()),
+    };
+    let selector = match (request.identifier.as_deref(), request.label.as_deref()) {
+        (Some(id), None) if !id.is_empty() && id.chars().count() <= 512 => {
+            format!("identifier == {}", runner_predicate_literal(id))
+        }
+        (None, Some(label)) if !label.is_empty() && label.chars().count() <= 512 => {
+            format!("label == {}", runner_predicate_literal(label))
+        }
+        _ => {
+            return invalid_list_request(
+                "give exactly one nonempty identifier or label, at most 512 characters".into(),
+            )
+        }
+    };
+    let limit = request.max_utf16.unwrap_or(8192);
+    if !(1..=65536).contains(&limit) {
+        return invalid_list_request("max_utf16 must be 1...65536".into());
+    }
+    let selector = if let Some(kind) = request.kind {
+        if kind.is_empty() || kind.len() > 80 {
+            return invalid_list_request("invalid kind".into());
+        }
+        if kind.trim_start_matches("XCUIElementType") == "SecureTextField" {
+            return json_response(StatusCode::FORBIDDEN,
+                serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}));
+        }
+        format!(
+            "({selector}) AND type == {}",
+            runner_predicate_literal(&format!(
+                "XCUIElementType{}",
+                kind.trim_start_matches("XCUIElementType")
+            ))
+        )
+    } else {
+        selector
+    };
+    let Some(runner) = &state.runner else {
+        return ControlRefusal::runner_not_configured().into_response();
+    };
+    state.touch_activity();
+    let work = scoped_value_read(&state, &scope, async {
+        let _priority = state.begin_runner_control();
+        let mut client = runner.lock().await;
+        let ids = client.find_elements("predicate string", &selector).await?;
+        if ids.len() != 1 {
+            return Ok::<_, anyhow::Error>(Err(if ids.is_empty() {
+                "element_not_found"
+            } else {
+                "ambiguous_element"
+            }));
+        }
+        client.read_element_value(&ids[0], limit).await.map(Ok)
+    });
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), work).await;
+    let current = || scope.current(&state);
+    let mut response = if !current() {
+        json_response(StatusCode::CONFLICT, value_scope_failure())
+    } else {
+        match outcome {
+            Ok(Some(Ok(Ok(mut value)))) if core::value_read::valid_contract(&value, limit) => {
+                value["ok"] = true.into();
+                json_response(StatusCode::OK, value)
+            }
+            Ok(Some(Ok(Err(error)))) => json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({"ok":false,"error":error}),
+            ),
+            Err(_) => json_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                serde_json::json!({"ok":false,"error":"value_read_timeout"}),
+            ),
+            Ok(Some(Err(error)))
+                if crate::runner::runner_http_error(&error).is_some_and(|e| {
+                    e.message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("secure_value_read_requires_human"))
+                }) =>
+            {
+                json_response(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}),
+                )
+            }
+            Ok(None) => json_response(StatusCode::CONFLICT, value_scope_failure()),
+            Ok(Some(Err(ref error))) => match crate::runner::runner_http_error(error) {
+                Some(error) if error.status.as_u16() == 501
+                    || matches!(error.code.as_deref(), Some("unknown command" | "unsupported operation")) => unsupported_value_read(error),
+                _ => json_response(StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"ok":false,"error":"value_read_failed","retry_safe":true})),
+            },
+            Ok(Some(Ok(Ok(_)))) => unavailable_value_read("invalid_contract",
+                "The Runner response failed complete-value validation. No preview was promoted, and no empty or null value was inferred. Use another permitted read."),
+        }
+    };
+    response
+        .extensions_mut()
+        .insert(ValueReadFence { state, scope, failure: value_scope_failure(), max_bytes: 1 << 20 });
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -12731,16 +14709,146 @@ async fn agent_actions_inner(
 // for one label, swiping on the agent's behalf (see `crate::collect`).
 // ---------------------------------------------------------------------------
 
+/// Native ACK counts only; neither displacement nor business completeness is implied.
+#[derive(Default)]
+struct ListDelivery {
+    setup_started: std::sync::atomic::AtomicBool,
+    confirmed: std::sync::atomic::AtomicU32,
+    uncertain: std::sync::atomic::AtomicU32,
+}
+impl ListDelivery {
+    fn receipt(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Acquire;
+        let confirmed = self.confirmed.load(Acquire);
+        let uncertain = self.uncertain.load(Acquire);
+        serde_json::json!({"swipes":confirmed,"swipes_confirmed":confirmed,"swipes_uncertain":uncertain,
+            "swipe_outcome":if uncertain>0 {"unknown"} else if confirmed>0 {"applied"} else {"not_sent"}})
+    }
+}
+struct ListSwipeReceipt {
+    delivery: Arc<ListDelivery>,
+    dispatched: Arc<std::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+impl ListSwipeReceipt {
+    fn finish(&mut self, confirmed: bool) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        if self.dispatched.load(Acquire) {
+            if confirmed {
+                self.delivery.confirmed.fetch_add(1, AcqRel);
+            } else {
+                self.delivery.uncertain.fetch_add(1, AcqRel);
+            }
+        }
+        self.finished = true;
+    }
+}
+impl Drop for ListSwipeReceipt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(false);
+        }
+    }
+}
+fn list_interrupted(delivery: &ListDelivery, error: &str) -> Response {
+    let mut body = delivery.receipt();
+    body["ok"] = false.into();
+    body["error"] = error.into();
+    body["retry_safe"] = false.into();
+    body["observation_omitted"] = true.into();
+    body["hint"]="List observations were withheld. Setup or scrolling may already have affected the device; check status and coordinate with the current owner before new work. Do not automatically replay this call.".into();
+    json_response(StatusCode::CONFLICT, body)
+}
+fn scoped_list_read_failure(
+    state: &AppState,
+    scope: &ScreenReadScope,
+    delivery: &ListDelivery,
+    error: &anyhow::Error,
+) -> Response {
+    if !scope.current(state) {
+        list_interrupted(delivery, "list_scope_changed")
+    } else {
+        first_read_failed(state, error)
+    }
+}
+fn private_list_refusal(state: &AppState) -> Option<Response> {
+    screen_private_refusal(state).map(|_| {
+        json_response(
+            StatusCode::LOCKED,
+            serde_json::json!({"ok":false,"error":"screen_private","outcome":"not_sent",
+            "retry_safe":true,"swipes":0,"swipes_confirmed":0,"swipes_uncertain":0}),
+        )
+    })
+}
+fn list_read_scope(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    generation: u64,
+) -> Result<ScreenReadScope, Response> {
+    // Pin the caller and expected epoch across claim/capture; a concurrent
+    // takeover must not lend its new permission to this request.
+    let epoch = state.owner_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let newly_claimed = claim_phone_owner(state, headers)?;
+    let mut scope = ScreenReadScope::capture(state);
+    scope.epoch = epoch.wrapping_add(u64::from(newly_claimed));
+    scope.owner = match owner_claim_from_headers(headers)? {
+        OwnerClaim::Named(name) | OwnerClaim::Takeover(name) => Some(name.to_owned()),
+        OwnerClaim::Anonymous => None,
+    };
+    scope.privacy_epoch = generation;
+    Ok(scope)
+}
+fn forget_unpublished_list_snapshot(
+    state: &AppState,
+    scope: &ScreenReadScope,
+    value: &serde_json::Value,
+) {
+    if let Some(snapshot) = value.get("snapshot").and_then(serde_json::Value::as_str) {
+        let mut owners = recover(state.owner_snapshots.lock());
+        if let Some(owner) = scope.owner.as_ref() {
+            if owners.get(owner).is_some_and(|id| id == snapshot) {
+                owners.remove(owner);
+            }
+        }
+        if !owners.values().any(|id| id == snapshot) {
+            recover(state.element_snapshots.lock()).retain(|(id, _)| id != snapshot);
+        }
+    }
+}
+#[derive(Clone)]
+struct ListObservationFence {
+    state: Arc<AppState>,
+    scope: ScreenReadScope,
+    delivery: Arc<ListDelivery>,
+}
+fn fence_list_response(
+    mut response: Response,
+    state: Arc<AppState>,
+    scope: ScreenReadScope,
+    delivery: Arc<ListDelivery>,
+) -> Response {
+    response.extensions_mut().insert(ListObservationFence {
+        state,
+        scope,
+        delivery,
+    });
+    response
+}
+
 /// The runner as a [`crate::collect::Pager`]: a page is the element tree, a
 /// swipe is the coordinate scroll `/agent/input` sends (`runner_scroll`).
 struct RunnerPager<'a> {
     w: &'a mut crate::runner::RunnerClient,
     screen: Option<(f64, f64)>,
     first_page: Option<crate::collect::Page>,
+    state: &'a Arc<AppState>,
+    scope: &'a ScreenReadScope,
+    delivery: Arc<ListDelivery>,
 }
 
 impl crate::collect::Pager for RunnerPager<'_> {
     async fn read(&mut self) -> anyhow::Result<crate::collect::Page> {
+        anyhow::ensure!(self.scope.current(self.state), "list authorization changed");
         if let Some(page) = self.first_page.take() {
             return Ok(page);
         }
@@ -12756,6 +14864,7 @@ impl crate::collect::Pager for RunnerPager<'_> {
         if self.screen.is_none() {
             self.screen = self.w.window_size().await.ok();
         }
+        anyhow::ensure!(self.scope.current(self.state), "list authorization changed");
         Ok(crate::collect::Page {
             rows,
             screen: self.screen,
@@ -12767,6 +14876,7 @@ impl crate::collect::Pager for RunnerPager<'_> {
         region: Option<crate::collect::Region>,
         direction: crate::collect::Direction,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.scope.current(self.state), "list authorization changed");
         let (_, height) = match self.screen {
             Some(screen) => screen,
             None => self.w.window_size().await?,
@@ -12774,11 +14884,25 @@ impl crate::collect::Pager for RunnerPager<'_> {
         let region = region.unwrap_or(crate::collect::Region::FULL);
         let (x, y) = region.center();
         let dy = crate::collect::page_dy(region.h * height, direction);
-        runner_scroll(self.w, x, y, 0.0, dy).await?;
+        let mut receipt = ListSwipeReceipt {
+            delivery: self.delivery.clone(),
+            dispatched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finished: false,
+        };
+        let result = crate::timing::with_dispatch_probe(
+            "POST /actions",
+            receipt.dispatched.clone(),
+            runner_scroll(self.w, x, y, 0.0, dy),
+        )
+        .await;
+        receipt.finish(result.is_ok());
+        result?;
+        anyhow::ensure!(self.scope.current(self.state), "list authorization changed");
         tokio::time::sleep(crate::collect::SWIPE_SETTLE).await;
         Ok(())
     }
 }
+
 
 /// Auth and the control header, before the body is even looked at.
 fn authorize_list_call(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -12810,8 +14934,8 @@ async fn begin_list_control<'a>(
     headers: &HeaderMap,
     runner: &'a tokio::sync::Mutex<crate::runner::RunnerClient>,
     deadline: tokio::time::Instant,
+    scope: &ScreenReadScope,
 ) -> Result<tokio::sync::MutexGuard<'a, crate::runner::RunnerClient>, Response> {
-    claim_phone_owner(state, headers)?;
     if let Some(refusal) = stale_action_lock_refusal(state).await {
         return Err(refusal.into_response());
     }
@@ -12836,7 +14960,12 @@ async fn begin_list_control<'a>(
             serde_json::json!({"ok": false, "error": "device_transition_in_progress", "transitioning": true, "retry_safe": true}),
         ));
     }
-    unlock_before_action(state, &mut w, deadline).await;
+    if let Err(interrupted) = unlock_before_action(state, &mut w, deadline, scope).await {
+        return Err(match control_interruption_outcome(interrupted) {
+            RunnerControlOutcome::Refused(error, hint) => hinted_control_response(StatusCode::CONFLICT,error,"not_sent",hint),
+            _ => control_scope_interrupted_response(),
+        });
+    }
     // Owner limits (`crate::guard`): these calls swipe inside the app in
     // front, and count as one action.
     let policy = crate::guard::Policy::get();
@@ -12930,34 +15059,85 @@ async fn agent_collect(
     if let Err(refused) = authorize_list_call(&state, &headers) {
         return refused;
     }
+    let generation = state
+        .privacy_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    if let Some(refused) = private_list_refusal(&state) {
+        return refused;
+    }
     let parsed = if body.trim().is_empty() {
         Ok(serde_json::Value::Null)
     } else {
-        serde_json::from_str::<serde_json::Value>(&body).map_err(|e| format!("body is not JSON: {e}"))
+        serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| format!("body is not JSON: {e}"))
     };
     let request = match parsed.and_then(|value| crate::collect::CollectRequest::from_json(&value)) {
         Ok(request) => request,
         Err(detail) => return invalid_list_request(detail),
     };
+    let scope = match list_read_scope(&state, &headers, generation) {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
+    let delivery = Arc::new(ListDelivery::default());
+    let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
+    let work = agent_collect_scoped(
+        state.clone(),
+        headers,
+        request,
+        scope.clone(),
+        delivery.clone(),
+        deadline,
+    );
+    let response =
+        match tokio::time::timeout_at(deadline, scoped_observation(&state, &scope, work)).await {
+            Ok(response) => response,
+            Err(_) => list_interrupted(&delivery, "list_deadline"),
+        };
+    fence_list_response(response, state, scope, delivery)
+}
+async fn agent_collect_scoped(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    request: crate::collect::CollectRequest,
+    scope: ScreenReadScope,
+    delivery: Arc<ListDelivery>,
+    deadline: tokio::time::Instant,
+) -> Response {
+    if !scope.current(&state) {
+        return list_interrupted(&delivery, "list_scope_changed");
+    }
     let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
     let Some(runner) = state.runner.clone() else {
         return ControlRefusal::runner_not_configured().into_response();
     };
-    let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
     let _priority = state.begin_runner_control();
-    let mut w = match begin_list_control(&state, &headers, &runner, deadline).await {
+    delivery.setup_started.store(true, std::sync::atomic::Ordering::Release);
+    let mut w = match begin_list_control(&state, &headers, &runner, deadline, &scope).await {
         Ok(w) => w,
         Err(refused) => return refused,
     };
+    if !scope.current(&state) {
+        return list_interrupted(&delivery, "list_scope_changed");
+    }
+    let cache_scope = scope.clone();
+    let weak = Arc::downgrade(&state);
+    w.begin_element_read(Arc::new(move || {
+        weak.upgrade()
+            .is_some_and(|state| cache_scope.current(&state))
+    }));
     let mut pager = RunnerPager {
         w: &mut w,
         screen: None,
         first_page: None,
+        state: &state,
+        scope: &scope,
+        delivery: delivery.clone(),
     };
     use crate::collect::Pager as _;
     let page = match pager.read().await {
         Ok(page) => page,
-        Err(error) => return first_read_failed(&state, &error),
+        Err(error) => return scoped_list_read_failure(&state, &scope, &delivery, &error),
     };
     if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
         return refusal;
@@ -12966,8 +15146,11 @@ async fn agent_collect(
     let result = crate::collect::collect(&mut pager, &request, deadline).await;
     drop(w);
     match result {
-        Err(error) => first_read_failed(&state, &error),
+        Err(error) => scoped_list_read_failure(&state, &scope, &delivery, &error),
         Ok(mut collection) => {
+            if !scope.current(&state) {
+                return list_interrupted(&delivery, "list_scope_changed");
+            }
             // After a failed swipe or read the last tree read is no longer
             // the screen: no snapshot to act on.
             let current = !matches!(
@@ -13180,6 +15363,12 @@ async fn agent_scroll_find(
     if let Err(refused) = authorize_list_call(&state, &headers) {
         return refused;
     }
+    let generation = state
+        .privacy_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    if let Some(refused) = private_list_refusal(&state) {
+        return refused;
+    }
     let request = match serde_json::from_str::<serde_json::Value>(&body)
         .map_err(|e| format!("body is not JSON: {e}"))
         .and_then(|value| crate::collect::FindRequest::from_json(&value))
@@ -13187,27 +15376,71 @@ async fn agent_scroll_find(
         Ok(request) => request,
         Err(detail) => return invalid_list_request(detail),
     };
+    let scope = match list_read_scope(&state, &headers, generation) {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
+    let delivery = Arc::new(ListDelivery::default());
+    let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
+    let work = agent_scroll_find_scoped(
+        state.clone(),
+        headers,
+        request,
+        scope.clone(),
+        delivery.clone(),
+        deadline,
+    );
+    let response =
+        match tokio::time::timeout_at(deadline, scoped_observation(&state, &scope, work)).await {
+            Ok(response) => response,
+            Err(_) => list_interrupted(&delivery, "list_deadline"),
+        };
+    fence_list_response(response, state, scope, delivery)
+}
+async fn agent_scroll_find_scoped(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    request: crate::collect::FindRequest,
+    scope: ScreenReadScope,
+    delivery: Arc<ListDelivery>,
+    deadline: tokio::time::Instant,
+) -> Response {
+    if !scope.current(&state) {
+        return list_interrupted(&delivery, "list_scope_changed");
+    }
     let expected_app = expected_collect_app(&state, request.snapshot.as_deref());
     let Some(runner) = state.runner.clone() else {
         return ControlRefusal::runner_not_configured().into_response();
     };
-    let deadline = tokio::time::Instant::now() + crate::collect::COLLECT_DEADLINE;
     let _priority = state.begin_runner_control();
-    let mut w = match begin_list_control(&state, &headers, &runner, deadline).await {
+    delivery.setup_started.store(true, std::sync::atomic::Ordering::Release);
+    let mut w = match begin_list_control(&state, &headers, &runner, deadline, &scope).await {
         Ok(w) => w,
         Err(refused) => return refused,
     };
+    if !scope.current(&state) {
+        return list_interrupted(&delivery, "list_scope_changed");
+    }
+    let cache_scope = scope.clone();
+    let weak = Arc::downgrade(&state);
+    w.begin_element_read(Arc::new(move || {
+        weak.upgrade()
+            .is_some_and(|state| cache_scope.current(&state))
+    }));
     let mut pager = RunnerPager {
         w: &mut w,
         screen: None,
         first_page: None,
+        state: &state,
+        scope: &scope,
+        delivery: delivery.clone(),
     };
     use crate::collect::Pager as _;
     let page = match pager.read().await {
         Ok(page) => page,
         Err(error) => {
             drop(w);
-            return first_read_failed(&state, &error);
+            return scoped_list_read_failure(&state, &scope, &delivery, &error);
         }
     };
     if let Some(refusal) = list_app_refusal(&state, &headers, expected_app.as_deref(), &page) {
@@ -13222,6 +15455,9 @@ async fn agent_scroll_find(
         seen_earlier,
     } = run_scroll_find(&mut pager, page, &request, deadline).await;
     drop(w);
+    if !scope.current(&state) {
+        return list_interrupted(&delivery, "list_scope_changed");
+    }
     let mut body = serde_json::json!({"swipes": swipes, "max_swipes": request.max_swipes});
     let found = matches!(verdict, FindVerdict::Found(_));
     if let Some(app) = active_application(&page.rows).filter(|app| !app.is_empty()) {
@@ -13233,7 +15469,9 @@ async fn agent_scroll_find(
             body["found"] = true.into();
             body["stop_reason"] = "found".into();
             body["target"] = found_row_json(&page.rows, *index);
-            body["hint"] = "on screen and tappable: tap it by its index with this snapshot, or by its label".into();
+            body["hint"] =
+                "on screen and tappable: tap it by its index with this snapshot, or by its label"
+                    .into();
         }
         FindVerdict::Ambiguous(detail) => {
             body["error"] = "ambiguous_element_label".into();
@@ -13243,14 +15481,20 @@ async fn agent_scroll_find(
         }
         FindVerdict::Blocked(code) => {
             body["error"] = (*code).into();
-            body["stop_reason"] = if *code == "element_occluded" { "occluded" } else { "not_visible" }.into();
+            body["stop_reason"] = if *code == "element_occluded" {
+                "occluded"
+            } else {
+                "not_visible"
+            }
+            .into();
             if let Some(index) = page.rows.iter().position(|row| {
                 row.label == request.label
                     && request.kind.as_deref().is_none_or(|kind| row.kind == kind)
             }) {
                 body["target"] = found_row_json(&page.rows, index);
                 if let Some(cover) = occluding_row(&page.rows, index) {
-                    body["covered_by"] = serde_json::json!({"kind": cover.kind, "label": cover.label});
+                    body["covered_by"] =
+                        serde_json::json!({"kind": cover.kind, "label": cover.label});
                 }
             }
             body["hint"] = "the label is there but a tap would not reach it (covered or not drawn); nothing more was swiped — bring it clear, then read again".into();
@@ -13288,7 +15532,10 @@ async fn agent_scroll_find(
         }
         body["stop_error"] = error.into();
     }
-    if let Some(snapshot) = current.then(|| remember_page(&state, &headers, page.rows)).flatten() {
+    if let Some(snapshot) = current
+        .then(|| remember_page(&state, &headers, page.rows))
+        .flatten()
+    {
         body["snapshot"] = snapshot.into();
     }
     json_response(StatusCode::OK, body)
@@ -13457,6 +15704,7 @@ async fn read_elements_once(
     w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
 ) -> SettleRead {
+    if !w.observation_scope_current() { return SettleRead::Deadline; }
     let rows = match tokio::time::timeout_at(deadline, w.elements()).await {
         Err(_) => return SettleRead::Deadline,
         Ok(Ok(rows)) => rows,
@@ -13494,7 +15742,7 @@ async fn settle_frame(
     // it, and the tree read behind it waits. After one slow or failed frame
     // the settle check stays tree-vs-tree for a while.
     const SLOW_FRAME_BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
-    if !w.settle_frames_usable() {
+    if !w.observation_scope_current() || !w.settle_frames_usable() {
         return None;
     }
     let cap = std::cmp::min(deadline, tokio::time::Instant::now() + SETTLE_FRAME_CAP);
@@ -13524,16 +15772,25 @@ const SETTLED_FRAME_MAX_SIDE: u32 = 1600;
 /// that screen is gone and there is nothing to keep. The next control
 /// request cancels it (see [`AppState::cancel_settled_frame_prefetch`]).
 fn capture_settled_frame_later(
-    state: &AppState,
+    state: &Arc<AppState>,
     runner: Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>,
     post_mark: Option<std::time::Instant>,
+    scope: ScreenReadScope,
 ) {
     let mut slot = recover(state.settled_frame_prefetch.lock());
     if let Some(previous) = slot.take() {
         previous.abort();
     }
+    if screen_private_now(&state.private_until) { return; }
+    let weak_state = Arc::downgrade(state);
+    let privacy_epoch = state.privacy_epoch.clone();
+    let private_until = state.private_until.clone();
+    let generation = privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
     let task = tokio::spawn(async move {
         let mut w = runner.lock().await;
+        if !weak_state.upgrade().is_some_and(|state| scope.current(&state)) { return; }
+        if privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation || screen_private_now(&private_until) { return; }
+        w.fence_settled_frame(generation);
         if w.last_post() != post_mark || w.settled_frame(SETTLED_FRAME_MAX_AGE).is_some() {
             return;
         }
@@ -13542,9 +15799,13 @@ fn capture_settled_frame_later(
         // is megabytes the 3 s budget may not carry.
         let shot = crate::runner::ShotRequest::jpeg(Some(SETTLED_FRAME_MAX_SIDE));
         let budget = std::time::Duration::from_secs(3);
-        if let Ok(Ok(frame)) = tokio::time::timeout(budget, w.screenshot_sized(shot, budget)).await
+        let Some(state) = weak_state.upgrade() else { return; };
+        if let Ok(Ok(frame)) = tokio::time::timeout(budget,
+            scoped_observation(&state, &scope, w.screenshot_sized(shot, budget))).await
         {
-            if w.last_post() == post_mark && is_valid_capture(&frame) {
+            if weak_state.upgrade().is_some_and(|state| scope.current(&state))
+                && w.last_post() == post_mark && is_valid_capture(&frame)
+                && privacy_epoch.load(std::sync::atomic::Ordering::Acquire) == generation && !screen_private_now(&private_until) {
                 w.remember_settled_frame(frame);
             }
         }
@@ -13591,6 +15852,7 @@ async fn settle_on_device(
     }
     // The runner answers within its budget, but the HTTP call allows 3 s
     // more for transport: never past the observation's own deadline.
+    if !w.observation_scope_current() { return None; }
     let device = tokio::time::timeout_at(deadline, w.device_settle(device_budget, QUIET, MIN_WAIT))
         .await
         .ok()
@@ -13819,6 +16081,37 @@ async fn agent_input(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    let generation = state.0.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let trace_state = state.0.clone();
+    let trace_headers = headers.clone();
+    let trace_handle = action_trace_handle(&trace_state, &trace_headers);
+    let trace_action = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let response = INPUT_LAUNCH_RESOLUTION
+        .scope(std::cell::RefCell::new(None), async move {
+            let response = agent_input_owned(state, Query(query), headers, body).await;
+            let Some(resolved) = INPUT_LAUNCH_RESOLUTION.with(|slot| slot.borrow_mut().take())
+            else {
+                return response;
+            };
+            let (response, json) = read_json_response(response).await;
+            let Some(mut json) = json.filter(serde_json::Value::is_object) else {
+                return response;
+            };
+            json["resolved"] = resolved;
+            let (mut parts, _) = response.into_parts();
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(json.to_string()))
+        })
+        .await;
+    action_receipt(&trace_state, &trace_headers, &trace_action, generation, trace_handle, response).await
+}
+
+async fn agent_input_owned(
+    state: State<Arc<AppState>>,
+    Query(query): Query<AgentInputQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let Some(owner) = trusted_bearer_owner(&state, &headers) else {
         return agent_input_inner(state, Query(query), headers, body).await;
     };
@@ -13877,6 +16170,7 @@ async fn agent_input_inner(
     if let Err(refused) = claim_phone_owner(&state, &headers) {
         return refused;
     }
+    let capture_scope = ScreenReadScope::capture(&state);
     // App install via CoreDevice (`agent_install`): checked on every
     // platform, installed on macOS.
     if body.contains("install") {
@@ -14041,16 +16335,29 @@ async fn agent_input_inner(
     if let Err(response) = reject_unknown_single_step_action(&value) {
         return response;
     }
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+        if let Err(error) = validate_text_request(value.as_object().unwrap()) {
+            return json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok":false,"error":"invalid_text_request","hint":error,"outcome":"not_sent","retry_safe":true}));
+        }
+        if (is_input_continuation(&value) || value.get("budget_ms").is_some()) && named_owner(&headers).is_none() {
+            return json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok":false,"error":"input_owner_required","outcome":"not_sent","retry_safe":true}));
+        }
+    }
     if let Err(response) = reject_oversized_text(&value) {
         return response;
     }
     if let Err(response) = reject_invalid_open_url(&value) {
         return response;
     }
+    if let Some(refused) = system_request_private_refusal(&state, &value) { return refused; }
     let mut value = value;
     fresh_launch_while_recording(&state, &mut value);
-    if let Err(refusal) = resolve_launch_app_action(&state, &mut value).await {
-        return refusal;
+    match resolve_launch_app_action(&state, &mut value).await {
+        Ok(Some(resolved)) => {
+            let _ = INPUT_LAUNCH_RESOLUTION.try_with(|slot| *slot.borrow_mut() = Some(resolved));
+        }
+        Ok(None) => {}
+        Err(refusal) => return refusal,
     }
     // A blocked app, or a link scheme the owner has not allowed, is refused
     // before anything else runs (`crate::guard`).
@@ -14080,7 +16387,9 @@ async fn agent_input_inner(
     // the focus step (or the action after it) waits for it.
     let _priority = state.begin_runner_control();
     let focus_started = tokio::time::Instant::now();
-    engage_agent_focus(&state, runner, crate::focus::launch_bundle(&value), true).await;
+    if !is_capture_or_volume(&value) && !is_input_continuation(&value) {
+        engage_agent_focus(&state, runner, crate::focus::launch_bundle(&value), true).await;
+    }
     // A long text gets its typing time on top (zero for text up to one chunk),
     // so the per-chunk timeouts, not this deadline, decide how it ends.
     let agent_runner_deadline = agent_runner_deadline
@@ -14126,6 +16435,7 @@ async fn agent_input_inner(
     // follows gets its own, strictly shorter deadline, so a slow `/source`
     // or `/alert/text` can never turn an applied action into
     // `outcome_unknown` and can never cause the mutation to be re-sent.
+    let mut detail = None;
     let dispatch = tokio::time::timeout_at(agent_runner_deadline, async {
         let mut client = runner.lock().await;
         if tokio::time::Instant::now() >= agent_runner_deadline
@@ -14134,36 +16444,46 @@ async fn agent_input_inner(
         {
             return None;
         }
-        unlock_before_action(&state, &mut client, agent_runner_deadline).await;
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        let mut detail = None;
-        let outcome = direct_agent_action(
-            &mut client,
-            &state.runner_actionable,
-            &value,
-            &mut detail,
-            agent_runner_deadline,
-        )
-        .await;
-        Some((client, outcome, detail))
+        let dispatch_allowed = || capture_scope.current(&state) && tokio::time::Instant::now() < agent_runner_deadline;
+        let outcome = scoped_runner_action(&state, &capture_scope, agent_runner_deadline, async {
+            if !is_capture_or_volume(&value) && !is_input_continuation(&value) {
+                if let Err(interrupted) = unlock_before_action(&state, &mut client, agent_runner_deadline, &capture_scope).await {
+                    return control_interruption_outcome(interrupted);
+                }
+            }
+            direct_agent_action(
+                &mut client,
+                &state.runner_actionable,
+                &value,
+                &mut detail,
+                agent_runner_deadline,
+                Some(&dispatch_allowed),
+            capture_scope.text_scope(named_owner(&headers)).as_ref(), ).await
+        }).await;
+        Some((client, outcome))
     })
     .await;
-    let (mut client, outcome, detail) = match dispatch {
+    let (mut client, outcome) = match dispatch {
         Ok(Some(dispatched)) => dispatched,
         Ok(None) => return runner_deadline_response(false),
         Err(_) => {
             let mark = *recover(dispatched.lock());
-            return runner_deadline_response(posted_since(runner, mark).await);
+            return with_app_lifecycle_receipt(runner_deadline_response(posted_since(runner, mark).await), detail.as_ref()).await;
         }
     };
-    renew_after_long_text(&state, &headers, &value);
+    let activity_rebound_rect=client.activity_rebound_rect.take();
+    if outcome==RunnerControlOutcome::Applied {
+        record_activity(&state,&headers,&value,client.cached_window_size(),&capture_scope,activity_rebound_rect);
+    }
+    renew_after_long_text(&state, &headers, &value, &capture_scope);
     // Post-action observation (`?return=delta`), still holding the SAME
     // guard so no other control interleaves between the action and its
     // read — but on its own budget, bounded by both the caller's
     // `settle_ms` and what is left of the endpoint deadline.
     let mut settled = None;
     let mut alert = None;
-    if want_delta && outcome == RunnerControlOutcome::Applied {
+    if want_delta && outcome == RunnerControlOutcome::Applied && capture_scope.current(&state) {
         // The observation's clock starts HERE, after the action is
         // confirmed — it is not carved out of what the action left of its
         // own deadline. Otherwise a slow action silently eats the
@@ -14182,7 +16502,11 @@ async fn agent_input_inner(
         } else {
             DEVICE_SETTLE_DEFAULT_CAP
         };
-        let (observed, report) = settle_and_read_elements(&mut client, budget, device_cap).await;
+        let weak_state = Arc::downgrade(&state);
+        let read_scope = capture_scope.clone();
+        client.bind_observation_scope(Arc::new(move ||
+            weak_state.upgrade().is_some_and(|state| read_scope.current(&state))));
+        let (observed, report) = scoped_observation(&state, &capture_scope, settle_and_read_elements(&mut client, budget, device_cap)).await;
         settled = Some((
             observed.map(|(snapshot, rows)| (snapshot, Arc::new(rows))),
             report,
@@ -14192,19 +16516,28 @@ async fn agent_input_inner(
         // Bounded by its own hard 1.5s cap (see `probe_alert`), which is
         // what the client's timeout budgets for on top of the action
         // deadline and the observation budget.
-        alert = probe_alert(&mut client).await;
+        if capture_scope.current(&state) { alert = scoped_observation(&state, &capture_scope, probe_alert(&mut client)).await; }
     }
     // The settled screen is ready for a screenshot request without a capture:
     // the settle check kept its frame, or — when it judged by the tree (a
     // focused text field, a screen that kept moving) — one is taken now, after
     // the response is on its way, while the agent reads it.
+    let observation_read = settled.is_some();
+    if observation_read && !capture_scope.current(&state) {
+        client.forget_observations();
+        state.cancel_settled_frame_prefetch();
+        recover(state.element_snapshots.lock()).clear();
+        recover(state.owner_snapshots.lock()).clear();
+        settled = None;
+        alert = None;
+    }
     let frame_needed = settled.is_some() && client.settled_frame(SETTLED_FRAME_MAX_AGE).is_none();
     let post_mark = client.last_post();
     drop(client);
     if frame_needed {
-        capture_settled_frame_later(&state, Arc::clone(runner), post_mark);
+        capture_settled_frame_later(&state, Arc::clone(runner), post_mark, capture_scope.clone());
     }
-    match outcome {
+    let mut response = match outcome {
         RunnerControlOutcome::Applied => {
             let body = match settled {
                 None => r#"{"ok":true,"transport":"runner"}"#.to_string(),
@@ -14287,16 +16620,40 @@ async fn agent_input_inner(
             };
             let body = attach_alert(body, alert);
             let mut blocks = flow_after_input(&state, &headers, &value);
+            if let Some(capture) = detail.as_ref().and_then(|value| value.get("system_capture")) {
+                blocks.push(("system_capture", capture.clone()));
+            }
+            if let Some(rebound) = detail.as_ref().and_then(|value| value.get("rebound")) {
+                blocks.push(("rebound", rebound.clone()));
+            }
+            if let Some(verification) = detail.as_ref().and_then(|detail| detail.get("verification")) {
+                blocks.push(("verification", verification.clone()));
+            }
+            if let Some(replacement) = detail.as_ref().and_then(|detail| detail.get("replacement")) {
+                blocks.push(("replacement", replacement.clone()));
+            }
             if let Some(block) = recover(state.agent_focus.lock()).take_notice() {
                 blocks.push(("agent_focus", block));
             }
             let body = attach_flow_blocks(body, blocks);
-            with_security_headers(
+            let mut fallback = serde_json::json!({"ok":true,"transport":"runner",
+                "retry_safe":false,"observation_omitted":true,"delta_error":"observation_unavailable"});
+            if let Some(capture) = detail.as_ref().and_then(|value| value.get("system_capture")) {
+                fallback["system_capture"] = serde_json::json!({
+                    "requested":capture.get("requested"),"saved_verified":capture.get("saved_verified")});
+            }
+            let mut response = with_security_headers(
                 Response::builder()
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-            )
+            );
+            if observation_read || detail.as_ref().is_some_and(|detail| detail.get("verification").is_some()) {
+                response.extensions_mut().insert(ActionObservationFence {
+                    state: state.clone(), scope: capture_scope.clone(), fallback,
+                });
+            }
+            response
         }
         RunnerControlOutcome::NotSent => {
             mark_runner_read_path_unactionable(&state);
@@ -14351,14 +16708,34 @@ async fn agent_input_inner(
             with_security_headers(
                 (
                     StatusCode::BAD_GATEWAY,
-                    axum::Json(text_partial_body(&value, confirmed, uncertain)),
+                    axum::Json(text_partial_with_detail(&value, confirmed, uncertain, detail.as_ref())),
                 )
                     .into_response(),
             )
         }
         RunnerControlOutcome::RunnerRejected => runner_rejected_response(detail.as_ref()),
-        RunnerControlOutcome::Failed => runner_failed_after_dispatch_response_with(detail.as_ref()),
+        RunnerControlOutcome::ScopeInterrupted => with_app_lifecycle_receipt(
+            control_scope_interrupted_response(), detail.as_ref()).await,
+        RunnerControlOutcome::AppLaunchInterrupted => app_launch_interrupted_response(detail.as_ref()),
+        RunnerControlOutcome::Failed => with_app_lifecycle_receipt(
+            runner_failed_after_dispatch_response_with(detail.as_ref()), detail.as_ref()).await,
+    };
+    if !response.status().is_success() {
+        response = with_replacement_receipt(response, detail.as_ref()).await;
     }
+    response.extensions_mut().insert(ActionRequestScope(capture_scope));
+    response
+}
+
+/// A failed `set_value` says how far its replacement got (#399).
+async fn with_replacement_receipt(response: Response, detail: Option<&serde_json::Value>) -> Response {
+    let Some(receipt) = detail.and_then(|d| d.get("replacement")) else { return response; };
+    let (response, body) = read_json_response(response).await;
+    let Some(mut body) = body else { return response; };
+    body["replacement"] = receipt.clone();
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(body.to_string()))
 }
 
 /// The bridge shortcut to run for agent Do Not Disturb, when the feature is
@@ -14761,16 +17138,25 @@ fn record_flow_action(state: &AppState, action: &serde_json::Value, now: Instant
 }
 
 /// One applied action on the activity feed, in plain words (`crate::activity`).
-fn record_activity(state: &AppState, headers: &HeaderMap, action: &serde_json::Value) {
+fn record_activity(state: &AppState, headers: &HeaderMap, action: &serde_json::Value, viewport: Option<(f64,f64)>, scope: &ScreenReadScope, rebound_rect:Option<[f64;4]>) {
+    if !scope.current(state) { return; }
     let rows = action
         .get("snapshot")
         .and_then(serde_json::Value::as_str)
         .and_then(|snapshot| lookup_element_snapshot(state, snapshot));
-    crate::activity::record(
-        named_owner(headers),
-        crate::activity::describe(action, rows.as_deref().map(Vec::as_slice)),
-        crate::metrics::now_ms(),
-    );
+    let mut line = crate::activity::describe(action, rows.as_deref().map(Vec::as_slice)).with_target_rect(rebound_rect);
+    let viewport = viewport.or_else(|| state.runner.as_ref()?.try_lock().ok()?.cached_window_size());
+    if let Some((width,height)) = viewport { line = line.with_runner_viewport(width,height); }
+    else if let Some(root) = rows.as_ref().and_then(|rows| rows.iter().find(|row| row.kind == "Application")) {
+        if root.rect[0] == 0.0 && root.rect[1] == 0.0 {
+            line = line.with_runner_viewport(root.rect[2], root.rect[3]);
+        }
+    }
+    if let Some(stamp)=scope.lifecycle_stamp {
+        crate::activity::record_scoped(named_owner(headers),line,crate::metrics::now_ms(),crate::activity::LiveScope {
+            owner_epoch:scope.epoch,privacy_epoch:scope.privacy_epoch,lifecycle_stamp:stamp,
+        });
+    }
 }
 
 /// `registry` (after a launch) and `flow_suggestion` (when due) for one
@@ -14780,7 +17166,6 @@ fn flow_after_input(
     headers: &HeaderMap,
     action: &serde_json::Value,
 ) -> Vec<(&'static str, serde_json::Value)> {
-    record_activity(state, headers, action);
     if headers.contains_key(FLOW_RUN_HEADER) {
         return Vec::new();
     }
@@ -15204,6 +17589,10 @@ async fn agent_task_start(
     let Some(scheduler) = crate::schedules::current() else {
         return agent_json_response(StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({"ok": false, "error": "not_ready"}));
     };
+    // A person who just tapped through the remote viewer (or the app's own
+    // startup) still holds a lease for minutes; starting a task is that person
+    // handing the phone to the assistant, so the task must not hit 409.
+    yield_viewer_lease(&state);
     match iphone_use_mcp::task::start(request, |owner| scheduler.self_client(owner)) {
         Ok(id) => agent_json_response(StatusCode::ACCEPTED, serde_json::json!({"ok": true, "id": id, "status": "running"})),
         Err(iphone_use_mcp::task::StartError::Busy(id)) => agent_json_response(
@@ -15341,16 +17730,53 @@ async fn agent_elements(
     query: Query<AgentElementsQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // Authenticate before the cancellation gate, including a private screen.
+    if let Some(refused) = auth_refusal(browser_or_agent_auth(&state, &headers)) { return refused; }
+    let read_scope = ScreenReadScope::capture(&state);
+    let generation = read_scope.privacy_epoch;
+    let response = unless_private(&state.private_until, &state.privacy_epoch, generation,
+        scoped_observation(&state, &read_scope,
+            agent_elements_unfenced(state.clone(), query, headers, read_scope.clone()))).await.unwrap_or_else(|| {
+            recover(state.element_snapshots.lock()).clear();
+            recover(state.owner_snapshots.lock()).clear();
+            agent_error(StatusCode::LOCKED, "screen_privacy_changed",
+                "screen privacy changed or was active during this read; it was cancelled without retry")
+        });
+    finish_private_read(&state, generation, response)
+}
+
+async fn agent_elements_unfenced(
+    state: State<Arc<AppState>>,
+    query: Query<AgentElementsQuery>,
+    headers: HeaderMap,
+    read_scope: ScreenReadScope,
+) -> Response {
     let owner = trusted_owner(&state, &headers);
     let full_read = query.since.is_none();
     let scope = query.scope.clone();
     let image_auto = query.image.as_deref() == Some("auto");
+    let selector = crate::scope::parse_selector(query.selector.as_deref());
     let filter_query = query.query.clone();
     let filter_limit = query.limit.as_deref().and_then(|l| l.trim().parse::<usize>().ok());
     let ocr_mode = parse_ocr_mode(query.ocr.as_deref());
     if let Err(error) = crate::scope::validate(scope.as_deref(), query.since.as_deref())
         .and_then(|()| {
             crate::scope::validate_filter(filter_query.as_deref(), query.limit.as_deref())
+        })
+        .and_then(|()| selector.as_ref().map(|_| ()).map_err(Clone::clone))
+        .and_then(|()| {
+            if query.selector.is_some() && query.since.is_some() {
+                Err(serde_json::json!({"ok":false,"error":"selector_needs_full_read",
+                    "hint":"selector filters a full fresh tree; omit since and scope=changed"}))
+            } else { Ok(()) }
+        })
+        .and_then(|()| {
+            match query.locator_state.as_deref() {
+                None => Ok(()),
+                Some("1") if query.since.is_none() => Ok(()),
+                _ => Err(serde_json::json!({"ok":false,"error":"invalid_locator_state",
+                    "hint":"locator_state=1 requires a full read without since"})),
+            }
         })
         .and_then(|()| ocr_mode.clone().map(|_| ()))
     {
@@ -15365,6 +17791,7 @@ async fn agent_elements(
             ),
         };
     }
+    let selector = selector.expect("selector validated before observation");
     if scope.as_deref() == Some("changed") && credentials_ok(&state, &headers) {
         let held = query
             .since
@@ -15379,7 +17806,7 @@ async fn agent_elements(
             );
         }
     }
-    let response = agent_elements_inner(state.clone(), query, headers.clone()).await;
+    let response = agent_elements_inner(state.clone(), query, headers.clone(), read_scope, selector.as_ref()).await;
     if refused_as_unauthenticated(&response) {
         return response;
     }
@@ -15468,17 +17895,19 @@ async fn agent_elements(
     // Before the scope: whether the tree is usable is judged on all of it.
     if let Ok(Some(mode)) = ocr_mode {
         if mode == OcrMode::Force || crate::scope::needs_image(&json) {
+            let started = std::time::Instant::now();
             let result = elements_ocr(&state, &headers, &json).await;
-            attach_ocr(&mut json, result);
+            attach_ocr(&mut json, result, started);
         }
     }
     if let Some(scope) = scope.as_deref().filter(|scope| *scope != "changed") {
         crate::scope::apply(&mut json, scope);
     }
     // After the scope, so `query`/`limit` narrow a scoped view too.
-    crate::scope::filter(&mut json, filter_query.as_deref(), filter_limit);
+    crate::scope::filter(&mut json, filter_query.as_deref(), filter_limit, selector.as_ref());
     let (mut parts, _) = response.into_parts();
     parts.headers.remove(header::CONTENT_LENGTH);
+    if json.get("error").and_then(serde_json::Value::as_str)==Some("ordinal_unproven") {parts.status=StatusCode::CONFLICT;}
     Response::from_parts(parts, Body::from(json.to_string()))
 }
 
@@ -15486,6 +17915,8 @@ async fn agent_elements_inner(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentElementsQuery>,
     headers: HeaderMap,
+    read_scope: ScreenReadScope,
+    selector: Option<&core::element_selector::ElementSelector>,
 ) -> Response {
     // The browser's accessible-controls drawer reads the same on-device tree
     // that agents use. It is read-only, so accept the authenticated browser
@@ -15549,6 +17980,12 @@ async fn agent_elements_inner(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(35);
     let result = tokio::time::timeout_at(deadline, async {
         let mut w = runner.lock().await;
+
+        if !read_scope.current(&state) { return Err(anyhow::anyhow!("observation scope changed while waiting for runner")); }
+        let cache_scope = read_scope.clone();
+        let weak_state = Arc::downgrade(&state);
+        w.begin_element_read(Arc::new(move ||
+            weak_state.upgrade().is_some_and(|state| cache_scope.current(&state))));
         let mut first_source_error = None;
         let read_started = tokio::time::Instant::now();
         let mut alert_probes = 0u8;
@@ -15556,11 +17993,11 @@ async fn agent_elements_inner(
         // Set once a read failed while the runner was still working on it
         // (a heavy screen): later reads are bounded, the answer `partial`.
         let mut bounded = false;
-        let rows = loop {
+        let snapshot = loop {
             let attempt = if bounded {
-                w.elements_bounded().await
+                w.elements_bounded().await.map(|rows| crate::runner::ElementSnapshot { rows, coverage:crate::runner::SnapshotCoverage::Truncated })
             } else {
-                w.elements().await
+                w.element_snapshot().await
             };
             match attempt {
                 Ok(rows) => break rows,
@@ -15649,10 +18086,15 @@ async fn agent_elements_inner(
         // flattened tree misses or misrepresents it (see RunnerClient::alert_summary).
         let alert = probe_alert(&mut w).await;
         let geometric = w.visibility_is_geometric();
-        Ok::<_, anyhow::Error>((rows, screen, alert, geometric, bounded))
+        Ok::<_, anyhow::Error>((snapshot.rows, screen, alert, geometric, if bounded {crate::runner::SnapshotCoverage::Truncated} else {snapshot.coverage}))
     })
     .await;
-    let (rows, screen, alert, geometric, partial) = match result {
+    if !read_scope.current(&state) {
+        return json_body(StatusCode::CONFLICT, serde_json::json!({
+            "elements": [], "error": "observation_scope_changed", "observation_omitted": true
+        }).to_string());
+    }
+    let (rows, screen, alert, geometric, coverage) = match result {
         Ok(Ok(result)) => result,
         Ok(Err(error)) if error.downcast_ref::<BlockingAlert>().is_some() => {
             // The phone is fine; an alert is waiting for an answer.
@@ -15721,6 +18163,7 @@ async fn agent_elements_inner(
             return json_body(StatusCode::GATEWAY_TIMEOUT, body.to_string());
         }
     };
+    let partial = !coverage.is_complete();
     let snapshot = match element_snapshot_id(&rows) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -15769,6 +18212,37 @@ async fn agent_elements_inner(
             "ax_stats": ax_stats,
         }),
     };
+    // Restore only the metadata the selector requests; ordinary reads stay
+    // sparse. Unknown and redacted secure values never become empty values.
+    let include_locator_state = query.locator_state.as_deref() == Some("1");
+    let include_enabled = include_locator_state || selector.and_then(|selector| selector.enabled).is_some();
+    let ordinal_query=selector.is_some_and(|selector|selector.index.is_some()) && query.query.is_some();
+    let include_value = include_locator_state || ordinal_query || selector.is_some_and(|selector| selector.value.is_some() || selector.value_present.is_some());
+    if include_locator_state { body["locator_state"] = 1.into(); }
+    if include_locator_state || selector.is_some_and(|selector|selector.index.is_some()) {body["coverage"]=coverage.as_str().into();}
+    if include_enabled || include_value {
+        if let Some(elements) = body.get_mut("elements").and_then(|value| value.as_array_mut()) {
+            for (element, row) in elements.iter_mut().zip(rows.iter()) {
+                if include_enabled {
+                    if let Some(enabled) = row.enabled { element["enabled"] = serde_json::json!(enabled); }
+                }
+                if include_locator_state {
+                    if let Some(visible) = row.visible { element["visible"] = visible.into(); }
+                    if let Some(focused) = row.focused { element["focused"] = focused.into(); }
+                    element["value_known"] = (!row.value_unavailable
+                        && row.value_truncated != Some(true) && row.kind != "SecureTextField").into();
+                }
+                if include_value {
+                    if let Some(value) = &row.value { element["value"] = serde_json::json!(value); }
+                    if (ordinal_query || selector.is_some_and(|selector| selector.value_present.is_some() || selector.value.is_some())) && row.value_unavailable {
+                        // Retain normalization failure until matching; otherwise
+                        // an unsupported raw value would look like known absence.
+                        element["snapshot_value_unavailable"] = true.into();
+                    }
+                }
+            }
+        }
+    }
     // A tree too large to read with runner's `isVisible` (see
     // RunnerClient::bounded_source) carries a geometric `visible`: off-root rows
     // are `visible:false`, but rows hidden inside the root rect (a collapsed
@@ -15779,6 +18253,7 @@ async fn agent_elements_inner(
     }
     if partial {
         mark_partial(&mut body);
+        body["coverage"] = coverage.as_str().into();
     }
     if let (Some(object), Some(alert)) = (body.as_object_mut(), alert_json(alert)) {
         object.insert("alert".to_string(), alert);
@@ -15925,21 +18400,252 @@ fn screen_private_now(private_until: &Mutex<Option<Instant>>) -> bool {
     recover(private_until.lock()).is_some_and(|until| until > Instant::now())
 }
 
+fn private_read_refusal(state: &AppState, generation: u64) -> Option<Response> {
+    if let Some(refused) = screen_private_refusal(state) { return Some(refused); }
+    (state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation).then(|| {
+        agent_error(StatusCode::LOCKED, "screen_privacy_changed",
+            "screen privacy changed during this read; its result was discarded. Check current status before requesting a new observation")
+    })
+}
+
+fn finish_private_read(state: &AppState, generation: u64, response: Response) -> Response {
+    if refused_as_unauthenticated(&response) { return response; }
+    if let Some(refused) = private_read_refusal(state, generation) {
+        // A rejected read may already have built a snapshot internally; no
+        // later delta or indexed target may reuse that unserved baseline.
+        recover(state.element_snapshots.lock()).clear();
+        recover(state.owner_snapshots.lock()).clear();
+        return refused;
+    }
+    let mut response = response;
+    response.extensions_mut().insert(ReadPrivacyFence {
+        private_until: state.private_until.clone(), privacy_epoch: state.privacy_epoch.clone(), generation,
+    });
+    response
+}
+
+#[derive(Clone)]
+struct ActionRequestScope(ScreenReadScope);
+
+#[derive(Clone)]
+struct ActionObservationFence {
+    state: Arc<AppState>,
+    scope: ScreenReadScope,
+    fallback: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct BatchPrivacyFence {
+    state: Arc<AppState>,
+    scope: ScreenReadScope,
+}
+
+#[derive(Clone)]
+struct ReadPrivacyFence {
+    private_until: Arc<Mutex<Option<Instant>>>,
+    privacy_epoch: Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+}
+
+/// Applied outside timing: no later JSON rewrite may strip the publication
+/// fence or lose its fixed-size timing/metrics enrichment before it is installed.
+async fn privacy_read_body_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let response = next.run(request).await;
+    if let Some(fence) = response.extensions().get::<ListObservationFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 8 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => return list_interrupted(&fence.delivery, "list_result_unavailable"),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let mut value=serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|_| serde_json::json!({"ok":false,"error":"list_result_unavailable","retry_safe":false}));
+            if !fence.scope.current(&fence.state) {
+                forget_unpublished_list_snapshot(&fence.state, &fence.scope, &value);
+                value = crate::observation::redact(value, "authorization_scope_changed");
+                value["ok"] = false.into();
+                value["error"] = "list_scope_changed".into();
+                value["retry_safe"] = false.into();
+                value["hint"]="List observations were withheld after authorization changed; retain the swipe receipt and do not replay this call automatically.".into();
+            }
+            if let (Some(map), Some(receipt)) =
+                (value.as_object_mut(), fence.delivery.receipt().as_object())
+            {
+                map.extend(receipt.clone());
+            }
+            if fence
+                .delivery
+                .setup_started
+                .load(std::sync::atomic::Ordering::Acquire)
+                || fence
+                    .delivery
+                    .confirmed
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    > 0
+                || fence
+                    .delivery
+                    .uncertain
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    > 0
+            {
+                value["retry_safe"] = false.into();
+                if value.get("outcome").and_then(serde_json::Value::as_str) == Some("not_sent") {
+                    value.as_object_mut().unwrap().remove("outcome");
+                }
+            }
+            Ok::<_, std::io::Error>(bytes::Bytes::from(value.to_string()))
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+    if let Some(fence) = response
+        .extensions()
+        .get::<ActionObservationFence>()
+        .cloned()
+    {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 2 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_response(StatusCode::OK, fence.fallback),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let bytes = if fence.scope.current(&fence.state) {
+                bytes
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(fence.fallback);
+                if let Some(snapshot) = value.get("snapshot").and_then(serde_json::Value::as_str) {
+                    let mut owners = recover(fence.state.owner_snapshots.lock());
+                    if let Some(owner) = fence.scope.owner.as_ref() {
+                        if owners.get(owner).is_some_and(|id| id == snapshot) {
+                            owners.remove(owner);
+                        }
+                    }
+                    if !owners.values().any(|id| id == snapshot) {
+                        recover(fence.state.element_snapshots.lock())
+                            .retain(|(id, _)| id != snapshot);
+                    }
+                }
+                bytes::Bytes::from(
+                    crate::observation::redact(value, "authorization_scope_changed").to_string(),
+                )
+            };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+    if let Some(fence) = response.extensions().get::<BatchPrivacyFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 2 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return json_response(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false}),
+                )
+            }
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let revoked = !fence.scope.current(&fence.state);
+            let bytes = if revoked {
+                let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                bytes::Bytes::from(crate::observation::redact_batch(value).to_string())
+            } else {
+                bytes
+            };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+
+    if let Some(fence) = response.extensions().get::<ValueReadFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, fence.max_bytes).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_response(StatusCode::BAD_GATEWAY, fence.failure),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let bytes = if fence.scope.current(&fence.state) {
+                bytes
+            } else {
+                bytes::Bytes::from(fence.failure.to_string())
+            };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+    let Some(fence) = response.extensions().get::<ReadPrivacyFence>().cloned() else {
+        return response;
+    };
+    // The response can sit queued before the HTTP writer first polls its body.
+    use futures_util::StreamExt;
+    let ReadPrivacyFence {
+        private_until,
+        privacy_epoch,
+        generation,
+    } = fence;
+    let (mut parts, body) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let stream =
+        futures_util::stream::unfold((body.into_data_stream(), false), move |(mut body, done)| {
+            let private_until = private_until.clone();
+            let privacy_epoch = privacy_epoch.clone();
+            async move {
+                if done {
+                    return None;
+                }
+                let current = || {
+                    privacy_epoch.load(std::sync::atomic::Ordering::Acquire) == generation
+                        && !screen_private_now(&private_until)
+                };
+                if !current() {
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "screen privacy changed before body publication",
+                        )),
+                        (body, true),
+                    ));
+                }
+                let next = body.next().await?;
+                if !current() {
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "screen privacy changed before body publication",
+                        )),
+                        (body, true),
+                    ));
+                }
+                Some((next.map_err(std::io::Error::other), (body, false)))
+            }
+        });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+
 /// Run `work` unless the screen turns private first (checked every 250 ms),
 /// so an open live feed ends at once when a private hold begins instead of
 /// waiting out its inactivity timeout.
 async fn unless_private<T>(
     private_until: &Mutex<Option<Instant>>,
+    privacy_epoch: &std::sync::atomic::AtomicU64,
+    generation: u64,
     work: impl std::future::Future<Output = T>,
 ) -> Option<T> {
     tokio::pin!(work);
     loop {
-        if screen_private_now(private_until) {
+        if privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation || screen_private_now(private_until) {
             return None;
         }
         if let Ok(out) = tokio::time::timeout(std::time::Duration::from_millis(250), &mut work).await {
             // Finished after the hold began: drop it, never send it.
-            return (!screen_private_now(private_until)).then_some(out);
+            return (privacy_epoch.load(std::sync::atomic::Ordering::Acquire) == generation && !screen_private_now(private_until)).then_some(out);
         }
     }
 }
@@ -15949,9 +18655,29 @@ async fn unless_private<T>(
 fn set_screen_private(state: &AppState, private: bool, secs: u64) {
     let until = (private && secs > 0)
         .then(|| Instant::now() + std::time::Duration::from_secs(secs));
-    *recover(state.private_until.lock()) = until;
+    let mut current = recover(state.private_until.lock());
+    let now = Instant::now();
+    // Cleaning up an already expired deadline changes no permission. Fresh
+    // work started after expiry must survive an ordinary keep-awake hold.
+    let was_private = current.is_some_and(|deadline| deadline > now);
+    let will_be_private = until.is_some_and(|deadline| deadline > now);
+    let changed = *current != until && (was_private || will_be_private);
+    *current = until;
+    if changed {
+        state.privacy_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    // Publish the hold and hub generation together: a reader released from
+    // this lock must not subscribe into the hub's previous privacy generation.
     if let Some(hub) = &state.video {
         hub.hide_until(until);
+    }
+    drop(current);
+    if changed {
+        crate::activity::clear_live();
+        state.cancel_settled_frame_prefetch();
+        recover(state.element_snapshots.lock()).clear();
+        recover(state.owner_snapshots.lock()).clear();
     }
 }
 
@@ -15977,12 +18703,33 @@ fn hold_owner_lease(
     now: Instant,
     secs: u64,
     lease: std::time::Duration,
-) {
+) -> bool {
     let Some(owner) = slot.as_mut().filter(|owner| owner.name == holder) else {
-        return;
+        return false;
     };
+    let reincarnated = lease_remaining(owner.last_seen, now, lease).is_zero();
     let hold = std::time::Duration::from_secs(secs);
-    owner.last_seen = if hold > lease { now + (hold - lease) } else { now };
+    owner.last_seen = if hold > lease {
+        now + (hold - lease)
+    } else {
+        now
+    };
+    reincarnated
+}
+
+fn extend_hold_owner(state: &AppState, holder: &str, now: Instant, secs: u64) {
+    let mut owner = recover(state.owner.lock());
+    if hold_owner_lease(
+        &mut owner,
+        holder,
+        now,
+        secs,
+        std::time::Duration::from_secs(state.owner_lease_secs),
+    ) {
+        state
+            .owner_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// The gate every `/agent/login*` call passes: auth, the control header, the
@@ -16201,14 +18948,7 @@ async fn agent_hold(
         );
     }
     if let Some(holder) = holder {
-        let mut owner = recover(state.owner.lock());
-        hold_owner_lease(
-            &mut owner,
-            &holder,
-            Instant::now(),
-            secs,
-            std::time::Duration::from_secs(state.owner_lease_secs),
-        );
+        extend_hold_owner(&state, &holder, Instant::now(), secs);
     }
     set_screen_private(&state, private, secs);
     state.touch_activity();
@@ -16221,6 +18961,77 @@ async fn agent_hold(
             )))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubtreeRequest {
+    snapshot: String,
+    element: usize,
+    #[serde(default = "subtree_depth")]
+    max_depth: u32,
+    #[serde(default = "subtree_nodes")]
+    max_nodes: u32,
+}
+fn subtree_depth() -> u32 { 8 }
+fn subtree_nodes() -> u32 { 500 }
+
+/// Observe one retained native element, without a global source read. The
+/// returned rows have no action token: local positions cannot drive input.
+async fn agent_subtree(State(state): State<Arc<AppState>>, headers: HeaderMap, body: String) -> Response {
+    if !matches!(agent_auth(&state, &headers), AgentAuth::Ok) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(refusal) = screen_private_refusal(&state) { return refusal; }
+    let Ok(request) = serde_json::from_str::<SubtreeRequest>(&body) else {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok":false,"error":"invalid_subtree_request"}));
+    };
+    if !(1..=64).contains(&request.max_depth) || !(1..=5000).contains(&request.max_nodes) {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({"ok":false,"error":"invalid_subtree_bounds"}));
+    }
+    let Some(rows) = lookup_element_snapshot(&state, &request.snapshot) else {
+        return stale_element_snapshot_response();
+    };
+    let Some(row) = rows.get(request.element) else { return invalid_element_snapshot_response(); };
+    let Some(locator) = snapshot_row_locator(row).and_then(|locator| locator_runner_query(&locator)) else {
+        return invalid_element_target_response();
+    };
+    let Some(runner) = state.runner.as_ref() else { return runner_failed_before_dispatch_response(); };
+    let scope = ScreenReadScope::capture(&state);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), scoped_observation(&state, &scope, async {
+        let mut client = runner.lock().await;
+        if !scope.current(&state) { return Err(anyhow::anyhow!("observation scope changed")); }
+        let matches = client.find_element_matches(locator.0, &locator.1).await?;
+        if !matches.coverage.is_complete() || matches.ids.len() != 1 {
+            return Err(anyhow::anyhow!("subtree target must have exactly one proven live match"));
+        }
+        client.element_subtree(&matches.ids[0], request.max_depth, request.max_nodes).await
+    })).await;
+    if !scope.current(&state) { return json_response(StatusCode::LOCKED, serde_json::json!({"ok":false,"error":"screen_scope_changed"})); }
+    match result {
+        Ok(Ok(tree)) => {
+            let mut response = json_response(StatusCode::OK, serde_json::json!({
+                "ok":true,"source":"element_subtree","read_only":true,
+                "action_refs":false,"root":{"snapshot":request.snapshot,"element":request.element},
+                "coverage":tree.coverage.as_str(),"complete":tree.coverage.is_complete(),
+                "partial":!tree.coverage.is_complete(),"rows":tree.rows,
+                "hint":"rows are local subtree positions, not action refs; use a unique locator or a fresh full snapshot for actions"
+            }));
+            response.extensions_mut().insert(ValueReadFence {
+                state: state.clone(), scope: scope.clone(), max_bytes: ADVICE_MAX_BODY,
+                failure: serde_json::json!({"ok":false,"error":"subtree_read_scope_changed","rows_omitted":true})
+            });
+            response
+        }
+        Ok(Err(error)) => {
+            let unsupported = error.downcast_ref::<crate::runner::RunnerHttpError>()
+                .is_some_and(|error| error.status == reqwest::StatusCode::NOT_IMPLEMENTED);
+            json_response(if unsupported { StatusCode::NOT_IMPLEMENTED } else { StatusCode::CONFLICT },
+                serde_json::json!({"ok":false,"error":if unsupported {"subtree_not_supported"} else {"subtree_read_failed"},
+                "hint":"use a fresh full elements read; no whole-screen fallback was made"}))
+        }
+        Err(_) => json_response(StatusCode::GATEWAY_TIMEOUT, serde_json::json!({"ok":false,"error":"subtree_timeout"})),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -16239,10 +19050,17 @@ struct AgentElementsQuery {
     /// text, case-insensitively (see [`crate::scope::filter`]).
     #[serde(default)]
     query: Option<String>,
+    /// JSON literal field selector, ANDed with query. No expression evaluation.
+    #[serde(default)]
+    selector: Option<String>,
     /// At most this many rows (1..=500) after `scope` and `query`. Kept as
     /// text so a bad value gets the daemon's own 400, not a parse error.
     #[serde(default)]
     limit: Option<String>,
+    /// `1`: preserve known booleans and empty values for failure diagnosis.
+    /// Only full reads support this projection; default reads remain sparse.
+    #[serde(default)]
+    locator_state: Option<String>,
     /// `1`/`auto`: add Vision OCR rows when the tree is unusable; `force`:
     /// always (see [`elements_ocr`]).
     #[serde(default)]
@@ -16741,11 +19559,11 @@ async fn agent_screenshot_capture(
     // The screen as it settled after the last action was captured then (see
     // `SETTLED_FRAME_MAX_AGE`); nothing was sent since, so it is this screen.
     if !raw && !fresh {
-        let settled = runner
-            .lock()
-            .await
-            .settled_frame(SETTLED_FRAME_MAX_AGE)
-            .filter(|frame| frame.covers(max_side));
+        let settled = {
+            let mut w = runner.lock().await;
+            w.fence_settled_frame(state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire));
+            w.settled_frame(SETTLED_FRAME_MAX_AGE).filter(|frame| frame.covers(max_side))
+        };
         if let Some(frame) = settled {
             return finish_screenshot(
                 runner,
@@ -17019,6 +19837,7 @@ async fn agent_mjpeg(
         }
         None => None,
     };
+    let privacy_generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
@@ -17111,6 +19930,7 @@ async fn agent_mjpeg(
             )
         }
     };
+    if let Some(refused) = private_read_refusal(&state, privacy_generation) { return refused; }
     match upstream {
         Ok(up) if up.status().is_success() => {
             let content_type = up
@@ -17145,16 +19965,18 @@ async fn agent_mjpeg(
             // A private hold taken while this feed is open ends it: the
             // person is signing in on the phone.
             let private_until = state.private_until.clone();
+    let privacy_epoch = state.privacy_epoch.clone();
             let timed = futures_util::stream::unfold(
                 (upstream, guard, activity_guard, false),
                 move |(mut upstream, guard, activity_guard, done)| {
                     let private_until = private_until.clone();
+            let privacy_epoch = privacy_epoch.clone();
                     async move {
                     if done {
                         return None;
                     }
                     let next = unless_private(
-                        &private_until,
+                        &private_until, &privacy_epoch, privacy_generation,
                         tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, upstream.next()),
                     )
                     .await?;
@@ -17243,6 +20065,7 @@ async fn agent_h264(
         }
         None => None,
     };
+    let privacy_generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
@@ -17285,6 +20108,7 @@ async fn agent_h264(
             .await;
         }
     }
+    if let Some(refused) = private_read_refusal(&state, privacy_generation) { return refused; }
     let subscription = hub.subscribe(mode);
     let activity_guard = stream_id.map(|stream_id| {
         MjpegActivityGuard::register(state.mjpeg_stream_activity.clone(), stream_id)
@@ -17292,14 +20116,16 @@ async fn agent_h264(
     // A private hold taken while this feed is open ends it (the hub stops
     // capturing too, see `VideoHub::hide_until`).
     let private_until = state.private_until.clone();
+    let privacy_epoch = state.privacy_epoch.clone();
     let frames = futures_util::stream::unfold(
         (subscription, stream_guard, activity_guard, hub),
         move |(mut subscription, guard, activity_guard, hub)| {
             let private_until = private_until.clone();
+            let privacy_epoch = privacy_epoch.clone();
             async move {
             loop {
                 let next = unless_private(
-                    &private_until,
+                    &private_until, &privacy_epoch, privacy_generation,
                     tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, subscription.frames.recv()),
                 )
                 .await?;
@@ -17889,7 +20715,9 @@ struct AgentAppsQuery {
     query: Option<String>,
     /// `auto` (default), `installed`, `catalog`, or `apple`.
     source: Option<String>,
-    /// App Store storefront for `apple`, two letters. Default `cn`.
+    /// App Store storefront for `apple`, two letters. Default: the
+    /// `IPHONE_USE_STORE_COUNTRY` setting, else the phone's own App Store, else `cn`
+    /// (see [`store_country`]).
     country: Option<String>,
     /// 1–30 candidates. Default 10.
     limit: Option<usize>,
@@ -17994,7 +20822,8 @@ async fn installed_inventory(
 struct AppLookupParams {
     query: String,
     source: &'static str,
-    country: String,
+    /// `None`: the caller named no storefront ([`store_country`] picks one).
+    country: Option<String>,
     limit: usize,
 }
 
@@ -18011,10 +20840,12 @@ fn app_lookup_params(query: &AgentAppsQuery) -> Result<AppLookupParams, String> 
         "apple" => "apple",
         _ => return Err("source must be auto, installed, catalog or apple".to_string()),
     };
-    let country = query.country.as_deref().unwrap_or("cn").to_ascii_lowercase();
-    if country.len() != 2 || !country.chars().all(|c| c.is_ascii_lowercase()) {
-        return Err("country must be a two-letter App Store storefront such as cn, us, hk, jp".to_string());
-    }
+    let country = match query.country.as_deref() {
+        Some(country) => Some(valid_store_country(country).ok_or_else(|| {
+            "country must be a two-letter App Store storefront such as cn, us, hk, jp".to_string()
+        })?),
+        None => None,
+    };
     let limit = query.limit.unwrap_or(10);
     if !(1..=30).contains(&limit) {
         return Err("limit must be 1 to 30".to_string());
@@ -18025,6 +20856,103 @@ fn app_lookup_params(query: &AgentAppsQuery) -> Result<AppLookupParams, String> 
         country,
         limit,
     })
+}
+
+fn valid_store_country(country: &str) -> Option<String> {
+    let country = country.trim().to_ascii_lowercase();
+    (country.len() == 2 && country.chars().all(|c| c.is_ascii_lowercase())).then_some(country)
+}
+
+/// What [`store_country`] last read from the phone, per udid, for an hour:
+/// the account's store rarely changes, and a search should not open two
+/// lockdown sessions every time.
+type StoreCountryCache =
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<(String, &'static str)>)>>;
+
+fn store_country_cache() -> &'static StoreCountryCache {
+    static CACHE: std::sync::OnceLock<StoreCountryCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Which App Store storefront a lookup that named none searches, and where
+/// that came from:
+/// - `setting`: `IPHONE_USE_STORE_COUNTRY`;
+/// - `app_store`: the store the phone's own apps were bought from (the
+///   Apple ID's storefront);
+/// - `device_region`: the phone's Region setting, when no app says;
+/// - `fallback`: `cn`, when nothing could be read (the answer warns).
+///
+/// A phone in Japan used to search the Chinese store and miss Japan-only apps.
+async fn store_country(state: &AppState) -> (String, &'static str) {
+    if let Some(country) = std::env::var("IPHONE_USE_STORE_COUNTRY")
+        .ok()
+        .and_then(|value| valid_store_country(&value))
+    {
+        return (country, "setting");
+    }
+    let Some(udid) = state.device_udid.clone() else {
+        return ("cn".to_string(), "fallback");
+    };
+    let cached = store_country_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&udid).cloned())
+        // A failed read is retried after a minute (the phone may reconnect),
+        // without paying its 8 s worst case on every lookup in between.
+        .filter(|(at, found)| {
+            let ttl = if found.is_some() { 3600 } else { 60 };
+            at.elapsed() < std::time::Duration::from_secs(ttl)
+        })
+        .map(|(_, found)| found);
+    let found = match cached {
+        Some(found) => found,
+        None => {
+            let found = read_store_country(state, &udid).await;
+            if let Ok(mut cache) = store_country_cache().lock() {
+                cache.insert(udid.clone(), (std::time::Instant::now(), found.clone()));
+            }
+            found
+        }
+    };
+    found.unwrap_or_else(|| ("cn".to_string(), "fallback"))
+}
+
+async fn read_store_country(state: &AppState, udid: &str) -> Option<(String, &'static str)> {
+    const READ: std::time::Duration = std::time::Duration::from_secs(4);
+    // Up to 32 third-party apps spread across the whole (alphabetical) list
+    // vote; each one's iTunesMetadata keeps a single Lookup reply small.
+    const VOTERS: usize = 32;
+    let all: Vec<String> = installed_inventory(state, false, APP_LOOKUP_INVENTORY_MAX_AGE)
+        .await
+        .ok()
+        .map(|body| crate::app_lookup::installed_from_inventory(&body))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|app| app.bundle_id)
+        .filter(|bundle| !bundle.starts_with("com.apple."))
+        .collect();
+    let step = all.len().div_ceil(VOTERS).max(1);
+    let bundles: Vec<String> = all.into_iter().step_by(step).collect();
+    match tokio::time::timeout(READ, crate::lockdown::app_store_country(udid, &bundles)).await {
+        Ok(Ok(Some(country))) => return Some((country, "app_store")),
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => tracing::debug!("app lookup: app store country: {error:#}"),
+        Err(_) => tracing::debug!("app lookup: app store country timed out"),
+    }
+    match tokio::time::timeout(READ, crate::lockdown::device_region(udid)).await {
+        Ok(Ok(region)) => region
+            .as_deref()
+            .and_then(valid_store_country)
+            .map(|region| (region, "device_region")),
+        Ok(Err(error)) => {
+            tracing::debug!("app lookup: lockdown region read: {error:#}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("app lookup: lockdown region read timed out");
+            None
+        }
+    }
 }
 
 /// `GET /agent/apps?query=<name>` — which bundle id is this app?
@@ -18048,6 +20976,9 @@ async fn agent_apps_lookup(state: &AppState, query: &AgentAppsQuery) -> Response
     };
     let refresh = matches!(query.refresh.as_deref(), Some("1" | "true"));
     let mut warnings: Vec<String> = Vec::new();
+    // The storefront is resolved only when the App Store is searched.
+    let mut country: Option<(String, &'static str)> =
+        params.country.clone().map(|country| (country, "request"));
     let mut searched: Vec<&str> = Vec::new();
     let mut installed: Option<Vec<crate::app_lookup::Candidate>> = None;
     if matches!(params.source, "auto" | "installed") {
@@ -18071,9 +21002,20 @@ async fn agent_apps_lookup(state: &AppState, query: &AgentAppsQuery) -> Response
     let local = crate::app_lookup::rank(&params.query, installed.as_deref(), catalog, &[]);
     let mut apple = Vec::new();
     let mut apple_error = None;
-    if params.source == "apple" || (params.source == "auto" && local.is_empty()) {
+    // Only an exact local match settles an auto lookup: a partial one ("PayPay"
+    // for "PayPay銀行") may be a different app the store has.
+    if params.source == "apple" || (params.source == "auto" && !local.iter().any(|row| row.exact)) {
         searched.push("apple");
-        match crate::app_lookup::search_apple(&params.query, &params.country, params.limit).await {
+        if country.is_none() {
+            country = Some(store_country(state).await);
+        }
+        let (store, country_source) = country.clone().expect("resolved above");
+        if country_source == "fallback" {
+            warnings.push(
+                "the phone's region could not be read; searched the cn App Store — pass country (jp, us, …) or set IPHONE_USE_STORE_COUNTRY".to_string(),
+            );
+        }
+        match crate::app_lookup::search_apple(&params.query, &store, params.limit).await {
             Ok(rows) => apple = rows,
             Err(error) => {
                 warnings.push(error.clone());
@@ -18111,7 +21053,8 @@ async fn agent_apps_lookup(state: &AppState, query: &AgentAppsQuery) -> Response
             "ok": true,
             "query": params.query,
             "source": params.source,
-            "country": params.country,
+            "country": country.as_ref().map(|(country, _)| country.clone()),
+            "country_source": country.as_ref().map(|(_, source)| *source),
             "candidates": candidates,
             "total_matches": total,
             "searched": searched,
@@ -18180,16 +21123,19 @@ async fn resolve_launch_app_name(
 /// Rewrite a `launch_app {"app": …}` action to the bundle it names, before
 /// any device lock is taken (a cold inventory read can take seconds). Other
 /// actions pass through untouched.
+///
+/// Returns what the name resolved to (`{app, name, bundle_id, match}`), so the
+/// result can say which app a loose name launched; `None` for other actions.
 async fn resolve_launch_app_action(
     state: &AppState,
     action: &mut serde_json::Value,
-) -> Result<(), Response> {
+) -> Result<Option<serde_json::Value>, Response> {
     if action.get("type").and_then(serde_json::Value::as_str) != Some("launch_app") {
-        return Ok(());
+        return Ok(None);
     }
     let Some(name) = action.get("app").and_then(serde_json::Value::as_str).map(str::to_string)
     else {
-        return Ok(());
+        return Ok(None);
     };
     let found = resolve_launch_app_name(state, &name).await?;
     if let Some(object) = action.as_object_mut() {
@@ -18199,7 +21145,22 @@ async fn resolve_launch_app_action(
             serde_json::Value::String(found.candidate.bundle_id.clone()),
         );
     }
-    Ok(())
+    Ok(Some(launch_resolution_json(&name, &found)))
+}
+
+fn launch_resolution_json(app: &str, found: &crate::app_lookup::Ranked) -> serde_json::Value {
+    serde_json::json!({
+        "app": app,
+        "name": found.candidate.name,
+        "bundle_id": found.candidate.bundle_id,
+        "match": if found.exact { "exact" } else { "partial" },
+    })
+}
+
+tokio::task_local! {
+    /// What `/agent/input`'s `launch_app {"app": …}` resolved to, read back by
+    /// [`agent_input`] to add `resolved` to the response.
+    static INPUT_LAUNCH_RESOLUTION: std::cell::RefCell<Option<serde_json::Value>>;
 }
 
 /// While recording, an app launch starts the app fresh (on its first screen),
@@ -18282,6 +21243,98 @@ async fn agent_home_layout(
             "ok":false,"error":"home_layout_unavailable","reason":format!("{error:#}"),
             "hint":"Connect the configured iPhone through its paired USB or usbmuxd network connection; no UI input or layout change was sent"}),
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeLayoutWrite {
+    action: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `POST /agent/home-layout {"action","file"?,"confirm"?}` (issue #383):
+/// `backup` saves the current layout; `preview` shows what writing `file`
+/// changes, by app identifier; `apply` writes `file` and `restore` writes the
+/// newest automatic backup (or `file`). Both writes answer the preview
+/// without writing until `confirm` is true, and back up the layout they
+/// replace first. Files are plists on this Mac.
+async fn agent_home_layout_write(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    use crate::home_layout as layout;
+    if let Some(refusal) = agent_auth_refusal(&state, &headers) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    let fail = |status: StatusCode, error: &str, reason: String| {
+        agent_apps_json(status, serde_json::json!({"ok": false, "error": error, "reason": reason}))
+    };
+    let request: HomeLayoutWrite = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => return fail(StatusCode::BAD_REQUEST, "invalid_request", error.to_string()),
+    };
+    if let Err(response) = claim_phone_owner(&state, &headers) {
+        return response;
+    }
+    if state.simulator.is_some() {
+        return fail(StatusCode::NOT_IMPLEMENTED, "home_layout_unavailable", "simulator layouts are not supported".into());
+    }
+    let Some(udid) = state.device_udid.clone().filter(|s| !s.is_empty()) else {
+        return fail(StatusCode::CONFLICT, "target_required", "configure IPHONE_USE_UDID".into());
+    };
+    let current = match layout::raw_state(&udid).await {
+        Ok(current) => current,
+        Err(error) => return fail(StatusCode::SERVICE_UNAVAILABLE, "home_layout_unavailable", format!("{error:#}")),
+    };
+    if request.action == "backup" {
+        return match layout::save_backup(&current, "home") {
+            Ok(path) => agent_apps_json(StatusCode::OK, serde_json::json!({
+                "ok": true, "file": path, "summary": layout::summarize(&current)})),
+            Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, "backup_failed", format!("{error:#}")),
+        };
+    }
+    let file = match (request.action.as_str(), request.file) {
+        ("preview" | "apply" | "restore", Some(file)) => std::path::PathBuf::from(file),
+        ("restore", None) => match layout::latest_backup() {
+            Some(file) => file,
+            None => return fail(StatusCode::NOT_FOUND, "no_backup", "no earlier layout in ~/.iphone-use-backups".into()),
+        },
+        ("preview" | "apply", None) => return fail(StatusCode::BAD_REQUEST, "file_required", "name the layout plist".into()),
+        (other, _) => return fail(StatusCode::BAD_REQUEST, "invalid_action", format!("{other}: use backup, preview, apply or restore")),
+    };
+    if !file.is_absolute() || file.extension().and_then(|e| e.to_str()) != Some("plist") {
+        return fail(StatusCode::BAD_REQUEST, "invalid_file", "an absolute path to a .plist".into());
+    }
+    let next: plist::Value = match plist::from_file(&file) {
+        Ok(next) => next,
+        Err(error) => return fail(StatusCode::BAD_REQUEST, "invalid_file", error.to_string()),
+    };
+    if let Err(error) = layout::validate(&next) {
+        return fail(StatusCode::BAD_REQUEST, "invalid_layout", error.to_string());
+    }
+    let preview = layout::preview(&current, &next);
+    if request.action == "preview" || !request.confirm {
+        return agent_apps_json(StatusCode::OK, serde_json::json!({
+            "ok": true, "written": false, "file": file, "preview": preview,
+            "next": (request.action != "preview").then_some("show the preview to the person; send again with confirm:true only after they agree")}));
+    }
+    let backup = match layout::save_backup(&current, "home-before-apply") {
+        Ok(path) => path,
+        Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "backup_failed", format!("{error:#}")),
+    };
+    match layout::set_state(&udid, next).await {
+        Ok(()) => agent_apps_json(StatusCode::OK, serde_json::json!({
+            "ok": true, "written": true, "file": file, "backup": backup, "preview": preview,
+            "next": "read the layout again (GET /agent/home-layout): SpringBoard may re-add hidden apps over a few passes; undo with action restore"})),
+        Err(error) => fail(StatusCode::BAD_GATEWAY, "write_failed", format!("{error:#} (current layout saved to {})", backup.display())),
     }
 }
 
@@ -20073,6 +23126,24 @@ fn overlay_marks(rows: &[crate::runner::ElementRow], window: (f64, f64)) -> Vec<
 async fn agent_screenshot(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
+    query: Query<ScreenshotQuery>,
+) -> Response {
+    // Authenticate before the cancellation gate, including a private screen.
+    if let Some(refused) = auth_refusal(browser_or_agent_auth(&state, &headers)) { return refused; }
+    let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let response = unless_private(&state.private_until, &state.privacy_epoch, generation,
+        agent_screenshot_unfenced(state.clone(), headers, query)).await.unwrap_or_else(|| {
+            recover(state.element_snapshots.lock()).clear();
+            recover(state.owner_snapshots.lock()).clear();
+            agent_error(StatusCode::LOCKED, "screen_privacy_changed",
+                "screen privacy changed or was active during this read; it was cancelled without retry")
+        });
+    finish_private_read(&state, generation, response)
+}
+
+async fn agent_screenshot_unfenced(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<ScreenshotQuery>,
 ) -> Response {
     match query.overlay.as_deref() {
@@ -20175,9 +23246,37 @@ fn parse_ocr_mode(raw: Option<&str>) -> Result<Option<OcrMode>, serde_json::Valu
     }
 }
 
-/// A recognition run's budget, the screenshot excluded. The first run on a
-/// Mac compiles the helper and may not fit; the next read then works.
-const ELEMENTS_OCR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a read waits for recognition, the screenshot excluded. A warm
+/// run takes well under a second; the first run after Vision sat idle can
+/// take 20–46 s (#404). The read does not hold the whole observation for
+/// that: it returns at this budget with `ocr_status: "warming"` while the
+/// detached run keeps loading the models, and a retry then reads fast.
+const ELEMENTS_OCR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// When to retry after a read stopped waiting for a cold recognition.
+const OCR_WARMING_RETRY_MS: u64 = 15_000;
+
+/// Why a read carries no OCR rows.
+#[derive(Debug)]
+struct OcrFailure {
+    message: String,
+    /// `warming` (this read's run outlived the wait and keeps going), `busy`
+    /// (an earlier run is still going) or `failed`.
+    status: &'static str,
+    retry_after_ms: Option<u64>,
+}
+
+impl From<String> for OcrFailure {
+    fn from(message: String) -> Self {
+        OcrFailure { message, status: "failed", retry_after_ms: None }
+    }
+}
+
+impl From<&str> for OcrFailure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
 
 /// A PNG's width from its header.
 fn png_width(bytes: &[u8]) -> Option<u32> {
@@ -20190,13 +23289,18 @@ async fn elements_ocr(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     json: &serde_json::Value,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, OcrFailure> {
     let width = json
         .get("screen")
         .and_then(|screen| screen.get("width"))
         .and_then(serde_json::Value::as_f64)
         .filter(|width| *width > 0.0)
         .ok_or("the screen size is unknown, so recognized text cannot be placed")?;
+    let reservation = crate::ocr::reserve_background().map_err(|error| OcrFailure {
+        message: format!("{error:#}"),
+        status: "busy",
+        retry_after_ms: Some(5_000),
+    })?;
     let shot = agent_screenshot_capture(
         State(state.clone()),
         headers.clone(),
@@ -20209,29 +23313,47 @@ async fn elements_ocr(
     )
     .await;
     if !shot.status().is_success() {
-        return Err(format!("the screenshot for OCR failed ({})", shot.status()));
+        return Err(format!("the screenshot for OCR failed ({})", shot.status()).into());
     }
     if shot
         .headers()
         .get("x-capture-redacted")
         .is_some_and(|v| v.as_bytes() == b"1")
     {
-        return Err("the app hides this screen from capture; there is no text to read".to_string());
+        return Err("the app hides this screen from capture; there is no text to read".into());
     }
     let png = axum::body::to_bytes(shot.into_body(), 64 << 20)
         .await
         .map_err(|error| format!("read the screenshot: {error}"))?;
     let pixels = png_width(&png).ok_or("the screenshot is not a PNG")?;
     let scale = f64::from(pixels) / width;
-    let rows = tokio::time::timeout(ELEMENTS_OCR_TIMEOUT, crate::ocr::recognize(&png, scale))
+    // Detached, like the OCR wait: a cold run that outlives this read still
+    // finishes and warms Vision for the next one.
+    let task = crate::ocr::recognize_background(reservation, png.to_vec(), scale);
+    let rows = tokio::time::timeout(ELEMENTS_OCR_TIMEOUT, task)
         .await
-        .map_err(|_| format!("OCR did not finish in {} s", ELEMENTS_OCR_TIMEOUT.as_secs()))?
+        .map_err(|_| OcrFailure {
+            message: format!(
+                "OCR is warming up: Vision had not finished after {} s, which happens on the first run after it sat idle. The tree and any screenshot in this read are current; the recognition keeps running, so retry the read in about {} s",
+                ELEMENTS_OCR_TIMEOUT.as_secs(),
+                OCR_WARMING_RETRY_MS / 1000
+            ),
+            status: "warming",
+            retry_after_ms: Some(OCR_WARMING_RETRY_MS),
+        })?
         .map_err(|error| format!("{error:#}"))?;
     Ok(crate::ocr::rows_for_elements(&rows))
 }
 
-/// `ocr: {rows, source}` or `ocr_error`; never fails the read.
-fn attach_ocr(json: &mut serde_json::Value, result: Result<Vec<serde_json::Value>, String>) {
+/// `ocr: {rows, source}` or `ocr_error` + `ocr_status` (+ `ocr_retry_after_ms`
+/// when a retry will work); never fails the read. `ocr_ms` is the time OCR
+/// added to this read, kept apart from the tree and screenshot.
+fn attach_ocr<E: Into<OcrFailure>>(
+    json: &mut serde_json::Value,
+    result: Result<Vec<serde_json::Value>, E>,
+    started: std::time::Instant,
+) {
+    json["ocr_ms"] = serde_json::json!(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     match result {
         Ok(rows) => {
             json["ocr"] = serde_json::json!({
@@ -20241,13 +23363,256 @@ fn attach_ocr(json: &mut serde_json::Value, result: Result<Vec<serde_json::Value
             });
         }
         Err(error) => {
-            json["ocr_error"] = serde_json::Value::String(error);
+            let error = error.into();
+            json["ocr_error"] = serde_json::Value::String(error.message);
+            json["ocr_status"] = serde_json::Value::from(error.status);
+            if let Some(ms) = error.retry_after_ms {
+                json["ocr_retry_after_ms"] = serde_json::json!(ms);
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_named_release_ends_the_task_even_after_its_lease_lapsed() {
+        use tower::ServiceExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let state = fixture_app_state(None);
+            let lapsed = Instant::now() - std::time::Duration::from_secs(state.owner_lease_secs + 60);
+            *state.owner.lock().unwrap() = Some(PhoneOwner { name: "reader-session".into(), last_seen: lapsed });
+            assert!(owner_status(&state).0.is_none(), "no live lease: it lapsed during a long think");
+            // A different session releasing does not end this one's task.
+            *recover(TASK_ENDED_AT.lock()) = None;
+            let other = router(state.clone()).oneshot(
+                axum::http::Request::builder().method("POST").uri("/agent/owner")
+                    .header("x-phone-control", "1").header("x-phone-owner", "someone-else")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"release":true}"#)).unwrap()).await.unwrap();
+            assert_eq!(other.status(), StatusCode::OK);
+            assert!(recover(TASK_ENDED_AT.lock()).is_none(), "not that session's task");
+            *state.owner.lock().unwrap() = Some(PhoneOwner { name: "reader-session".into(), last_seen: lapsed });
+            let before = Instant::now();
+            let response = router(state.clone()).oneshot(
+                axum::http::Request::builder().method("POST").uri("/agent/owner")
+                    .header("x-phone-control", "1").header("x-phone-owner", "reader-session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"release":true}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let ended = recover(TASK_ENDED_AT.lock()).expect("the task end was noted");
+            assert!(ended >= before);
+        });
+    }
+
+    #[test]
+    fn a_task_ends_on_release_or_a_lapsed_lease_until_the_phone_is_driven_again() {
+        let lease = std::time::Duration::from_secs(300);
+        let now = Instant::now();
+        let earlier = now - std::time::Duration::from_secs(5);
+        // The session gave its lease back after its last action.
+        assert!(task_ended(Some(now), earlier, None, lease));
+        // Driven again after that: a new task, not an ended one.
+        assert!(!task_ended(Some(earlier), now, None, lease));
+        // Never released: a live lease is a task in progress, a lapsed one is over…
+        let lapsed = now - lease - std::time::Duration::from_secs(1);
+        assert!(!task_ended(None, earlier, Some(earlier), lease));
+        assert!(task_ended(None, lapsed, Some(lapsed), lease));
+        // …unless someone drove the phone after it.
+        assert!(!task_ended(None, now, Some(lapsed), lease));
+        assert!(!task_ended(None, now, None, lease));
+    }
+
+    #[test]
+    fn setup_retry_reports_a_scheduled_supervisor_retry_only_after_a_failed_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RUNNER_RETRY_STATE_FILE);
+        assert!(setup_retry_json(dir.path(), Some("prereq-fail"), 100).is_null(), "no state, no retry");
+        crate::setup::retry::record_failure(&path, crate::setup::retry::Kind::Generic).unwrap();
+        let now = crate::setup::retry::now();
+        let retry = setup_retry_json(dir.path(), Some("prereq-fail"), now);
+        assert_eq!(retry["kind"], "generic");
+        assert_eq!(retry["attempt"], 1);
+        assert!(retry["next_in_secs"].as_u64().unwrap() <= 5, "{retry}");
+        // A round in progress is `reconnecting`, not a scheduled retry.
+        assert!(setup_retry_json(dir.path(), Some("building"), now).is_null());
+        assert!(setup_retry_json(dir.path(), None, now).is_null());
+        // A schedule long past its time: the supervisor is not coming back.
+        assert!(setup_retry_json(dir.path(), Some("prereq-fail"), now + 6 + SETUP_RETRY_GRACE_SECS).is_null());
+    }
+
+    #[test]
+    fn a_capped_readback_of_a_long_value_is_truncated_not_unapplied() {
+        let long = "word ".repeat(130);
+        assert!(readback_truncated(&long[..512], &long));
+        assert!(!readback_truncated(&long, &long), "a full readback is a match, not a truncation");
+        assert!(!readback_truncated("word word", &long), "a short prefix proves nothing");
+        assert!(!readback_truncated(&"x".repeat(600)[..512], &long));
+    }
+
+    #[test]
+    fn history_activity_is_fenced_against_late_private_hold() {
+        use tower::ServiceExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let state=fixture_app_state(None);
+            let response=router(state.clone()).oneshot(axum::http::Request::builder().uri("/agent/activity?live=false").body(Body::empty()).unwrap()).await.unwrap();
+            state.privacy_epoch.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
+            assert!(axum::body::to_bytes(response.into_body(),ADVICE_MAX_BODY).await.is_err());
+        });
+    }
+
+    #[test]
+    fn rebound_notice_preserves_the_value_verification_receipt() {
+        let mut runner=crate::runner::RunnerClient::new("http://127.0.0.1:9").unwrap();
+        runner.rebound_row=Some((1,2));
+        let mut detail=Some(serde_json::json!({"verification":{"status":"verified","scope":"element_value"}}));
+        assert!(snapshot_element_outcome(Ok(()),&mut runner,"fixture",&mut detail).unwrap().is_ok());
+        let detail=detail.unwrap();
+        assert_eq!(detail["verification"]["status"],"verified");
+        assert_eq!(detail["rebound"],serde_json::json!({"from":1,"to":2}));
+    }
+
+    #[test]
+    fn live_activity_is_no_store_and_fenced_until_publication() {
+        use tower::ServiceExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let state=fixture_app_state(None);
+            *state.owner.lock().unwrap()=Some(PhoneOwner{name:"activity-owner".into(),last_seen:Instant::now()});
+            let response=router(state.clone()).oneshot(axum::http::Request::builder().uri("/agent/activity?live=true").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(),"no-store");
+            state.owner_epoch.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
+            let bytes=axum::body::to_bytes(response.into_body(),ADVICE_MAX_BODY).await.unwrap();
+            let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"],"activity_scope_changed");
+            assert!(body.get("live_target").is_none());
+        });
+    }
+
+    #[test]
+    fn lease_release_and_expiry_end_the_previous_owners_trace() {
+        let state=fixture_app_state(None);
+        for mode in [0,1,2] {
+            let expired=mode>0;
+            let owner=match mode {0=>"released-owner",1=>"expired-owner",_=>"expired-anonymous-owner"};
+            *state.owner.lock().unwrap()=Some(PhoneOwner{name:owner.into(),last_seen:if expired {Instant::now()-std::time::Duration::from_secs(state.owner_lease_secs+1)} else {Instant::now()}});
+            assert!(state.action_traces.lock().unwrap().start(owner,"run"));
+            let epoch=state.owner_epoch.load(std::sync::atomic::Ordering::Acquire);
+            if expired {
+                let mut headers=HeaderMap::new();
+                if mode==1 {headers.insert("x-phone-owner","new-owner".parse().unwrap());}
+                assert!(claim_phone_owner(&state,&headers).is_ok());
+            } else { state.release_owner_lease(); }
+            assert_eq!(state.action_traces.lock().unwrap().export(owner,"run").unwrap()["active"],false);
+            if mode==2 {assert_eq!(state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),epoch);}
+        }
+    }
+
+    #[test]
+    fn scope_less_delivered_install_cannot_cross_an_owner_change() {
+        let state=fixture_app_state(None);
+        let mut headers=HeaderMap::new();headers.insert("x-phone-owner","install-owner".parse().unwrap());
+        state.action_traces.lock().unwrap().start("install-owner","run");
+        let handle=state.action_traces.lock().unwrap().active_handle("install-owner").unwrap();
+        *state.owner.lock().unwrap()=Some(PhoneOwner{name:"other-owner".into(),last_seen:Instant::now()});
+        for mut result in [
+            serde_json::json!({"ok":true,"installed":true}),
+            serde_json::json!({"ok":false,"error":"outcome_unknown","outcome":"unknown"}),
+            serde_json::json!({"ok":false,"error":"phone_owned","owner":"other-owner"}),
+        ] {
+            crate::action_feedback::enrich(&mut result);
+            record_action_trace(&state,&headers,&serde_json::json!({"type":"install"}),Some(&handle),0,None,&result);
+        }
+        let trace=state.action_traces.lock().unwrap().export("install-owner","run").unwrap();
+        assert_eq!(trace["events"].as_array().unwrap().len(),1);
+        assert_eq!(trace["events"][0]["result"]["ok"],false);
+    }
+
+    #[test]
+    fn unknown_candidate_state_cannot_prove_a_locator_unique() {
+        use crate::runner::ElementRow;
+        let locator: super::AgentElementLocator = serde_json::from_value(serde_json::json!({"label":"Done","value":"saved"})).unwrap();
+        let known = ElementRow { label: "Done".into(), value: Some("saved".into()), ..Default::default() };
+        let unknown = ElementRow { label: "Done".into(), value: Some("prefix".into()), value_truncated: Some(true), ..Default::default() };
+        assert!(matches!(super::unique_locator_index(&[known.clone(), unknown.clone()], &locator), Err(super::UniqueLabelTapError::Refused("target_state_unproven", _))));
+        assert!(matches!(super::unique_locator_index(&[unknown], &locator), Err(super::UniqueLabelTapError::Refused("target_state_unproven", _))));
+        assert!(matches!(super::unique_locator_index(&[known.clone(), known.clone()], &locator), Err(super::UniqueLabelTapError::Ambiguous(_))));
+        assert!(matches!(super::unique_locator_index(&[known], &locator), Ok(0)));
+    }
+
+    #[test]
+    fn cancelled_list_swipe_retains_exactly_one_uncertain_receipt() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                for dispatched in [false, true] {
+                    let delivery = std::sync::Arc::new(super::ListDelivery::default());
+                    let work = {
+                        let delivery = delivery.clone();
+                        async move {
+                            let _receipt = super::ListSwipeReceipt {
+                                delivery,
+                                dispatched: std::sync::Arc::new(AtomicBool::new(dispatched)),
+                                finished: false,
+                            };
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(10), work)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(delivery.confirmed.load(Ordering::Acquire), 0);
+                    assert_eq!(
+                        delivery.uncertain.load(Ordering::Acquire),
+                        u32::from(dispatched)
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn list_scope_epoch_matches_each_successful_claim() {
+        for (previous, expired, requested, takeover) in [
+            (None, false, None, false),
+            (None, false, Some("a"), false),
+            (Some("a"), false, Some("a"), false),
+            (Some("a"), true, Some("a"), false),
+            (Some("a"), false, Some("a"), true),
+            (Some("a"), false, Some("b"), true),
+        ] {
+            let state = readiness_test_state();
+            *recover(state.owner.lock()) = previous.map(|name| PhoneOwner {
+                name: name.into(),
+                last_seen: if expired {
+                    Instant::now() - std::time::Duration::from_secs(state.owner_lease_secs + 1)
+                } else {
+                    Instant::now()
+                },
+            });
+            let mut headers = HeaderMap::new();
+            if let Some(name) = requested {
+                headers.insert("x-phone-owner", name.parse().unwrap());
+            }
+            if takeover {
+                headers.insert("x-phone-owner-takeover", "1".parse().unwrap());
+            }
+            let generation = state
+                .privacy_epoch
+                .load(std::sync::atomic::Ordering::Acquire);
+            let scope = list_read_scope(&state, &headers, generation)
+                .unwrap_or_else(|_| panic!("claim should succeed"));
+            assert!(
+                scope.current(&state),
+                "claim {previous:?} -> {requested:?}, expired={expired}, takeover={takeover}"
+            );
+            assert_eq!(scope.owner.as_deref(), requested);
+        }
+    }
+
     #[test]
     fn scroll_alert_present_refuses_all_gesture_modes() {
         let source = include_str!("http.rs");
@@ -20331,8 +23696,9 @@ mod tests {
                             &actionable,
                             &action,
                             &mut detail,
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(5)
-                        ));
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                            None,
+                        None, ));
                         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
                         assert_eq!(
                             std::future::Future::poll(action.as_mut(), &mut cx),
@@ -20363,8 +23729,9 @@ mod tests {
                         &actionable,
                         &action,
                         &mut detail,
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
-                    ));
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                        None,
+                    None, ));
                     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
                     assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_ready());
                 }
@@ -20399,7 +23766,7 @@ mod tests {
             .split("async fn direct_control(")
             .next()
             .unwrap();
-        assert!(agent.contains("value, detail, true)"));
+        assert!(agent.contains("value, detail, true, dispatch_allowed)"));
     }
     #[test]
     fn scroll_alert_error_keeps_full_json_and_buttons() {
@@ -20491,6 +23858,58 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn value_readback_is_withheld_after_late_privacy_revocation() {
+        use tower::ServiceExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let state = fixture_app_state(None);
+            let handler_state = state.clone();
+            let app = Router::new().route("/check", get(move || {
+                let state = handler_state.clone();
+                async move {
+                    let scope = ScreenReadScope::capture(&state);
+                    let mut response = json_response(StatusCode::OK, serde_json::json!({
+                        "ok":true,"transport":"runner","verification":{"status":"verified","scope":"element_value"},
+                        "action_evidence":{"postcondition":{"status":"verified"}}
+                    }));
+                    response.extensions_mut().insert(ActionObservationFence {
+                        state, scope, fallback:serde_json::json!({"ok":true,"transport":"runner","retry_safe":false})
+                    });
+                    response
+                }
+            })).layer(axum::middleware::from_fn(privacy_read_body_layer));
+            let response = app.oneshot(axum::http::Request::builder().uri("/check").body(Body::empty()).unwrap()).await.unwrap();
+            state.privacy_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let bytes = axum::body::to_bytes(response.into_body(), 100000).await.unwrap();
+            let body:serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["ok"],true);
+            assert!(body.get("verification").is_none());
+            assert!(body.get("action_evidence").is_none());
+            assert_eq!(body["observation_omitted"],true);
+        });
+    }
+
+    #[test]
+    fn revoked_observation_scope_does_not_enter_trace() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let state = fixture_app_state(None);
+            assert!(state.action_traces.lock().unwrap().start("trace-owner", "scope-run"));
+            let scope = ScreenReadScope::capture(&state);
+            let mut response = json_response(StatusCode::OK, serde_json::json!({"ok":true,"transport":"runner"}));
+            response.extensions_mut().insert(ActionObservationFence {state:state.clone(),scope,
+                fallback:serde_json::json!({"ok":true,"transport":"runner"})});
+            state.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let mut headers = HeaderMap::new();
+            headers.insert("x-phone-owner", "trace-owner".parse().unwrap());
+            let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+            let handle = state.action_traces.lock().unwrap().active_handle("trace-owner");
+            let _ = action_receipt(&state, &headers, &serde_json::json!({"type":"tap","x":0.1,"y":0.1}), generation, handle, response).await;
+            let trace = state.action_traces.lock().unwrap().export("trace-owner","scope-run").unwrap();
+            assert_eq!(trace["events"].as_array().unwrap().len(),0);
+        });
+    }
+
 
     // --- Batch outcome: the failed step is not the batch ---
 
@@ -21691,6 +25110,29 @@ mod tests {
     }
 
     #[test]
+    fn hold_update_bumps_owner_incarnation_only_on_revival() {
+        let state=readiness_test_state();let now=Instant::now();
+        *recover(state.owner.lock())=Some(PhoneOwner{name:"holder".into(),last_seen:now});
+        let epoch=state.owner_epoch.load(std::sync::atomic::Ordering::Acquire);
+        extend_hold_owner(&state,"holder",now,0);
+        assert_eq!(epoch,state.owner_epoch.load(std::sync::atomic::Ordering::Acquire));
+        let later=now+std::time::Duration::from_secs(state.owner_lease_secs+1);
+        extend_hold_owner(&state,"holder",later,0);
+        assert_eq!(epoch+1,state.owner_epoch.load(std::sync::atomic::Ordering::Acquire));
+        extend_hold_owner(&state,"holder",later,0);
+        assert_eq!(epoch+1,state.owner_epoch.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn delayed_hold_reports_an_expired_lease_revival() {
+        let now=Instant::now();let lease=std::time::Duration::from_secs(5);
+        let mut owner=Some(PhoneOwner{name:"holder".into(),last_seen:now});
+        assert!(!hold_owner_lease(&mut owner,"holder",now,10,lease));
+        assert!(hold_owner_lease(&mut owner,"holder",now+std::time::Duration::from_secs(11),0,lease));
+        assert!(!hold_owner_lease(&mut owner,"holder",now+std::time::Duration::from_secs(11),0,lease));
+    }
+
+    #[test]
     fn owner_names_are_short_printable_ascii() {
         assert!(valid_owner_name("bank-flow"));
         assert!(valid_owner_name("mcp 12345"));
@@ -22612,8 +26054,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_locator_and_native_query_preserve_opaque_identifier_whitespace() {
+        for (identifier, literal) in [
+            ("  opaque\nID  ", "'  opaque\\u000aID  '"),
+            ("\t", "'\\u0009'"),
+            ("\u{3000}标识\u{3000}", "'\u{3000}标识\u{3000}'"),
+        ] {
+            let row=crate::runner::ElementRow {kind:"Button".into(),label:"Literal control".into(),
+                identifier:Some(identifier.into()),rect:[20.0,80.0,330.0,70.0],..Default::default()};
+            let locator=snapshot_row_locator(&row).unwrap();
+            assert_eq!(locator.identifier.as_deref(),Some(identifier));
+            assert_eq!(agent_locator_assessment(&row,&locator),Some(true));
+            let (_,query)=locator_runner_query(&locator).unwrap();
+            assert!(query.contains(&format!("identifier == {literal}")),"{query}");
+            assert_eq!(serde_json::to_value(&locator).unwrap()["identifier"],identifier);
+        }
+    }
+
+    #[test]
     fn locator_runner_query_uses_element_clickable_predicate_fields() {
         let locator = AgentElementLocator {
+            label_contains: None,
             label: Some("保存到“文件”".to_string()),
             identifier: Some("actionGroupCell".to_string()),
             kind: Some("Cell".to_string()),
@@ -22623,6 +26084,10 @@ mod tests {
             visible: Some(true),
         };
 
+        assert_eq!(serde_json::to_value(&locator).unwrap(),serde_json::json!({
+            "label":"保存到“文件”","identifier":"actionGroupCell","kind":"Cell",
+            "focused":false,"enabled":true,"visible":true
+        }));
         let (using, value) = locator_runner_query(&locator).unwrap();
         assert_eq!(using, "predicate string");
         assert_eq!(
@@ -22642,7 +26107,7 @@ mod tests {
         assert_eq!(using, "predicate string");
         assert_eq!(
             query,
-            "type == 'XCUIElementTypeTextField' AND (label == 'local-agent-goal' OR name == 'local-agent-goal') AND value == '\\nQA\\r\\t\\'\\\\n'"
+            "type == 'XCUIElementTypeTextField' AND (label == 'local-agent-goal' OR name == 'local-agent-goal') AND value == '\\u000aQA\\u000d\\u0009\\'\\\\n'"
         );
         assert!(!query.contains(['\n', '\r', '\t']));
     }
@@ -22650,6 +26115,7 @@ mod tests {
     #[test]
     fn locator_runner_query_matches_the_identifier_and_escapes_predicates() {
         let locator = AgentElementLocator {
+            label_contains: None,
             label: None,
             identifier: Some("unique-control".to_string()),
             kind: None,
@@ -22666,6 +26132,176 @@ mod tests {
             runner_predicate_literal("O'Reilly\\Files"),
             "'O\\'Reilly\\\\Files'"
         );
+    }
+
+    #[test]
+    fn ordinal_waits_use_known_and_possible_counts_and_snapshot_completeness() {
+        let known = crate::runner::ElementRow {
+            kind: "Button".into(),
+            label: "Save".into(),
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let unknown = crate::runner::ElementRow {
+            enabled: None,
+            ..known.clone()
+        };
+        let unrelated = crate::runner::ElementRow {
+            label: "Other".into(),
+            enabled: None,
+            ..known.clone()
+        };
+        for (mode, rows, complete, index, expected, unproven) in [
+            (
+                "present",
+                vec![known.clone(), known.clone()],
+                true,
+                1,
+                true,
+                false,
+            ),
+            (
+                "present",
+                vec![known.clone(), unknown.clone()],
+                true,
+                1,
+                false,
+                true,
+            ),
+            (
+                "present",
+                vec![known.clone(), unrelated.clone()],
+                true,
+                1,
+                false,
+                false,
+            ),
+            (
+                "present",
+                vec![known.clone(), unrelated.clone()],
+                false,
+                1,
+                false,
+                true,
+            ),
+            (
+                "present",
+                vec![known.clone(), unknown.clone()],
+                false,
+                0,
+                true,
+                false,
+            ),
+            (
+                "absent",
+                vec![known.clone(), unknown.clone()],
+                true,
+                1,
+                false,
+                true,
+            ),
+            (
+                "absent",
+                vec![known.clone(), unknown.clone()],
+                true,
+                2,
+                true,
+                false,
+            ),
+            (
+                "absent",
+                vec![known.clone(), unrelated.clone()],
+                true,
+                1,
+                true,
+                false,
+            ),
+            (
+                "absent",
+                vec![known.clone(), unrelated.clone()],
+                false,
+                1,
+                false,
+                true,
+            ),
+            (
+                "absent",
+                vec![known.clone(), known.clone()],
+                false,
+                1,
+                false,
+                false,
+            ),
+        ] {
+            let expect:AgentUiExpectation=serde_json::from_value(serde_json::json!({mode:[{"kind":"Button","label":"Save","enabled":true,"index":index}]})).unwrap();
+            let (matched, observation) = agent_expectation_observation(&rows, &expect, if complete {crate::runner::SnapshotCoverage::Complete} else {crate::runner::SnapshotCoverage::Truncated});
+            assert_eq!(matched, expected, "{mode}: {observation}");
+            assert_eq!(
+                observation[format!("{mode}_unproven")],
+                if unproven {
+                    serde_json::json!([0])
+                } else {
+                    serde_json::json!([])
+                }
+            );
+            assert_eq!(
+                observation[format!("{mode}_counts")][0]["required_matches"],
+                index + 1
+            );
+        }
+        let higher: AgentUiExpectation =
+            serde_json::from_value(serde_json::json!({"present":[{"kind":"Alert","index":1}]}))
+                .unwrap();
+        assert!(!alert_only_expectation(&higher));
+        assert!(wait_probe_predicates(&higher).is_none());
+    }
+
+    #[test]
+    fn alert_text_shortcut_does_not_reinterpret_a_label_substring() {
+        let exact: AgentUiExpectation = serde_json::from_value(
+            serde_json::json!({"present":[{"kind":"Alert","label":"Notice"}]}),
+        )
+        .unwrap();
+        let contains: AgentUiExpectation = serde_json::from_value(
+            serde_json::json!({"present":[{"kind":"Alert","label_contains":"Notice"}]}),
+        )
+        .unwrap();
+        assert!(alert_only_expectation(&exact));
+        assert!(!alert_only_expectation(&contains));
+    }
+
+    #[test]
+    fn native_predicate_literal_encoding_matches_foundation_fixtures() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/predicate-literals.json"
+        ))
+        .unwrap();
+        for case in fixtures.as_array().unwrap() {
+            assert_eq!(
+                runner_predicate_literal(case["input"].as_str().unwrap()),
+                case["literal"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn selector_enabled_enrichment_keeps_default_snapshot_delta_and_action_contracts() {
+        let unknown=crate::runner::ElementRow {kind:"Button".into(),label:"Save".into(),identifier:Some("save".into()),..Default::default()};
+        let known=crate::runner::ElementRow {enabled:Some(true),visible:Some(true),focused:Some(false),..unknown.clone()};
+        assert_eq!(element_snapshot_id(&[unknown.clone()]).unwrap(),element_snapshot_id(&[known.clone()]).unwrap());
+        let delta=diff_element_rows(&[unknown.clone()],&[known.clone()]);
+        assert_eq!(delta.unchanged,1);
+        assert!(delta.changed.is_empty());
+        assert_eq!(snapshot_row_locator(&unknown).unwrap().enabled,None);
+        assert_eq!(snapshot_row_locator(&known).unwrap().enabled,None);
+        let empty=crate::runner::ElementRow {value:Some(String::new()),..known.clone()};
+        assert_eq!(element_snapshot_id(&[known.clone()]).unwrap(),element_snapshot_id(&[empty.clone()]).unwrap());
+        assert!(diff_element_rows(&[known.clone()],&[empty.clone()]).changed.is_empty());
+        assert_eq!(snapshot_row_locator(&empty).unwrap().value,None);
+        let disabled=crate::runner::ElementRow {enabled:Some(false),..known.clone()};
+        assert_ne!(element_snapshot_id(&[known.clone()]).unwrap(),element_snapshot_id(&[disabled.clone()]).unwrap());
+        assert_eq!(diff_element_rows(&[known],&[disabled.clone()]).changed,vec![0]);
+        assert_eq!(snapshot_row_locator(&disabled).unwrap().enabled,Some(false));
     }
 
     #[test]
@@ -22688,7 +26324,7 @@ mod tests {
         let locator = snapshot_row_locator(&row).unwrap();
         assert_eq!(locator.label.as_deref(), Some("保存"));
         assert_eq!(locator.kind.as_deref(), Some("Button"));
-        assert_eq!(locator.enabled, Some(true));
+        assert_eq!(locator.enabled, None, "known true enrichment must not add a default action constraint");
         assert_eq!(locator.visible, Some(true));
     }
 
@@ -23007,6 +26643,70 @@ mod tests {
         }
     }
 
+
+
+    #[test]
+    fn waits_do_not_treat_unavailable_or_protected_values_as_absence() {
+        for row in [
+            crate::runner::ElementRow {kind:"TextField".into(),value_unavailable:true,..Default::default()},
+            crate::runner::ElementRow {kind:"TextField".into(),value:Some("target".into()),value_truncated:Some(true),..Default::default()},
+            crate::runner::ElementRow {kind:"SecureTextField".into(),value:Some("••••".into()),..Default::default()},
+        ] {
+            let rows=vec![crate::runner::ElementRow {label:"Field".into(),identifier:Some("field".into()),rect:[10.0,10.0,100.0,40.0],..row}];
+            for mode in ["present","absent"] {
+                let mut input=serde_json::json!({});input[mode]=serde_json::json!([{"identifier":"field","value":"target"}]);
+                let expect:AgentUiExpectation=serde_json::from_value(input).unwrap();
+                let (matched,observation)=agent_expectation_observation(&rows,&expect, crate::runner::SnapshotCoverage::Complete);
+                assert!(!matched,"{mode}: {observation}");
+                assert_eq!(observation[format!("{mode}_unproven")],serde_json::json!([0]));
+            }
+        }
+    }
+
+    #[test]
+    fn wait_known_mismatch_overrides_unknown_and_a_known_match_proves_presence() {
+        let unknown=crate::runner::ElementRow {kind:"Button".into(),label:"Control".into(),identifier:Some("control".into()),rect:[10.0,10.0,100.0,40.0],enabled:Some(false),..Default::default()};
+        let expect:AgentUiExpectation=serde_json::from_value(serde_json::json!({"absent":[{"identifier":"control","focused":false,"enabled":true}]})).unwrap();
+        assert!(agent_expectation_observation(&[unknown.clone()],&expect, crate::runner::SnapshotCoverage::Complete).0);
+        let known=crate::runner::ElementRow {focused:Some(false),enabled:Some(true),..unknown.clone()};
+        let present:AgentUiExpectation=serde_json::from_value(serde_json::json!({"present":[{"identifier":"control","focused":false,"enabled":true}]})).unwrap();
+        let uncertain=crate::runner::ElementRow {enabled:Some(true),..unknown};
+        let rows=[uncertain,known];
+        assert!(agent_expectation_observation(&rows,&present, crate::runner::SnapshotCoverage::Complete).0);
+        let (gone,observation)=agent_expectation_observation(&rows,&expect, crate::runner::SnapshotCoverage::Complete);
+        assert!(!gone);
+        assert_eq!(observation["violated_absent"],serde_json::json!([0]));
+        assert_eq!(observation["absent_unproven"],serde_json::json!([]));
+    }
+
+    #[test]
+    fn wait_unknown_boolean_metadata_is_not_presence_or_absence_evidence() {
+        for field in ["enabled", "visible", "focused"] {
+            for reported in [None, Some(serde_json::json!(true)), Some(serde_json::json!(false)), Some(serde_json::json!({"invalid": true}))] {
+                let known = reported.as_ref().and_then(serde_json::Value::as_bool);
+                let mut row = crate::runner::ElementRow { kind:"Button".into(), label:"Control".into(), identifier:Some("control".into()), rect:[10.0,10.0,100.0,40.0], ..Default::default() };
+                match field { "enabled" => row.enabled=known, "visible" => row.visible=known, "focused" => row.focused=known, _ => unreachable!() }
+                let rows = vec![row];
+                for wanted in [false, true] {
+                    let mut locator = serde_json::json!({"identifier":"control"});
+                    locator[field] = serde_json::json!(wanted);
+                    let present: AgentUiExpectation = serde_json::from_value(serde_json::json!({"present":[locator.clone()]})).unwrap();
+                    let absent: AgentUiExpectation = serde_json::from_value(serde_json::json!({"absent":[locator.clone()]})).unwrap();
+                    let (found, positive) = agent_expectation_observation(&rows, &present, crate::runner::SnapshotCoverage::Complete);
+                    let (gone, negative) = agent_expectation_observation(&rows, &absent, crate::runner::SnapshotCoverage::Complete);
+                    assert_eq!(found, known == Some(wanted), "present {field}={wanted}, raw={reported:?}: {positive}");
+                    assert_eq!(gone, known.is_some_and(|value| value != wanted), "absent {field}={wanted}, raw={reported:?}: {negative}");
+                    assert_eq!(negative["absent_unproven"], if known.is_none() { serde_json::json!([0]) } else { serde_json::json!([]) });
+                    assert_eq!(positive["present_unproven"], if known.is_none() { serde_json::json!([0]) } else { serde_json::json!([]) });
+                    // An unrelated row with unknown flags cannot block a proven absence.
+                    locator["identifier"] = serde_json::json!("different");
+                    let unrelated: AgentUiExpectation = serde_json::from_value(serde_json::json!({"absent":[locator]})).unwrap();
+                    assert!(agent_expectation_observation(&rows, &unrelated, crate::runner::SnapshotCoverage::Complete).0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn batch_expectations_match_application_and_strict_element_state() {
         let rows = vec![
@@ -23031,8 +26731,8 @@ mod tests {
                 rect: [20.0, 80.0, 400.0, 44.0],
                 depth: 4,
                 value: Some("示例联系人".to_string()),
-                enabled: None,
-                visible: None,
+                enabled: Some(true),
+                visible: Some(true),
                 accessible: Some(true),
                 focused: Some(true),
                 placeholder: Some("搜索交易".to_string()),
@@ -23042,6 +26742,7 @@ mod tests {
         let expect = AgentUiExpectation {
             application: Some("招商银行".to_string()),
             present: vec![AgentElementLocator {
+                label_contains: None,
                 label: Some("搜索".to_string()),
                 identifier: Some("search-field".to_string()),
                 kind: Some("TextField".to_string()),
@@ -23049,8 +26750,9 @@ mod tests {
                 focused: Some(true),
                 enabled: Some(true),
                 visible: Some(true),
-            }],
+            }.into()],
             absent: vec![AgentElementLocator {
+                label_contains: None,
                 label: Some("确认转账".to_string()),
                 identifier: None,
                 kind: None,
@@ -23058,10 +26760,13 @@ mod tests {
                 focused: None,
                 enabled: None,
                 visible: None,
-            }],
+            }.into()],
+            ocr_present: vec![],
+            ocr_absent: vec![],
+            absent_after_present: false,
         };
 
-        let (matches, observation) = agent_expectation_observation(&rows, &expect);
+        let (matches, observation) = agent_expectation_observation(&rows, &expect, crate::runner::SnapshotCoverage::Complete);
         assert!(matches);
         assert_eq!(observation["application"], "招商银行");
         assert_eq!(observation["missing_present"], serde_json::json!([]));
@@ -23071,8 +26776,56 @@ mod tests {
             application: Some("聚焦".to_string()),
             present: vec![],
             absent: vec![],
+            ocr_present: vec![],
+            ocr_absent: vec![],
+            absent_after_present: false,
         };
-        assert!(!agent_expectation_observation(&rows, &wrong_app).0);
+        assert!(!agent_expectation_observation(&rows, &wrong_app, crate::runner::SnapshotCoverage::Complete).0);
+    }
+
+    #[test]
+    fn an_ocr_wait_matches_recognized_text_ignoring_case_and_spaces() {
+        let expect: AgentUiExpectation = serde_json::from_value(serde_json::json!({
+            "ocr_present": ["长按自动", "lv 3"],
+            "ocr_absent": ["Loading"]
+        }))
+        .unwrap();
+        assert!(expect.uses_ocr());
+        let loading = ["LOADING 42%".to_string(), "Lv3".to_string()];
+        let (matches, observation) = ocr_expectation_observation(&loading, &expect);
+        assert!(!matches);
+        assert_eq!(observation["ocr_present"][0]["seen"], false);
+        assert_eq!(observation["ocr_present"][1]["seen"], true);
+        assert_eq!(observation["ocr_absent"][0]["seen"], true);
+        assert_eq!(observation["lines"][0], "LOADING 42%");
+        // Vision split the CJK caption with a space; it still counts.
+        let board = ["长按 自动".to_string(), "LV 3".to_string(), "1,200".to_string()];
+        assert!(ocr_expectation_observation(&board, &expect).0);
+    }
+
+    #[test]
+    fn ocr_waits_are_validated() {
+        let check = |expect: serde_json::Value, timeout_ms: u64| {
+            let request: AgentActionsRequest = serde_json::from_value(serde_json::json!({
+                "steps": [{"kind": "wait_for", "expect": expect, "timeout_ms": timeout_ms}]
+            }))
+            .unwrap();
+            validate_agent_actions(&request)
+        };
+        // OCR text alone may wait longer than an element wait.
+        assert!(check(serde_json::json!({"ocr_present": ["长按自动"]}), 45_000).is_ok());
+        assert!(check(serde_json::json!({"ocr_absent": ["Loading"]}), 60_000).is_ok());
+        assert!(check(serde_json::json!({"ocr_present": ["x"]}), 60_001).is_err());
+        assert!(check(serde_json::json!({"present": [{"label": "OK"}]}), 45_000).is_err());
+        // Never mixed with element locators, never blank.
+        let mixed = check(
+            serde_json::json!({"ocr_present": ["a"], "present": [{"label": "OK"}]}),
+            5_000,
+        )
+        .unwrap_err();
+        assert!(mixed.contains("two wait_for steps"), "{mixed}");
+        assert!(check(serde_json::json!({"ocr_present": ["  "]}), 5_000).is_err());
+        assert!(check(serde_json::json!({}), 5_000).is_err());
     }
 
     #[test]
@@ -23314,6 +27067,44 @@ mod tests {
     }
 
     #[test]
+    fn setup_recovery_distinguishes_selection_from_on_phone_authorization() {
+        let unconfigured = setup_recovery("unconfigured", "");
+        assert_eq!(unconfigured["actor"], "agent");
+        assert_eq!(unconfigured["requires_unambiguous_target"], true);
+        assert_eq!(unconfigured["requires_task_authorization"], true);
+        assert_eq!(unconfigured["discovery_command"], "xcrun devicectl list devices");
+        for blocker in ["trust", "needs_passcode_on_phone", "locked_after_restart", "automation_mode_disabled"] {
+            let handoff = setup_recovery("blocker", blocker);
+            assert_eq!(handoff["cause"], blocker);
+            assert_eq!(handoff["actor"], "person_on_phone");
+            assert_eq!(handoff["pause_screen_reads"], true);
+            assert_eq!(handoff["disclose_passcode"], false);
+            assert_eq!(handoff["retry_reconnect"], false);
+            assert_eq!(handoff["prompt_detection"], "not_confirmed");
+        }
+        assert!(setup_recovery("", "trust").is_null(), "ready status must not invent a handoff");
+        assert!(setup_recovery("blocker", "usb").is_null());
+    }
+
+    #[test]
+    fn trust_guidance_covers_pairing_and_developer_certificates() {
+        let (zh, en) = human_next_step("blocker", "trust", "").unwrap();
+        assert!(zh.contains("VPN 与设备管理") && zh.contains("信任此电脑"));
+        assert!(en.contains("VPN & Device Management") && en.contains("Trust This Computer"));
+        assert!(en.contains("If no certificate or prompt") && en.contains("may appear later"));
+        assert!(!en.contains("phone_status") && !en.contains("pause screenshots"));
+        let pairing = crate::setup::usbdiag::Diagnosis::NotTrusted { serial: "test-phone".into() };
+        assert_eq!(pairing.blocker(), "trust");
+        let hint = setup_blocker_hint(pairing.blocker()).unwrap();
+        assert!(hint.contains("Trust This Computer") && hint.contains("VPN & Device Management"));
+        assert!(hint.contains("pause screenshots and screen reads"));
+        assert!(crate::setup::DEVELOPER_TRUST_EN.contains("Apple Development"));
+        let named = crate::instance::Instance::derive("guidance-test", "/tmp/ipu-guidance-home", None).unwrap();
+        let text = for_instance(hint, &named);
+        assert!(text.contains("iphone-use doctor --instance guidance-test"));
+    }
+
+    #[test]
     fn needs_passcode_on_phone_asks_a_person_once() {
         let payload = r#"{"phase":"building-fail","blocked_on":"needs_passcode_on_phone","message":"m","ts":1000}"#;
         assert_eq!(
@@ -23323,7 +27114,7 @@ mod tests {
         let (zh, en) = human_next_step("blocker", "needs_passcode_on_phone", "").unwrap();
         assert_eq!(
             zh,
-            "连接记录提示可能需要手机授权；若出现密码或允许提示，请处理。若已处理，检查 CoreDevice 连接和 runner 日志。"
+            "连接记录提示可能需要手机授权。若出现密码或允许提示，请只在手机上处理，不要透露密码，完成后告诉代理继续；若没有提示或已处理，请告诉代理检查连接。"
         );
         assert!(
             en.contains("if one appears") && en.contains("if already authorized"),
@@ -23362,6 +27153,17 @@ mod tests {
         assert!(ended_on_phone(true, false, dir.path()));
         assert!(!ended_on_phone(false, false, dir.path()), "not released yet");
         assert!(!ended_on_phone(true, true, dir.path()), "the hand-off says more");
+    }
+
+    #[test]
+    fn invalidated_or_unknown_parking_does_not_claim_a_phone_side_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::SessionInvalidated).unwrap();
+        assert!(crate::phone_exit::parked(dir.path()));
+        assert!(!ended_on_phone(true, false, dir.path()));
+        std::fs::write(dir.path().join(crate::phone_exit::PARKED_FILE), "unknown").unwrap();
+        assert!(crate::phone_exit::parked(dir.path()));
+        assert!(!ended_on_phone(true, false, dir.path()));
     }
 
     #[test]
@@ -23668,6 +27470,7 @@ mod tests {
     fn build_state_parked_is_terminal_and_does_not_claim_work_or_failure() {
         for age in [0, 10, BUILD_STALE_SECS + 1, 99_999] {
             assert_eq!(classify_build_state("parked", age), "parked");
+            assert_eq!(classify_build_state("stopped", age), "stopped");
         }
     }
 
@@ -24330,8 +28133,9 @@ mod tests {
                     let response = if body.starts_with("HTTP/1.1 ") {
                         body
                     } else {
+                        let coverage=if request.contains("/source") || (request.starts_with("POST ") && request.contains("/elements ")) {"X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n"} else {""};
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{coverage}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         )
                     };
@@ -24367,6 +28171,452 @@ mod tests {
                 self.shutdown();
             }
         }
+    }
+
+    #[test]
+    fn fresh_launch_stops_after_control_scope_changes() {
+        block(async {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let allowed = Arc::new(AtomicBool::new(true));
+            let scope = allowed.clone();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let runner = MockRunner::start(move |request| {
+                seen.lock().unwrap().push(request.lines().next().unwrap().to_string());
+                if request.contains("/wda/apps/terminate") {
+                    scope.store(false, Ordering::Release);
+                }
+                if request.starts_with("POST /session ") {
+                    r#"{"value":{"sessionId":"SESSION"}}"#.into()
+                } else {
+                    r#"{"value":true}"#.into()
+                }
+            });
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let actionable = AtomicBool::new(true);
+            let mut detail = None;
+            let outcome = direct_agent_action(
+                &mut client, &actionable,
+                &serde_json::json!({"type":"launch_app","bundle":"test.fixture","fresh":true}),
+                &mut detail,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                Some(&|| allowed.load(Ordering::Acquire)),
+            None, ).await;
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.iter().filter(|r| r.contains("/wda/apps/terminate")).count(), 1);
+            assert_eq!(requests.iter().filter(|r| r.contains("/wda/apps/launch")).count(), 0,
+                "launch must stop after termination transfers control");
+            assert_eq!(outcome, RunnerControlOutcome::AppLaunchInterrupted);
+            assert!(actionable.load(Ordering::Acquire), "scope change is not a Runner fault");
+            let response = app_launch_interrupted_response(detail.as_ref());
+            let (_, body) = read_json_response(response).await;
+            let body = body.unwrap();
+            assert_eq!(body["app_lifecycle"]["launch_attempted"], false);
+            assert_eq!(body["app_lifecycle"]["terminate_acknowledged"], true);
+            assert_eq!(body["retry_safe"], false);
+            assert_eq!(body["outcome"], "partial");
+            let redacted = crate::observation::redact_batch(body);
+            assert_eq!(redacted["app_lifecycle"]["terminate_acknowledged"], true);
+        });
+    }
+
+    #[test]
+    fn app_launch_admission_and_compound_failure_contracts() {
+        block(async {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            // Initial revocation, setup revocation, healthy fresh, uncertain
+            // termination, rejected launch after termination, ordinary launch,
+            // missing authorization, and expired deadline.
+            for case in 0..9 {
+                let allowed = Arc::new(AtomicBool::new(case != 0));
+                let scope = allowed.clone();
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = requests.clone();
+                let runner = MockRunner::start(move |request| {
+                    seen.lock().unwrap().push(request.lines().next().unwrap().to_string());
+                    if (case == 1 && request.starts_with("POST /session "))
+                        || (case == 2 && request.contains("/appium/settings")) {
+                        scope.store(false, Ordering::Release);
+                    }
+                    let error = if case == 4 && request.contains("/wda/apps/terminate") {
+                        Some(("500 Internal Server Error", r#"{"value":{"error":"unknown error","message":"termination outcome unknown"}}"#))
+                    } else if case == 5 && request.contains("/wda/apps/launch") {
+                        Some(("400 Bad Request", r#"{"value":{"error":"invalid argument","message":"nothing was sent"}}"#))
+                    } else { None };
+                    if let Some((status, body)) = error {
+                        return format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    }
+                    if request.starts_with("POST /session ") {
+                        r#"{"value":{"sessionId":"SESSION"}}"#.into()
+                    } else { r#"{"value":true}"#.into() }
+                });
+                let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+                let actionable = AtomicBool::new(true);
+                let guard = || allowed.load(Ordering::Acquire);
+                let mut detail = None;
+                let deadline = if case == 8 { tokio::time::Instant::now() }
+                    else { far_deadline() };
+                let outcome = direct_agent_action(&mut client, &actionable,
+                    &serde_json::json!({"type":"launch_app","bundle":"test.fixture","fresh":case != 6}),
+                    &mut detail, deadline, if case == 7 {None} else {Some(&guard)}, None).await;
+                let requests = requests.lock().unwrap();
+                let terminations = requests.iter().filter(|r| r.contains("/wda/apps/terminate")).count();
+                let launches = requests.iter().filter(|r| r.contains("/wda/apps/launch")).count();
+                assert_eq!(terminations, usize::from(matches!(case, 3..=5)), "case {case}: {requests:?}");
+                assert_eq!(launches, usize::from(matches!(case, 3 | 5 | 6)), "case {case}: {requests:?}");
+                match case {
+                    3 | 6 => assert_eq!(outcome, RunnerControlOutcome::Applied),
+                    5 => {
+                        assert_eq!(outcome, RunnerControlOutcome::AppLaunchInterrupted);
+                        assert!(actionable.load(Ordering::Acquire));
+                        let (_, body) = read_json_response(app_launch_interrupted_response(detail.as_ref())).await;
+                        assert_eq!(body.as_ref().unwrap()["retry_safe"], false);
+                        assert_eq!(body.as_ref().unwrap()["app_lifecycle"]["terminate_acknowledged"], true);
+                        assert_eq!(body.as_ref().unwrap()["runner_error"]["status"], 400);
+                    }
+                    4 => {
+                        assert_eq!(outcome, RunnerControlOutcome::Failed);
+                        let response = runner_failed_after_dispatch_response_with(detail.as_ref());
+                        let (_, body) = read_json_response(response).await;
+                        assert_eq!(body.as_ref().unwrap()["retry_safe"], false);
+                        assert_eq!(body.as_ref().unwrap()["outcome"], "unknown");
+                    }
+                    _ => {
+                        assert!(matches!(outcome, RunnerControlOutcome::Refused("app_scope_changed", _)));
+                        assert!(client.last_post().is_none(), "case {case}: no mutation admitted");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn fresh_launch_http_preserves_handoff_receipt_in_single_and_batch() {
+        block(async {
+            use tower::ServiceExt;
+            for (batch, fault) in [false, true].into_iter().flat_map(|batch| (0..3).map(move |fault| (batch, fault))) {
+                let state_slot = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<AppState>>));
+                let slot = state_slot.clone();
+                let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen_launches = launches.clone();
+                let runner = MockRunner::start(move |request| {
+                    if request.contains("/wda/apps/terminate") {
+                        if fault == 0 {
+                            slot.lock().unwrap().as_ref().unwrap().upgrade().unwrap()
+                                .released.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        return r#"{"value":false}"#.into();
+                    }
+                    if request.contains("/wda/apps/launch") {
+                        seen_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if fault == 1 {
+                            return "HTTP/1.1 200 OK\r\nContent-Length: 99\r\nConnection: close\r\n\r\n".into();
+                        }
+                        let body = r#"{"value":{"error":"invalid argument","message":"nothing was sent"}}"#;
+                        return format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    }
+                    healthy_runner_responder(request)
+                });
+                let state = readiness_state_with_runner(runner.base());
+                state.runner_actionable.store(true, std::sync::atomic::Ordering::Release);
+                *state_slot.lock().unwrap() = Some(Arc::downgrade(&state));
+                let action = serde_json::json!({"type":"launch_app","bundle":"test.fixture","fresh":true});
+                let (path, body) = if batch {
+                    ("/agent/actions", serde_json::json!({"steps":[{"kind":"action","action":action}]}))
+                } else { ("/agent/input", action) };
+                let response = router(state.clone()).oneshot(axum::http::Request::builder()
+                    .method("POST").uri(path).header("x-phone-control", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), if fault == 1 {StatusCode::BAD_GATEWAY} else {StatusCode::CONFLICT});
+                let (_, body) = read_json_response(response).await;
+                let body = body.unwrap();
+                assert_eq!(body["outcome"], if fault == 1 {"unknown"} else {"partial"}, "{body}");
+                assert_eq!(body["retry_safe"], false);
+                assert_eq!(body["app_lifecycle"]["terminate_acknowledged"], true);
+                assert_eq!(body["app_lifecycle"]["launch_attempted"], fault != 0);
+                assert_eq!(launches.load(std::sync::atomic::Ordering::Relaxed), usize::from(fault != 0));
+                assert_eq!(state.runner_actionable.load(std::sync::atomic::Ordering::Acquire), fault != 1);
+                if batch { assert_eq!(body["batch_outcome"], if fault == 1 {"unknown"} else {"partially_applied"}); }
+            }
+        });
+    }
+
+    #[test]
+    fn fresh_launch_cancellation_keeps_ack_without_inventing_launch_attempt() {
+        block(async {
+            let runner = MockRunner::start(healthy_runner_responder);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            client.ensure_session().await.unwrap();
+            let actionable = std::sync::atomic::AtomicBool::new(true);
+            let mut detail = None;
+            // Session setup is complete; cancel during the 300ms post-ACK wait.
+            let result = tokio::time::timeout(std::time::Duration::from_millis(150), direct_agent_action(
+                &mut client, &actionable,
+                &serde_json::json!({"type":"launch_app","bundle":"test.fixture","fresh":true}),
+                &mut detail, far_deadline(), Some(&|| true), None)).await;
+            assert!(result.is_err());
+            let response = with_app_lifecycle_receipt(runner_deadline_response(true), detail.as_ref()).await;
+            let (_, body) = read_json_response(response).await;
+            let body = body.unwrap();
+            assert_eq!(body["retry_safe"], false);
+            assert_eq!(body["app_lifecycle"]["terminate_acknowledged"], true);
+            assert!(body["app_lifecycle"].get("launch_attempted").is_none());
+        });
+    }
+
+    #[test]
+    fn text_clear_handoff_never_dispatches_following_keys() {
+        block(async {
+            use tower::ServiceExt;
+            for (batch, long, revocation) in [false,true].into_iter().flat_map(|batch|
+                [false,true].into_iter().flat_map(move |long| (0..4).map(move |revocation| (batch,long,revocation)))) {
+                let state_slot = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<AppState>>));
+                let slot = state_slot.clone();
+                let keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen_keys = keys.clone();
+                let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen_clears = clears.clone();
+                let runner = MockRunner::start(move |request| {
+                    if request.contains("/element/active") {
+                        return r#"{"value":{"element-6066-11e4-a52e-4f735466cecf":"E1"}}"#.into();
+                    }
+                    if request.contains("/element/E1/clear") {
+                        seen_clears.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let state = slot.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                        match revocation {
+                            0 => state.released.store(true, std::sync::atomic::Ordering::Release),
+                            1 => {state.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);},
+                            2 => {state.privacy_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);},
+                            _ => {
+                                let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
+                                assert!(state.runner_lifecycle.finish_reconnecting(token));
+                            },
+                        }
+                    }
+                    if request.contains("/wda/keys") {
+                        seen_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    healthy_runner_responder(request)
+                });
+                let mut state = readiness_state_with_runner(runner.base());
+                Arc::get_mut(&mut state).unwrap().managed_runner = false;
+                state.runner_actionable.store(true, std::sync::atomic::Ordering::Release);
+                *state_slot.lock().unwrap() = Some(Arc::downgrade(&state));
+                let text = if long {"x".repeat(crate::text_input::CHUNK_CHARS+1)} else {"fixture".into()};
+                let action = serde_json::json!({"type":"text","text":text,"clear":true});
+                let (path, body) = if batch {
+                    ("/agent/actions", serde_json::json!({"steps":[{"kind":"action","action":action}]}))
+                } else { ("/agent/input", action) };
+                let response = router(state.clone()).oneshot(axum::http::Request::builder()
+                    .method("POST").uri(path).header("x-phone-control", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(clears.load(std::sync::atomic::Ordering::Relaxed), 1);
+                assert_eq!(keys.load(std::sync::atomic::Ordering::Relaxed), 0,
+                    "keys must stop after control handoff; batch={batch}, long={long}, revocation={revocation}");
+                let (_, body) = read_json_response(response).await;
+                assert_eq!(body.unwrap()["retry_safe"], false, "clear already acknowledged");
+                assert!(state.runner_actionable.load(std::sync::atomic::Ordering::Acquire),
+                    "a scope interruption is not a hardware failure");
+            }
+        });
+    }
+
+    #[test]
+    fn session_handoff_stops_home_on_all_control_routes() {
+        block(async {
+            use tower::ServiceExt;
+            for path in ["/control", "/agent/input", "/agent/actions"] {
+                let state_slot = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<AppState>>));
+                let slot = state_slot.clone();
+                let buttons = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen = buttons.clone();
+                let runner = MockRunner::start(move |request| {
+                    if request.contains("/appium/settings") {
+                        slot.lock().unwrap().as_ref().unwrap().upgrade().unwrap()
+                            .owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                    if request.contains("/wda/pressButton") {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    healthy_runner_responder(request)
+                });
+                let mut state = readiness_state_with_runner(runner.base());
+                Arc::get_mut(&mut state).unwrap().managed_runner = false;
+                state.runner_actionable.store(true, std::sync::atomic::Ordering::Release);
+                *state_slot.lock().unwrap() = Some(Arc::downgrade(&state));
+                let action = serde_json::json!({"type":"home","ttl_ms":2500});
+                let body = if path == "/agent/actions" {
+                    serde_json::json!({"steps":[{"kind":"action","action":action}]})
+                } else { action };
+                let response = router(state.clone()).oneshot(axum::http::Request::builder()
+                    .method("POST").uri(path).header("x-phone-control", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(buttons.load(std::sync::atomic::Ordering::Relaxed), 0, "{path}");
+                let (_, body) = read_json_response(response).await;
+                let body = body.unwrap();
+                assert_eq!(body["retry_safe"], true, "session/settings do not dispatch phone input");
+                assert_eq!(body["outcome"], "not_sent");
+                assert!(state.runner_actionable.load(std::sync::atomic::Ordering::Acquire));
+            }
+        });
+    }
+
+    #[test]
+    fn unlock_ack_cannot_reverse_scope_revocation() {
+        block(async {
+            use tower::ServiceExt;
+            let state_slot = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<AppState>>));
+            let slot = state_slot.clone();
+            let keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = keys.clone();
+            let runner = MockRunner::start(move |request| {
+                if request.contains("/wda/unlock") {
+                    slot.lock().unwrap().as_ref().unwrap().upgrade().unwrap()
+                        .released.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if request.contains("/wda/keys") {seen.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
+                healthy_runner_responder(request)
+            });
+            let mut state = readiness_state_with_runner(runner.base());
+            Arc::get_mut(&mut state).unwrap().managed_runner = false;
+            *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {updated_at:std::time::Instant::now(),up:true,actionable:true,locked:Some(true)};
+            state.runner_actionable.store(true,std::sync::atomic::Ordering::Release);
+            *state_slot.lock().unwrap() = Some(Arc::downgrade(&state));
+            let response = router(state.clone()).oneshot(axum::http::Request::builder()
+                .method("POST").uri("/agent/input").header("x-phone-control","1")
+                .header("content-type","application/json")
+                .body(Body::from(r#"{"type":"text","text":"fixture"}"#)).unwrap()).await.unwrap();
+            assert!(state.released.load(std::sync::atomic::Ordering::Acquire), "unlock ACK must not undo release");
+            assert_eq!(keys.load(std::sync::atomic::Ordering::Relaxed),0);
+            assert_eq!(recover(state.runner_health.lock()).locked,Some(true),"stale ACK must not commit health");
+            let (_, body) = read_json_response(response).await;
+            assert_eq!(body.unwrap()["retry_safe"],false);
+        });
+    }
+
+    #[test]
+    fn stale_text_renewal_cannot_take_back_scope_revocation() {
+        let state = fixture_app_state(None);
+        let mut old_headers = HeaderMap::new();
+        old_headers.insert("x-phone-owner", "old-agent".parse().unwrap());
+        old_headers.insert("x-phone-owner-takeover", "1".parse().unwrap());
+        claim_phone_owner(&state,&old_headers).unwrap();
+        let scope = ScreenReadScope::capture(&state);
+        let mut new_headers = HeaderMap::new();
+        new_headers.insert("x-phone-owner", "new-owner".parse().unwrap());
+        new_headers.insert("x-phone-owner-takeover", "1".parse().unwrap());
+        claim_phone_owner(&state,&new_headers).unwrap();
+        let epoch = state.owner_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let before = recover(state.owner.lock()).clone();
+        assert!(!scope.current(&state));
+        renew_after_long_text(&state,&old_headers,&serde_json::json!({"type":"text","text":"x".repeat(crate::text_input::CHUNK_CHARS+1)}),&scope);
+        assert_eq!(*recover(state.owner.lock()),before,"renewal must not retake a newer owner");
+        assert_eq!(state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),epoch);
+    }
+
+    #[test]
+    fn completed_reconnect_never_revalidates_an_old_scope() {
+        let state = fixture_app_state(None);
+        let scope = ScreenReadScope::capture(&state);
+        assert!(scope.current(&state));
+        let token = state.runner_lifecycle.try_begin_reconnecting().unwrap();
+        assert!(!scope.current(&state));
+        assert!(state.runner_lifecycle.finish_reconnecting(token));
+        assert!(!scope.current(&state), "finishing reconnect must not revive the previous request");
+        assert!(state.runner_lifecycle.publish_if_active_stamp(scope.lifecycle_stamp, || panic!("stale ACK published")).is_none());
+        let fresh = ScreenReadScope::capture(&state);
+        assert!(fresh.current(&state));
+        assert_eq!(state.runner_lifecycle.publish_if_active_stamp(fresh.lifecycle_stamp, || true), Some(true));
+    }
+
+    #[test]
+    fn nested_control_counts_inner_mutation_before_outer_refusal() {
+        block(async {
+            use std::sync::atomic::{AtomicBool,Ordering};
+            let runner = MockRunner::start(healthy_runner_responder);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let permit = Arc::new(AtomicBool::new(true));
+            let allowed = permit.clone();
+            let result = crate::timing::with_control_permit(Arc::new(move || allowed.load(Ordering::Acquire)),async {
+                crate::timing::with_control_permit(Arc::new(|| true),client.press_home()).await.unwrap().unwrap();
+                permit.store(false,Ordering::Release);
+                client.press_home().await
+            }).await;
+            assert!(result.unwrap_err().mutations_admitted,"inner Home was already admitted");
+        });
+    }
+
+    #[test]
+    fn nested_control_cannot_replace_revoked_ancestor() {
+        block(async {
+            use std::sync::atomic::{AtomicBool,Ordering};
+            let runner = MockRunner::start(healthy_runner_responder);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let admitted = Arc::new(AtomicBool::new(false));
+            let result = crate::timing::with_dispatch_probe("POST /session",admitted.clone(),
+                crate::timing::with_control_permit(Arc::new(|| false),async {
+                    tokio::select! {
+                        biased;
+                        _ = client.press_home() => {},
+                        _ = std::future::ready(()) => {},
+                    }
+                    crate::timing::with_control_permit(Arc::new(|| true),client.press_home()).await
+                })).await;
+            assert!(result.is_err());
+            assert!(!admitted.load(Ordering::Acquire),"inner permit must not bypass ancestor denial");
+        });
+    }
+
+    #[test]
+    fn nested_control_unlock_ack_keeps_unknown_after_later_handoff() {
+        block(async {
+            use tower::ServiceExt;
+            let slot = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<AppState>>));
+            let state_slot = slot.clone();
+            let touches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = touches.clone();
+            let runner = MockRunner::start(move |request| {
+                if request.contains("/window/size") {
+                    state_slot.lock().unwrap().as_ref().unwrap().upgrade().unwrap()
+                        .released.store(true,std::sync::atomic::Ordering::Release);
+                    return r#"{"value":{"width":390,"height":844}}"#.into();
+                }
+                if request.contains("/actions") {seen.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
+                healthy_runner_responder(request)
+            });
+            let mut state = readiness_state_with_runner(runner.base());
+            Arc::get_mut(&mut state).unwrap().managed_runner=false;
+            *recover(state.runner_health.lock()) = crate::runner::RunnerHealth {updated_at:std::time::Instant::now(),up:true,actionable:true,locked:Some(true)};
+            state.runner_actionable.store(true,std::sync::atomic::Ordering::Release);
+            *slot.lock().unwrap()=Some(Arc::downgrade(&state));
+            let response=router(state).oneshot(axum::http::Request::builder().method("POST").uri("/agent/input")
+                .header("x-phone-control","1").header("content-type","application/json")
+                .body(Body::from(r#"{"type":"tap","x":0.5,"y":0.5}"#)).unwrap()).await.unwrap();
+            let (_,body)=read_json_response(response).await;let body=body.unwrap();
+            assert_eq!(touches.load(std::sync::atomic::Ordering::Relaxed),0);
+            assert_eq!(body["retry_safe"],false,"unlock already acted: {body}");
+            assert_eq!(body["outcome"],"unknown");
+        });
+    }
+
+    #[test]
+    fn revoked_unlock_preserves_zero_admission_information() {
+        block(async {
+            let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));let seen=calls.clone();
+            let runner=MockRunner::start(move |request| {seen.fetch_add(1,std::sync::atomic::Ordering::Relaxed);healthy_runner_responder(request)});
+            let state=fixture_app_state(None);
+            *recover(state.runner_health.lock())=crate::runner::RunnerHealth {updated_at:std::time::Instant::now(),up:true,actionable:true,locked:Some(true)};
+            let scope=ScreenReadScope::capture(&state);
+            state.owner_epoch.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
+            let mut client=crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let interrupted=unlock_before_action(&state,&mut client,far_deadline(),&scope).await.unwrap_err();
+            assert!(!interrupted.mutations_admitted);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed),0);
+            assert!(matches!(control_interruption_outcome(interrupted),RunnerControlOutcome::Refused(_, _)));
+        });
     }
 
     fn readiness_state_with_runner(base: &str) -> Arc<AppState> {
@@ -24986,6 +29236,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_wire_includes_the_live_lease_generation() {
+        block(async {
+            use http_body_util::BodyExt as _;
+            use tower::ServiceExt as _;
+            let state = readiness_test_state();
+            *recover(state.owner.lock())=Some(PhoneOwner{name:"wire-owner".into(),last_seen:Instant::now()});
+            state.owner_epoch.store(7,std::sync::atomic::Ordering::Release);
+            let response=router(state).oneshot(axum::http::Request::builder()
+                .uri("/agent/status").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let body:serde_json::Value=serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+            assert_eq!(body["owner"],"wire-owner");
+            assert_eq!(body["control_lease"]["owner"],"wire-owner");
+            assert_eq!(body["control_lease"]["owner_epoch"],"7");
+            assert_eq!(body["control_lease"]["private"],false);
+            assert_eq!(body["control_lease"]["daemon_instance"].as_str().unwrap().len(),64);
+        });
+    }
+
+
+
+
+
+    #[test]
+    fn control_lease_tracks_reacquisition_and_privacy_without_renewal_churn() {
+        let state = readiness_test_state();
+        let mut headers=HeaderMap::new();headers.insert("x-phone-owner",HeaderValue::from_static("same-owner"));
+        assert!(claim_phone_owner(&state,&headers).is_ok());
+        let (name,_,epoch)=owner_status_versioned(&state);
+        let first=control_lease_status(&state,name.as_deref(),epoch);
+        assert_eq!(first["owner"],"same-owner");assert_eq!(first["private"],false);
+        assert!(claim_phone_owner(&state,&headers).is_ok());
+        assert_eq!(first,control_lease_status(&state,name.as_deref(),epoch));
+        state.release_owner_lease();assert!(control_lease_status(&state,name.as_deref(),epoch).is_null());
+        assert!(claim_phone_owner(&state,&headers).is_ok());
+        let (name,_,next)=owner_status_versioned(&state);
+        assert_ne!(epoch,next);
+        let reacquired=control_lease_status(&state,name.as_deref(),next);
+        assert_ne!(first["owner_epoch"],reacquired["owner_epoch"]);
+        set_screen_private(&state,true,30);
+        let hidden=control_lease_status(&state,name.as_deref(),next);
+        assert!(hidden.is_null());
+        set_screen_private(&state,false,0);
+        let visible=control_lease_status(&state,name.as_deref(),next);
+        assert_eq!(visible["private"],false);assert_ne!(reacquired["privacy_epoch"],visible["privacy_epoch"]);
+        let transition=state.runner_lifecycle.try_begin_reconnecting().unwrap();
+        assert!(control_lease_status(&state,name.as_deref(),next).is_null());
+        assert!(state.runner_lifecycle.finish_reconnecting(transition));
+        let restarted=control_lease_status(&state,name.as_deref(),next);
+        assert_ne!(visible["lifecycle_stamp"],restarted["lifecycle_stamp"]);
+        recover(state.owner.lock()).as_mut().unwrap().last_seen=Instant::now()-std::time::Duration::from_secs(state.owner_lease_secs+1);
+        assert!(control_lease_status(&state,name.as_deref(),next).is_null());
+        assert!(claim_phone_owner(&state,&headers).is_ok());
+        let (name,_,after_expiry)=owner_status_versioned(&state);
+        assert_ne!(next,after_expiry);
+        assert!(!control_lease_status(&state,name.as_deref(),after_expiry).is_null());
+    }
+
+    /// A task started right after someone tapped through the remote viewer
+    /// must not inherit that viewer's lease (every step used to 409); another
+    /// agent's lease is left alone.
+    #[test]
+    fn a_task_start_yields_only_the_viewer_lease() {
+        let state = readiness_test_state();
+        for (holder, kept) in [(HUMAN_VIEWER_OWNER, false), ("iphone-local-startup", false), ("claude-1", true)] {
+            *recover(state.owner.lock()) = Some(PhoneOwner { name: holder.into(), last_seen: Instant::now() });
+            yield_viewer_lease(&state);
+            assert_eq!(owner_status(&state).0.is_some(), kept, "{holder}");
+        }
+    }
+
     /// Fetch `/agent/capabilities` through the real router.
     async fn capabilities_json(state: &Arc<AppState>, owner: Option<&str>) -> serde_json::Value {
         capabilities_json_as(state, owner, false).await
@@ -25432,6 +29754,137 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
+    #[test]
+    fn system_capture_capability_and_outcome_contracts() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        block(async {
+            // Unsupported/malformed capabilities never reach the capture route;
+            // ACK is request-only, while any post-dispatch ambiguity stays unknown.
+            for (capability, reply, expected, posts) in [
+                (serde_json::Value::Null, r#"{"value":null}"#, RunnerControlOutcome::Refused("system_capture_unsupported", "the native Runner cannot request a system screenshot; update it; nothing was captured"), 0),
+                (serde_json::json!("true"), r#"{"value":null}"#, RunnerControlOutcome::Refused("system_capture_unsupported", "the native Runner cannot request a system screenshot; update it; nothing was captured"), 0),
+                (serde_json::json!(true), r#"{"value":{"invoked":true,"acknowledged":true,"saved_verified":true}}"#, RunnerControlOutcome::Applied, 1),
+                (serde_json::json!(true), r#"{"value":{"invoked":false,"acknowledged":false}}"#, RunnerControlOutcome::Refused("system_capture_unsupported", "the native Runner cannot request a system screenshot; update it; nothing was captured"), 1),
+                (serde_json::json!(true), r#"{"value":{"invoked":true,"acknowledged":false}}"#, RunnerControlOutcome::Failed, 1),
+                (serde_json::json!(true), r#"{"value":{"invoked":true}}"#, RunnerControlOutcome::Failed, 1),
+                (serde_json::json!(true), "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n", RunnerControlOutcome::Failed, 1),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let seen = calls.clone();
+                let mut runner = MockRunner::start(move |request| {
+                    if request.starts_with("POST /session ") {
+                        return serde_json::json!({"value":{"sessionId":"SESSION","capabilities":{"ipu:systemCaptureRequest":capability}}}).to_string();
+                    }
+                    if request.starts_with("POST /session/SESSION/ipu/system-capture ") {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        return reply.to_string();
+                    }
+                    healthy_runner_responder(request)
+                });
+                let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+                let actionable = AtomicBool::new(true);
+                let mut detail = None;
+                let outcome = direct_agent_action(&mut client, &actionable,
+                    &serde_json::json!({"type":"shortcut","name":"save_screenshot"}), &mut detail, far_deadline(),
+                    Some(&|| true),
+                None, ).await;
+                assert_eq!(outcome, expected);
+                assert_eq!(calls.load(Ordering::SeqCst), posts, "capture must never be replayed");
+                if outcome == RunnerControlOutcome::Applied {
+                    let receipt = detail.unwrap();
+                    assert_eq!(receipt["system_capture"]["requested"], true);
+                    assert_eq!(receipt["system_capture"]["saved_verified"], false, "a backend assertion cannot promote ACK to a saved image");
+                }
+                runner.shutdown();
+            }
+        });
+    }
+
+    #[test]
+    fn system_capture_scope_revoked_during_session_setup_never_dispatches() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        block(async {
+            let permitted = Arc::new(AtomicBool::new(true));
+            let permission = permitted.clone();
+            let captures = Arc::new(AtomicUsize::new(0));
+            let seen = captures.clone();
+            let mut runner = MockRunner::start(move |request| {
+                if request.starts_with("POST /session ") {
+                    return r#"{"value":{"sessionId":"SESSION","capabilities":{"ipu:systemCaptureRequest":true}}}"#.into();
+                }
+                if request.contains("/appium/settings") { permission.store(false, Ordering::SeqCst); }
+                if request.contains("/ipu/system-capture") { seen.fetch_add(1, Ordering::SeqCst); }
+                healthy_runner_responder(request)
+            });
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let actionable = AtomicBool::new(true);
+            let allowed = || permitted.load(Ordering::SeqCst);
+            let result = direct_agent_action(&mut client, &actionable,
+                &serde_json::json!({"type":"shortcut","name":"save_screenshot"}), &mut None, far_deadline(), Some(&allowed), None).await;
+            assert!(matches!(result, RunnerControlOutcome::Refused("capture_scope_changed", _)));
+            assert_eq!(captures.load(Ordering::SeqCst), 0);
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn system_capture_private_hold_refuses_even_without_observation() {
+        block(async {
+            let state = readiness_test_state();
+            set_screen_private(&state, true, 60);
+            let response = system_request_private_refusal(&state,
+                &serde_json::json!({"type":"shortcut","name":"save_screenshot"})).unwrap();
+            assert_eq!(response.status(), StatusCode::LOCKED);
+            let (_, body) = read_json_response(response).await;
+            let body = body.unwrap();
+            assert_eq!(body["error"], "screen_private");
+            assert_eq!(body["outcome"], "not_sent");
+            assert_eq!(body["retry_safe"], true);
+            assert!(system_request_private_refusal(&state, &serde_json::json!({"type":"shortcut","name":"home"})).is_none());
+        });
+    }
+
+    #[test]
+    fn system_capture_browser_control_preserves_request_only_receipt() {
+        block(async {
+            let mut runner = MockRunner::start(|request| {
+                if request.starts_with("POST /session ") {
+                    return r#"{"value":{"sessionId":"SESSION","capabilities":{"ipu:systemCaptureRequest":true}}}"#.into();
+                }
+                if request.contains("/ipu/system-capture") {
+                    return r#"{"value":{"invoked":true,"acknowledged":true}}"#.into();
+                }
+                healthy_runner_responder(request)
+            });
+            let mut state = readiness_test_state();
+            Arc::get_mut(&mut state).unwrap().runner = Some(Arc::new(tokio::sync::Mutex::new(
+                crate::runner::RunnerClient::new(runner.base()).unwrap())));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-phone-control", HeaderValue::from_static("1"));
+            let response = direct_control(State(state), headers, serde_json::json!({"type":"shortcut","name":"save_screenshot","ttl_ms":2500}).to_string()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let (_, value) = read_json_response(response).await;
+            let value = value.unwrap();
+            assert_eq!(value["system_capture"]["requested"], true);
+            assert_eq!(value["system_capture"]["saved_verified"], false);
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn interrupted_post_action_wait_preserves_capture_receipt() {
+        let steps = vec![serde_json::json!({"index":0,"kind":"action","ok":true,
+            "after_ms_omitted":true,"system_capture":{"requested":true,"saved_verified":false}})];
+        let body = agent_actions_failure_body(0,0,1,"batch_deadline_after_action",
+            "applied",false,&steps,None);
+        let redacted = crate::observation::redact_batch(body);
+        assert_eq!(redacted["steps"][0]["system_capture"]["requested"],true);
+        assert_eq!(redacted["steps"][0]["system_capture"]["saved_verified"],false);
+        assert_eq!(redacted["steps"][0]["after_ms_omitted"],true);
+        assert_eq!(redacted["applied_actions"],1);
+        assert_eq!(redacted["retry_safe"],false);
+    }
+
     // -- long text ----------------------------------------------------------
 
     /// A mock runner that counts `/wda/keys` requests and fails the
@@ -25476,11 +29929,519 @@ mod tests {
                 &serde_json::json!({"type":"text","text":text}),
                 &mut None,
                 far_deadline(),
-            )
+                None,
+            None, )
             .await;
             assert_eq!(outcome, RunnerControlOutcome::Applied);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 1);
             runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn devanagari_long_text_uses_three_bounded_native_requests() {
+        block(async {
+            let (mut runner, keys, _) = counting_keys_runner(0);
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let actionable = std::sync::atomic::AtomicBool::new(false);
+            let outcome = direct_agent_action(&mut client, &actionable,
+                &serde_json::json!({"type":"text","text":"क".repeat(500)}),
+                &mut None, far_deadline(), None, None).await;
+            assert_eq!(outcome, RunnerControlOutcome::Applied);
+            assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 3);
+            runner.shutdown();
+        });
+    }
+
+    /// How the fake bound field answers a guarded clear.
+    #[derive(Clone, Copy, PartialEq)]
+    enum FakeClear {
+        Ok,
+        /// Refused before deleting anything (`… nothing was sent`).
+        Refused,
+        /// Interrupted after deleting, leaving the field with this many of
+        /// its characters (`None` = all of them, i.e. nothing was deleted).
+        Interrupted(Option<usize>),
+    }
+
+    struct FakeField {
+        value: std::sync::Mutex<String>,
+        binds: std::sync::atomic::AtomicUsize,
+        clears: std::sync::atomic::AtomicUsize,
+        keys: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A runner whose one text field (`FIELD`) supports the guarded,
+    /// selected-target replacement path. `clear(n)` answers the n-th clear;
+    /// `fail_keys` fails that keys request (1-based) after dispatch.
+    fn guarded_field_runner(
+        initial: &str,
+        clear: impl Fn(usize) -> FakeClear + Send + 'static,
+        fail_keys: Option<usize>,
+    ) -> (MockRunner, Arc<FakeField>) {
+        let field = Arc::new(FakeField {
+            value: std::sync::Mutex::new(initial.to_string()),
+            binds: 0.into(),
+            clears: 0.into(),
+            keys: 0.into(),
+        });
+        let seen = field.clone();
+        let error = |status: &str, code: &str, message: &str| {
+            let body = serde_json::json!({"value":{"error":code,"message":message}}).to_string();
+            format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        };
+        let runner = MockRunner::start(move |request| {
+            use std::sync::atomic::Ordering::SeqCst;
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+            if request.starts_with("POST /session ") {
+                return r#"{"value":{"sessionId":"S","capabilities":{"ipu:guardedInput":true,"ipu:selectedInputTarget":true,"ipu:valueRead":true}}}"#.into();
+            }
+            if request.contains("/ipu/element/FIELD/input-target") {
+                let n = seen.binds.fetch_add(1, SeqCst) + 1;
+                return format!(r#"{{"value":{{"token":"T{n}"}}}}"#);
+            }
+            if request.starts_with("GET ") && request.contains("/value?complete=1") {
+                let value = seen.value.lock().unwrap().clone();
+                return serde_json::json!({"value":{"complete":true,"value":value}}).to_string();
+            }
+            if request.starts_with("POST ") && request.contains("/clear") {
+                let n = seen.clears.fetch_add(1, SeqCst) + 1;
+                return match clear(n) {
+                    FakeClear::Ok => {
+                        seen.value.lock().unwrap().clear();
+                        r#"{"value":null}"#.into()
+                    }
+                    FakeClear::Refused => error("400 Bad Request", "invalid argument", "bound clear unavailable; nothing was sent"),
+                    FakeClear::Interrupted(left) => {
+                        if let Some(left) = left {
+                            let mut value = seen.value.lock().unwrap();
+                            *value = value.chars().take(left).collect();
+                        }
+                        error("500 Internal Server Error", "unknown error", "bound clear interrupted; deletion outcome unknown; inspect the original field")
+                    }
+                };
+            }
+            if request.starts_with("POST ") && request.contains("/wda/keys") {
+                let n = seen.keys.fetch_add(1, SeqCst) + 1;
+                let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                let text = sent["value"][0].as_str().unwrap_or_default().to_string();
+                if fail_keys == Some(n) {
+                    return error("500 Internal Server Error", "unknown error", "input target changed during typing; text outcome unknown; do not retry input");
+                }
+                seen.value.lock().unwrap().push_str(&text);
+                return r#"{"value":null}"#.into();
+            }
+            healthy_runner_responder(request)
+        });
+        (runner, field)
+    }
+
+    /// Run a guarded replacement of `FIELD` with `text`; the result and receipt.
+    fn run_guarded_replacement(
+        runner: &MockRunner,
+        text: &str,
+    ) -> (Result<(), SnapshotElementTapError>, serde_json::Value) {
+        block(async {
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let target = client.input_target_for_element("FIELD", text).await.unwrap().expect("selected input target");
+            let mut receipt = ReplacementReceipt::new(text);
+            let result = guarded_replacement(&mut client, "FIELD", text, target, &|| true, &mut receipt).await;
+            let mut detail = None;
+            receipt.store(&mut detail);
+            (result, detail.unwrap()["replacement"].clone())
+        })
+    }
+
+    #[test]
+    fn a_guarded_replacement_reports_every_segment_it_delivered() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let text = "字".repeat(crate::text_input::CHUNK_CHARS * 2 + 50);
+        let (mut runner, field) = guarded_field_runner("old text", |_| FakeClear::Ok, None);
+        let (result, receipt) = run_guarded_replacement(&runner, &text);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(*field.value.lock().unwrap(), text);
+        assert_eq!(receipt["phase"], "done");
+        assert_eq!(receipt["clear"]["status"], "cleared");
+        assert_eq!(receipt["segments_total"], 3);
+        assert_eq!(receipt["segments_delivered"], 3);
+        assert_eq!(receipt["characters_confirmed"], 450);
+        assert_eq!(receipt["characters_total"], 450);
+        assert!(receipt["stopped_at_segment"].is_null());
+        assert_eq!(field.keys.load(SeqCst), 3);
+        runner.shutdown();
+    }
+
+    #[test]
+    fn a_guarded_replacement_that_fails_part_way_names_the_segment_it_stopped_at() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let text = "a".repeat(crate::text_input::CHUNK_CHARS * 2 + 50);
+        let (mut runner, field) = guarded_field_runner("old", |_| FakeClear::Ok, Some(2));
+        let (result, receipt) = run_guarded_replacement(&runner, &text);
+        assert!(matches!(result, Err(SnapshotElementTapError::AfterDispatch(_))), "{result:?}");
+        assert_eq!(receipt["phase"], "type");
+        assert_eq!(receipt["stopped_at_segment"], 2);
+        assert_eq!(receipt["segments_delivered"], 1);
+        assert_eq!(receipt["characters_confirmed"], 200);
+        assert_eq!(receipt["characters_uncertain"], 200);
+        let statuses: Vec<_> = receipt["segments"].as_array().unwrap().iter().map(|s| s["status"].clone()).collect();
+        assert_eq!(statuses, ["delivered", "uncertain", "not_sent"]);
+        // Nothing after the failed segment was sent.
+        assert_eq!(field.keys.load(SeqCst), 2);
+        runner.shutdown();
+    }
+
+    #[test]
+    fn a_clear_that_lost_the_field_before_deleting_rebinds_and_clears_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for first in [FakeClear::Refused, FakeClear::Interrupted(None)] {
+            let (mut runner, field) =
+                guarded_field_runner("old text", move |n| if n == 1 { first } else { FakeClear::Ok }, None);
+            let (result, receipt) = run_guarded_replacement(&runner, "new");
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(*field.value.lock().unwrap(), "new");
+            assert_eq!(receipt["clear"], serde_json::json!({"status":"recovered","field":"unchanged","rebound":true}));
+            assert_eq!(field.binds.load(SeqCst), 2, "bound once more");
+            assert_eq!(field.clears.load(SeqCst), 2);
+            runner.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_clear_interrupted_after_it_emptied_the_field_rebinds_without_clearing_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut runner, field) = guarded_field_runner("old text", |_| FakeClear::Interrupted(Some(0)), None);
+        let (result, receipt) = run_guarded_replacement(&runner, "new");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(*field.value.lock().unwrap(), "new");
+        assert_eq!(receipt["clear"], serde_json::json!({"status":"recovered","field":"empty","rebound":true}));
+        assert_eq!(field.clears.load(SeqCst), 1);
+        assert_eq!(field.binds.load(SeqCst), 2);
+        runner.shutdown();
+    }
+
+    #[test]
+    fn a_partly_cleared_field_stops_the_replacement_without_typing() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut runner, field) = guarded_field_runner("old text", |_| FakeClear::Interrupted(Some(3)), None);
+        let (result, receipt) = run_guarded_replacement(&runner, "new");
+        assert!(matches!(result, Err(SnapshotElementTapError::AfterDispatch(_))), "{result:?}");
+        assert_eq!(receipt["phase"], "clear");
+        assert_eq!(receipt["clear"]["status"], "failed");
+        assert_eq!(receipt["clear"]["field"], "partially_cleared");
+        assert_eq!(receipt["characters_confirmed"], 0);
+        assert_eq!(field.keys.load(SeqCst), 0);
+        assert_eq!(field.binds.load(SeqCst), 1, "never rebound");
+        runner.shutdown();
+    }
+
+    #[test]
+    fn a_clear_that_keeps_failing_leaves_the_field_unchanged_and_says_so() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut runner, field) = guarded_field_runner("old text", |_| FakeClear::Refused, None);
+        let (result, receipt) = run_guarded_replacement(&runner, "new");
+        assert!(matches!(result, Err(SnapshotElementTapError::NoEffect("replacement_not_applied", _))), "{result:?}");
+        assert_eq!(receipt["clear"]["status"], "failed");
+        assert_eq!(receipt["clear"]["field"], "unchanged");
+        assert_eq!(receipt["clear"]["attempts"], 2);
+        assert_eq!(*field.value.lock().unwrap(), "old text");
+        assert_eq!(field.keys.load(SeqCst), 0);
+        runner.shutdown();
+    }
+
+    #[test]
+    fn cleared_field_state_compares_without_reporting_contents() {
+        assert_eq!(cleared_field_state(Some("abc"), Some("")), "empty");
+        assert_eq!(cleared_field_state(Some("abc"), Some("abc")), "unchanged");
+        assert_eq!(cleared_field_state(Some("abc"), Some("ab")), "partially_cleared");
+        assert_eq!(cleared_field_state(None, Some("ab")), "partially_cleared");
+        assert_eq!(cleared_field_state(Some("abc"), None), "unknown");
+    }
+
+    #[test]
+    fn slow_input_binding_cannot_clear_after_the_action_deadline() {
+        block(async {
+            let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = mutations.clone();
+            let mut runner = MockRunner::start(move |request| {
+                if request.starts_with("POST /session ") {
+                    return r#"{"value":{"sessionId":"SESSION","capabilities":{"ipu:guardedInput":true}}}"#.into();
+                }
+                if request.contains("/wda/input-target") {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    return r#"{"value":{"token":"original-field"}}"#.into();
+                }
+                if request.contains("/clear") || request.contains("/wda/keys") {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                healthy_runner_responder(request)
+            });
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let actionable = std::sync::atomic::AtomicBool::new(true);
+            let outcome = direct_agent_action(
+                &mut client,
+                &actionable,
+                &serde_json::json!({"type":"text","text":"new","clear":true}),
+                &mut None,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(40),
+                None,
+            None, )
+            .await;
+            assert_eq!(outcome, RunnerControlOutcome::NotSent);
+            assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn bounded_text_rejects_a_cluster_that_cannot_fit_before_any_write() {
+        let text = format!("prefix b{}", "\u{0301}".repeat(500));
+        assert!(validate_text_request(
+            serde_json::json!({"type":"text","text":text,"budget_ms":6000})
+                .as_object()
+                .unwrap()
+        )
+        .is_err());
+        assert!(validate_text_request(
+            serde_json::json!({"type":"text","text":text,"budget_ms":15000})
+                .as_object()
+                .unwrap()
+        )
+        .is_ok());
+        assert!(validate_text_request(
+            serde_json::json!({"type":"text","text":text})
+                .as_object()
+                .unwrap()
+        )
+        .is_ok());
+        let exact = format!("b{}", "\u{0301}".repeat(329));
+        assert!(!text_chunks_fit_budget(&exact, 6000));
+        assert!(text_chunks_fit_budget(&exact, 6001));
+    }
+
+    #[test]
+    fn bounded_500_character_http_input_continues_once_without_rebinding() {
+        block(async {
+            use tower::ServiceExt;
+            let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let delivered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen_binds = binds.clone();
+            let seen_delivery = delivered.clone();
+            let mut runner = MockRunner::start(move |request| {
+                if request.starts_with("POST /session ") {
+                    return r#"{"value":{"sessionId":"SESSION","capabilities":{"ipu:guardedInput":true,"ipu:inputContinuation":true}}}"#.into();
+                }
+                if request.contains("/wda/input-target") {
+                    seen_binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return r#"{"value":{"token":"original-field"}}"#.into();
+                }
+                if request.contains("/wda/keys") {
+                    let body: serde_json::Value =
+                        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    assert_eq!(body["inputTarget"], "original-field");
+                    let text = body["value"][0].as_str().unwrap().to_string();
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        if text.chars().count() == 200 {
+                            3200
+                        } else {
+                            1500
+                        },
+                    ));
+                    seen_delivery.lock().unwrap().push(text);
+                    return r#"{"value":null}"#.into();
+                }
+                healthy_runner_responder(request)
+            });
+            let mut state = Arc::try_unwrap(readiness_state_with_runner(runner.base()))
+                .ok()
+                .unwrap();
+            state.managed_runner = false;
+            state
+                .runner_actionable
+                .store(true, std::sync::atomic::Ordering::Release);
+            recover(state.runner_health.lock()).locked = Some(false);
+            let state = Arc::new(state);
+            let app = router(state);
+            let request = |action: serde_json::Value| {
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agent/input")
+                    .header("x-phone-control", "1")
+                    .header("x-phone-owner", "writer")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap()
+            };
+            let first = app
+                .clone()
+                .oneshot(request(
+                    serde_json::json!({"type":"text","text":"字".repeat(500),"budget_ms":6000}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+            let (_, first) = read_json_response(first).await;
+            let first = first.unwrap();
+            assert_eq!(first["characters_confirmed"], 200, "{first}");
+            assert_eq!(first["characters_uncertain"], 0);
+            assert_eq!(first["continuation_safe"], true);
+            let token = first["continue_token"].as_str().unwrap().to_string();
+            let resume = serde_json::json!({"type":"text","continue_token":token});
+            let second = app.clone().oneshot(request(resume.clone())).await.unwrap();
+            assert_eq!(second.status(), StatusCode::OK);
+            let replay = app.oneshot(request(resume)).await.unwrap();
+            let (_, replay) = read_json_response(replay).await;
+            let replay = replay.unwrap();
+            assert_eq!(replay["error"], "input_continuation_expired", "{replay}");
+            assert_eq!(binds.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(delivered.lock().unwrap().concat(), "字".repeat(500));
+            assert_eq!(delivered.lock().unwrap().len(), 3);
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn continuation_restores_only_saved_text_and_consumes_before_dispatch() {
+        block(async {
+            let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen_binds = binds.clone();
+            let seen_keys = keys.clone();
+            let mut runner = MockRunner::start(move |request| {
+                if request.starts_with("POST /session ") {
+                    return r#"{"value":{"sessionId":"SESSION","capabilities":{"ipu:guardedInput":true,"ipu:inputContinuation":true}}}"#.into();
+                }
+                if request.contains("/wda/input-target") {
+                    seen_binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return r#"{"value":{"token":"original-field"}}"#.into();
+                }
+                if request.contains("/wda/keys") {
+                    let body: serde_json::Value =
+                        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    assert_eq!(body["inputTarget"], "original-field");
+                    seen_keys
+                        .lock()
+                        .unwrap()
+                        .push(body["value"][0].as_str().unwrap().to_string());
+                    return r#"{"value":null}"#.into();
+                }
+                healthy_runner_responder(request)
+            });
+            let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+            let target = client.input_target().await.unwrap().unwrap();
+            let scope = crate::input_continuation::Scope {
+                owner: "writer".into(),
+                epoch: 1,
+                privacy_epoch: 0,
+                lifecycle_stamp: 256,
+            };
+            let token = client
+                .save_input_continuation(scope.clone(), target, "剩余👋🏻".into(), 6000)
+                .unwrap();
+            let action = serde_json::json!({"type":"text","continue_token":token});
+            let actionable = std::sync::atomic::AtomicBool::new(true);
+            assert_eq!(
+                direct_agent_action(
+                    &mut client,
+                    &actionable,
+                    &action,
+                    &mut None,
+                    far_deadline(),
+                    None,
+                    Some(&scope)
+                )
+                .await,
+                RunnerControlOutcome::Applied
+            );
+            assert_eq!(direct_agent_action(&mut client,&actionable,&action,&mut None,far_deadline(),None,Some(&scope)).await,
+                RunnerControlOutcome::Refused("input_continuation_expired","continuation is expired, consumed or belongs to another owner, privacy, lifecycle or session; nothing was typed; inspect the original field before planning new input; do not retry this token"));
+            assert_eq!(binds.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(*keys.lock().unwrap(), vec!["剩余👋🏻".to_string()]);
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn partial_receipt_only_advertises_continuation_without_uncertainty() {
+        let action = serde_json::json!({"type":"text","text":"original"});
+        let detail = serde_json::json!({"continue_token":"a".repeat(64),"partial_text_receipt":text_partial_body(&serde_json::json!({"text":"saved suffix"}),2,0)});
+        let safe = text_partial_with_detail(&action, 2, 0, Some(&detail));
+        assert_eq!(safe["remaining_text"], "ved suffix");
+        assert_eq!(safe["continuation_safe"], true);
+        assert_eq!(safe["continue_token"], "a".repeat(64));
+        let unknown = text_partial_with_detail(
+            &action,
+            2,
+            1,
+            Some(&serde_json::json!({"continue_token":"a".repeat(64)})),
+        );
+        assert!(unknown.get("continue_token").is_none());
+        assert!(unknown.get("continuation_safe").is_none());
+    }
+
+    #[test]
+    fn agent_text_binds_once_and_never_reselects_after_a_guarded_refusal() {
+        block(async {
+            for length in [8, 450] {
+                let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen_binds = binds.clone();
+                let seen_keys = keys.clone();
+                let mut runner = MockRunner::start(move |request| {
+                    if request.starts_with("POST /session ") {
+                        return r#"{"value":{"sessionId":"SESSION","capabilities":{"ipu:guardedInput":true}}}"#.into();
+                    }
+                    if request.contains("/wda/input-target") {
+                        seen_binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return r#"{"value":{"token":"original-field"}}"#.into();
+                    }
+                    if request.contains("/wda/keys") {
+                        let body: serde_json::Value =
+                            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap())
+                                .unwrap();
+                        assert_eq!(body["inputTarget"], "original-field");
+                        let index = seen_keys.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if length == 8 || index == 1 {
+                            let body = r#"{"value":{"error":"invalid argument","message":"input_target_focus_changed; nothing was sent"}}"#;
+                            return format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        }
+                        return r#"{"value":null}"#.into();
+                    }
+                    healthy_runner_responder(request)
+                });
+                let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+                let actionable = std::sync::atomic::AtomicBool::new(true);
+                let mut detail = None;
+                let outcome = direct_agent_action(
+                    &mut client,
+                    &actionable,
+                    &serde_json::json!({"type":"text","text":"字".repeat(length)}),
+                    &mut detail,
+                    far_deadline(),
+                    None,
+                None, )
+                .await;
+                assert_eq!(
+                    outcome,
+                    if length == 8 {
+                        RunnerControlOutcome::RunnerRejected
+                    } else {
+                        RunnerControlOutcome::TextPartial {
+                            confirmed: 200,
+                            uncertain: 0,
+                        }
+                    }
+                );
+                assert_eq!(binds.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(
+                    keys.load(std::sync::atomic::Ordering::SeqCst),
+                    if length == 8 { 1 } else { 2 }
+                );
+                assert_eq!(
+                    detail.as_ref().unwrap()["runner_error"]["message"],
+                    "input_target_focus_changed; nothing was sent"
+                );
+                runner.shutdown();
+            }
         });
     }
 
@@ -25499,7 +30460,8 @@ mod tests {
                 &serde_json::json!({"type":"text","text":text}),
                 &mut None,
                 far_deadline(),
-            )
+                None,
+            None, )
             .await;
             assert_eq!(outcome, RunnerControlOutcome::Applied);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), chunks);
@@ -25517,7 +30479,7 @@ mod tests {
             let text = "a".repeat(1000);
             let action = serde_json::json!({"type":"text","text":text});
             let outcome =
-                direct_agent_action(&mut client, &actionable, &action, &mut None, far_deadline())
+                direct_agent_action(&mut client, &actionable, &action, &mut None, far_deadline(), None, None)
                     .await;
             assert_eq!(
                 outcome,
@@ -25554,7 +30516,8 @@ mod tests {
                 &serde_json::json!({"type":"text","text":"a".repeat(600)}),
                 &mut None,
                 soon,
-            )
+                None,
+            None, )
             .await;
             assert_eq!(outcome, RunnerControlOutcome::NotSent);
             assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -25608,7 +30571,8 @@ mod tests {
                 &serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}),
                 &mut detail,
                 far_deadline(),
-            )
+                None,
+            None, )
             .await;
             assert_eq!(outcome, RunnerControlOutcome::RunnerRejected);
             assert_eq!(
@@ -25636,6 +30600,75 @@ mod tests {
     }
 
     #[test]
+    fn replacement_clear_failure_never_dispatches_short_or_chunked_text() {
+        block(async {
+            for length in [8, crate::text_input::CHUNK_CHARS + 1] {
+                for refused in [false, true] {
+                    let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let seen_clears = clears.clone();
+                    let seen_keys = keys.clone();
+                    let message = if refused {
+                        "clear unavailable; nothing was sent"
+                    } else {
+                        "clear interrupted after deletion; outcome unknown"
+                    };
+                    let mut runner = MockRunner::start(move |request| {
+                        if request.contains("/element/active") {
+                            return r#"{"value":{"ELEMENT":"field"}}"#.into();
+                        }
+                        if request.contains("/element/field/clear") {
+                            seen_clears.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let code = if refused {
+                                "invalid argument"
+                            } else {
+                                "unknown error"
+                            };
+                            let status = if refused {
+                                "400 Bad Request"
+                            } else {
+                                "500 Internal Server Error"
+                            };
+                            let body =
+                                serde_json::json!({"value":{"error":code,"message":message}})
+                                    .to_string();
+                            return format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        }
+                        if request.contains("/wda/keys") {
+                            seen_keys.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        healthy_runner_responder(request)
+                    });
+                    let mut client = crate::runner::RunnerClient::new(runner.base()).unwrap();
+                    let actionable = std::sync::atomic::AtomicBool::new(true);
+                    let mut detail = None;
+                    let outcome = direct_agent_action(
+                        &mut client,
+                        &actionable,
+                        &serde_json::json!({"type":"text","text":"字".repeat(length),"clear":true}),
+                        &mut detail,
+                        far_deadline(),
+                        None,
+                    None, )
+                    .await;
+                    assert_eq!(
+                        outcome,
+                        if refused {
+                            RunnerControlOutcome::RunnerRejected
+                        } else {
+                            RunnerControlOutcome::Failed
+                        }
+                    );
+                    assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert_eq!(keys.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    assert_eq!(detail.as_ref().unwrap()["runner_error"]["message"], message);
+                    runner.shutdown();
+                }
+            }
+        });
+    }
+
+    #[test]
     fn any_other_runner_error_stays_unknown_but_keeps_its_reason() {
         block(async {
             // A 400 alone does not prove nothing happened.
@@ -25650,7 +30683,8 @@ mod tests {
                 &serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}),
                 &mut detail,
                 far_deadline(),
-            )
+                None,
+            None, )
             .await;
             assert_eq!(outcome, RunnerControlOutcome::Failed);
             assert!(!actionable.load(std::sync::atomic::Ordering::SeqCst));
@@ -25673,7 +30707,8 @@ mod tests {
                 &serde_json::json!({"type":"scroll","x":0.5,"y":0.5,"dx":0,"dy":80}),
                 &mut detail,
                 far_deadline(),
-            )
+                None,
+            None, )
             .await;
             assert_eq!(outcome, RunnerControlOutcome::Failed);
             let response = runner_failed_after_dispatch_response_with(detail.as_ref());
@@ -25758,7 +30793,16 @@ mod tests {
         block(async {
             let state = readiness_test_state();
             let mut action = serde_json::json!({"type":"launch_app","app":"设置"});
-            resolve_launch_app_action(&state, &mut action).await.unwrap();
+            let resolved = resolve_launch_app_action(&state, &mut action).await.unwrap();
+            assert_eq!(
+                resolved,
+                Some(serde_json::json!({
+                    "app": "设置",
+                    "name": resolved.as_ref().unwrap()["name"],
+                    "bundle_id": "com.apple.Preferences",
+                    "match": "exact",
+                }))
+            );
             assert_eq!(
                 action,
                 serde_json::json!({"type":"launch_app","bundle":"com.apple.Preferences"})
@@ -25828,6 +30872,29 @@ mod tests {
     }
 
     #[test]
+    fn typing_with_no_focused_field_is_a_named_refusal() {
+        let runner = |message: &str| {
+            anyhow::Error::new(crate::runner::RunnerHttpError::from_body(
+                "GET /wda/input-target",
+                reqwest::StatusCode::BAD_REQUEST,
+                &serde_json::json!({"value":{"error":"invalid argument","message":message}}).to_string(),
+            ))
+        };
+        assert!(matches!(
+            input_target_refusal(&runner("input_target_ambiguous_or_missing; nothing was sent")),
+            Some(RunnerControlOutcome::Refused("no_focused_field", _))
+        ));
+        assert!(matches!(
+            input_target_refusal(&runner("newline_requires_multiline_field; nothing was sent")),
+            Some(RunnerControlOutcome::Refused("newline_requires_multiline_field", _))
+        ));
+        // Other refusals keep the generic path; a refusal that may have sent is never renamed.
+        assert!(input_target_refusal(&runner("input_target_tree_incomplete; nothing was sent")).is_none());
+        assert!(input_target_refusal(&runner("input_target_ambiguous_or_missing")).is_none());
+        assert!(input_target_refusal(&anyhow::anyhow!("connection reset")).is_none());
+    }
+
+    #[test]
     fn lookup_parameters_are_validated() {
         let q = |query: &str, source: Option<&str>, country: Option<&str>, limit: Option<usize>| {
             app_lookup_params(&AgentAppsQuery {
@@ -25844,11 +30911,11 @@ mod tests {
             AppLookupParams {
                 query: "微信".to_string(),
                 source: "auto",
-                country: "cn".to_string(),
+                country: None,
                 limit: 10
             }
         );
-        assert_eq!(q("x", Some("apple"), Some("US"), Some(30)).unwrap().country, "us");
+        assert_eq!(q("x", Some("apple"), Some("US"), Some(30)).unwrap().country.as_deref(), Some("us"));
         assert!(q("", None, None, None).is_err());
         assert!(q(&"a".repeat(101), None, None, None).is_err());
         assert!(q("x", Some("web"), None, None).is_err());
@@ -25856,6 +30923,287 @@ mod tests {
         assert!(q("x", None, Some("c1"), None).is_err());
         assert!(q("x", None, None, Some(0)).is_err());
         assert!(q("x", None, None, Some(31)).is_err());
+    }
+
+    #[test]
+    fn element_selector_router_keeps_the_full_snapshot_and_original_indexes() {
+        use tower::ServiceExt;
+        block(async {
+            let mut runner=MockRunner::start(|request| {
+                if request.contains("/source") {
+                    serde_json::json!({"value":{"type":"XCUIElementTypeApplication","label":"Selector fixture",
+                        "rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                        {"type":"XCUIElementTypeButton","rawIdentifier":"other","label":"Save","isEnabled":true,"rect":{"x":0,"y":60,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeButton","rawIdentifier":"primary","label":"Save","isEnabled":true,"rect":{"x":0,"y":120,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeButton","rawIdentifier":"primary","label":"Save","isEnabled":true,"rect":{"x":0,"y":180,"width":100,"height":40}}
+                    ]}}).to_string()
+                } else if request.contains("/window/size") {
+                    r#"{"value":{"width":390,"height":844}}"#.into()
+                } else { healthy_runner_responder(request) }
+            });
+            let state=readiness_state_with_runner(runner.base());
+            let mut url=reqwest::Url::parse("http://daemon/agent/elements").unwrap();
+            url.query_pairs_mut().append_pair("selector",r#"{"kind":"Button","identifier":"primary","enabled":true}"#)
+                .append_pair("limit","1").append_pair("ocr","off");
+            let response=router(state.clone()).oneshot(axum::http::Request::builder()
+                .uri(format!("{}?{}",url.path(),url.query().unwrap())).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+            let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["elements"].as_array().unwrap().len(),1);
+            assert_eq!(body["elements"][0]["index"],2);
+            assert_eq!(body["elements"][0]["enabled"],true);
+            assert_eq!(body["filter"]["matched"],2);
+            assert_eq!(body["filter"]["omitted"],1);
+            let snapshot=body["snapshot"].as_str().unwrap();
+            let rows=lookup_element_snapshot(&state,snapshot).unwrap();
+            assert_eq!(rows.len(),4,"filtering must not replace the full snapshot cache");
+            assert_eq!(rows[2].identifier.as_deref(),Some("primary"));
+            assert_eq!(rows[2].enabled,Some(true));
+            assert_eq!(rows[1].identifier.as_deref(),Some("other"));
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn diagnostic_projection_preserves_known_state_without_changing_default_or_cache() {
+        use tower::ServiceExt;
+        block(async {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = reads.clone();
+            let mut runner = MockRunner::start(move |request| {
+                if request.contains("/source") {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::json!({"value":{"type":"XCUIElementTypeApplication","label":"Fixture",
+                        "rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"empty","rect":{"x":0,"y":60,"width":100,"height":40},"label":"Empty","value":"","isEnabled":true,"isVisible":true,"isFocused":false},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"missing","rect":{"x":0,"y":120,"width":100,"height":40},"label":"Missing"},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"truncated","rect":{"x":0,"y":180,"width":100,"height":40},"label":"Truncated","value":"prefix","value_truncated":true},
+                        {"type":"XCUIElementTypeSecureTextField","rawIdentifier":"secure","rect":{"x":0,"y":240,"width":100,"height":40},"label":"Password","value":"synthetic-secret"},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"unsupported","rect":{"x":0,"y":300,"width":100,"height":40},"label":"Unsupported","value":{}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"known","rect":{"x":0,"y":360,"width":100,"height":40},"label":"Known","value":"prefix"}
+                    ]}}).to_string()
+                } else if request.contains("/window/size") {
+                    r#"{"value":{"width":390,"height":844}}"#.into()
+                } else {
+                    healthy_runner_responder(request)
+                }
+            });
+            let state = readiness_state_with_runner(runner.base());
+            let mut snapshot = None;
+            for (uri, diagnostic, filtered) in [
+                ("/agent/elements?ocr=off", false, false),
+                ("/agent/elements?ocr=off&locator_state=1", true, false),
+                (
+                    "/agent/elements?ocr=off&locator_state=1&query=empty&limit=1",
+                    true,
+                    true,
+                ),
+            ] {
+                let response = router(state.clone())
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(!body.to_string().contains("synthetic-secret"));
+                let current = body["snapshot"].as_str().unwrap();
+                if let Some(expected) = &snapshot {
+                    assert_eq!(current, expected);
+                } else {
+                    snapshot = Some(current.to_string());
+                }
+                let cached = lookup_element_snapshot(&state, current).unwrap();
+                assert_eq!(cached.len(), 7);
+                assert_eq!(cached[1].value.as_deref(), Some(""));
+                assert_eq!(cached[1].enabled, Some(true));
+                let elements = body["elements"].as_array().unwrap();
+                let empty = elements
+                    .iter()
+                    .find(|r| r["identifier"] == "empty")
+                    .unwrap();
+                if filtered {
+                    assert_eq!(empty["index"], 1);
+                } else {
+                    assert_eq!(elements.iter().position(|row| row["identifier"] == "empty"), Some(1));
+                    assert!(empty.get("index").is_none(), "unfiltered rows retain implicit indices");
+                }
+                if diagnostic {
+                    assert_eq!(body["locator_state"], 1);
+                    assert_eq!(empty["value"], "");
+                    assert_eq!(empty["value_known"], true);
+                    assert_eq!(empty["enabled"], true);
+                    assert_eq!(empty["visible"], true);
+                    assert_eq!(empty["focused"], false);
+                    if filtered {
+                        assert_eq!(elements.len(), 1);
+                    } else {
+                        for (id, known) in [
+                            ("missing", true),
+                            ("truncated", false),
+                            ("secure", false),
+                            ("unsupported", false),
+                            ("known", true),
+                        ] {
+                            let row = elements.iter().find(|r| r["identifier"] == id).unwrap();
+                            assert_eq!(row["value_known"], known, "{row}");
+                            if id == "missing" {
+                                assert!(row.get("value").is_none());
+                                assert!(row.get("enabled").is_none());
+                                assert!(row.get("focused").is_none());
+                            }
+                        }
+                    }
+                } else {
+                    assert!(body.get("locator_state").is_none());
+                    assert!(elements.iter().all(|row| row.get("value_known").is_none()));
+                    assert!(empty.get("value").is_none());
+                    assert!(empty.get("enabled").is_none());
+                    assert!(empty.get("focused").is_none());
+                }
+            }
+            assert_eq!(
+                reads.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "One source read per request"
+            );
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn diagnostic_projection_refuses_invalid_or_delta_queries_after_authentication() {
+        use tower::ServiceExt;
+        block(async {
+            for uri in [
+                "/agent/elements?locator_state=true",
+                "/agent/elements?locator_state=0",
+                "/agent/elements?locator_state=1&since=old",
+            ] {
+                for (state, status) in [
+                    (readiness_test_state(), StatusCode::BAD_REQUEST),
+                    (
+                        fixture_app_state(Some("synthetic-password")),
+                        StatusCode::UNAUTHORIZED,
+                    ),
+                ] {
+                    let response = router(state)
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .uri(uri)
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), status);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn element_selector_empty_value_keeps_missing_and_secure_fields_distinct() {
+        use tower::ServiceExt;
+        block(async {
+            let mut runner=MockRunner::start(|request| {
+                if request.contains("/source") {
+                    serde_json::json!({"value":{"type":"XCUIElementTypeApplication","label":"Value fixture",
+                        "rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"empty","label":"Empty","value":"","rect":{"x":0,"y":60,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"missing","label":"Missing","rect":{"x":0,"y":120,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeSecureTextField","rawIdentifier":"secure-empty","label":"Secure","value":"","rect":{"x":0,"y":180,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeSecureTextField","rawIdentifier":"secret","label":"Password","value":"synthetic-secret","rect":{"x":0,"y":240,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"bad-object","label":"Bad object","value":{},"rect":{"x":0,"y":300,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"bad-array","label":"Bad array","value":[],"rect":{"x":0,"y":360,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"number","label":"Number","value":0,"rect":{"x":0,"y":420,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"boolean","label":"Boolean","value":false,"rect":{"x":0,"y":480,"width":100,"height":40}},
+                        {"type":"XCUIElementTypeTextField","rawIdentifier":"null","label":"Null","value":null,"rect":{"x":0,"y":540,"width":100,"height":40}}
+                    ]}}).to_string()
+                } else if request.contains("/window/size") {
+                    r#"{"value":{"width":390,"height":844}}"#.into()
+                } else { healthy_runner_responder(request) }
+            });
+            let state=readiness_state_with_runner(runner.base());
+            let mut url=reqwest::Url::parse("http://daemon/agent/elements").unwrap();
+            url.query_pairs_mut().append_pair("selector",r#"{"value":""}"#).append_pair("ocr","off");
+            let response=router(state.clone()).oneshot(axum::http::Request::builder()
+                .uri(format!("{}?{}",url.path(),url.query().unwrap())).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+            let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["elements"].as_array().unwrap().len(),1);
+            assert_eq!(body["elements"][0]["identifier"],"empty");
+            assert_eq!(body["elements"][0]["value"],"");
+            let rows=lookup_element_snapshot(&state,body["snapshot"].as_str().unwrap()).unwrap();
+            assert_eq!(rows[1].value.as_deref(),Some(""));
+            assert_eq!(rows[2].value,None);
+            assert_eq!(rows[3].value,None);
+            let ordinary=serde_json::to_value(&*rows).unwrap();
+            assert!(ordinary[1].get("value").is_none());
+            assert!(!ordinary.to_string().contains("synthetic-secret"));
+            for (selector, expected_indexes) in [
+                (serde_json::json!({"kind":"TextField","value_present":true}),vec![1,7,8]),
+                (serde_json::json!({"kind":"TextField","value_present":false}),vec![2,9]),
+                (serde_json::json!({"kind":"SecureTextField","value_present":true}),vec![]),
+                (serde_json::json!({"kind":"SecureTextField","value_present":false}),vec![]),
+            ] {
+                let mut url=reqwest::Url::parse("http://daemon/agent/elements").unwrap();
+                url.query_pairs_mut().append_pair("selector",&selector.to_string()).append_pair("ocr","off");
+                let response=router(state.clone()).oneshot(axum::http::Request::builder()
+                    .uri(format!("{}?{}",url.path(),url.query().unwrap())).body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(),StatusCode::OK);
+                let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+                let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+                let indexes=body["elements"].as_array().unwrap().iter().map(|row|row["index"].as_u64().unwrap()).collect::<Vec<_>>();
+                assert_eq!(indexes,expected_indexes,"{selector}: {body}");
+                assert_eq!(body["filter"]["selector"],selector);
+                assert_eq!(lookup_element_snapshot(&state,body["snapshot"].as_str().unwrap()).unwrap().len(),10);
+                assert!(!body.to_string().contains("synthetic-secret"));
+            }
+            runner.shutdown();
+        });
+    }
+
+    #[test]
+    fn element_selector_refuses_invalid_or_delta_requests_before_device_reads() {
+        use tower::ServiceExt;
+        block(async {
+            for (selector, since, expected) in [
+                ("{}",false,"invalid_selector"),
+                (r#"["Button",null,null,null,null,null]"#,false,"invalid_selector"),
+                (r#"["Button"]"#,false,"invalid_selector"),
+                (r#"{"predicate":"TRUEPREDICATE"}"#,false,"invalid_selector"),
+                (r#"{"value":"","value_present":false}"#,false,"invalid_selector"),
+                (r#"{"value_present":"false"}"#,false,"invalid_selector"),
+                (r#"{"enabled":true}"#,true,"selector_needs_full_read"),
+                (r#"{"value_present":false}"#,true,"selector_needs_full_read"),
+            ] {
+                let mut uri=reqwest::Url::parse("http://daemon/agent/elements").unwrap();
+                uri.query_pairs_mut().append_pair("selector",selector);
+                if since { uri.query_pairs_mut().append_pair("since","old"); }
+                let path=format!("{}?{}",uri.path(),uri.query().unwrap());
+                let response=router(readiness_test_state()).oneshot(
+                    axum::http::Request::builder().uri(&path).body(Body::empty()).unwrap()
+                ).await.unwrap();
+                assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+                let bytes=axum::body::to_bytes(response.into_body(),8192).await.unwrap();
+                let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"],expected);
+                let response=router(fixture_app_state(Some("synthetic-password"))).oneshot(
+                    axum::http::Request::builder().uri(&path).body(Body::empty()).unwrap()
+                ).await.unwrap();
+                assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
+            }
+        });
     }
 
     #[test]
@@ -26077,6 +31425,25 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_status_exposes_selection_recovery_without_starting_a_phone() {
+        let mut state = fixture_app_state(None);
+        Arc::get_mut(&mut state).unwrap().managed_runner_pending = true;
+        block(async move {
+            let (code, body) = call(&state, "GET", "/agent/status", "").await;
+            assert_eq!(code, StatusCode::OK);
+            let status: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(status["target_configured"], false);
+            assert_eq!(status["drivable"], false);
+            assert_eq!(status["recovery_owner"], "unconfigured");
+            assert_eq!(status["recovery"]["cause"], "target_unconfigured");
+            assert_eq!(status["recovery"]["actor"], "agent");
+            assert_eq!(status["recovery"]["pause_screen_reads"], true);
+            assert!(status["hint"].as_str().unwrap().contains("not paired phones"));
+            assert!(!status["next_step"]["en"].as_str().unwrap().contains("devicectl"));
+        });
+    }
+
+    #[test]
     fn status_names_a_simulator_target_and_leaves_a_phone_s_status_alone() {
         let status_of = |state: Arc<AppState>| {
             block(async move {
@@ -26225,9 +31592,17 @@ mod tests {
         assert_eq!(parse_ocr_mode(Some("always")).unwrap_err()["error"], "invalid_ocr");
 
         let mut json = serde_json::json!({"elements": []});
-        attach_ocr(&mut json, Err("OCR needs macOS".to_string()));
+        let now = std::time::Instant::now();
+        attach_ocr(&mut json, Err("OCR needs macOS".to_string()), now);
         assert_eq!(json["ocr_error"], "OCR needs macOS");
-        attach_ocr(&mut json, Ok(vec![serde_json::json!({"kind":"OCRText"})]));
+        assert_eq!(json["ocr_status"], "failed");
+        assert!(json.get("ocr_retry_after_ms").is_none());
+        assert!(json["ocr_ms"].is_u64());
+        let mut warming = serde_json::json!({"elements": []});
+        attach_ocr(&mut warming, Err(OcrFailure { message: "warming".into(), status: "warming", retry_after_ms: Some(OCR_WARMING_RETRY_MS) }), now);
+        assert_eq!(warming["ocr_status"], "warming");
+        assert_eq!(warming["ocr_retry_after_ms"], OCR_WARMING_RETRY_MS);
+        attach_ocr(&mut json, Ok::<_, String>(vec![serde_json::json!({"kind":"OCRText"})]), now);
         assert_eq!(json["ocr"]["source"], "vision");
         assert_eq!(json["ocr"]["rows"][0]["kind"], "OCRText");
 
@@ -26881,7 +32256,7 @@ mod selfrunner_p2_tests {
         let observation = wait_probe_observation(
             3,
             3,
-            agent_wait_observation(serde_json::Value::Null, 4, 0, true, Some("timeout")),
+            agent_wait_observation(serde_json::Value::Null, 4, 0, true, Some("timeout"), false),
         );
         assert_eq!(observation["probe_misses"], 3);
         assert_eq!(observation["probes_answered"], 3);
@@ -26949,5 +32324,298 @@ mod selfrunner_p2_tests {
         ];
         assert!(center_covered(&settings, 5));
         assert!(!center_covered(&settings, 6));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_rebind_tests {
+    //! An index from an older snapshot of the same screen still names its
+    //! row after small changes, and never another row.
+    use super::*;
+    use crate::runner::ElementRow;
+
+    fn row(depth: u32, kind: &str, label: &str) -> ElementRow {
+        ElementRow { kind: kind.into(), label: label.into(), depth, ..Default::default() }
+    }
+
+    fn with_value(mut row: ElementRow, value: &str) -> ElementRow {
+        row.value = Some(value.into());
+        row
+    }
+
+    /// A settings page: clock, navigation bar, a switch and a few cells.
+    fn settings() -> Vec<ElementRow> {
+        vec![
+            row(0, "Application", "设置"),
+            row(1, "StaticText", "10:41"),
+            row(1, "NavigationBar", "无线局域网"),
+            row(2, "Button", "设置"),
+            row(1, "Table", ""),
+            with_value(row(2, "Switch", "无线局域网"), "0"),
+            row(2, "Cell", "Home"),
+            row(2, "Cell", "Office"),
+            row(2, "Button", "其他网络"),
+        ]
+    }
+
+    #[test]
+    fn a_clock_tick_and_a_switch_flip_keep_every_row() {
+        let old = settings();
+        let mut new = settings();
+        new[1].label = "10:42".into();
+        new[5].value = Some("1".into());
+        new.insert(4, row(1, "StaticText", "已连接"));
+        assert_eq!(rebind_snapshot_row(&old, 7, &new), RowRebind::Index(8));
+        assert_eq!(rebind_snapshot_row(&old, 8, &new), RowRebind::Index(9));
+        // The clock is one of the 设置 button's two neighbours: a tick there
+        // already makes that row unprovable.
+        let mut clock_only = settings();
+        clock_only[1].label = "10:42".into();
+        assert_eq!(rebind_snapshot_row(&old, 3, &clock_only), RowRebind::Stale);
+    }
+
+    #[test]
+    fn another_app_or_another_page_is_stale() {
+        let old = settings();
+        let mut other_app = settings();
+        other_app[0].label = "Safari".into();
+        assert_eq!(rebind_snapshot_row(&old, 3, &other_app), RowRebind::Stale);
+
+        // Pushed to a detail page: the back button reads the same, the page
+        // does not.
+        let detail = vec![
+            row(0, "Application", "设置"),
+            row(1, "NavigationBar", "Home"),
+            row(2, "Button", "设置"),
+            row(1, "Table", ""),
+            row(2, "Button", "忽略此网络"),
+        ];
+        assert_eq!(rebind_snapshot_row(&old, 3, &detail), RowRebind::Stale);
+    }
+
+    #[test]
+    fn most_of_the_screen_replaced_is_stale_even_under_the_same_bar() {
+        let old = settings();
+        let mut new = vec![old[0].clone(), old[2].clone(), old[3].clone()];
+        new.extend((0..6).map(|i| row(2, "Cell", &format!("其他 {i}"))));
+        assert_eq!(rebind_snapshot_row(&old, 3, &new), RowRebind::Stale);
+    }
+
+    #[test]
+    fn the_same_button_under_another_row_is_stale() {
+        let screen = |item: &str| {
+            let mut rows = settings();
+            rows.push(row(2, "Cell", item));
+            rows.push(row(3, "Button", "删除"));
+            rows
+        };
+        let (old, new) = (screen("Item 5"), screen("Item 12"));
+        assert_eq!(rebind_snapshot_row(&old, 10, &new), RowRebind::Stale);
+        assert_eq!(rebind_snapshot_row(&old, 10, &screen("Item 5")), RowRebind::Index(10));
+    }
+
+    #[test]
+    fn an_alert_that_came_up_is_stale() {
+        let old = settings();
+        let mut new = settings();
+        new.push(row(1, "Alert", "允许“设置”使用你的位置？"));
+        new.push(row(2, "Button", "允许"));
+        assert_eq!(rebind_snapshot_row(&old, 7, &new), RowRebind::Stale);
+    }
+
+    #[test]
+    fn a_replaced_alert_is_stale() {
+        let mut old = settings();
+        old.push(row(1, "Alert", "要加入“Home”吗？"));
+        let mut new = settings();
+        new.push(row(1, "Alert", "密码错误"));
+        assert_eq!(rebind_snapshot_row(&old, 7, &new), RowRebind::Stale);
+        assert_eq!(rebind_snapshot_row(&old, 7, &old.clone()), RowRebind::Index(7));
+    }
+
+    #[test]
+    fn a_button_in_an_unlabeled_cell_is_stale() {
+        let mut old = settings();
+        old.push(row(2, "Cell", ""));
+        old.push(row(3, "Button", "删除"));
+        let mut new = old.clone();
+        new[1].label = "10:42".into();
+        assert_eq!(rebind_snapshot_row(&old, 10, &new), RowRebind::Stale);
+    }
+
+    #[test]
+    fn a_tab_switch_kept_only_by_its_bars_is_stale() {
+        let tabs = |page: &[(&str, &str)]| {
+            let mut rows = vec![row(0, "Application", "时钟"), row(1, "TabBar", "")];
+            rows.extend(["世界时钟", "闹钟", "秒表", "计时器"].map(|tab| row(2, "Button", tab)));
+            rows.extend(page.iter().map(|(kind, label)| row(1, kind, label)));
+            rows
+        };
+        let old = tabs(&[("Button", "编辑"), ("StaticText", "北京")]);
+        let new = tabs(&[("Button", "编辑"), ("StaticText", "07:00")]);
+        assert_eq!(rebind_snapshot_row(&old, 6, &new), RowRebind::Stale);
+    }
+
+    #[test]
+    fn a_same_titled_sheet_for_another_item_is_stale() {
+        let sheet = |item: &str| {
+            let mut rows = settings();
+            rows.push(row(1, "Sheet", "删除备忘录？"));
+            rows.push(row(2, "StaticText", item));
+            rows.push(row(2, "Button", "删除"));
+            rows
+        };
+        let (old, new) = (sheet("购物清单"), sheet("会议记录"));
+        assert_eq!(rebind_snapshot_row(&old, 11, &new), RowRebind::Stale);
+        assert_eq!(rebind_snapshot_row(&old, 11, &sheet("购物清单")), RowRebind::Index(11));
+    }
+
+    #[test]
+    fn another_selected_tab_is_stale() {
+        let tabs = |selected: usize| {
+            let mut rows = settings();
+            rows.push(row(1, "TabBar", ""));
+            for (i, tab) in ["收藏", "最近"].into_iter().enumerate() {
+                let mut tab = row(2, "Button", tab);
+                tab.selected = (i == selected).then_some(true);
+                rows.push(tab);
+            }
+            rows
+        };
+        assert_eq!(rebind_snapshot_row(&tabs(0), 7, &tabs(1)), RowRebind::Stale);
+        assert_eq!(rebind_snapshot_row(&tabs(0), 7, &tabs(0)), RowRebind::Index(7));
+    }
+
+    #[test]
+    fn a_button_in_another_unlabeled_list_item_is_stale() {
+        // Items built from unlabeled containers emit no row of their own:
+        // only the item's text sits next to its 删除.
+        let list = |item: &str| {
+            let mut rows = settings();
+            rows.push(row(3, "StaticText", item));
+            rows.push(row(3, "Button", "删除"));
+            rows
+        };
+        assert_eq!(rebind_snapshot_row(&list("Item 5"), 10, &list("Item 12")), RowRebind::Stale);
+        let mut clock = list("Item 5");
+        clock[1].label = "10:42".into();
+        assert_eq!(rebind_snapshot_row(&list("Item 5"), 10, &clock), RowRebind::Index(10));
+    }
+
+    #[test]
+    fn a_title_beyond_blank_rows_still_tells_items_apart() {
+        // Unlabeled controls between an item's text and its 删除 read the
+        // same in every item; the text further up is what tells them apart.
+        let list = |item: &str| {
+            let mut rows = settings();
+            rows.push(row(3, "StaticText", item));
+            rows.extend((0..3).map(|_| row(3, "Button", "")));
+            rows.push(row(3, "Button", "删除"));
+            rows
+        };
+        assert_eq!(rebind_snapshot_row(&list("Item 5"), 13, &list("Item 12")), RowRebind::Stale);
+        let mut clock = list("Item 5");
+        clock[1].label = "10:42".into();
+        assert_eq!(rebind_snapshot_row(&list("Item 5"), 13, &clock), RowRebind::Index(13));
+    }
+
+    #[test]
+    fn a_vanished_row_is_stale() {
+        let old = settings();
+        let mut new = settings();
+        new.remove(8);
+        assert_eq!(rebind_snapshot_row(&old, 8, &new), RowRebind::Stale);
+    }
+
+    #[test]
+    fn a_twin_is_told_apart_by_its_section_or_refused() {
+        let section = |name: &str| {
+            vec![row(1, "Other", name), row(2, "Button", "删除")]
+        };
+        let mut old = vec![row(0, "Application", "备忘录")];
+        old.extend(section("A"));
+        old.extend((0..4).map(|i| row(1, "StaticText", &format!("行 {i}"))));
+        // A second 删除 appears in another section: ancestry tells them apart.
+        let mut new = old.clone();
+        new.extend(section("B"));
+        assert_eq!(rebind_snapshot_row(&old, 2, &new), RowRebind::Index(2));
+
+        // A second 删除 in the SAME section: nothing tells them apart.
+        let mut twin = old.clone();
+        twin.insert(3, row(2, "Button", "删除"));
+        assert_eq!(rebind_snapshot_row(&old, 2, &twin), RowRebind::Ambiguous);
+    }
+
+    #[test]
+    fn rows_without_a_durable_identity_never_rebind() {
+        let mut old = settings();
+        old.push(row(2, "Other", ""));
+        old.push(with_value(row(2, "TextField", "你好"), "你好"));
+        let mut new = old.clone();
+        new[1].label = "10:42".into();
+        assert_eq!(rebind_snapshot_row(&old, 9, &new), RowRebind::Stale);
+        assert_eq!(rebind_snapshot_row(&old, 10, &new), RowRebind::Stale);
+
+        // The same text field with an identifier is recognizable whatever it holds.
+        let mut field = with_value(row(2, "TextField", "你好"), "你好");
+        field.identifier = Some("message".into());
+        old[10] = field.clone();
+        new[10] = ElementRow { label: "你好吗".into(), value: Some("你好吗".into()), ..field };
+        assert_eq!(rebind_snapshot_row(&old, 10, &new), RowRebind::Index(10));
+    }
+}
+
+#[cfg(test)]
+mod disappearance_tests {
+    use super::*;
+    #[test]
+    fn another_application_cannot_satisfy_appearance_history() {
+        let expect:AgentUiExpectation=serde_json::from_value(serde_json::json!({"application":"Wanted","absent":[{"label":"Loading"}],"absent_after_present":true})).unwrap();
+        let mut seen=vec![false];
+        let mut other=serde_json::json!({"application_matches":false,"violated_absent":[0]});
+        assert!(!disappearance_observed(&expect,&mut seen,&mut other));
+        assert_eq!(seen,vec![false]);
+        let mut absent=serde_json::json!({"application_matches":true,"violated_absent":[]});
+        assert!(!disappearance_observed(&expect,&mut seen,&mut absent));
+        let mut present=serde_json::json!({"application_matches":true,"violated_absent":[0]});
+        assert!(disappearance_observed(&expect,&mut seen,&mut present));
+        assert!(disappearance_observed(&expect,&mut seen,&mut absent));
+    }
+
+    #[test]
+    fn formatted_values_do_not_claim_exact_readback() {
+        for (actual, expected) in [("-15", "15"), ("1/2", "12")] {
+            let mut detail = None;
+            set_value_readback_verification(&mut detail, actual, expected);
+            let mut body = serde_json::json!({"ok":true,"transport":"runner","verification":detail.unwrap()["verification"]});
+            crate::action_feedback::enrich(&mut body);
+            assert_eq!(body["action_evidence"]["postcondition"]["status"], "unverified");
+        }
+    }
+
+    #[test]
+    fn absence_before_appearance_does_not_complete_the_opt_in_wait() {
+        let expect: AgentUiExpectation = serde_json::from_value(serde_json::json!({
+            "absent":[{"label":"Loading"}],"absent_after_present":true
+        })).unwrap();
+        let mut seen = vec![false];
+        let mut absent = serde_json::json!({"violated_absent":[],"read":true,"application_matches":true});
+        assert!(!disappearance_observed(&expect, &mut seen, &mut absent));
+        assert_eq!(absent["unseen_absent"], serde_json::json!([0]));
+        let mut present = serde_json::json!({"violated_absent":[0],"read":true,"application_matches":true});
+        assert!(disappearance_observed(&expect, &mut seen, &mut present));
+        assert!(disappearance_observed(&expect, &mut seen, &mut absent));
+    }
+
+    #[test]
+    fn each_negative_target_needs_its_own_evidence() {
+        let expect: AgentUiExpectation = serde_json::from_value(serde_json::json!({
+            "ocr_absent":["Loading", "Saving"],"absent_after_present":true
+        })).unwrap();
+        let mut seen = vec![false,false];
+        let mut one = serde_json::json!({"ocr_absent":[{"seen":true},{"seen":false}]});
+        assert!(!disappearance_observed(&expect, &mut seen, &mut one));
+        let mut other = serde_json::json!({"ocr_absent":[{"seen":false},{"seen":true}]});
+        assert!(disappearance_observed(&expect, &mut seen, &mut other));
     }
 }

@@ -1,0 +1,35 @@
+# iphone-use
+
+> iphone-use lets AI agents use a real iPhone. A daemon on your Mac (macOS 15+, Xcode) drives an iPhone (iOS 15+) through its own XCTest device runner, over USB or Wi-Fi. Claude Code, Codex, Cursor, Claude Desktop or any MCP client reads the screen as text (an accessibility tree), taps, types and swipes in any app, including apps with no API. It also offers an HTTP agent API (`/agent/*`), a browser and iOS-app remote control for people, and saved per-app flows that replay with no model. Source-available under PolyForm Shield 1.0.0 (not an OSI open-source license); free to download.
+
+Install: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh`, then `iphone-use doctor` and `iphone-use try`.
+
+## Docs (English)
+
+- [Overview](https://iphone-use.leeguoo.com/en/): what agents can do on a real iPhone, three-step setup
+- [Install](https://iphone-use.leeguoo.com/en/install): requirements, the installer, plugins, upgrades, a second phone, simulators
+- [Ask your agent](https://iphone-use.leeguoo.com/en/tasks): example requests and what agents can and cannot do on the phone
+- [Flows & replay](https://iphone-use.leeguoo.com/en/flows): record a task once, replay it with no model; the official flow registry; test suites and schedules
+- [MCP, HTTP API & skill](https://iphone-use.leeguoo.com/en/connect): config for Claude Code, Codex, Cursor, VS Code, Claude Desktop, Gemini CLI, opencode, Windsurf; HTTP API headers and endpoints
+- [How it works](https://iphone-use.leeguoo.com/en/how-it-works): the daemon, the XCTest runner, USB and the Wi-Fi tunnel, lifecycle and handing the phone back
+- [vs other tools](https://iphone-use.leeguoo.com/en/compare): agent-device, Mobile MCP, Appium/WebDriverAgent and other iPhone MCP servers, from their READMEs
+- [Privacy & security](https://iphone-use.leeguoo.com/en/privacy): local by default, request signing, telemetry off, the iOS app
+- [FAQ](https://iphone-use.leeguoo.com/en/faq)
+
+## 中文文档
+
+- [概览](https://iphone-use.leeguoo.com/) · [安装](https://iphone-use.leeguoo.com/install) · [让 agent 用手机](https://iphone-use.leeguoo.com/tasks) · [Flow 录制与重放](https://iphone-use.leeguoo.com/flows) · [接入方式](https://iphone-use.leeguoo.com/connect) · [它怎么工作](https://iphone-use.leeguoo.com/how-it-works) · [对比](https://iphone-use.leeguoo.com/compare) · [隐私与安全](https://iphone-use.leeguoo.com/privacy) · [常见问题](https://iphone-use.leeguoo.com/faq)
+
+## Source and references
+
+- [GitHub repository](https://github.com/leeguooooo/iphone-use): README, full guide (docs/guide.md), agent reference (docs/agent-reference.md)
+- [MCP tools](https://github.com/leeguooooo/iphone-use/blob/main/crates/mcp/README.md)
+- [Official flow registry](https://github.com/leeguooooo/iphone-use-flows)
+- [Agent skill](https://github.com/leeguooooo/iphone-use/blob/main/skills/iphone-use/SKILL.md)
+- [Releases](https://github.com/leeguooooo/iphone-use/releases)
+
+## Optional
+
+- [Blog: iphone-use guide](https://blog.leeguoo.com/en/posts/iphone-use/)
+- [Blog: iphone-use in one minute (video)](https://blog.leeguoo.com/en/posts/iphone-use-video/)
+- [chrome-use](https://chrome-use.leeguoo.com/en/): the sibling tool that lets agents use your real, signed-in Chrome

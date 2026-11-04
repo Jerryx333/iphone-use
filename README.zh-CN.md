@@ -23,6 +23,8 @@ Claude Code、Codex 或任何 MCP 客户端都能用它把屏幕读成文字，�
   <strong>简体中文</strong>
 </p>
 
+<p align="center"><strong>官网与文档：<a href="https://iphone-use.leeguoo.com/">iphone-use.leeguoo.com</a></strong></p>
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 ```
@@ -54,6 +56,10 @@ https://github.com/user-attachments/assets/6192e8a6-ab2d-4dfc-b2e9-2c971f527d55
 想支持项目持续维护，也可以邮件联系，商量一次性或按月赞助。
 
 普通问题和功能建议仍可在 GitHub 提交。咨询时请勿附上密码、验证码或私人账号数据。
+
+MCP 调用可用 `instance:"i13"` 选择已安装的本机实例，读屏和输入均支持；
+`phone_instances` 只读列出实例，不重连。省略参数仍使用启动时配置的 daemon，
+实例缺失时直接报错，不改选其他手机。见[按调用选择实例](crates/mcp/README.md#selecting-an-installed-instance-per-call)。
 
 ## 为什么用 iphone-use
 

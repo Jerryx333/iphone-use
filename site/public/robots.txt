@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://iphone-use.leeguoo.com/sitemap.xml

@@ -12,6 +12,7 @@ pub mod flow;
 pub mod hints;
 pub mod http;
 pub mod jev;
+mod instances;
 pub mod outputs;
 pub mod registry;
 pub mod schedule;

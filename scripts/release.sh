@@ -56,6 +56,10 @@ t bash scripts/test-setup-runner-shim.sh
 t bash runner/ci-check.sh
 t python3 scripts/test-auto-update.py
 t python3 -I scripts/test-agent-bench.py
+t python3 -I scripts/test-agent-bench-runtime.py
+t python3 -I scripts/test-agent-bench-policy.py
+t python3 -I scripts/test-agent-selector-oracle.py
+t python3 -I scripts/test-simulator-cleanup.py
 echo "checks passed"
 
 if [ "$DRY" = 1 ]; then
@@ -68,7 +72,7 @@ fi
 git diff --quiet || git commit -qm "chore(release): v$V" -- $CRATES $VERSIONED_JSON Cargo.lock
 trap - EXIT
 git tag "v$V"
-git push -q origin main "v$V"
+git push --atomic -q origin main "v$V"
 
 # release-binaries.yml builds, signs and publishes the Release on the tag push; the plugin must not
 # update before its binaries exist.
