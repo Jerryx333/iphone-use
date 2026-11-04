@@ -1,8 +1,10 @@
 //! `POST /agent/login` moves credentials from the vault to the phone inside the
-//! daemon. A sentinel password and username go in through a scripted `bwu`;
-//! they must reach the phone (the runner's value writes and key presses) and
-//! nothing else: not the HTTP responses, not an element read or diff, not the
-//! flow draft, not the timing log, not a log line, not the `bwu` argv.
+//! daemon. A sentinel password and username go in through a scripted `bwu`
+//! (and a scripted `op` for 1Password); they must reach the phone (the
+//! runner's value writes and key presses) and nothing else: not the HTTP
+//! responses, not an element read or diff, not the flow draft, not the timing
+//! log, not a log line, not the `bwu` / `op` argv. Nor may the 1Password
+//! service account token.
 
 mod support;
 
@@ -20,6 +22,7 @@ use support::{block, build_state_with_runner, mock_runner_with_apps};
 
 const PASSWORD: &str = "SENTINEL_PASS_9zz";
 const USERNAME: &str = "SENTINEL_USER_7fq@x.com";
+const OP_TOKEN: &str = "SENTINEL_OP_TOKEN_4kd";
 const SESSION: &str = r#"{"value":{"sessionId":"SESSION"}}"#;
 
 /// Fields on the scripted login page: a search box at the top, then the form.
@@ -316,6 +319,7 @@ struct Harness {
     logs: Sink,
     timing: PathBuf,
     argv: PathBuf,
+    op_argv: PathBuf,
 }
 
 /// One scripted `bwu`, one log sink and one timing log for the whole binary
@@ -354,11 +358,45 @@ esac
         std::fs::set_permissions(&bwu, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
         std::env::set_var("IPHONE_USE_BWU", &bwu);
+
+        // The service account sees one vault (Bank only); the app the user
+        // approves sees the rest (Shop). Each call logs whether it carried the
+        // token, never the token.
+        let op_argv = dir.path().join("op-argv.log");
+        let op = dir.path().join("op");
+        let script = r#"#!/bin/sh
+case "$OP_SERVICE_ACCOUNT_TOKEN" in
+  '') tok=none ;;
+  '{TOKEN}') tok=service ;;
+  *) tok=wrong ;;
+esac
+printf '%s [%s]\n' "$*" "$tok" >> '{ARGV}'
+case "$1 $2" in
+  "item list")
+    if [ "$tok" = service ]; then
+      printf '%s' '[{"id":"bank1","title":"Bank","category":"LOGIN","additional_information":"x@y.z","urls":[{"href":"https://bank.example.org"}],"vault":{"id":"vagent","name":"Agent"}}]'
+    else
+      printf '%s' '[{"id":"note1","title":"Shop notes","category":"SECURE_NOTE","vault":{"id":"vpersonal"}},{"id":"shop1","title":"Shop","category":"LOGIN","additional_information":"{USERNAME}","urls":[{"href":"https://login.example.com/"}],"vault":{"id":"vpersonal","name":"Personal"}}]'
+    fi ;;
+  "item get") printf '%s' '{"id":"x","fields":[{"id":"username","type":"STRING","purpose":"USERNAME","value":"{USERNAME}"},{"id":"password","type":"CONCEALED","purpose":"PASSWORD","value":"{PASSWORD}"}]}' ;;
+  *) exit 1 ;;
+esac
+"#
+        .replace("{TOKEN}", OP_TOKEN)
+        .replace("{USERNAME}", USERNAME)
+        .replace("{PASSWORD}", PASSWORD)
+        .replace("{ARGV}", &op_argv.display().to_string());
+        std::fs::write(&op, script).unwrap();
+        std::fs::set_permissions(&op, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::env::set_var("IPHONE_USE_OP", &op);
+        std::env::set_var("OP_SERVICE_ACCOUNT_TOKEN", OP_TOKEN);
         Harness {
             _dir: dir,
             logs,
             timing,
             argv,
+            op_argv,
         }
     })
 }
@@ -396,6 +434,10 @@ fn assert_clean(what: &str, text: &str) {
         !text.contains(USERNAME),
         "{what} leaked the username: {text}"
     );
+    assert!(
+        !text.contains(OP_TOKEN),
+        "{what} leaked the 1Password token: {text}"
+    );
 }
 
 /// Logs, timing records and the bwu argv, checked after every scenario.
@@ -404,14 +446,24 @@ fn assert_side_channels_clean() {
     let logs = String::from_utf8_lossy(&harness.logs.0.lock().unwrap()).into_owned();
     let timing = std::fs::read_to_string(&harness.timing).unwrap_or_default();
     let argv = std::fs::read_to_string(&harness.argv).unwrap_or_default();
+    let op_argv = std::fs::read_to_string(&harness.op_argv).unwrap_or_default();
     for (what, text) in [
         ("daemon log", &logs),
         ("timing log", &timing),
         ("bwu argv", &argv),
+        ("op argv", &op_argv),
     ] {
         assert!(!text.contains(PASSWORD), "{what} leaked the password");
         assert!(!text.contains(USERNAME), "{what} leaked the username");
+        assert!(
+            !text.contains(OP_TOKEN),
+            "{what} leaked the 1Password token"
+        );
     }
+    assert!(
+        !op_argv.contains("[wrong]"),
+        "op only ever got the service account token: {op_argv}"
+    );
     assert!(
         argv.contains("get --raw --reveal e-1"),
         "bwu was asked by id: {argv}"
@@ -497,6 +549,59 @@ fn credentials_reach_the_phone_and_nothing_else() {
         received.contains(USERNAME),
         "username never reached the phone"
     );
+    assert_side_channels_clean();
+}
+
+/// 1Password: the service account's vault is searched first, with no prompt;
+/// an app with no entry there is looked up through the app the user approves,
+/// and that entry is read the same way, without the token.
+#[test]
+fn one_password_reads_the_agent_vault_first_then_asks_the_app() {
+    let harness = harness();
+    for (body, entry, account) in [
+        (r#"{"vault":"1password"}"#, "Shop", "SE***@x.com"),
+        (r#"{"vault":"1password","item":"Bank"}"#, "Bank", "x***@y.z"),
+    ] {
+        let phone = Arc::new(Mutex::new(Phone::default()));
+        let runner = scripted_runner(Runner::Native, phone.clone());
+        let state = build_state_with_runner(runner.url());
+        block(async {
+            let (status, login) = call(&state, "POST", "/agent/login", body).await;
+            assert_eq!(status, StatusCode::OK, "{login}");
+            assert_clean("login response", &login);
+            let json: serde_json::Value = serde_json::from_str(&login).unwrap();
+            assert_eq!(json["ok"], true, "{login}");
+            assert_eq!(json["vault"], "1password", "{login}");
+            assert_eq!(json["entry"], entry, "{login}");
+            assert_eq!(json["account"], account, "{login}");
+            assert_eq!(json["submitted"], true, "{login}");
+        });
+        assert!(
+            phone.lock().unwrap().logged_in,
+            "the scripted app accepted the login"
+        );
+        let received = phone.lock().unwrap().received.join("\n");
+        assert!(
+            received.contains(PASSWORD),
+            "password never reached the phone"
+        );
+    }
+    let op_argv = std::fs::read_to_string(&harness.op_argv).unwrap();
+    for wanted in [
+        "item list --format json [service]",
+        "item list --format json [none]",
+        "item get shop1 --vault vpersonal --reveal --format json [none]",
+        "item get bank1 --vault vagent --reveal --format json [service]",
+    ] {
+        assert!(op_argv.contains(wanted), "op ran `{wanted}`: {op_argv}");
+    }
+    block(async {
+        let state = build_state_with_runner(
+            scripted_runner(Runner::Native, Arc::new(Mutex::new(Phone::default()))).url(),
+        );
+        let (status, bad) = call(&state, "POST", "/agent/login", r#"{"vault":"keepass"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    });
     assert_side_channels_clean();
 }
 

@@ -107,7 +107,7 @@ it off again.
 | Home / Spotlight | `shortcut` | `phone_shortcut` | `shortcut` |
 | Scroll | `scroll` `dy` (80 ≈ 15% of a screen, 400 ≈ 75%) | `phone_scroll` (`x`, `y`, `dx`, `dy` required) | `scroll` (`x`, `y`, `dx`, `dy` required in MCP batches) |
 | System alert | `alert` `button` / `action` | `phone_run_steps` step | `alert` |
-| App asks you to log in | `POST /agent/login` (`iphone-use auth login --bwu`) | `phone_login` | — |
+| App asks you to log in | `POST /agent/login` (`iphone-use auth login`) | `phone_login` | — |
 | Switch / slider | `perform` `toggle` / `adjust` | `phone_run_steps` `perform` step (element + snapshot) | — |
 
 For a drag that needs an edge hover, a `drag` step can use
@@ -218,8 +218,9 @@ reference: *Flows*.
 5. **One session per phone.** Send `X-Phone-Owner`. On `409 phone_owned`, wait;
    never take over unless the user says the other session is abandoned. Release
    your lease when done.
-6. **Log in only through `phone_login` / `iphone-use auth login --bwu`.** It
-   fills the user's own vault entry inside the daemon. Never ask for, type or
+6. **Log in only through `phone_login` / `iphone-use auth login`.** It
+   fills the user's own password vault entry (1Password or bitwarden-use, as
+   the Mac is set up) inside the daemon. Never ask for, type or
    repeat a password or code yourself; never sign up, change a password or pay.
    Face ID, a PIN, a code or a login `phone_login` cannot finish: stop, take
    `phone_hold(secs, private=true)` so nothing reads the screen meanwhile, ask the

@@ -708,11 +708,30 @@ where they stopped.
 ## Logging in from the password vault
 
 When an app shows its login page during a task the user asked for, call
-`phone_login` (HTTP `POST /agent/login`, CLI `iphone-use auth login --bwu`). The
-daemon matches the app to an entry in the user's own vault (bitwarden-use on the
-Mac: an `iosapp://<bundle>` URI, then a web host the bundle id implies, then the
+`phone_login` (HTTP `POST /agent/login`, CLI `iphone-use auth login`). The
+daemon matches the app to an entry in the user's own password vault on the Mac
+(an `iosapp://<bundle>` URI, then a web host the bundle id implies, then the
 app's name), reads it, types the account and password into the fields and taps
-Log in. Nothing in the answer, the logs or later element reads carries a value:
+Log in.
+
+Two vault backends; `vault` in the request (`--bwu` / `--op` on the CLI) picks
+one, otherwise the daemon's `IPHONE_USE_VAULT` (`1password` or `bitwarden`,
+default `bitwarden`):
+
+- **1Password** (`op`, the 1Password CLI). The daemon first reads the vaults a
+  service account can see, with no prompt: the token comes from
+  `OP_SERVICE_ACCOUNT_TOKEN` or the login-keychain item named by
+  `IPHONE_USE_OP_TOKEN_KEYCHAIN=<service>[/<account>]`, and goes to `op` in its
+  environment only. An app with no entry there is looked up through the
+  1Password app, which asks the user to approve on the Mac (Touch ID); set
+  `IPHONE_USE_OP_DESKTOP=0` to never ask, `IPHONE_USE_OP_ACCOUNT` when the app
+  holds several accounts. Give the service account only the vault the agent may
+  use; everything else then needs the user's approval for each login.
+- **bitwarden-use** (`bwu`): the whole vault, unlocked from the keychain or
+  bitwarden-use's own dialog.
+
+Set these in the daemon's LaunchAgent environment (an upgrade keeps every
+`IPHONE_USE_*` setting). Nothing in the answer, the logs or later element reads carries a value:
 the entry is named, the account masked (`le***@qq.com`), and password fields
 always read `••••••••`.
 
@@ -722,7 +741,8 @@ always read `••••••••`.
 | `needs_code: {via}` | The app sent a code: call `phone_login` with `code_via` `sms`/`mail` and `code_from` (the sender) once it arrived (`POST /agent/login/code`). At most two code requests per login. An authenticator code from the entry is entered automatically. |
 | `ambiguous_vault_entry` + `candidates` | Ask the user which entry; pass its name as `item` (and `user` when names repeat). |
 | `no_vault_entry` | Ask the user which entry to use. Never guess. |
-| `vault_locked` | Ask the user to unlock the vault on the Mac (`bwu unlock`). |
+| `vault_locked` | The vault wants the user: approve the 1Password prompt on the Mac, or unlock bitwarden-use (`bwu unlock`). Then try once more. |
+| `vault_unavailable` | The vault tool is missing or not signed in; the hint says what to install or turn on. |
 | `not_a_login_form` | Two password fields: sign-up or a password change. Not done automatically. |
 | `value_not_applied` | The account field rejected the typed text (a composing keyboard): ask the user to switch the phone's keyboard to English. |
 | `value_landed_elsewhere` | Typing went into another field; that field was cleared at once. Finish this login by hand with the user. |

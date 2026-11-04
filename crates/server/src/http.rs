@@ -16041,10 +16041,11 @@ fn login_response(result: Result<serde_json::Value, crate::login::LoginError>) -
     }
 }
 
-/// `POST /agent/login {"item"?, "user"?, "submit"?}` — fill the app's login
-/// form from the user's own password vault (bitwarden-use) and submit it. The
-/// credentials go from the vault to the phone inside the daemon; the response
-/// names the entry and a masked account, never a value. See `login.rs`.
+/// `POST /agent/login {"item"?, "user"?, "submit"?, "vault"?}` — fill the app's
+/// login form from the user's own password vault (bitwarden-use or 1Password)
+/// and submit it. The credentials go from the vault to the phone inside the
+/// daemon; the response names the entry and a masked account, never a value.
+/// See `login.rs`.
 async fn agent_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -16065,13 +16066,15 @@ async fn agent_login(
                     serde_json::json!({
                         "ok": false,
                         "error": "invalid_request",
-                        "hint": "body is {\"item\"?: name or id, \"user\"?: username, \"submit\"?: bool}"
+                        "hint": "body is {\"item\"?: name or id, \"user\"?: username, \"submit\"?: bool, \"vault\"?: \"bitwarden\" or \"1password\"}"
                     }),
                 )
             }
         }
     };
-    let vault = match crate::login::Vault::locate() {
+    let vault = match crate::login::Backend::choose(request.vault.as_deref())
+        .and_then(crate::login::Vault::locate)
+    {
         Ok(vault) => vault,
         Err(error) => return login_response(Err(error)),
     };
@@ -16081,7 +16084,12 @@ async fn agent_login(
     recover(state.flow_trail.lock()).flow_ran();
     let _priority = state.begin_runner_control();
     let mut w = runner.lock().await;
-    let result = crate::login::sign_in(&mut w, &vault, &request).await;
+    let result = crate::login::sign_in(&mut w, &vault, &request)
+        .await
+        .map(|mut body| {
+            body["vault"] = serde_json::json!(vault.backend().name());
+            body
+        });
     drop(w);
     recover(state.flow_trail.lock()).flow_ran();
     login_response(result)

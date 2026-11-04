@@ -324,7 +324,7 @@ enum Command {
         no_open: bool,
     },
     /// Sign the app on the phone in from your own password vault
-    /// (bitwarden-use), or enter the verification code it asks for.
+    /// (bitwarden-use or 1Password), or enter the verification code it asks for.
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -693,9 +693,13 @@ enum AuthAction {
     /// app in front. The values go from the vault to the phone inside the
     /// daemon; nothing prints them.
     Login {
-        /// Read the credentials from bitwarden-use (the only source today).
-        #[arg(long)]
+        /// Read the credentials from bitwarden-use (default: the daemon's
+        /// IPHONE_USE_VAULT, else bitwarden-use).
+        #[arg(long, conflicts_with = "op")]
         bwu: bool,
+        /// Read the credentials from 1Password (its `op` CLI).
+        #[arg(long)]
+        op: bool,
         /// Vault entry name or id, when several match the app.
         #[arg(long)]
         item: Option<String>,
@@ -925,18 +929,25 @@ fn main() -> Result<()> {
         Command::Auth { action } => match action {
             AuthAction::Login {
                 bwu,
+                op,
                 item,
                 user,
                 no_submit,
                 instance,
             } => {
-                if !bwu {
-                    anyhow::bail!(
-                        "say where the credentials come from: iphone-use auth login --bwu"
-                    );
-                }
+                // Neither flag: the vault the daemon is set up for (IPHONE_USE_VAULT).
+                let vault = match (bwu, op) {
+                    (true, _) => Some("bitwarden"),
+                    (_, true) => Some("1password"),
+                    _ => None,
+                };
                 let target = onboarding::Target::resolve(instance.as_deref())?;
-                let body = serde_json::json!({ "item": item, "user": user, "submit": !no_submit });
+                let body = serde_json::json!({
+                    "item": item,
+                    "user": user,
+                    "submit": !no_submit,
+                    "vault": vault,
+                });
                 std::process::exit(onboarding::run_auth(&target, "/agent/login", body)?)
             }
             AuthAction::Code {

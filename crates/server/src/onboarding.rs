@@ -371,7 +371,7 @@ fn hint(status: &Value) -> Option<String> {
 // auth: log the app on the phone in from the password vault
 // ---------------------------------------------------------------------------
 
-/// `iphone-use auth login --bwu` / `auth code`: one call to the daemon, which
+/// `iphone-use auth login [--bwu|--op]` / `auth code`: one call to the daemon, which
 /// reads the vault itself. Prints the daemon's answer; the exit code is 0 only
 /// when it says ok.
 pub fn run_auth(target: &Target, path: &str, body: Value) -> Result<i32> {

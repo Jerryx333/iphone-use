@@ -1,9 +1,10 @@
 //! `POST /agent/login` — sign the phone's foreground app in with the user's own
-//! Bitwarden / Vaultwarden entry, the phone twin of `chrome-use auth login
-//! --bwu`.
+//! password vault entry, the phone twin of `chrome-use auth login --bwu`. Two
+//! backends: Bitwarden / Vaultwarden through bitwarden-use, and 1Password
+//! through its CLI (`Backend`; `IPHONE_USE_VAULT` picks the default).
 //!
-//! The secret path never leaves the daemon. `bwu` (bitwarden-use) runs as a
-//! child of the daemon with only an entry id in its argv; the values come back
+//! The secret path never leaves the daemon. `bwu` or `op` runs as a child of
+//! the daemon with only entry ids in its argv; the values come back
 //! on a pipe and go straight into the phone's fields through the runner.
 //! Nothing that leaves the daemon carries them:
 //! - the HTTP response names the entry and a masked account only;
@@ -66,7 +67,8 @@ pub struct Credentials {
     pub has_totp: bool,
 }
 
-/// A vault entry as `bwu list --raw` describes it: no secret in here.
+/// A vault entry as `bwu list --raw` describes it (1Password's list is mapped
+/// onto it): no secret in here.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct VaultEntry {
     pub id: String,
@@ -75,6 +77,12 @@ pub struct VaultEntry {
     pub user: Option<String>,
     #[serde(default, deserialize_with = "deserialize_vault_uris")]
     pub uris: Vec<Value>,
+    /// 1Password: the id of the vault holding the item.
+    #[serde(skip)]
+    pub vault: Option<String>,
+    /// How the entry was listed, and so how it is read.
+    #[serde(skip)]
+    pub access: Access,
 }
 
 // `bwu list --raw` emits null for entries without website URIs (including
@@ -158,7 +166,7 @@ fn phone_error(step: &str) -> LoginError {
 }
 
 // ---------------------------------------------------------------------------
-// Tools: bwu, message-use, mail-use
+// Tools: the password manager, message-use, mail-use
 // ---------------------------------------------------------------------------
 
 /// A launchd daemon starts with a bare PATH, so look where the installers put
@@ -195,8 +203,16 @@ async fn run_tool(
     args: &[&str],
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let child = tokio::process::Command::new(program)
-        .args(args)
+    let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    run_command(command, timeout).await
+}
+
+async fn run_command(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -209,22 +225,146 @@ async fn run_tool(
         .ok()
 }
 
-/// An id that `bwu` will read as an id, never as an option.
+/// An id that `bwu` or `op` will read as an id, never as an option.
 fn safe_id(id: &str) -> bool {
     id.len() <= 64
         && id.starts_with(|c: char| c.is_ascii_alphanumeric())
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// The password vault, through bitwarden-use.
-pub struct Vault {
-    bwu: PathBuf,
+/// A tool's one-line answer (a code, a token) as a secret; the raw output is
+/// zeroed either way.
+fn secret_line(stdout: Vec<u8>) -> Option<Secret> {
+    let whole = Secret::new(
+        String::from_utf8(stdout)
+            .map_err(|e| e.into_bytes().fill(0))
+            .ok()?,
+    );
+    let line = whole.expose().trim();
+    (!line.is_empty()).then(|| Secret::new(line.to_string()))
+}
+
+/// The password manager a login reads from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Bitwarden / Vaultwarden, through bitwarden-use (`bwu`).
+    Bitwarden,
+    /// 1Password, through its own CLI (`op`).
+    OnePassword,
+}
+
+impl Backend {
+    pub fn parse(name: &str) -> Option<Backend> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "bitwarden" | "bwu" | "bitwarden-use" | "vaultwarden" => Some(Backend::Bitwarden),
+            "1password" | "onepassword" | "op" => Some(Backend::OnePassword),
+            _ => None,
+        }
+    }
+
+    /// The request's choice, else `IPHONE_USE_VAULT`, else Bitwarden (the
+    /// first source, so an install that never set it keeps working).
+    pub fn choose(requested: Option<&str>) -> Result<Backend, LoginError> {
+        if let Some(name) = requested {
+            return Backend::parse(name).ok_or_else(|| {
+                LoginError::new(
+                    400,
+                    "invalid_request",
+                    "vault must be bitwarden or 1password",
+                )
+            });
+        }
+        match std::env::var("IPHONE_USE_VAULT") {
+            Ok(name) if !name.trim().is_empty() => Backend::parse(&name).ok_or_else(|| {
+                LoginError::new(
+                    503,
+                    "vault_unavailable",
+                    "IPHONE_USE_VAULT on this Mac must be bitwarden or 1password",
+                )
+            }),
+            _ => Ok(Backend::Bitwarden),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Bitwarden => "bitwarden",
+            Backend::OnePassword => "1password",
+        }
+    }
+}
+
+/// How an entry is read. bitwarden-use and a 1Password service account read
+/// without a prompt; the 1Password app reads every vault the user has, after
+/// the user approves on the Mac (Touch ID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Access {
+    #[default]
+    Unattended,
+    Approval,
+}
+
+/// The password vault.
+pub enum Vault {
+    Bitwarden(Bitwarden),
+    OnePassword(OnePassword),
 }
 
 impl Vault {
-    pub fn locate() -> Result<Vault, LoginError> {
+    pub fn locate(backend: Backend) -> Result<Vault, LoginError> {
+        match backend {
+            Backend::Bitwarden => Bitwarden::locate().map(Vault::Bitwarden),
+            Backend::OnePassword => OnePassword::locate().map(Vault::OnePassword),
+        }
+    }
+
+    pub fn backend(&self) -> Backend {
+        match self {
+            Vault::Bitwarden(_) => Backend::Bitwarden,
+            Vault::OnePassword(_) => Backend::OnePassword,
+        }
+    }
+
+    /// The ways in, in the order to look: an app with no entry in one is
+    /// looked up in the next.
+    pub async fn accesses(&self) -> Result<Vec<Access>, LoginError> {
+        match self {
+            Vault::Bitwarden(_) => Ok(vec![Access::Unattended]),
+            Vault::OnePassword(op) => op.accesses().await,
+        }
+    }
+
+    pub async fn entries(&self, access: Access) -> Result<Vec<VaultEntry>, LoginError> {
+        match self {
+            Vault::Bitwarden(bwu) => bwu.entries().await,
+            Vault::OnePassword(op) => op.entries(access).await,
+        }
+    }
+
+    pub async fn credentials(&self, entry: &VaultEntry) -> Result<Credentials, LoginError> {
+        match self {
+            Vault::Bitwarden(bwu) => bwu.credentials(&entry.id).await,
+            Vault::OnePassword(op) => op.credentials(entry).await,
+        }
+    }
+
+    pub async fn totp(&self, entry: &VaultEntry) -> Result<Secret, LoginError> {
+        match self {
+            Vault::Bitwarden(bwu) => bwu.totp(&entry.id).await,
+            Vault::OnePassword(op) => op.totp(entry).await,
+        }
+    }
+}
+
+/// The password vault, through bitwarden-use.
+pub struct Bitwarden {
+    bwu: PathBuf,
+}
+
+impl Bitwarden {
+    fn locate() -> Result<Bitwarden, LoginError> {
         find_tool(&["bwu", "bitwarden-use"], "IPHONE_USE_BWU")
-            .map(|bwu| Vault { bwu })
+            .map(|bwu| Bitwarden { bwu })
             .ok_or_else(|| {
                 LoginError::new(
                     503,
@@ -256,7 +396,7 @@ impl Vault {
         ))
     }
 
-    pub async fn entries(&self) -> Result<Vec<VaultEntry>, LoginError> {
+    async fn entries(&self) -> Result<Vec<VaultEntry>, LoginError> {
         self.ensure_unlocked().await?;
         let output = run_tool(&self.bwu, &["list", "--raw"], Duration::from_secs(30))
             .await
@@ -277,13 +417,9 @@ impl Vault {
         })
     }
 
-    pub async fn credentials(&self, id: &str) -> Result<Credentials, LoginError> {
+    async fn credentials(&self, id: &str) -> Result<Credentials, LoginError> {
         if !safe_id(id) {
-            return Err(LoginError::new(
-                500,
-                "vault_unavailable",
-                "unexpected vault entry id",
-            ));
+            return Err(unexpected_id());
         }
         let mut output = run_tool(
             &self.bwu,
@@ -310,13 +446,9 @@ impl Vault {
         })
     }
 
-    pub async fn totp(&self, id: &str) -> Result<Secret, LoginError> {
+    async fn totp(&self, id: &str) -> Result<Secret, LoginError> {
         if !safe_id(id) {
-            return Err(LoginError::new(
-                500,
-                "vault_unavailable",
-                "unexpected vault entry id",
-            ));
+            return Err(unexpected_id());
         }
         let mut output = run_tool(&self.bwu, &["code", id], Duration::from_secs(20))
             .await
@@ -341,6 +473,10 @@ impl Vault {
     }
 }
 
+fn unexpected_id() -> LoginError {
+    LoginError::new(500, "vault_unavailable", "unexpected vault entry id")
+}
+
 /// `bwu get --raw --reveal` → the login's username, password and whether it
 /// carries a TOTP seed (the seed itself is never kept).
 pub fn parse_credentials(stdout: &[u8]) -> Option<Credentials> {
@@ -359,6 +495,324 @@ pub fn parse_credentials(stdout: &[u8]) -> Option<Credentials> {
             .get("totp")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty()),
+    })
+}
+
+const SECURITY: &str = "/usr/bin/security";
+const OP_TOKEN_VAR: &str = "OP_SERVICE_ACCOUNT_TOKEN";
+
+/// The password vault, through the 1Password CLI. Two ways in, tried in
+/// order:
+/// - a service account (`OP_SERVICE_ACCOUNT_TOKEN`, or the keychain item
+///   `IPHONE_USE_OP_TOKEN_KEYCHAIN=service[/account]` names) reads the vaults
+///   it was granted, with no prompt;
+/// - the 1Password app (`IPHONE_USE_OP_DESKTOP`, on unless `0`) reads the
+///   rest once the user approves on the Mac.
+///
+/// The token goes to `op` in its environment, never in argv.
+pub struct OnePassword {
+    op: PathBuf,
+    /// `--account` for the app, when it holds several accounts.
+    account: Option<String>,
+    keychain: Option<(String, Option<String>)>,
+    desktop: bool,
+    token: tokio::sync::OnceCell<Option<Secret>>,
+}
+
+/// One item of `op item list --format json`: no secret in here.
+#[derive(serde::Deserialize)]
+struct OpListItem {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    additional_information: Option<String>,
+    #[serde(default)]
+    urls: Option<Vec<OpUrl>>,
+    #[serde(default)]
+    vault: Option<OpVaultRef>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpUrl {
+    #[serde(default)]
+    href: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OpVaultRef {
+    id: String,
+}
+
+fn env_set(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+impl OnePassword {
+    fn locate() -> Result<OnePassword, LoginError> {
+        let op = find_tool(&["op"], "IPHONE_USE_OP").ok_or_else(|| {
+            LoginError::new(
+                503,
+                "vault_unavailable",
+                "the 1Password CLI is not installed on this Mac: brew install --cask 1password-cli, \
+                 then turn on Settings → Developer → Integrate with 1Password CLI in the app",
+            )
+        })?;
+        let keychain =
+            env_set("IPHONE_USE_OP_TOKEN_KEYCHAIN").map(|item| match item.split_once('/') {
+                Some((service, account)) => (service.to_string(), Some(account.to_string())),
+                None => (item, None),
+            });
+        let desktop = !matches!(
+            env_set("IPHONE_USE_OP_DESKTOP").as_deref(),
+            Some("0" | "false" | "off" | "no")
+        );
+        Ok(OnePassword {
+            op,
+            account: env_set("IPHONE_USE_OP_ACCOUNT"),
+            keychain,
+            desktop,
+            token: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    /// The service account token, read once per login.
+    async fn token(&self) -> Option<&Secret> {
+        self.token
+            .get_or_init(|| async {
+                if let Some(token) = env_set(OP_TOKEN_VAR) {
+                    return Some(Secret::new(token));
+                }
+                let (service, account) = self.keychain.as_ref()?;
+                let mut args = vec!["find-generic-password", "-s", service.as_str()];
+                if let Some(account) = account {
+                    args.extend(["-a", account.as_str()]);
+                }
+                args.push("-w");
+                let output = run_tool(Path::new(SECURITY), &args, Duration::from_secs(10))
+                    .await
+                    .filter(|output| output.status.success())?;
+                secret_line(output.stdout)
+            })
+            .await
+            .as_ref()
+    }
+
+    async fn accesses(&self) -> Result<Vec<Access>, LoginError> {
+        let mut ways = Vec::new();
+        if self.token().await.is_some() {
+            ways.push(Access::Unattended);
+        }
+        if self.desktop {
+            ways.push(Access::Approval);
+        }
+        if ways.is_empty() {
+            return Err(LoginError::new(
+                503,
+                "vault_unavailable",
+                "the daemon has no way into 1Password: set IPHONE_USE_OP_TOKEN_KEYCHAIN to the keychain \
+                 item holding a service account token, or allow the 1Password app (IPHONE_USE_OP_DESKTOP)",
+            ));
+        }
+        Ok(ways)
+    }
+
+    /// Run `op` one way in. Errors keep only a category of `op`'s complaint,
+    /// never its text.
+    async fn op(
+        &self,
+        access: Access,
+        args: &[&str],
+        failed: &'static str,
+    ) -> Result<std::process::Output, LoginError> {
+        let mut command = tokio::process::Command::new(&self.op);
+        command.args(args);
+        let timeout = match access {
+            Access::Unattended => {
+                let token = self.token().await.ok_or_else(|| {
+                    LoginError::new(
+                        503,
+                        "vault_unavailable",
+                        "the 1Password service account token is gone",
+                    )
+                })?;
+                command.env(OP_TOKEN_VAR, token.expose());
+                Duration::from_secs(30)
+            }
+            Access::Approval => {
+                command.env_remove(OP_TOKEN_VAR);
+                if let Some(account) = &self.account {
+                    command.args(["--account", account.as_str()]);
+                }
+                // Long enough for the user to reach the Mac and touch the sensor.
+                Duration::from_secs(90)
+            }
+        };
+        match run_command(command, timeout).await {
+            Some(output) if output.status.success() => Ok(output),
+            Some(output) => Err(op_error(access, &output.stderr, failed)),
+            None if access == Access::Approval => Err(not_approved()),
+            None => Err(LoginError::new(503, "vault_unavailable", failed)),
+        }
+    }
+
+    async fn entries(&self, access: Access) -> Result<Vec<VaultEntry>, LoginError> {
+        let output = self
+            .op(
+                access,
+                &["item", "list", "--format", "json"],
+                "1Password could not list the vault",
+            )
+            .await?;
+        let items: Vec<OpListItem> = serde_json::from_slice(&output.stdout).map_err(|_| {
+            LoginError::new(
+                503,
+                "vault_unavailable",
+                "1Password returned an unreadable list",
+            )
+        })?;
+        Ok(items
+            .into_iter()
+            .filter(|item| matches!(item.category.as_str(), "LOGIN" | "PASSWORD"))
+            .map(|item| VaultEntry {
+                id: item.id,
+                name: item.title,
+                user: item.additional_information.filter(|u| !u.is_empty()),
+                uris: item
+                    .urls
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|url| !url.href.is_empty())
+                    .map(|url| Value::String(url.href))
+                    .collect(),
+                vault: item.vault.map(|vault| vault.id),
+                access,
+            })
+            .collect())
+    }
+
+    /// The item's id and vault, both checked to read as ids.
+    fn item_ref(entry: &VaultEntry) -> Result<(&str, &str), LoginError> {
+        match entry.vault.as_deref() {
+            Some(vault) if safe_id(&entry.id) && safe_id(vault) => Ok((&entry.id, vault)),
+            _ => Err(unexpected_id()),
+        }
+    }
+
+    async fn credentials(&self, entry: &VaultEntry) -> Result<Credentials, LoginError> {
+        let (id, vault) = Self::item_ref(entry)?;
+        let mut output = self
+            .op(
+                entry.access,
+                &[
+                    "item", "get", id, "--vault", vault, "--reveal", "--format", "json",
+                ],
+                "1Password could not read the entry",
+            )
+            .await?;
+        let parsed = parse_op_credentials(&output.stdout);
+        output.stdout.fill(0);
+        parsed.ok_or_else(|| {
+            LoginError::new(
+                503,
+                "vault_unavailable",
+                "1Password returned an unreadable entry",
+            )
+        })
+    }
+
+    async fn totp(&self, entry: &VaultEntry) -> Result<Secret, LoginError> {
+        let (id, vault) = Self::item_ref(entry)?;
+        let unavailable = || {
+            LoginError::new(
+                503,
+                "code_unavailable",
+                "1Password could not produce the authenticator code",
+            )
+        };
+        let output = self
+            .op(
+                entry.access,
+                &["item", "get", id, "--vault", vault, "--otp"],
+                "1Password could not produce the authenticator code",
+            )
+            .await
+            .map_err(|e| {
+                if e.error == "vault_unavailable" {
+                    unavailable()
+                } else {
+                    e
+                }
+            })?;
+        secret_line(output.stdout).ok_or_else(unavailable)
+    }
+}
+
+fn not_approved() -> LoginError {
+    LoginError::new(
+        503,
+        "vault_locked",
+        "1Password asked for approval on the Mac and did not get it: ask the user to approve the \
+         1Password prompt (Touch ID), then try again",
+    )
+}
+
+/// What went wrong in `op`, from its stderr; the text itself is not relayed.
+fn op_error(access: Access, stderr: &[u8], failed: &'static str) -> LoginError {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if text.contains("authorization prompt dismissed") || text.contains("authorization timeout") {
+        not_approved()
+    } else if access == Access::Approval
+        && (text.contains("connect to the 1password desktop app")
+            || text.contains("no accounts configured")
+            || text.contains("not currently signed in")
+            || text.contains("account is not signed in"))
+    {
+        LoginError::new(
+            503,
+            "vault_unavailable",
+            "the 1Password app is not open or its CLI integration is off: ask the user to open \
+             1Password and turn on Settings → Developer → Integrate with 1Password CLI",
+        )
+    } else {
+        LoginError::new(503, "vault_unavailable", failed)
+    }
+}
+
+/// `op item get --reveal --format json` → the login's username, password and
+/// whether it carries a one-time password (the seed itself is never kept).
+pub fn parse_op_credentials(stdout: &[u8]) -> Option<Credentials> {
+    let value: Value = serde_json::from_slice(stdout).ok()?;
+    let fields = value.get("fields")?.as_array()?;
+    let filled = |field: &Value| {
+        field
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let take = |purpose: &str| {
+        fields
+            .iter()
+            .find(|field| field.get("purpose").and_then(Value::as_str) == Some(purpose))
+            .and_then(filled)
+            .map(Secret::new)
+    };
+    Some(Credentials {
+        username: take("USERNAME"),
+        password: take("PASSWORD"),
+        has_totp: fields.iter().any(|field| {
+            field.get("type").and_then(Value::as_str) == Some("OTP")
+                && field
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+        }),
     })
 }
 
@@ -1157,6 +1611,9 @@ pub struct LoginRequest {
     /// Tap the login button after filling (default true).
     #[serde(default)]
     pub submit: Option<bool>,
+    /// `bitwarden` or `1password`; default: `IPHONE_USE_VAULT`, else bitwarden.
+    #[serde(default)]
+    pub vault: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1176,7 +1633,8 @@ pub struct CodeRequest {
 /// The login a code call belongs to.
 struct Session {
     started: Instant,
-    entry_id: String,
+    backend: Backend,
+    entry: VaultEntry,
     code_requests: u8,
 }
 
@@ -1347,6 +1805,29 @@ fn pick_entry<'a>(
     }
 }
 
+/// The entry for the app, from the first way into the vault that has one:
+/// 1Password's service account before the app the user approves, so a
+/// prompt appears only for entries outside the agent's vaults.
+async fn find_entry(
+    vault: &Vault,
+    request: &LoginRequest,
+    bundle: Option<&str>,
+    app_name: &str,
+    extra_hosts: &[String],
+) -> Result<VaultEntry, LoginError> {
+    let mut missing = None;
+    for access in vault.accesses().await? {
+        let entries = vault.entries(access).await?;
+        match pick_entry(&entries, request, bundle, app_name, extra_hosts) {
+            Ok(entry) => return Ok(entry.clone()),
+            Err(e) if e.error == "no_vault_entry" => missing = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(missing
+        .unwrap_or_else(|| LoginError::new(503, "vault_unavailable", "no way into the vault")))
+}
+
 /// Fill and submit the login form on screen.
 pub async fn sign_in(
     w: &mut RunnerClient,
@@ -1393,18 +1874,16 @@ pub async fn sign_in(
         });
     }
 
-    let entries = vault.entries().await?;
-    let entry = pick_entry(
-        &entries,
+    let entry = find_entry(
+        vault,
         request,
         bundle.as_deref(),
         &app_name,
         page_host.as_slice(),
     )
-    .map_err(|e| e.with("matched_app", matched.clone()))?
-    .clone();
-    drop(entries);
-    let credentials = vault.credentials(&entry.id).await?;
+    .await
+    .map_err(|e| e.with("matched_app", matched.clone()))?;
+    let credentials = vault.credentials(&entry).await?;
     let submit = request.submit.unwrap_or(true);
     let mut filled: Vec<&str> = Vec::new();
 
@@ -1445,7 +1924,7 @@ pub async fn sign_in(
         // login (found on hardware) could create an account. Stop after the
         // account: the caller sends the code with the app's own button, then
         // calls POST /agent/login/code, which needs this session.
-        remember_session(&entry);
+        remember_session(vault.backend(), &entry);
         return Ok(done(
             &entry,
             &matched,
@@ -1516,7 +1995,7 @@ pub async fn sign_in(
         ));
     }
 
-    remember_session(&entry);
+    remember_session(vault.backend(), &entry);
 
     // A second factor, when the app asks for one.
     let mut needs_code = None;
@@ -1524,7 +2003,7 @@ pub async fn sign_in(
         let after = read_form(&rows);
         if after.code.is_some() && after.password.is_none() {
             if credentials.has_totp {
-                let code = vault.totp(&entry.id).await?;
+                let code = vault.totp(&entry).await?;
                 if let Some(index) = after.code {
                     fill(w, &rows[index], &code, "verification code").await?;
                     filled.push("one_time_code");
@@ -1550,10 +2029,11 @@ pub async fn sign_in(
 const CODE_LOGIN_HINT: &str = "this login uses a one-time code instead of a password: the account is filled and nothing was submitted; send the code with the app's own button (it may sign up a number it does not know — check the screen's wording with the user first), then call POST /agent/login/code";
 
 /// The login in progress, for a follow-up `POST /agent/login/code`.
-fn remember_session(entry: &VaultEntry) {
+fn remember_session(backend: Backend, entry: &VaultEntry) {
     *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
         started: Instant::now(),
-        entry_id: entry.id.clone(),
+        backend,
+        entry: entry.clone(),
         code_requests: 0,
     });
 }
@@ -1613,7 +2093,7 @@ fn done(
 /// Fetch an SMS / email / authenticator code for the login in progress and
 /// enter it.
 pub async fn enter_code(w: &mut RunnerClient, request: &CodeRequest) -> Result<Value, LoginError> {
-    let (entry_id, elapsed) = {
+    let (backend, entry, elapsed) = {
         let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
         let Some(current) = session
             .as_mut()
@@ -1633,7 +2113,11 @@ pub async fn enter_code(w: &mut RunnerClient, request: &CodeRequest) -> Result<V
             ));
         }
         current.code_requests += 1;
-        (current.entry_id.clone(), current.started.elapsed())
+        (
+            current.backend,
+            current.entry.clone(),
+            current.started.elapsed(),
+        )
     };
     let rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
     let form = read_form(&rows);
@@ -1656,7 +2140,7 @@ pub async fn enter_code(w: &mut RunnerClient, request: &CodeRequest) -> Result<V
     let via = request.via.as_deref().unwrap_or("auto");
     let wait = Duration::from_secs(request.wait_secs.unwrap_or(20).min(25));
     let code = match via {
-        "totp" => Vault::locate()?.totp(&entry_id).await?,
+        "totp" => Vault::locate(backend)?.totp(&entry).await?,
         "sms" | "mail" | "auto" => {
             wait_for_code(via, request.from.as_deref(), elapsed, wait).await?
         }
@@ -1865,6 +2349,7 @@ mod tests {
             name: name.to_string(),
             user: Some(user.to_string()),
             uris: uris.iter().map(|u| Value::String(u.to_string())).collect(),
+            ..Default::default()
         }
     }
 
@@ -2035,6 +2520,7 @@ mod tests {
                 name: "github.com".into(),
                 user: None,
                 uris: vec![json!("https://github.com")],
+                ..Default::default()
             },
             entry("c", "gitlab", "me@x.com", &["https://gitlab.com"]),
         ];
@@ -2291,6 +2777,84 @@ mod tests {
     }
 
     #[test]
+    fn op_output_parses_without_keeping_the_seed() {
+        let raw = br#"{"id":"x","fields":[
+            {"id":"username","type":"STRING","purpose":"USERNAME","value":"u"},
+            {"id":"password","type":"CONCEALED","purpose":"PASSWORD","value":"p"},
+            {"id":"notesPlain","type":"STRING","purpose":"NOTES","value":"n"},
+            {"id":"otp1","type":"OTP","label":"one-time password","value":"otpauth://x","totp":"123456"}]}"#;
+        let credentials = parse_op_credentials(raw).unwrap();
+        assert_eq!(credentials.username.unwrap().expose(), "u");
+        assert_eq!(credentials.password.unwrap().expose(), "p");
+        assert!(credentials.has_totp);
+        let bare = parse_op_credentials(br#"{"fields":[{"type":"OTP","value":""}]}"#).unwrap();
+        assert!(bare.username.is_none() && bare.password.is_none() && !bare.has_totp);
+        assert!(parse_op_credentials(b"not json").is_none());
+    }
+
+    /// The real `op`, as the launchd daemon finds it: lists the service
+    /// account's vault (names only, no secret read). Needs
+    /// `IPHONE_USE_OP_TOKEN_KEYCHAIN`; run with `-- --ignored`.
+    #[test]
+    #[ignore]
+    fn real_op_lists_the_service_account_vault() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let Vault::OnePassword(op) = Vault::locate(Backend::OnePassword).unwrap() else {
+            unreachable!()
+        };
+        runtime.block_on(async {
+            assert_eq!(op.accesses().await.unwrap()[0], Access::Unattended);
+            let entries = op.entries(Access::Unattended).await.unwrap();
+            assert!(!entries.is_empty());
+            assert!(entries
+                .iter()
+                .all(|e| e.vault.is_some() && e.access == Access::Unattended));
+            eprintln!("service account lists {} logins", entries.len());
+        });
+    }
+
+    #[test]
+    fn backends_are_named_by_request_or_default_to_bitwarden() {
+        assert_eq!(Backend::parse(" 1Password "), Some(Backend::OnePassword));
+        assert_eq!(Backend::parse("op"), Some(Backend::OnePassword));
+        assert_eq!(Backend::parse("bwu"), Some(Backend::Bitwarden));
+        assert_eq!(Backend::parse("keepass"), None);
+        assert_eq!(
+            Backend::choose(Some("1password")).unwrap(),
+            Backend::OnePassword
+        );
+        assert_eq!(Backend::choose(Some("x")).unwrap_err().status, 400);
+        for backend in [Backend::Bitwarden, Backend::OnePassword] {
+            assert_eq!(Backend::parse(backend.name()), Some(backend));
+        }
+    }
+
+    #[test]
+    fn op_errors_name_the_approval_but_never_relay_op_text() {
+        let dismissed = op_error(
+            Access::Approval,
+            b"[ERROR] authorization prompt dismissed, please try again",
+            "x",
+        );
+        assert_eq!(dismissed.error, "vault_locked");
+        let closed = op_error(
+            Access::Approval,
+            b"[ERROR] couldn't connect to the 1Password desktop app",
+            "x",
+        );
+        assert!(closed.hint.contains("Integrate with 1Password CLI"));
+        let other = op_error(
+            Access::Unattended,
+            b"[ERROR] secret-looking text",
+            "op failed",
+        );
+        assert_eq!(other.hint, "op failed");
+    }
+
+    #[test]
     fn codes_parse_from_message_use_and_mail_use() {
         assert_eq!(
             sms_code(br#"{"code":"123456","brand":"X"}"#)
@@ -2332,6 +2896,7 @@ mod tests {
     #[test]
     fn only_vault_ids_reach_bwu_argv() {
         assert!(safe_id("6e9663e2-0a84-4633-a413-d825a6b6c312"));
+        assert!(safe_id("vxhkq3example0000000000000"));
         assert!(!safe_id("--reveal"));
         assert!(!safe_id("name with space"));
     }

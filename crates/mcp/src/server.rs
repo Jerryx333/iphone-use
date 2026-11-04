@@ -655,6 +655,10 @@ pub struct LoginParams {
     /// Tap the app's Log in button after filling (default true).
     #[serde(default)]
     pub submit: Option<bool>,
+    /// The password manager: bitwarden or 1password. Default: the one the Mac
+    /// is set up for (IPHONE_USE_VAULT).
+    #[serde(default)]
+    pub vault: Option<String>,
     /// Enter a verification code instead of logging in: sms, mail, totp or auto.
     #[serde(default)]
     pub code_via: Option<String>,
@@ -1871,7 +1875,8 @@ impl PhoneHandler {
             open_world_hint = true,
         ),
         description = "Log the app on screen in with the user's OWN account from their password \
-        vault (bitwarden-use on the Mac). The daemon reads the vault entry and types it into the \
+        vault on the Mac (1Password or bitwarden-use; `vault` picks one, default: the Mac's setting). \
+        The daemon reads the vault entry and types it into the \
         phone, so no password or username passes through this conversation. Use it when an app \
         shows its login page during a task the user asked for. The entry is matched to the app; \
         when several match, the answer lists their names: ask the user, then pass `item` (and \
@@ -1893,6 +1898,7 @@ impl PhoneHandler {
                     "item": params.item,
                     "user": params.user,
                     "submit": params.submit.unwrap_or(true),
+                    "vault": params.vault,
                 }),
             ),
         };
