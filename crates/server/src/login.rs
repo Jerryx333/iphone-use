@@ -632,6 +632,14 @@ impl OnePassword {
     ) -> Result<std::process::Output, LoginError> {
         let mut command = tokio::process::Command::new(&self.op);
         command.args(args);
+        // Only the way in chosen here: an inherited `OP_SESSION_*`, Connect
+        // server or token would let `op` read without the user's approval or
+        // outside the service account's vaults.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("OP_") {
+                command.env_remove(name);
+            }
+        }
         let timeout = match access {
             Access::Unattended => {
                 let token = self.token().await.ok_or_else(|| {
@@ -645,7 +653,6 @@ impl OnePassword {
                 Duration::from_secs(30)
             }
             Access::Approval => {
-                command.env_remove(OP_TOKEN_VAR);
                 if let Some(account) = &self.account {
                     command.args(["--account", account.as_str()]);
                 }
@@ -1805,6 +1812,36 @@ fn pick_entry<'a>(
     }
 }
 
+fn screen_changed() -> LoginError {
+    LoginError::new(
+        409,
+        "screen_changed",
+        "the phone left the login form while the vault waited for approval on the Mac; nothing more was typed. Open the login page again and retry",
+    )
+}
+
+/// A fresh read after the vault waited for the user on the Mac (up to a
+/// minute and a half), refused unless the same app, and the same page of a
+/// web sheet, is still in front: the phone may have moved on meanwhile, and
+/// fields are found again by role and place, which another app could match.
+async fn same_app_after_approval(
+    w: &mut RunnerClient,
+    bundle: Option<&str>,
+    web_sheet: bool,
+    page_host: Option<&str>,
+) -> Result<Vec<ElementRow>, LoginError> {
+    let active = w.active_bundles().await.unwrap_or_default();
+    let rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
+    let (now, now_sheet) = presenting_app(&active);
+    if now.as_deref() != bundle
+        || now_sheet != web_sheet
+        || (web_sheet && sheet_host(&rows).as_deref() != page_host)
+    {
+        return Err(screen_changed());
+    }
+    Ok(rows)
+}
+
 /// The entry for the app, from the first way into the vault that has one:
 /// 1Password's service account before the app the user approves, so a
 /// prompt appears only for entries outside the agent's vaults.
@@ -1884,6 +1921,14 @@ pub async fn sign_in(
     .await
     .map_err(|e| e.with("matched_app", matched.clone()))?;
     let credentials = vault.credentials(&entry).await?;
+    if entry.access == Access::Approval {
+        rows = same_app_after_approval(w, bundle.as_deref(), web_sheet, page_host.as_deref())
+            .await?;
+        form = read_form(&rows);
+        if form.secure_fields >= 2 || (form.account.is_none() && form.password.is_none()) {
+            return Err(screen_changed());
+        }
+    }
     let submit = request.submit.unwrap_or(true);
     let mut filled: Vec<&str> = Vec::new();
 
@@ -2004,7 +2049,16 @@ pub async fn sign_in(
         if after.code.is_some() && after.password.is_none() {
             if credentials.has_totp {
                 let code = vault.totp(&entry).await?;
-                if let Some(index) = after.code {
+                if entry.access == Access::Approval {
+                    rows = same_app_after_approval(
+                        w,
+                        bundle.as_deref(),
+                        web_sheet,
+                        page_host.as_deref(),
+                    )
+                    .await?;
+                }
+                if let Some(index) = read_form(&rows).code {
                     fill(w, &rows[index], &code, "verification code").await?;
                     filled.push("one_time_code");
                     if let Some(before) = press(w, VERIFY_VERBS).await? {
@@ -2119,15 +2173,15 @@ pub async fn enter_code(w: &mut RunnerClient, request: &CodeRequest) -> Result<V
             current.started.elapsed(),
         )
     };
-    let rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
-    let form = read_form(&rows);
-    let Some(index) = form.code else {
-        return Err(LoginError::new(
+    let no_code_field = || {
+        LoginError::new(
             422,
             "no_code_field",
             "no verification-code field on this screen; read the screen",
-        ));
+        )
     };
+    let mut rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
+    let mut index = read_form(&rows).code.ok_or_else(no_code_field)?;
     if let Some(from) = &request.from {
         if from.starts_with('-') || from.len() > 80 {
             return Err(LoginError::new(
@@ -2152,6 +2206,11 @@ pub async fn enter_code(w: &mut RunnerClient, request: &CodeRequest) -> Result<V
             ));
         }
     };
+    if entry.access == Access::Approval {
+        // The code may have waited for approval on the Mac: find the field again.
+        rows = w.elements().await.map_err(|_| phone_error("screen read"))?;
+        index = read_form(&rows).code.ok_or_else(no_code_field)?;
+    }
     fill(w, &rows[index], &code, "verification code").await?;
     drop(code);
     let mut submitted = false;

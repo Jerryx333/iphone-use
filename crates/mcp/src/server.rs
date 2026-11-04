@@ -1904,7 +1904,7 @@ impl PhoneHandler {
         };
         match self
             .daemon
-            .request_json(reqwest::Method::POST, path, Some(&body))
+            .login(path, &body)
             .await
         {
             Ok(response) => daemon_read_result(&response),

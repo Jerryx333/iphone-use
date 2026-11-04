@@ -370,6 +370,7 @@ case "$OP_SERVICE_ACCOUNT_TOKEN" in
   '{TOKEN}') tok=service ;;
   *) tok=wrong ;;
 esac
+[ -z "$OP_SESSION_example" ] || tok="$tok+session"
 printf '%s [%s]\n' "$*" "$tok" >> '{ARGV}'
 case "$1 $2" in
   "item list")
@@ -391,6 +392,8 @@ esac
             .unwrap();
         std::env::set_var("IPHONE_USE_OP", &op);
         std::env::set_var("OP_SERVICE_ACCOUNT_TOKEN", OP_TOKEN);
+        // A CLI session in the daemon's environment must never reach `op`.
+        std::env::set_var("OP_SESSION_example", "inherited-session");
         Harness {
             _dir: dir,
             logs,
@@ -463,6 +466,10 @@ fn assert_side_channels_clean() {
     assert!(
         !op_argv.contains("[wrong]"),
         "op only ever got the service account token: {op_argv}"
+    );
+    assert!(
+        !op_argv.contains("+session"),
+        "op never saw an inherited CLI session: {op_argv}"
     );
     assert!(
         argv.contains("get --raw --reveal e-1"),

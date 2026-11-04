@@ -376,6 +376,12 @@ fn hint(status: &Value) -> Option<String> {
 /// when it says ok.
 pub fn run_auth(target: &Target, path: &str, body: Value) -> Result<i32> {
     let mut daemon = Daemon::new(target)?;
+    // The vault may wait for the user's approval on the Mac (90 s per read).
+    daemon.client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5 * 60))
+        .build()?;
     daemon.owner = std::env::var("IPHONE_USE_OWNER")
         .ok()
         .filter(|owner| !owner.trim().is_empty())

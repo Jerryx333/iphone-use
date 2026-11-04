@@ -130,6 +130,9 @@ const APPS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(75);
 /// `install` downloads up to 2 GB and runs devicectl; the daemon answers
 /// when the phone has the app or has refused it.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// A login may wait on the Mac for the user to approve the password vault
+/// (up to 90 s for each of the list, the entry and its one-time code).
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_ERROR_BODY_CHARS: usize = 2_048;
 
 /// Characters the daemon types in one runner request; longer text is chunked.
@@ -705,6 +708,16 @@ impl DaemonClient {
     /// the install deadline.
     pub async fn install(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
         self.request_json_within(reqwest::Method::POST, "/agent/input", Some(body), INSTALL_TIMEOUT)
+            .await
+    }
+
+    /// `POST <path>` for a login: [`Self::request_json`] with the login deadline.
+    pub async fn login(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<DaemonResponse> {
+        self.request_json_within(reqwest::Method::POST, path, Some(body), LOGIN_TIMEOUT)
             .await
     }
 

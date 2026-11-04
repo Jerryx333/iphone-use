@@ -726,7 +726,10 @@ default `bitwarden`):
   1Password app, which asks the user to approve on the Mac (Touch ID); set
   `IPHONE_USE_OP_DESKTOP=0` to never ask, `IPHONE_USE_OP_ACCOUNT` when the app
   holds several accounts. Give the service account only the vault the agent may
-  use; everything else then needs the user's approval for each login.
+  use; everything else then goes through the app's own approval prompt. `op`
+  gets no other `OP_*` setting from the daemon's environment. A login that waited
+  for approval re-reads the screen and stops (`screen_changed`) if the phone
+  left the login form meanwhile.
 - **bitwarden-use** (`bwu`): the whole vault, unlocked from the keychain or
   bitwarden-use's own dialog.
 
