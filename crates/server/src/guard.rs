@@ -14,6 +14,13 @@
 //!
 //! The first two are off by default. A refusal is `403` with `outcome: not_sent`: no
 //! input reached the phone. The human control page is never limited.
+//!
+//! Always on, with no setting: a press that pays or places an order (a
+//! control labelled 付款, 立即购买, 转账, 充值, 免密, Pay, Checkout, … — the list
+//! `iphone_use_mcp::task` keeps) and typing into a password or verification
+//! code field are refused as `sensitive_action`; the owner does those on the
+//! phone. Sending, deleting and sharing pass. A saved flow's replay
+//! (`X-Phone-Flow-Run`) passes too: the owner approved it when it was saved.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -21,6 +28,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::Value;
 
 use crate::app_lookup::{catalog, normalize, system_app_bundle, valid_bundle};
+use crate::runner::ElementRow;
 
 /// Callers tracked at once; past this the map is cleared.
 const MAX_OWNERS: usize = 64;
@@ -116,6 +124,13 @@ pub enum Refusal {
     /// An app install whose bundle id could not be read while the owner
     /// blocks some apps: it cannot be ruled out.
     InstallUnverified,
+    /// A press on a control whose words pay or place an order (the label).
+    Sensitive(String),
+    /// Typing into a password or verification code field (the field's label).
+    SensitiveField(String),
+    /// A coordinate press in a payment or bank app whose target could not
+    /// be read (the app).
+    SensitiveUnverified(String),
 }
 
 impl Refusal {
@@ -126,6 +141,9 @@ impl Refusal {
             Refusal::Budget { .. } => "action_budget_exhausted",
             Refusal::UrlScheme(_) => "url_scheme_not_allowed",
             Refusal::InstallUnverified => "install_unverified",
+            Refusal::Sensitive(_)
+            | Refusal::SensitiveField(_)
+            | Refusal::SensitiveUnverified(_) => "sensitive_action",
         }
     }
 
@@ -147,6 +165,15 @@ impl Refusal {
                 "{scheme}: links are not opened unless the phone owner allows the scheme (IPHONE_USE_ALLOW_URL_SCHEMES, e.g. IPHONE_USE_ALLOW_URL_SCHEMES={scheme}). http and https links always open. Do not reach it another way; tell the user."
             ),
             Refusal::InstallUnverified => "the app's bundle id could not be read from the .app/.ipa, and the phone owner blocks some apps (IPHONE_USE_BLOCKED_APPS), so it is not installed. Tell the user.".to_string(),
+            Refusal::Sensitive(label) => format!(
+                "这步要主人自己在手机上点：“{label}”像是付款或下单。Nothing was sent. Do not reach it another way (coordinates, perform, the keyboard, a batch); stop and tell the user to tap it on the phone themselves."
+            ),
+            Refusal::SensitiveField(label) => format!(
+                "这步要主人自己在手机上输入：“{label}”是密码或验证码框。Nothing was typed. Do not type it another way; to sign in use phone_login (POST /agent/login), otherwise tell the user to enter it on the phone."
+            ),
+            Refusal::SensitiveUnverified(app) => format!(
+                "这步要主人自己在手机上点：{app} 是支付或银行类 App，这个坐标下的控件读不出来，没法确认它不是付款。Nothing was sent. Tap by label or element instead, or tell the user."
+            ),
         }
     }
 
@@ -167,6 +194,12 @@ impl Refusal {
             }
             Refusal::UrlScheme(scheme) => {
                 body["scheme"] = Value::String(scheme.clone());
+            }
+            Refusal::Sensitive(label) | Refusal::SensitiveField(label) => {
+                body["label"] = Value::String(label.clone());
+            }
+            Refusal::SensitiveUnverified(app) => {
+                body["app"] = Value::String(app.clone());
             }
             Refusal::ForegroundUnknown | Refusal::InstallUnverified => {}
         }
@@ -427,6 +460,378 @@ pub fn describe(policy: &Policy) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Sensitive actions
+// ---------------------------------------------------------------------------
+
+/// Words on a field that holds a secret. ASCII ones match whole words.
+const SECRET_FIELD_WORDS: &[&str] = &[
+    "密码",
+    "口令",
+    "验证码",
+    "校验码",
+    "动态码",
+    "安全码",
+    "Password",
+    "Passcode",
+    "PIN",
+    "OTP",
+    "CVV",
+    "CVC",
+    "Verification Code",
+    "Security Code",
+    "One-Time Code",
+];
+
+/// Kinds a person types into.
+const TEXT_FIELD_KINDS: &[&str] = &["TextField", "SecureTextField", "SearchField", "TextView"];
+
+/// `perform` verbs that press the control; the rest (increment, adjust,
+/// scroll_to_visible, …) move it without activating it.
+const PRESSING_PERFORMS: &[&str] = &[
+    "toggle",
+    "menu",
+    "double_tap",
+    "two_finger_tap",
+    "force_press",
+];
+
+/// Key names the runner sends as Return (`RunnerClient::named_key`).
+const RETURN_KEYS: &[&str] = &["return", "enter", "send", "go", "search"];
+
+/// The word in `label` that pays or places an order.
+pub fn paying_word(label: &str) -> Option<&'static str> {
+    iphone_use_mcp::task::paying_word(label)
+}
+
+fn secret_word(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    SECRET_FIELD_WORDS.iter().any(|word| {
+        if !word.is_ascii() {
+            text.contains(word)
+        } else if word.contains(' ') || word.contains('-') {
+            lower.contains(&word.to_lowercase())
+        } else {
+            lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|token| token == word.to_lowercase())
+        }
+    })
+}
+
+fn refuse_label(label: &str) -> Result<(), Refusal> {
+    match paying_word(label) {
+        Some(_) => Err(Refusal::Sensitive(label.trim().to_string())),
+        None => Ok(()),
+    }
+}
+
+fn kind(action: &Value) -> &str {
+    action.get("type").and_then(Value::as_str).unwrap_or("")
+}
+
+/// What the action names in its own fields: a `tap` label, a `tap_locator`
+/// label, an `alert` button. Checked before anything is sent, so a batch
+/// with one such step is refused whole.
+pub fn check_sensitive_request(action: &Value) -> Result<(), Refusal> {
+    let field =
+        |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let named: Vec<String> = match kind(action) {
+        "tap" | "longpress" => field(action, "label").into_iter().collect(),
+        "tap_locator" => action
+            .get("locator")
+            .map(|locator| {
+                ["label", "label_contains", "value"]
+                    .iter()
+                    .filter_map(|key| field(locator, key))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "alert" => field(action, "button").into_iter().collect(),
+        _ => Vec::new(),
+    };
+    named.iter().try_for_each(|label| refuse_label(label))
+}
+
+/// What the sensitive check must read on the phone before `action` runs,
+/// beyond [`check_sensitive_request`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SensitiveRead {
+    /// Nothing: the action presses nothing that could pay.
+    None,
+    /// The snapshot row it names (`tap`/`perform` press it, `set_value` types into it).
+    Element,
+    /// The rows a `tap_locator` with `label_contains` could match.
+    LabelContains(String),
+    /// The controls under these normalized points.
+    Points(Vec<(f64, f64)>),
+    /// The focused field (typing) and, with `submits`, the Return key too.
+    Focused { submits: bool },
+    /// The buttons of the alert in front (`alert accept`).
+    Alert,
+}
+
+pub fn sensitive_read(action: &Value) -> SensitiveRead {
+    let point = |value: &Value| {
+        Some((
+            value.get("x").and_then(Value::as_f64)?,
+            value.get("y").and_then(Value::as_f64)?,
+        ))
+    };
+    match kind(action) {
+        "tap" if action.get("label").is_some() => SensitiveRead::None,
+        "tap" if action.get("element").is_some() => SensitiveRead::Element,
+        "set_value" => SensitiveRead::Element,
+        "perform" => {
+            let verb = action.get("action").and_then(Value::as_str).unwrap_or("");
+            if PRESSING_PERFORMS.contains(&verb) {
+                SensitiveRead::Element
+            } else {
+                SensitiveRead::None
+            }
+        }
+        "tap" | "longpress" => {
+            point(action).map_or(SensitiveRead::None, |p| SensitiveRead::Points(vec![p]))
+        }
+        "multi_longpress" => SensitiveRead::Points(
+            action
+                .get("points")
+                .and_then(Value::as_array)
+                .map(|points| points.iter().filter_map(point).collect())
+                .unwrap_or_default(),
+        ),
+        "tap_locator" => action
+            .get("locator")
+            .and_then(|locator| locator.get("label_contains"))
+            .and_then(Value::as_str)
+            .map_or(SensitiveRead::None, |part| {
+                SensitiveRead::LabelContains(part.to_string())
+            }),
+        "text" => SensitiveRead::Focused {
+            submits: action
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains(['\n', '\r'])),
+        },
+        "key" => {
+            let name = action.get("name").and_then(Value::as_str).unwrap_or("");
+            if RETURN_KEYS.contains(&name.to_ascii_lowercase().as_str()) {
+                SensitiveRead::Focused { submits: true }
+            } else {
+                SensitiveRead::None
+            }
+        }
+        "alert"
+            if action.get("button").is_none()
+                && action.get("action").and_then(Value::as_str) == Some("accept") =>
+        {
+            SensitiveRead::Alert
+        }
+        _ => SensitiveRead::None,
+    }
+}
+
+/// One past the last row of `index`'s subtree (rows are in document order).
+fn subtree_end(rows: &[ElementRow], index: usize) -> usize {
+    let depth = rows[index].depth;
+    rows[index + 1..]
+        .iter()
+        .position(|row| row.depth <= depth)
+        .map_or(rows.len(), |offset| index + 1 + offset)
+}
+
+fn row_words(row: &ElementRow) -> impl Iterator<Item = &str> {
+    std::iter::once(row.label.as_str())
+        .chain(row.identifier.as_deref())
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// A press on row `index`: its own words and those of everything inside it
+/// (a Cell whose StaticText says 立即购买).
+pub fn check_pressed_row(rows: &[ElementRow], index: usize) -> Result<(), Refusal> {
+    if index >= rows.len() {
+        return Ok(());
+    }
+    for row in &rows[index..subtree_end(rows, index)] {
+        if let Some(label) = row_words(row).find(|text| paying_word(text).is_some()) {
+            return Err(Refusal::Sensitive(label.trim().to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// Typing into `row`: a secure field, or one whose label, placeholder or
+/// identifier asks for a password or a verification code.
+pub fn check_typed_row(row: &ElementRow) -> Result<(), Refusal> {
+    if !TEXT_FIELD_KINDS.contains(&row.kind.as_str()) {
+        return Ok(());
+    }
+    let words: Vec<&str> = row_words(row).chain(row.placeholder.as_deref()).collect();
+    if row.kind == "SecureTextField" || words.iter().any(|text| secret_word(text)) {
+        let name = words.first().copied().unwrap_or(row.kind.as_str());
+        return Err(Refusal::SensitiveField(name.trim().to_string()));
+    }
+    Ok(())
+}
+
+/// Rows a `tap_locator` `label_contains` could press.
+pub fn check_label_contains(rows: &[ElementRow], part: &str) -> Result<(), Refusal> {
+    if part.is_empty() {
+        return Ok(());
+    }
+    for (index, row) in rows.iter().enumerate() {
+        if row.label.contains(part) {
+            check_pressed_row(rows, index)?;
+        }
+    }
+    Ok(())
+}
+
+/// Kinds a press activates, as opposed to text and containers.
+const CONTROL_KINDS: &[&str] = &[
+    "Button",
+    "Cell",
+    "Link",
+    "Key",
+    "Switch",
+    "Toggle",
+    "Tab",
+    "Icon",
+    "MenuItem",
+    "SegmentedControl",
+    "Image",
+];
+
+/// The press at runner point (`x`, `y`): the smallest control that holds it
+/// (with everything inside it), and the smallest labelled row of any kind
+/// (text drawn on a bare view). `None`: no words there, so the target is
+/// unknown.
+pub fn check_point(rows: &[ElementRow], x: f64, y: f64) -> Option<Result<(), Refusal>> {
+    let holds = |row: &ElementRow| {
+        let [rx, ry, rw, rh] = row.rect;
+        row.visible != Some(false)
+            && !matches!(row.kind.as_str(), "Application" | "Window")
+            && rw > 0.0
+            && rh > 0.0
+            && x >= rx
+            && x <= rx + rw
+            && y >= ry
+            && y <= ry + rh
+    };
+    let smallest = |keep: &dyn Fn(&ElementRow) -> bool| {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| holds(row) && keep(row))
+            .min_by(|a, b| (a.1.rect[2] * a.1.rect[3]).total_cmp(&(b.1.rect[2] * b.1.rect[3])))
+            .map(|(index, _)| index)
+    };
+    let control = smallest(&|row| CONTROL_KINDS.contains(&row.kind.as_str()));
+    let text = smallest(&|row| row_words(row).next().is_some());
+    let control_words = control.is_some_and(|index| {
+        rows[index..subtree_end(rows, index)]
+            .iter()
+            .any(|row| row_words(row).next().is_some())
+    });
+    if !control_words && text.is_none() {
+        return None;
+    }
+    Some((|| {
+        if let Some(index) = control {
+            check_pressed_row(rows, index)?;
+        }
+        if let Some(label) =
+            text.and_then(|index| row_words(&rows[index]).find(|t| paying_word(t).is_some()))
+        {
+            return Err(Refusal::Sensitive(label.trim().to_string()));
+        }
+        Ok(())
+    })())
+}
+
+/// The focused text field, if the tree marks one.
+pub fn focused_field(rows: &[ElementRow]) -> Option<&ElementRow> {
+    rows.iter()
+        .find(|row| row.focused == Some(true) && TEXT_FIELD_KINDS.contains(&row.kind.as_str()))
+}
+
+/// Return pressed in the focused field: the Return key's own words (a
+/// keyboard whose action key says 付款) and the field's. An unlabelled
+/// keyboard is not a row, so the keyboard is the box around its `Key` rows;
+/// its action key is a `Button` inside that box.
+pub fn check_return(rows: &[ElementRow]) -> Result<(), Refusal> {
+    let mut keyboard: Option<[f64; 4]> = None;
+    for row in rows
+        .iter()
+        .filter(|row| row.kind == "Key" || row.kind == "Keyboard")
+    {
+        let [x, y, w, h] = row.rect;
+        keyboard = Some(match keyboard {
+            None => [x, y, x + w, y + h],
+            Some([x0, y0, x1, y1]) => [x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h)],
+        });
+    }
+    if let Some([x0, y0, x1, y1]) = keyboard {
+        for (index, row) in rows.iter().enumerate() {
+            let [x, y, w, h] = row.rect;
+            let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+            if matches!(row.kind.as_str(), "Button" | "Key" | "Keyboard")
+                && (x0..=x1).contains(&cx)
+                && (y0..=y1).contains(&cy)
+            {
+                check_pressed_row(rows, index)?;
+            }
+        }
+    }
+    if let Some(field) = focused_field(rows) {
+        if let Some(label) = row_words(field).find(|text| paying_word(text).is_some()) {
+            return Err(Refusal::Sensitive(label.trim().to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// `alert accept` presses the alert's default button: any of its buttons
+/// that pays refuses it.
+pub fn check_alert_buttons(buttons: &[String]) -> Result<(), Refusal> {
+    buttons.iter().try_for_each(|button| refuse_label(button))
+}
+
+/// Payment and bank apps: where a press whose target cannot be read is
+/// refused. Names from the app catalog, plus bundle words.
+pub fn payment_app(active: &[String]) -> Option<String> {
+    const NAME_WORDS: &[&str] = &[
+        "银行",
+        "支付",
+        "钱包",
+        "信用卡",
+        "证券",
+        "Bank",
+        "Pay",
+        "Wallet",
+    ];
+    const BUNDLE_WORDS: &[&str] = &["bank", "alipay", "unionpay", "paypal", "wallet", "passbook"];
+    active.iter().find_map(|bundle| {
+        let catalogued = catalog()
+            .iter()
+            .find(|app| app.bundle_id.eq_ignore_ascii_case(bundle));
+        if let Some(app) = catalogued {
+            if std::iter::once(&app.name)
+                .chain(app.aliases.iter())
+                .any(|name| NAME_WORDS.iter().any(|word| name.contains(word)))
+            {
+                return Some(app.name.clone());
+            }
+        }
+        let lower = bundle.to_ascii_lowercase();
+        lower
+            .split('.')
+            .any(|part| {
+                BUNDLE_WORDS.iter().any(|word| part.contains(word)) || part.ends_with("pay")
+            })
+            .then(|| catalogued.map_or_else(|| bundle.clone(), |app| app.name.clone()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +1025,170 @@ mod tests {
         let unknown = p.check_install(None).unwrap_err();
         assert_eq!(unknown.to_json()["error"], "install_unverified");
         assert!(Policy::from_map(|_| None).check_install(None).is_ok());
+    }
+
+    fn row(kind: &str, label: &str, rect: [f64; 4], depth: u32) -> ElementRow {
+        ElementRow {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            rect,
+            depth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_paying_words_are_sensitive_not_sending_or_deleting() {
+        for label in [
+            "立即购买",
+            "确认付款 ¥99",
+            "转账",
+            "充值",
+            "开通免密支付",
+            "Place Order",
+            "Checkout",
+        ] {
+            assert!(paying_word(label).is_some(), "{label}");
+        }
+        for label in ["发送", "删除", "分享", "Send", "加入购物车", "Postcode", ""] {
+            assert!(paying_word(label).is_none(), "{label}");
+        }
+        let refused =
+            check_sensitive_request(&json!({"type":"tap","label":"立即购买"})).unwrap_err();
+        assert_eq!(refused.to_json()["error"], "sensitive_action");
+        assert_eq!(refused.to_json()["outcome"], "not_sent");
+        assert_eq!(refused.to_json()["retry_safe"], false);
+        assert_eq!(refused.to_json()["label"], "立即购买");
+        assert!(check_sensitive_request(&json!({"type":"tap","label":"发送"})).is_ok());
+        assert!(check_sensitive_request(
+            &json!({"type":"tap_locator","locator":{"label_contains":"去结算"}})
+        )
+        .is_err());
+        assert!(check_sensitive_request(&json!({"type":"alert","button":"允许"})).is_ok());
+    }
+
+    #[test]
+    fn what_each_action_reads_before_it_is_sent() {
+        assert_eq!(
+            sensitive_read(&json!({"type":"tap","label":"x"})),
+            SensitiveRead::None
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"tap","element":1,"snapshot":"s"})),
+            SensitiveRead::Element
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"perform","action":"toggle","element":1})),
+            SensitiveRead::Element
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"perform","action":"increment","element":1})),
+            SensitiveRead::None
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"tap","x":0.5,"y":0.25})),
+            SensitiveRead::Points(vec![(0.5, 0.25)])
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"key","name":"Return"})),
+            SensitiveRead::Focused { submits: true }
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"key","name":"delete"})),
+            SensitiveRead::None
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"text","text":"hi\n"})),
+            SensitiveRead::Focused { submits: true }
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"alert","action":"accept"})),
+            SensitiveRead::Alert
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"alert","action":"dismiss"})),
+            SensitiveRead::None
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"swipe","x":0.5,"y":0.5})),
+            SensitiveRead::None
+        );
+    }
+
+    #[test]
+    fn a_press_checks_the_control_and_everything_inside_it() {
+        let rows = vec![
+            row("Cell", "", [0.0, 100.0, 390.0, 60.0], 1),
+            row("StaticText", "立即购买", [20.0, 110.0, 100.0, 40.0], 2),
+            row("Button", "加入购物车", [0.0, 200.0, 190.0, 60.0], 1),
+            row("Other", "", [0.0, 300.0, 390.0, 60.0], 1),
+        ];
+        assert!(check_pressed_row(&rows, 0).is_err(), "the cell's text pays");
+        assert!(check_pressed_row(&rows, 2).is_ok());
+        assert!(
+            check_point(&rows, 300.0, 130.0).unwrap().is_err(),
+            "blank part of the cell"
+        );
+        assert!(check_point(&rows, 50.0, 230.0).unwrap().is_ok());
+        assert!(
+            check_point(&rows, 50.0, 330.0).is_none(),
+            "no words under the finger"
+        );
+    }
+
+    #[test]
+    fn secret_fields_are_secure_or_named_for_a_password_or_code() {
+        assert!(check_typed_row(&row("SecureTextField", "", [0.0; 4], 0)).is_err());
+        assert!(check_typed_row(&row("TextField", "短信验证码", [0.0; 4], 0)).is_err());
+        assert!(check_typed_row(&row("TextField", "Enter PIN", [0.0; 4], 0)).is_err());
+        let mut placeholder = row("TextField", "", [0.0; 4], 0);
+        placeholder.placeholder = Some("请输入支付密码".into());
+        assert!(check_typed_row(&placeholder).is_err());
+        assert!(
+            check_typed_row(&row("TextField", "Spinach", [0.0; 4], 0)).is_ok(),
+            "whole words"
+        );
+        assert!(check_typed_row(&row("SearchField", "搜索", [0.0; 4], 0)).is_ok());
+        assert!(
+            check_typed_row(&row("Button", "密码设置", [0.0; 4], 0)).is_ok(),
+            "not a field"
+        );
+    }
+
+    #[test]
+    fn return_is_judged_by_the_keyboard_action_key_and_the_field() {
+        let keys = |action: &str| {
+            vec![
+                row("Key", "q", [0.0, 600.0, 40.0, 50.0], 2),
+                row("Key", "p", [350.0, 600.0, 40.0, 50.0], 2),
+                row("Key", "space", [0.0, 700.0, 280.0, 50.0], 2),
+                row("Button", action, [290.0, 700.0, 100.0, 50.0], 2),
+            ]
+        };
+        assert!(
+            check_return(&keys("发送")).is_ok(),
+            "sending is the agent's"
+        );
+        assert!(check_return(&keys("搜索")).is_ok());
+        assert!(check_return(&keys("确认付款")).is_err());
+        let mut field = row("TextField", "转账金额", [0.0, 100.0, 390.0, 44.0], 1);
+        field.focused = Some(true);
+        assert!(check_return(&[field]).is_err());
+    }
+
+    #[test]
+    fn payment_and_bank_apps_by_catalog_name_or_bundle() {
+        assert_eq!(
+            payment_app(&["com.alipay.iphoneclient".into()]).as_deref(),
+            Some("支付宝")
+        );
+        assert_eq!(
+            payment_app(&["com.icbc.iphoneclient".into()]).as_deref(),
+            Some("中国工商银行")
+        );
+        assert!(payment_app(&["com.example.mybank".into()]).is_some());
+        assert!(payment_app(&["com.apple.Passbook".into()]).is_some());
+        assert!(payment_app(&["com.apple.Preferences".into(), "com.tencent.xin".into()]).is_none());
+        assert!(payment_app(&["com.apple.springboard".into()]).is_none());
     }
 }

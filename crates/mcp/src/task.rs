@@ -820,31 +820,47 @@ pub fn risky_step(operation: &str, label: Option<&str>) -> Option<String> {
         return None;
     }
     let label = label?.trim();
-    if label.is_empty() {
-        return None;
-    }
-    let lower = label.to_lowercase();
-    RISKY_WORDS
-        .iter()
-        .find(|word| {
-            let word_lower = word.to_lowercase();
-            if word.is_ascii() {
-                // Whole words only: "Postcode" is not "Post".
-                lower
-                    .split(|c: char| !c.is_alphanumeric())
-                    .any(|token| token == word_lower)
-            } else {
-                label.contains(*word)
-            }
-        })
-        .map(|word| format!("“{label}” looks like it would {}", risk_verb(word)))
+    risky_word(label).map(|word| format!("“{label}” looks like it would {}", risk_verb(word)))
 }
+
+/// The first risky word `label` contains, if any.
+pub fn risky_word(label: &str) -> Option<&'static str> {
+    risky_words(label).next()
+}
+
+/// The first word in `label` that pays or places an order (not one that
+/// sends, publishes or deletes). The daemon's guard (`guard` in the server)
+/// refuses those taps with this same list.
+pub fn paying_word(label: &str) -> Option<&'static str> {
+    risky_words(label).find(|word| risk_verb(word) == PAY_VERB)
+}
+
+fn risky_words(label: &str) -> impl Iterator<Item = &'static str> + '_ {
+    let label = label.trim();
+    let lower = label.to_lowercase();
+    RISKY_WORDS.iter().copied().filter(move |word| {
+        if label.is_empty() {
+            return false;
+        }
+        if word.is_ascii() {
+            // Whole words only: "Postcode" is not "Post".
+            let word_lower = word.to_lowercase();
+            lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|token| token == word_lower)
+        } else {
+            label.contains(word)
+        }
+    })
+}
+
+const PAY_VERB: &str = "pay or place an order";
 
 fn risk_verb(word: &str) -> &'static str {
     match word {
         "发送" | "Send" | "发布" | "Post" | "Publish" | "分享" | "Share" => "send or publish something",
         "删除" | "移除" | "清空" | "Delete" | "Remove" | "注销" | "退出登录" | "Sign Out" => "delete or remove something",
-        _ => "pay or place an order",
+        _ => PAY_VERB,
     }
 }
 
@@ -1569,6 +1585,12 @@ mod tests {
         assert!(risky_step("CLICK", Some("Postcode")).is_none(), "whole words only");
         assert!(risky_step("TYPE_TEXT", Some("发送")).is_none(), "typing is not sending");
         assert!(risky_step("SCROLL_DOWN", None).is_none());
+        assert_eq!(paying_word("立即购买 ¥99"), Some("购买"));
+        assert_eq!(paying_word("Place Order"), Some("Order"));
+        assert_eq!(paying_word("分享拼单"), Some("拼单"), "a pay word after a send word");
+        assert_eq!(paying_word("发送"), None, "sending is not paying");
+        assert_eq!(paying_word("Delete"), None);
+        assert_eq!(paying_word("   "), None);
     }
 
     #[test]

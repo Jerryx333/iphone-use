@@ -12080,6 +12080,119 @@ async fn guard_foreground(
     }
 }
 
+/// How long the sensitive check waits for each read it needs.
+const GUARD_SENSITIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// The sensitive-action checks that need no phone: what `action` names, and
+/// the snapshot row it points at when that snapshot is still held.
+fn guard_sensitive_request(
+    state: &AppState,
+    action: &serde_json::Value,
+) -> Result<(), crate::guard::Refusal> {
+    crate::guard::check_sensitive_request(action)?;
+    if crate::guard::sensitive_read(action) != crate::guard::SensitiveRead::Element {
+        return Ok(());
+    }
+    let index = action.get("element").and_then(serde_json::Value::as_u64);
+    let rows = action
+        .get("snapshot")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|snapshot| lookup_element_snapshot(state, snapshot));
+    match (rows, index.and_then(|index| usize::try_from(index).ok())) {
+        (Some(rows), Some(index)) if index < rows.len() => {
+            if action.get("type").and_then(serde_json::Value::as_str) == Some("set_value") {
+                crate::guard::check_typed_row(&rows[index])
+            } else {
+                crate::guard::check_pressed_row(&rows, index)
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse `action` when it would pay, place an order or type a secret
+/// (`crate::guard`), reading the control it would press right before it is
+/// sent. What cannot be read passes, except a press in a payment app.
+async fn guard_sensitive(
+    client: &mut crate::runner::RunnerClient,
+    action: &serde_json::Value,
+) -> Result<(), crate::guard::Refusal> {
+    use crate::guard::SensitiveRead;
+    use tokio::time::timeout as within;
+    crate::guard::check_sensitive_request(action)?;
+    let read = crate::guard::sensitive_read(action);
+    match &read {
+        SensitiveRead::None => return Ok(()),
+        SensitiveRead::Element => {
+            // The rows the action itself resolves next (a fresh read is kept
+            // for it to reuse).
+            if let Ok(Ok((rows, index, _))) = within(GUARD_SENSITIVE_READ_TIMEOUT, fetch_snapshot_row_reusing(client, action)).await {
+                return if action.get("type").and_then(serde_json::Value::as_str) == Some("set_value") {
+                    crate::guard::check_typed_row(&rows[index])
+                } else {
+                    crate::guard::check_pressed_row(&rows, index)
+                };
+            }
+            return guard_sensitive_unverified(client).await;
+        }
+        SensitiveRead::Alert => {
+            client.forget_alert_probe();
+            return match within(GUARD_SENSITIVE_READ_TIMEOUT, client.alert_summary()).await {
+                Ok(Ok(Some((_, buttons)))) => crate::guard::check_alert_buttons(&buttons),
+                _ => Ok(()),
+            };
+        }
+        _ => {}
+    }
+    let rows = match client.recent_tree(SNAPSHOT_TREE_REUSE) {
+        Some(rows) => Some(rows),
+        None => within(GUARD_SENSITIVE_READ_TIMEOUT, client.elements()).await.ok().and_then(Result::ok).map(Arc::new),
+    };
+    let Some(rows) = rows else {
+        return guard_sensitive_unverified(client).await;
+    };
+    match read {
+        SensitiveRead::LabelContains(part) => crate::guard::check_label_contains(&rows, &part),
+        SensitiveRead::Focused { submits } => {
+            if action.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                if let Some(field) = crate::guard::focused_field(&rows) {
+                    crate::guard::check_typed_row(field)?;
+                }
+            }
+            if submits {
+                crate::guard::check_return(&rows)?;
+            }
+            Ok(())
+        }
+        SensitiveRead::Points(points) => {
+            let Ok(Ok((width, height))) = within(GUARD_SENSITIVE_READ_TIMEOUT, client.window_size()).await else {
+                return guard_sensitive_unverified(client).await;
+            };
+            for (x, y) in points {
+                match crate::guard::check_point(&rows, x * width, y * height) {
+                    Some(checked) => checked?,
+                    None => guard_sensitive_unverified(client).await?,
+                }
+            }
+            Ok(())
+        }
+        SensitiveRead::None | SensitiveRead::Element | SensitiveRead::Alert => Ok(()),
+    }
+}
+
+/// A target that could not be read: refused only in a payment or bank app.
+async fn guard_sensitive_unverified(
+    client: &mut crate::runner::RunnerClient,
+) -> Result<(), crate::guard::Refusal> {
+    match tokio::time::timeout(GUARD_SENSITIVE_READ_TIMEOUT, client.active_bundles()).await {
+        Ok(Ok(active)) => match crate::guard::payment_app(&active) {
+            Some(app) => Err(crate::guard::Refusal::SensitiveUnverified(app)),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
 /// The one readiness check `/agent/input` and `/agent/actions` share: why the
 /// phone cannot take a control request now, if it cannot. An idle-released
 /// managed phone starts coming back here, whichever endpoint asked (the batch
@@ -13660,10 +13773,15 @@ async fn agent_actions_scoped(
     // refuse the whole batch before anything is sent; a blocked app in front
     // is checked per step, since an earlier step may have left or entered it.
     let policy = crate::guard::Policy::get();
-    // The link-scheme policy holds with or without the other limits.
+    // The link-scheme policy holds with or without the other limits, and so
+    // does the sensitive-action check: one step that pays refuses the whole
+    // batch. A saved flow's replay was approved when it was saved.
+    let sensitive_checked = !headers.contains_key(FLOW_RUN_HEADER);
     for step in &request.steps {
         if let AgentActionStep::Action { action, .. } = step {
-            if let Err(refusal) = policy.check_url(action) {
+            if let Err(refusal) = policy.check_url(action).and_then(|()| {
+                if sensitive_checked { guard_sensitive_request(&state, action) } else { Ok(()) }
+            }) {
                 return guard_refusal(&refusal, true);
             }
         }
@@ -13790,7 +13908,11 @@ async fn agent_actions_scoped(
                     .await;
                 }
 
-                if let Err(refusal) = scoped_observation(&state, &capture_scope, guard_foreground(&mut w, action)).await {
+                let guarded = async {
+                    guard_foreground(&mut w, action).await?;
+                    if sensitive_checked { guard_sensitive(&mut w, action).await } else { Ok(()) }
+                };
+                if let Err(refusal) = scoped_observation(&state, &capture_scope, guarded).await {
                     let mut body = agent_actions_failure_body(
                         index,
                         completed,
@@ -13805,7 +13927,7 @@ async fn agent_actions_scoped(
                     if let (Some(body), serde_json::Value::Object(extra)) =
                         (body.as_object_mut(), refusal.to_json())
                     {
-                        for key in ["hint", "app"] {
+                        for key in ["hint", "app", "label"] {
                             if let Some(value) = extra.get(key) {
                                 body.insert(key.to_string(), value.clone());
                             }
@@ -16359,11 +16481,12 @@ async fn agent_input_inner(
         Ok(None) => {}
         Err(refusal) => return refusal,
     }
-    // A blocked app, or a link scheme the owner has not allowed, is refused
-    // before anything else runs (`crate::guard`).
+    // A blocked app, a link scheme the owner has not allowed, or a press
+    // that pays, is refused before anything else runs (`crate::guard`).
     if let Err(refusal) = crate::guard::Policy::get()
         .check_launch(&value)
         .and_then(|()| crate::guard::Policy::get().check_url(&value))
+        .and_then(|()| guard_sensitive_request(&state, &value))
     {
         return guard_refusal(&refusal, false);
     }
@@ -16436,6 +16559,7 @@ async fn agent_input_inner(
     // or `/alert/text` can never turn an applied action into
     // `outcome_unknown` and can never cause the mutation to be re-sent.
     let mut detail = None;
+    let mut sensitive = None;
     let dispatch = tokio::time::timeout_at(agent_runner_deadline, async {
         let mut client = runner.lock().await;
         if tokio::time::Instant::now() >= agent_runner_deadline
@@ -16451,6 +16575,11 @@ async fn agent_input_inner(
                 if let Err(interrupted) = unlock_before_action(&state, &mut client, agent_runner_deadline, &capture_scope).await {
                     return control_interruption_outcome(interrupted);
                 }
+            }
+            // Read on the screen the action lands on, after any unlock.
+            if let Err(refusal) = guard_sensitive(&mut client, &value).await {
+                sensitive = Some(refusal);
+                return RunnerControlOutcome::NotSent;
             }
             direct_agent_action(
                 &mut client,
@@ -16472,6 +16601,9 @@ async fn agent_input_inner(
             return with_app_lifecycle_receipt(runner_deadline_response(posted_since(runner, mark).await), detail.as_ref()).await;
         }
     };
+    if let Some(refusal) = sensitive.take() {
+        return guard_refusal(&refusal, false);
+    }
     let activity_rebound_rect=client.activity_rebound_rect.take();
     if outcome==RunnerControlOutcome::Applied {
         record_activity(&state,&headers,&value,client.cached_window_size(),&capture_scope,activity_rebound_rect);
