@@ -6,7 +6,17 @@ import CoreFoundation
 @main
 struct SelfRunnerSpikeApp: App {
     @StateObject private var model = RunnerModel()
-    var body: some Scene { WindowGroup { ContentView(model: model) } }
+    var body: some Scene { WindowGroup { OwnerRunnerRoot(model: model) } }
+}
+
+struct OwnerRunnerRoot: View {
+    @ObservedObject var model: RunnerModel
+    var body: some View {
+        ContentView(model: model)
+            .sheet(isPresented: Binding(get: { model.owner.presented }, set: { model.owner.presented = $0 })) {
+                OwnerConfirmationView(model: model.owner)
+            }
+    }
 }
 
 // C handles use the boot worker; AX, screenshot and synthesis have independent serial workers.
@@ -81,6 +91,8 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     private var activeOperation: Operation?
     var remoteConnectionStatus: String { remoteLink.status + (remoteLink.currentRoute.map { " (" + $0 + ")" } ?? "") }
     private let remoteLink = RemoteLink()
+    let owner = OwnerConfirmationModel()
+    private var ownerChanges: AnyObject?
     private let remoteActions = RemoteActions()
     private let remoteWorker = DispatchQueue(label: "dev.iphoneuse.selfrunner.remote.actions")
     private var remotePairing: RemotePairing?
@@ -156,6 +168,8 @@ final class RunnerModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         remoteLink.changed = { [weak self] in self?.objectWillChange.send() }
         remoteLink.ready = { [weak self] in self?.ready ?? false }
         remoteLink.request = { [weak self] frame, reply in self?.executeRemote(frame, reply: reply) }
+        owner.attach(remoteLink)
+        ownerChanges = owner.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         importRemotePairing()
         remoteMode = UserDefaults.standard.bool(forKey: "remoteMode")
         remoteLink.configure(enabled: remoteMode, pairing: remotePairing)
@@ -1050,6 +1064,7 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 8) {
             Text("Self Runner · \(model.state)").font(.headline)
+            Button("主人确认") { model.owner.open() }
             Group {
                 TextField("接口地址（10.7.1.1）", text: $model.interfaceIP)
                 TextField("对端地址（10.7.0.1）", text: $model.peerIP)

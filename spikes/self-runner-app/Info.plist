@@ -29,6 +29,8 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to the paired gateway on your local network and to this phone through LocalDevVPN for UI automation.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>使用面容 ID 绑定主人设备并签名确认敏感操作；不使用设备密码回退。</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>Keep the local automation connection alive in the background. Location is not stored or sent.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

@@ -23,6 +23,38 @@ final class RemoteLink {
     var ready: () -> Bool = { false }
     var request: ([String: Any], @escaping ([String: Any]) -> Void) -> Void = { _, _ in }
     var status: String { phase }
+    var ownerPending: (Data) -> Void = { _ in }
+    var ownerDisconnected: () -> Void = {}
+    private var ownerReplies: [String: (Result<(Int, Data), OwnerLinkError>) -> Void] = [:]
+    private var ownerSending = false
+    private var nextOwnerRequest: Double = 0
+    enum OwnerLinkError: Error, LocalizedError {
+        case code(String)
+        var errorDescription: String? { if case .code(let code) = self { return code }; return nil }
+    }
+    // Phone-originated only. Never use the action request/cache/log path or retry a signature.
+    @MainActor func ownerRequest(method: String, path: String, body: Data = Data()) async throws -> (Int, Data) {
+        guard phase == "online" else { throw OwnerLinkError.code("owner_offline") }
+        guard body.count <= 16 * 1024, ownerReplies.isEmpty, !ownerSending else { throw OwnerLinkError.code("owner_busy_or_too_large") }
+        ownerSending = true
+        defer { ownerSending = false }
+        let requestEpoch = epoch
+        // Pace manual refresh/bind chains under the gateway's four-per-second budget.
+        let wait = nextOwnerRequest - ProcessInfo.processInfo.systemUptime
+        if wait > 0 { try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+        guard requestEpoch == epoch, phase == "online" else { throw OwnerLinkError.code("owner_disconnected_outcome_unknown") }
+        nextOwnerRequest = ProcessInfo.processInfo.systemUptime + 0.3
+        let id = UUID().uuidString
+        return try await withCheckedThrowingContinuation { continuation in
+            ownerReplies[id] = { continuation.resume(with: $0.mapError { $0 as Error }) }
+            send(["t": "owner_req", "id": id, "method": method, "path": path,
+                  "body_b64": body.base64EncodedString()], token: epoch)
+            let timeout = DispatchWorkItem { [weak self] in
+                self?.ownerReplies.removeValue(forKey: id)?(.failure(.code("owner_timeout_outcome_unknown")))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
+        }
+    }
     init() {
         routes.changed = { [weak self] in self?.pathChanged() }
     }
@@ -57,6 +89,10 @@ final class RemoteLink {
         heartbeat?.invalidate(); heartbeat = nil
         retry?.cancel(); retry = nil
         buffer.removeAll(); phase = "offline"
+        let replies = ownerReplies.values
+        ownerReplies.removeAll()
+        for reply in replies { reply(.failure(.code("owner_disconnected_outcome_unknown"))) }
+        ownerDisconnected()
     }
     private func failed(_ token: Int) {
         guard token == epoch else { return }
@@ -137,6 +173,23 @@ final class RemoteLink {
         }
         guard phase == "online" else { return false }
         switch t {
+        case "owner_res":
+            guard let id = frame["id"] as? String else { return false }
+            guard let reply = ownerReplies.removeValue(forKey: id) else { return true }
+            if let code = (frame["error"] as? [String: Any])?["code"] as? String {
+                let allowed = ["owner_unconfigured", "owner_config_invalid", "owner_daemon_unavailable",
+                    "owner_response_too_large", "owner_invalid_request", "owner_request_too_large",
+                    "owner_rate_limited", "owner_busy"]
+                reply(.failure(.code(allowed.contains(code) ? code : "owner_protocol_error")))
+            } else if let status = frame["status"] as? Int, (100...599).contains(status),
+                      let encoded = frame["body_b64"] as? String, encoded.utf8.count <= 349528,
+                      let data = Data(base64Encoded: encoded), data.count <= 256 * 1024 {
+                reply(.success((status, data)))
+            } else { reply(.failure(.code("owner_protocol_error"))) }
+        case "owner_pending":
+            guard let encoded = frame["body_b64"] as? String, encoded.utf8.count <= 349528,
+                  let data = Data(base64Encoded: encoded), data.count <= 256 * 1024 else { return false }
+            ownerPending(data)
         case "ping": send(["t": "pong", "seq": frame["seq"] ?? NSNull()], token: token)
         case "pong": break
         case "req": request(frame) { [weak self] response in self?.send(response, token: token) }

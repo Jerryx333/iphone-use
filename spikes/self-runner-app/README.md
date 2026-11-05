@@ -31,6 +31,18 @@ UDID=<USB-UDID> DEVELOPMENT_TEAM=<your-team-id> ./install.sh
 免费账号可能需先在 Xcode Settings 添加 Apple ID，签名约七天过期。
 配对文件保存在 `build/pairing/rp_pairing.plist`，不会覆盖已有记录。
 
+## 主人确认（仅面容 ID）
+
+主界面「主人确认」→「绑定为主人设备（面容 ID）」。先在 gateway 配置 `PHONE_GATEWAY_OWNER_URL` 与 `PHONE_GATEWAY_OWNER_TOKEN_FILE`（或 `PHONE_GATEWAY_OWNER_TOKEN`），手机仍只需要原有配对和已认证控制连接，不保存 daemon Bearer 密码。绑定后核对本机与 daemon 显示的 SHA-256 公钥指纹。首次 TOFU 绑定必须由主人在共享 daemon 凭据前完成。
+
+使用 Secure Enclave P-256 和 `.privateKeyUsage + .biometryCurrentSet`，每次签名要求 Face ID，不允许设备密码或软件密钥回退。更换面容登记会使旧钥不可用，须主人本地恢复绑定。已绑定另一把钥匙时页面拒绝覆盖；换钥协议仍要求旧钥签名。入口和签名不依赖 XCTest ready。
+
+gateway 在线每约 3 秒查询 pending，列表变化后推送完整原始响应；前台弹确认页，后台发本地通知（需授权且 App 仍在线），点通知进入对应单。详情完整滚动显示 summary 和所有 details。「允许」签名后提交，「拒绝」不签名；过期/已消费/签错的 daemon 错误原样显示。掉线/超时不自动重发签名，刷新确认实际结果。通知不携带 nonce、签名或详情；主人消息不经过动作日志和结果缓存。
+
+确认页展示期间，RemoteActions 及内嵌 RunnerCore 的远程变更入口阻止针对自身前台/bundle 的自动化，返回 `owner_app_protected`；本地自测按钮保持原流程。daemon 还保护默认 bundle 与点分签名后缀，自定义 bundle 通过既有 `IPU_SELFRUNNER_BUNDLE_ID` 配置；托管 devicectl 恢复路径不受影响。此保护只是第二层防线，Face ID 签名才是主人权限边界。
+
+完整消息格式、大小/频率限制和配置见 [主人确认协议](../../docs/owner-confirmation.md)。真机需核验：Face ID 成功/取消/锁定/变更登记、没有密码回退、后台通知点击、过期和一次性消费、两条远程动作入口的自身保护。不要为验收自动安装或重启服务。
+
 ## 配对与独立诊断
 
 从仓库根目录：
