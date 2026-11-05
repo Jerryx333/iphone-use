@@ -6,9 +6,11 @@ pub const HEADER: &str = "x-phone-flow-grant";
 const TTL: Duration = Duration::from_secs(120);
 const MAX_GRANTS: usize = 1024;
 
+type GrantEntry = ([u8; 32], [u8; 32], Instant, Option<serde_json::Value>);
+
 #[derive(Default)]
 pub struct FlowGrants {
-    entries: Vec<([u8; 32], [u8; 32], Instant)>,
+    entries: Vec<GrantEntry>,
 }
 
 fn digest(body: &str) -> Option<[u8; 32]> {
@@ -51,8 +53,25 @@ impl FlowGrants {
             Sha256::digest(token.as_bytes()).into(),
             digest(body)?,
             now + TTL,
+            None,
         ));
         Some(token)
+    }
+
+    pub fn issue_flow(&mut self, body: &str, flow: serde_json::Value) -> Option<String> {
+        let token = self.issue(body)?;
+        self.entries.last_mut()?.3 = Some(flow);
+        Some(token)
+    }
+    pub fn consume_flow(&mut self, token: &str, body: &str) -> Option<serde_json::Value> {
+        let candidate: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let i = self.entries.iter().position(|e| e.0 == candidate)?;
+        let (_, expected, expires, flow) = self.entries.swap_remove(i);
+        if expires > Instant::now() && digest(body) == Some(expected) {
+            flow
+        } else {
+            None
+        }
     }
 
     pub fn consume(&mut self, token: &str, body: &str) -> bool {
@@ -64,7 +83,7 @@ impl FlowGrants {
             return false;
         };
         // Even a mismatched body consumes the capability, before any dispatch.
-        let (_, expected, expires) = self.entries.swap_remove(index);
+        let (_, expected, expires, _) = self.entries.swap_remove(index);
         expires > Instant::now() && digest(body) == Some(expected)
     }
 }

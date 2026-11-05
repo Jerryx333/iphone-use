@@ -91,3 +91,4 @@ objc2-video-toolbox = "0.3.2"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+iphone-use-mcp = { path = "../mcp", features = ["owner-confirm-test-hooks"] }

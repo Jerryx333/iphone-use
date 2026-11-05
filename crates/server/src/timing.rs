@@ -319,6 +319,11 @@ pub fn normalize_route(path: &str) -> String {
     let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
     while let Some(part) = parts.next() {
         match part {
+            "confirm" if out.last().is_some_and(|p| p == "owner") && parts.peek().is_some() => {
+                out.push("confirm".to_string());
+                parts.next();
+                out.push(":id".to_string());
+            }
             "session" if parts.peek().is_some() => {
                 parts.next(); // the session id carries no information here
             }

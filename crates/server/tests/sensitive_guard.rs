@@ -416,6 +416,41 @@ fn installed_flow_grants_are_bound_and_single_use() {
         let seen: Seen = Arc::default();
         let mock = runner("[]", Some(TREE), seen.clone());
         let state = build_state_with_runner(mock.url());
+        // Replay authority now additionally requires the owner's content signature.
+        let owner_dir = tempfile::tempdir().unwrap();
+        *state.owner_confirm.lock().unwrap() =
+            server::owner_confirm::OwnerConfirm::new(owner_dir.path().into());
+        use base64::Engine;
+        use ring::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let public = b64.encode(key.public_key().as_ref());
+        let proof = b64.encode(
+            key.sign(
+                &rng,
+                format!("iphone-use-owner-key/v1\n{public}").as_bytes(),
+            )
+            .unwrap(),
+        );
+        let mut owner = state.owner_confirm.lock().unwrap();
+        owner.bind(&public, Some(&proof)).unwrap();
+        let object = serde_json::json!({"flow":serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),"inputs":{}});
+        let id = owner.request("flow", object, "Buy").unwrap();
+        let pending = owner.pending()[0].clone();
+        owner
+            .confirm(
+                &id,
+                true,
+                Some(&b64.encode(key.sign(&rng, pending.message().as_bytes()).unwrap())),
+            )
+            .unwrap();
+        drop(owner);
         for id in ["../buy", "/tmp/buy.json", "shop/missing"] {
             let (status, _) = call(
                 &state,

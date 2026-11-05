@@ -16,6 +16,7 @@ struct IPhoneUseRemoteApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(app: app)
+                .modifier(OwnerPendingWatcher(app: app))
                 .task {
                     do { try SingleAppTestBootstrap.startIfRequested() }
                     catch { app.show(String(localized: "本机控制组件无法启动，请重新安装完整版本")) }
@@ -737,6 +738,9 @@ struct SettingsSheet: View {
     var body: some View {
         AppNavigationStack {
             List {
+                if let client = session.client {
+                    NavigationLink("主人确认") { OwnerConfirmationView(client: client) }
+                }
                 Section {
                     HStack(spacing: Theme.Space.m) {
                         Image(systemName: "iphone")

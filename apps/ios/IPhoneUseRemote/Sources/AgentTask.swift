@@ -311,6 +311,13 @@ extension DaemonClient: AgentTaskAPI {
 
     /// `POST /agent/task/<id>/confirm`: the person's answer to `needs_confirm`.
     func answer(task id: String, approve: Bool) async throws {
+        if approve {
+            guard let sheet = try await ownerPending().first(where: { $0.kind == "task_press" && $0.object.taskID == id }) else {
+                throw AgentTaskError.refused("请先在 iPhone Use App 绑定主人设备，并等待主人确认单")
+            }
+            try await ownerAnswer(sheet, approve: true)
+            return
+        }
         var urlRequest = agentRequest("agent/task/\(id)/confirm", method: "POST")
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: ["approve": approve])
         let (data, response) = try await send(urlRequest, repeatable: false)

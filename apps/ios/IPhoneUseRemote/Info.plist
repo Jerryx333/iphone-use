@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSFaceIDUsageDescription</key>
+	<string>使用面容 ID 签名批准主人专用操作。</string>
 	<key>IPUKeychainGroup</key>
 	<string>$(AppIdentifierPrefix)com.leeguoo.iphone-use.selfhost-probe.shared</string>
 	<key>IPUTunnelBundle</key>

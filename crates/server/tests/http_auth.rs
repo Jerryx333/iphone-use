@@ -1131,12 +1131,21 @@ fn direct_browser_control_timeout_after_dispatch_is_unknown_504() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed = action_count.clone();
-        let (base, server) = mock_runner(3, move |request, _| {
+        let (base, server) = mock_runner(5, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
                     r#"{"value":{"sessionId":"SESSION"}}"#.to_string(),
                 ))
+            } else if request.contains("/source?format=json") {
+                // The sensitive-action guard reads the screen before the tap.
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"type":"XCUIElementTypeApplication","children":[]}}"#.to_string(),
+                ))
+            } else if request.contains("/wda/apps/list") {
+                // No tree row under the point: the guard checks the front app.
+                Some((std::time::Duration::ZERO, r#"{"value":[]}"#.to_string()))
             } else if request.contains("/window/size") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1192,11 +1201,17 @@ fn direct_browser_control_timeout_during_lookups_is_retry_safe_408() {
     block(async {
         let action_count = Arc::new(AtomicUsize::new(0));
         let observed = action_count.clone();
-        let (base, server) = mock_runner(2, move |request, _| {
+        let (base, server) = mock_runner(3, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
                     r#"{"value":{"sessionId":"SESSION"}}"#.to_string(),
+                ))
+            } else if request.contains("/source?format=json") {
+                // The sensitive-action guard reads the screen before the tap.
+                Some((
+                    std::time::Duration::ZERO,
+                    r#"{"value":{"type":"XCUIElementTypeApplication","children":[]}}"#.to_string(),
                 ))
             } else if request.contains("/window/size") {
                 Some((
@@ -1302,7 +1317,7 @@ fn direct_browser_control_can_tap_an_accessibility_label() {
     block(async {
         let click_count = Arc::new(AtomicUsize::new(0));
         let observed = click_count.clone();
-        let (base, server) = mock_runner(3, move |request, _| {
+        let (base, server) = mock_runner(5, move |request, _| {
             if request.starts_with("POST /session ") {
                 Some((
                     std::time::Duration::ZERO,
@@ -1313,6 +1328,10 @@ fn direct_browser_control_can_tap_an_accessibility_label() {
                     std::time::Duration::ZERO,
                     r#"{"value":{"type":"XCUIElementTypeApplication","children":[{"type":"XCUIElementTypeButton","label":"完成","rect":{"x":300,"y":700,"width":60,"height":44}}]}}"#.to_string(),
                 ))
+            } else if request.contains("/elements") {
+                // The guard's read is reused only once the row is confirmed
+                // live; an unconfirmed row falls back to a fresh read.
+                Some((std::time::Duration::ZERO, r#"{"value":null}"#.to_string()))
             } else if request.contains("/actions") {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Some((std::time::Duration::ZERO, r#"{"value":null}"#.to_string()))
@@ -1344,7 +1363,7 @@ fn direct_browser_control_can_tap_an_accessibility_label() {
 #[test]
 fn direct_browser_label_tap_rejects_ambiguous_matches_without_tapping() {
     block(async {
-        let (base, server) = mock_runner(1, move |request, _| {
+        let (base, server) = mock_runner(2, move |request, _| {
             assert!(
                 request.contains("/source?format=json"),
                 "ambiguous label resolution must stop before an action: {request}"
@@ -1382,7 +1401,7 @@ fn direct_browser_label_tap_rejects_ambiguous_matches_without_tapping() {
 #[test]
 fn direct_browser_label_tap_rejects_missing_match_without_tapping() {
     block(async {
-        let (base, server) = mock_runner(1, move |request, _| {
+        let (base, server) = mock_runner(2, move |request, _| {
             assert!(
                 request.contains("/source?format=json"),
                 "missing label resolution must stop before an action: {request}"
@@ -4416,13 +4435,13 @@ fn a_label_tap_without_kind_still_reports_both_matches() {
 
 #[test]
 fn a_label_tap_under_a_fixed_header_is_refused_unless_allowed() {
-    let source = r#"{"value":{"type":"XCUIElementTypeApplication","label":"Rakuten","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeOther","rect":{"x":0,"y":50,"width":390,"height":60},"children":[{"type":"XCUIElementTypeButton","label":"ポイント","rect":{"x":150,"y":70,"width":120,"height":40}}]},{"type":"XCUIElementTypeTable","rect":{"x":0,"y":50,"width":390,"height":790},"children":[{"type":"XCUIElementTypeCell","label":"Apple Pay","rect":{"x":0,"y":66,"width":390,"height":44}}]}]}}"#;
+    let source = r#"{"value":{"type":"XCUIElementTypeApplication","label":"Rakuten","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeOther","rect":{"x":0,"y":50,"width":390,"height":60},"children":[{"type":"XCUIElementTypeButton","label":"ポイント","rect":{"x":150,"y":70,"width":120,"height":40}}]},{"type":"XCUIElementTypeTable","rect":{"x":0,"y":50,"width":390,"height":790},"children":[{"type":"XCUIElementTypeCell","label":"設定","rect":{"x":0,"y":66,"width":390,"height":44}}]}]}}"#;
     let source: &'static str = Box::leak(source.to_string().into_boxed_str());
     let (status, json, lines) = control_against(
         source,
         "",
         false,
-        serde_json::json!({"type":"tap","label":"Apple Pay","ttl_ms":2000}),
+        serde_json::json!({"type":"tap","label":"設定","ttl_ms":2000}),
     );
     assert_eq!(status, StatusCode::CONFLICT, "{json}");
     assert_eq!(json["error"], "element_occluded");
@@ -4433,7 +4452,7 @@ fn a_label_tap_under_a_fixed_header_is_refused_unless_allowed() {
         source,
         "",
         false,
-        serde_json::json!({"type":"tap","label":"Apple Pay","allow_occluded":true,"ttl_ms":2000}),
+        serde_json::json!({"type":"tap","label":"設定","allow_occluded":true,"ttl_ms":2000}),
     );
     assert_eq!(status, StatusCode::OK, "{json}");
 }

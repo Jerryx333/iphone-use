@@ -1462,17 +1462,36 @@ async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request:
 
 /// Wait for the person to allow a risky step. On the same phone, bring the
 /// app that started the task to the front so they see the question.
-async fn ask_person(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest, question: Value) -> bool {
+async fn ask_person(
+    task: &Arc<Task>,
+    daemon: &DaemonClient,
+    request: &TaskRequest,
+    mut question: Value,
+) -> bool {
+    question["confirmation_id"] = json!(new_id());
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    *task.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
-    task.with(|s| {
-        s.status = Status::NeedsConfirm;
-        s.confirm = Some(question);
-    });
+    {
+        let mut answer = task.answer.lock().unwrap_or_else(|e| e.into_inner());
+        task.with(|s| {
+            s.status = Status::NeedsConfirm;
+            s.confirm = Some(question.clone());
+        });
+        *answer = Some(sender);
+    }
+    let hook = OWNER_CONFIRMATION_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(&task.with(|s| s.id.clone()), &question);
+    }
     if let Some(bundle) = &request.return_bundle {
         let _ = jev::act(daemon, json!({"type": "launch_app", "bundle": bundle})).await;
     }
-    let approved = matches!(tokio::time::timeout(CONFIRM_TIMEOUT, receiver).await, Ok(Ok(true)));
+    let approved = matches!(
+        tokio::time::timeout(CONFIRM_TIMEOUT, receiver).await,
+        Ok(Ok(true))
+    );
     task.answer.lock().unwrap_or_else(|e| e.into_inner()).take();
     task.with(|s| {
         s.confirm = None;
@@ -1746,7 +1765,75 @@ mod tests {
 
     #[test]
     fn json_is_found_inside_prose() {
-        assert_eq!(first_json_object("ok {\"flow\": null} thanks").unwrap()["flow"], Value::Null);
+        assert_eq!(
+            first_json_object("ok {\"flow\": null} thanks").unwrap()["flow"],
+            Value::Null
+        );
         assert!(first_json_object("no json here").is_none());
     }
+}
+
+// The daemon installs this callback; MCP does not receive owner signing keys.
+pub type OwnerConfirmationHook = std::sync::Arc<dyn Fn(&str, &Value) + Send + Sync>;
+static OWNER_CONFIRMATION_HOOK: std::sync::Mutex<Option<OwnerConfirmationHook>> =
+    std::sync::Mutex::new(None);
+pub fn set_owner_confirmation_hook(hook: OwnerConfirmationHook) {
+    *OWNER_CONFIRMATION_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+}
+
+/// Integration fixture: a real waiting task and its one-shot answer channel.
+/// Feature is enabled only by the server's dev-dependency, never over HTTP.
+#[cfg(feature = "owner-confirm-test-hooks")]
+#[doc(hidden)]
+pub fn owner_confirmation_fixture(
+    question: Value,
+) -> (String, tokio::sync::oneshot::Receiver<bool>) {
+    let id = new_id();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let task = Arc::new(Task {
+        state: Mutex::new(State {
+            id: id.clone(),
+            goal: "owner confirmation fixture".into(),
+            client_request_id: None,
+            request_fingerprint: String::new(),
+            status: Status::NeedsConfirm,
+            phase: "confirming",
+            planned_action: None,
+            flow: None,
+            steps: vec![],
+            confirm: Some(question.clone()),
+            summary: None,
+            error: None,
+            started_at_ms: unix_ms(),
+            started: Instant::now(),
+            finished_ms: None,
+            models_used: json!({}),
+        }),
+        cancel: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
+        cancel_signal: tokio::sync::Notify::new(),
+        answer: Mutex::new(Some(sender)),
+    });
+    registry(|r| r.current = Some(task));
+    let hook = OWNER_CONFIRMATION_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(&id, &question);
+    }
+    (id, receiver)
+}
+
+/// Verify and answer under the same answer lock, so an expired question cannot
+/// authorize the next question during a timeout/confirmation race.
+pub fn answer_owner(id: &str, question: &Value, approve: bool) -> std::result::Result<(), &'static str> {
+    let task = find(id).ok_or("not_found")?;
+    let mut answer = task.answer.lock().unwrap_or_else(|e| e.into_inner());
+    if !task.with(|s| s.status == Status::NeedsConfirm && s.confirm.as_ref() == Some(question)) {
+        return Err("owner_confirmation_object_changed");
+    }
+    answer.take().ok_or("not_waiting")?.send(approve).map_err(|_| "not_waiting")
 }

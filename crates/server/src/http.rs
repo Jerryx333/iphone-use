@@ -463,6 +463,8 @@ pub struct AppState {
     /// observed action that names no baseline diffs against it, so a client
     /// gets only what changed without having to carry the token itself.
     pub owner_snapshots: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Owner signatures and pending capabilities, independent of HTTP auth.
+    pub owner_confirm: Arc<Mutex<crate::owner_confirm::OwnerConfirm>>,
     /// Daemon-issued, single-use saved replay capabilities. Never persisted.
     pub flow_grants: Arc<Mutex<crate::flow_grants::FlowGrants>>,
     /// What the driving agent did in the current app, for `registry` hints,
@@ -1054,6 +1056,15 @@ const INBOX_CAP: usize = 64;
 /// clients that know only the port); the browser pages redirect to their
 /// prefixed address so the session cookie, scoped to the prefix, is sent.
 pub fn router(state: Arc<AppState>) -> Router {
+    let weak = Arc::downgrade(&state);
+    iphone_use_mcp::task::set_owner_confirmation_hook(Arc::new(move |id, question| {
+        if let Some(state) = weak.upgrade() {
+            let object = serde_json::json!({"task_id":id,"operation":question});
+            let label = question["target"].as_str().unwrap_or("任务当前操作");
+            let _ = recover(state.owner_confirm.lock()).request("task_press", object, label);
+        }
+    }));
+
     let pages = Router::new()
         .route("/", get(root))
         .route("/phone", get(phone))
@@ -1103,6 +1114,9 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/browser/chrome", post(browser_chrome))
         // Browser control: one HTTP request per gesture, each with an explicit
         // ACK, alongside the MJPEG view.
+        .route("/owner/key", get(owner_key_get).post(owner_key_post))
+        .route("/owner/pending", get(owner_pending))
+        .route("/owner/confirm/:id", post(owner_confirm_post))
         .route("/control", post(direct_control))
         // Agent operation entry (connect-in). Bearer-token auth; see
         // `agent_input` / `agent_status`.
@@ -10153,7 +10167,10 @@ async fn runner_control_with_client(
     dispatch_allowed: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
-    w.activity_rebound_rect=None;
+    if let Err(refusal) = protect_owner_app(w, v) {
+        return RunnerControlOutcome::Refused(refusal.error(), "主人确认 App 受保护，请在手机上操作");
+    }
+    w.activity_rebound_rect = None;
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let r: anyhow::Result<()> = match typ {
         "tap" if v.get("label").is_some() => {
@@ -11391,7 +11408,10 @@ async fn direct_agent_action(
     input_scope: Option<&crate::input_continuation::Scope>,
 ) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
-    w.activity_rebound_rect=None;
+    if let Err(refusal) = protect_owner_app(w, value) {
+        return RunnerControlOutcome::Refused(refusal.error(), "主人确认 App 受保护，请在手机上操作");
+    }
+    w.activity_rebound_rect = None;
 
     let typ = value
         .get("type")
@@ -11662,7 +11682,10 @@ async fn direct_control(
             );
         }
     };
-    if let Some(refused) = system_request_private_refusal(&state, &value) { return refused; }
+    if let Some(refused) = system_request_private_refusal(&state, &value) {
+        return refused;
+    }
+    let request_refusal = guard_sensitive_request(&state, &value).err();
     let deadline = match direct_control_deadline(&value, tokio::time::Instant::now()) {
         Ok(deadline) => deadline,
         Err(ControlFreshnessError::Missing | ControlFreshnessError::Invalid) => {
@@ -11733,6 +11756,7 @@ async fn direct_control(
     // lifecycle after acquiring the mutex: a request that sat behind a status
     // probe or previous gesture must never execute after its browser was already
     // told it timed out or after release began.
+    let mut sensitive_refusal = None;
     let outcome = tokio::time::timeout_at(deadline, async {
         let mut client = runner.lock().await;
         if tokio::time::Instant::now() >= deadline
@@ -11740,6 +11764,17 @@ async fn direct_control(
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
             return None;
+        }
+        let checked = match guard_sensitive(&mut client, &value).await {
+            Err(refusal) => Err(refusal),
+            Ok(()) => request_refusal.clone().map_or(Ok(()), Err),
+        };
+        if let Err(refusal) = checked {
+            let object = control_confirmation_object(&value, &refusal);
+            if !recover(state.owner_confirm.lock()).consume("control_press", &object) {
+                sensitive_refusal = Some(refusal);
+                return None;
+            }
         }
         // A recording turns a person's coordinate tap into the element under
         // the finger, read before the tap changes the screen.
@@ -11749,18 +11784,28 @@ async fn direct_control(
             None
         };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
-        let dispatch_allowed = || capture_scope.current(&state) && tokio::time::Instant::now() < deadline;
-        let outcome = scoped_runner_action(&state, &capture_scope, deadline, runner_control_with_client(
-            &mut client,
-            &state.runner_actionable,
-            &value,
-            &mut detail,
-            false,
-            Some(&dispatch_allowed),
-        )).await;
+        let dispatch_allowed =
+            || capture_scope.current(&state) && tokio::time::Instant::now() < deadline;
+        let outcome = scoped_runner_action(
+            &state,
+            &capture_scope,
+            deadline,
+            runner_control_with_client(
+                &mut client,
+                &state.runner_actionable,
+                &value,
+                &mut detail,
+                false,
+                Some(&dispatch_allowed),
+            ),
+        )
+        .await;
         Some((outcome, recorded_locator))
     })
     .await;
+    if let Some(refusal) = sensitive_refusal {
+        return control_owner_required(&state, &value, &refusal);
+    }
     let outcome = match outcome {
         Ok(Some((outcome, recorded_locator))) => {
             if outcome == RunnerControlOutcome::Applied {
@@ -11863,7 +11908,16 @@ async fn direct_control(
             return hinted_control_response(StatusCode::CONFLICT, error, "no_effect", hint);
         }
         RunnerControlOutcome::Refused(error, hint) => {
-            return hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint);
+            return hinted_control_response(
+                if error == "owner_app_protected" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::CONFLICT
+                },
+                error,
+                "not_sent",
+                hint,
+            );
         }
         _ => {}
     }
@@ -13715,10 +13769,10 @@ async fn agent_actions_generation(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
-    let authorized_replay = headers
+    let replay_flow = headers
         .get(crate::flow_grants::HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|token| recover(state.flow_grants.lock()).consume(token, &body));
+        .and_then(|token| recover(state.flow_grants.lock()).consume_flow(token, &body));
     if body.len() > AGENT_ACTIONS_MAX_BODY_BYTES {
         return agent_actions_invalid(format!(
             "request body exceeds {AGENT_ACTIONS_MAX_BODY_BYTES} bytes"
@@ -13752,7 +13806,7 @@ async fn agent_actions_generation(
         headers,
         body,
         request,
-        authorized_replay,
+        replay_flow,
         privacy_generation,
         capture_scope.clone(),
     )
@@ -13772,7 +13826,7 @@ async fn agent_actions_scoped(
     headers: HeaderMap,
     body: String,
     mut request: AgentActionsRequest,
-    authorized_replay: bool,
+    replay_flow: Option<serde_json::Value>,
     privacy_generation: u64,
     capture_scope: ScreenReadScope,
 ) -> Response {
@@ -13821,20 +13875,24 @@ async fn agent_actions_scoped(
     // does the sensitive-action check: one step that pays refuses the whole
     // batch. Only daemon-verified saved replay authority skips this check.
     // A press the owner allowed passes its step's checks, used once.
-    let sensitive_checked = !authorized_replay;
+    let sensitive_checked = !replay_flow
+        .as_ref()
+        .is_some_and(|flow| recover(state.owner_confirm.lock()).flow_approved(flow));
     let mut owner_allowed_step = None;
     for (step_index, step) in request.steps.iter().enumerate() {
         if let AgentActionStep::Action { action, .. } = step {
             if let Err(refusal) = policy.check_url(action) {
                 return guard_refusal(&refusal, true);
             }
-            if !sensitive_checked {
+            if !sensitive_checked || replay_flow.is_some() {
                 continue;
             }
             if let Err(refusal) = guard_sensitive_request(&state, action) {
                 match crate::guard::owner_allowed(refusal) {
                     Ok(()) => owner_allowed_step = Some(step_index),
-                    Err(refusal) => return guard_refusal(&refusal, true),
+                    Err(refusal) => {
+                        return flow_owner_refusal(&state, replay_flow.as_ref(), &refusal, true)
+                    }
                 }
             }
         }
@@ -13990,6 +14048,7 @@ async fn agent_actions_scoped(
                             }
                         }
                     }
+                    add_flow_confirmation(&state, replay_flow.as_ref(), &refusal, &mut body);
                     return agent_actions_json(StatusCode::FORBIDDEN, body);
                 }
                 // Dispatch exactly once. If the batch deadline wins after this
@@ -16888,7 +16947,7 @@ async fn agent_input_inner(
             hinted_control_response(StatusCode::CONFLICT, error, "no_effect", hint)
         }
         RunnerControlOutcome::Refused(error, hint) => {
-            with_scroll_alert_detail(hinted_control_response(StatusCode::CONFLICT, error, "not_sent", hint), detail.as_ref()).await
+            with_scroll_alert_detail(hinted_control_response(if error == "owner_app_protected" { StatusCode::FORBIDDEN } else { StatusCode::CONFLICT }, error, "not_sent", hint), detail.as_ref()).await
         }
         RunnerControlOutcome::NoAlert if optional_alert(&value) => with_security_headers(
             Response::builder()
@@ -17337,7 +17396,7 @@ async fn agent_flow_run_grant(
         let bytes = iphone_use_mcp::flow::read_flow_file_bytes(file, &path).ok()?;
         let flow = iphone_use_mcp::flow::parse_flow(&bytes, "daemon flow library").ok()?;
         let request = flow.actions_request(&req.inputs).ok()?;
-        recover(state.flow_grants.lock()).issue(&request.to_string())
+        recover(state.flow_grants.lock()).issue_flow(&request.to_string(), serde_json::json!({"flow": serde_json::from_slice::<serde_json::Value>(&bytes).ok()?, "inputs": req.inputs}))
     };
     match issue() {
         Some(grant) => agent_json_response(
@@ -17921,7 +17980,10 @@ async fn agent_task_act(
                     serde_json::json!({"ok": false, "error": "invalid_request", "message": "send {\"approve\": true|false}"}),
                 );
             };
-            iphone_use_mcp::task::answer(&id, approve)
+            if approve {
+                return task_owner_required(&state, &id);
+            }
+            iphone_use_mcp::task::answer(&id, false)
         }
         "cancel" => iphone_use_mcp::task::cancel(&id),
         "pause" => iphone_use_mcp::task::pause(&id, true),
@@ -20634,8 +20696,7 @@ struct IntentEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     permission: Option<String>,
     status: String,
-    /// `none` | `operator` — `operator` verbs are refused unless the request
-    /// carries `"operator_confirmed":true` (set only after a human confirms).
+    /// `none` | `operator` — operator verbs require a signed owner capability.
     confirm: String,
 }
 
@@ -20863,8 +20924,8 @@ enum IntentError {
         known: Vec<String>,
         registry_hint: Option<String>,
     },
-    /// Registry marks the verb `confirm:"operator"` and the request lacks
-    /// `"operator_confirmed":true`. Nothing dispatched.
+    /// Registry marks the verb `confirm:"operator"`; signed owner authority is required.
+    #[cfg(test)]
     OperatorConfirmationRequired { name: String },
     /// runner (the only dispatch path) is unreachable/not configured/recovering —
     /// failed before anything was sent.
@@ -20916,13 +20977,14 @@ fn intent_error_parts(error: &IntentError) -> (StatusCode, serde_json::Value) {
             }
             (StatusCode::NOT_FOUND, body)
         }
+        #[cfg(test)]
         IntentError::OperatorConfirmationRequired { name } => (
             StatusCode::FORBIDDEN,
             serde_json::json!({
                 "ok": false, "error": "intent_requires_operator_confirmation",
                 "outcome": "not_sent", "retry_safe": true,
                 "intent": name,
-                "hint": "this verb is registered confirm:\"operator\" — resend with \"operator_confirmed\":true only after a human explicitly approved this exact call",
+                "hint": "this verb is registered confirm:\"operator\" — approve the pending owner confirmation in iPhone Use App",
             }),
         ),
         IntentError::BridgeUnavailable { reason } => (
@@ -21778,10 +21840,6 @@ async fn agent_intent(
     if args_bytes > INTENT_ARGS_MAX_BYTES {
         return intent_error_response(&IntentError::ArgsTooLarge { bytes: args_bytes });
     }
-    let operator_confirmed = parsed
-        .get("operator_confirmed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
     let registry_path = intents_registry_path();
     let registry = match load_intents_registry(&registry_path) {
         IntentsRegistryLoad::Loaded(registry) => registry,
@@ -21815,10 +21873,11 @@ async fn agent_intent(
             registry_hint: None,
         });
     };
-    if entry.confirm == "operator" && !operator_confirmed {
-        return intent_error_response(&IntentError::OperatorConfirmationRequired {
-            name: name.clone(),
-        });
+    if entry.confirm == "operator" {
+        let object = serde_json::json!({"name": name, "args": args});
+        if !recover(state.owner_confirm.lock()).consume("intent", &object) {
+            return owner_required(&state, "intent", object, &name);
+        }
     }
     // Lifecycle gating, mirroring `agent_input`'s Direct branch. The one
     // deliberate difference: a released device does NOT start recovery here —
@@ -21872,6 +21931,9 @@ async fn agent_intent(
             || state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
         {
+            return None;
+        }
+        if protect_owner_app(&client, &serde_json::json!({"type":"open_url"})).is_err() {
             return None;
         }
         dispatch_marker.store(true, std::sync::atomic::Ordering::Release);
@@ -23946,6 +24008,20 @@ mod tests {
     fn scroll_alert_buttons_only_blocks() {
         assert!(scroll_alert_guard::<()>(Ok(Some(("".into(), vec!["OK".into()])))).is_some());
     }
+    #[test]
+    fn owner_app_protection_allows_unknown_foreground_without_io() {
+        let client = crate::runner::RunnerClient::new("http://127.0.0.1:1").unwrap();
+        assert!(protect_owner_app(&client, &serde_json::json!({"type":"home"})).is_ok());
+        let refusal = protect_owner_app(
+            &client,
+            &serde_json::json!({
+                "type":"launch_app", "bundle":"com.leeguoo.iphone-use.remote"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.error(), "owner_app_protected");
+    }
+
     #[test]
     fn scroll_alert_invalid_coordinates_do_not_probe() {
         tokio::runtime::Builder::new_current_thread()
@@ -32889,4 +32965,190 @@ mod disappearance_tests {
         let mut other = serde_json::json!({"ocr_absent":[{"seen":false},{"seen":true}]});
         assert!(disappearance_observed(&expect, &mut seen, &mut other));
     }
+}
+
+// HTTP authentication admits readers and agents; only the Secure Enclave key
+// grants owner authority. Arbitrary local shell execution is out of scope.
+async fn owner_key_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = auth_refusal(browser_or_agent_auth(&state, &headers)) {
+        return r;
+    }
+    agent_json_response(
+        StatusCode::OK,
+        recover(state.owner_confirm.lock()).key_info(),
+    )
+}
+async fn owner_key_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    if let Some(r) = auth_refusal(browser_or_agent_auth(&state, &headers)) {
+        return r;
+    }
+    let result = recover(state.owner_confirm.lock()).bind(
+        body["public_key"].as_str().unwrap_or(""),
+        body["signature"].as_str(),
+    );
+    match result {
+        Ok(()) => agent_json_response(StatusCode::OK, serde_json::json!({"ok":true})),
+        Err(error) => agent_json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"ok":false,"error":error}),
+        ),
+    }
+}
+fn task_confirmation_object(id: &str) -> Option<serde_json::Value> {
+    let task = iphone_use_mcp::task::get(id, None)?;
+    if task["status"] != "needs_confirm" {
+        return None;
+    }
+    Some(serde_json::json!({"task_id":id,"operation":task["confirm"].clone()}))
+}
+fn task_owner_required(state: &AppState, id: &str) -> Response {
+    match task_confirmation_object(id) {
+        Some(object) => {
+            let label = object["operation"]["target"].as_str().unwrap_or("任务当前操作").to_string();
+            owner_required(state, "task_press", object, &label)
+        },
+        None => agent_json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"ok":false,"error":"owner_confirmation_required"}),
+        ),
+    }
+}
+async fn owner_pending(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = auth_refusal(browser_or_agent_auth(&state, &headers)) {
+        return r;
+    }
+    agent_json_response(
+        StatusCode::OK,
+        serde_json::json!({"pending":recover(state.owner_confirm.lock()).pending()}),
+    )
+}
+async fn owner_confirm_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    if let Some(r) = auth_refusal(browser_or_agent_auth(&state, &headers)) {
+        return r;
+    }
+    let Some(approve) = body["approve"].as_bool() else {
+        return agent_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error":"invalid_request"}),
+        );
+    };
+    let result =
+        recover(state.owner_confirm.lock()).confirm(&id, approve, body["signature"].as_str());
+    match result {
+        Ok(p) => {
+            if p.kind == "task_press" {
+                let task_id = p.object["task_id"].as_str().unwrap_or("");
+                if task_confirmation_object(task_id).as_ref() != Some(&p.object) {
+                    return agent_json_response(
+                        StatusCode::FORBIDDEN,
+                        serde_json::json!({"error":"owner_confirmation_object_changed"}),
+                    );
+                }
+                if let Err(error) = iphone_use_mcp::task::answer_owner(task_id, &p.object["operation"], approve) {
+                    return agent_json_response(
+                        StatusCode::CONFLICT,
+                        serde_json::json!({"error":error}),
+                    );
+                }
+            }
+            agent_json_response(StatusCode::OK, serde_json::json!({"ok":true}))
+        }
+        Err(error) => {
+            agent_json_response(StatusCode::FORBIDDEN, serde_json::json!({"error":error}))
+        }
+    }
+}
+fn owner_required(
+    state: &AppState,
+    kind: &str,
+    object: serde_json::Value,
+    label: &str,
+) -> Response {
+    let mut body =
+        serde_json::json!({"ok":false,"error":"owner_confirmation_required","outcome":"not_sent"});
+    match recover(state.owner_confirm.lock()).request(kind, object, label) {
+        Ok(id) => body["owner_confirm_id"] = id.into(),
+        Err(hint) => body["hint"] = hint.into(),
+    }
+    agent_json_response(StatusCode::FORBIDDEN, body)
+}
+fn control_owner_required(
+    state: &AppState,
+    action: &serde_json::Value,
+    refusal: &crate::guard::Refusal,
+) -> Response {
+    let label = refusal.to_json()["label"]
+        .as_str()
+        .unwrap_or("敏感控件")
+        .to_string();
+    owner_required(
+        state,
+        "control_press",
+        control_confirmation_object(action, refusal),
+        &label,
+    )
+}
+fn add_flow_confirmation(
+    state: &AppState,
+    flow: Option<&serde_json::Value>,
+    refusal: &crate::guard::Refusal,
+    body: &mut serde_json::Value,
+) {
+    if refusal.error() != "sensitive_action" {
+        return;
+    }
+    if let Some(flow) = flow {
+        let label = flow["flow"]["name"].as_str().unwrap_or("敏感流程").to_string();
+        match recover(state.owner_confirm.lock()).request("flow", flow.clone(), &label) {
+            Ok(id) => body["owner_confirm_id"] = id.into(),
+            Err(hint) => body["hint"] = hint.into(),
+        }
+    }
+}
+fn flow_owner_refusal(
+    state: &AppState,
+    flow: Option<&serde_json::Value>,
+    refusal: &crate::guard::Refusal,
+    batch: bool,
+) -> Response {
+    if flow.is_none() {
+        return guard_refusal(refusal, batch);
+    }
+    let mut body = refusal.to_json();
+    add_flow_confirmation(state, flow, refusal, &mut body);
+    agent_json_response(StatusCode::FORBIDDEN, body)
+}
+
+// Secondary, best-effort protection: reuse evidence already read for ordinary
+// observation/launches. Unknown foreground must not add a request or block input;
+// Secure Enclave biometric signatures are the primary confirmation boundary.
+fn protect_owner_app(
+    client: &crate::runner::RunnerClient,
+    action: &serde_json::Value,
+) -> Result<(), crate::guard::Refusal> {
+    if action
+        .get("bundle")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(crate::owner_confirm::protected_bundle)
+        || client.owner_app_in_foreground()
+    {
+        return Err(crate::guard::Refusal::OwnerAppProtected);
+    }
+    Ok(())
+}
+
+fn control_confirmation_object(
+    action: &serde_json::Value,
+    refusal: &crate::guard::Refusal,
+) -> serde_json::Value {
+    serde_json::json!({"action":action,"target":refusal.to_json()["label"].clone(),"reason":refusal.error()})
 }

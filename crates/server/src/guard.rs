@@ -114,6 +114,7 @@ pub fn open_url_target(action: &Value) -> Option<&str> {
 /// Why an action was refused.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
+    OwnerAppProtected,
     /// `launch_app` of a blocked app.
     BlockedLaunch(String),
     /// A blocked app is in front and the action does not leave it.
@@ -139,6 +140,7 @@ pub enum Refusal {
 impl Refusal {
     pub fn error(&self) -> &'static str {
         match self {
+            Refusal::OwnerAppProtected => "owner_app_protected",
             Refusal::BlockedLaunch(_) | Refusal::BlockedForeground(_) => "blocked_app",
             Refusal::ForegroundUnknown => "foreground_unverified",
             Refusal::Budget { .. } => "action_budget_exhausted",
@@ -154,6 +156,7 @@ impl Refusal {
     /// agent follows, so it names the next step.
     pub fn hint(&self) -> String {
         match self {
+            Refusal::OwnerAppProtected => "主人确认 App 受保护，请在手机上操作".into(),
             Refusal::BlockedLaunch(name) => format!(
                 "{name} is blocked by the phone owner (IPHONE_USE_BLOCKED_APPS). Do not try to reach it another way; tell the user."
             ),
@@ -204,7 +207,9 @@ impl Refusal {
             Refusal::SensitiveUnverified(app) => {
                 body["app"] = Value::String(app.clone());
             }
-            Refusal::ForegroundUnknown | Refusal::InstallUnverified => {}
+            Refusal::OwnerAppProtected
+            | Refusal::ForegroundUnknown
+            | Refusal::InstallUnverified => {}
         }
         body
     }

@@ -184,6 +184,8 @@ pub struct RunnerClient {
     /// while the runner is busy on a slow read instead of queueing session
     /// and apps-list requests behind it.
     last_actionable: bool,
+    /// Recent foreground evidence from existing reads; never probed for input.
+    known_foreground: Option<(Vec<String>, std::time::Instant)>,
 }
 
 /// Smoothed round trip of runner's no-op `/status`, in ms (0 = not measured).
@@ -409,6 +411,7 @@ impl RunnerClient {
             pending_input: crate::input_continuation::Store::default(),
             volume_buttons: false,
             system_capture_request: false,
+            known_foreground: None,
             last_tree: None,
             served_trees: std::collections::VecDeque::new(),
             rebound_row: None,
@@ -2052,7 +2055,11 @@ impl RunnerClient {
         self.mark_post(&url);
         let response = crate::timing::execute_timed(client, request).await
             .with_context(|| format!("POST /wda/apps/{action}"))?;
-        ensure_runner_success(response, &format!("POST /wda/apps/{action}")).await.map(Some)
+        let value = ensure_runner_success(response, &format!("POST /wda/apps/{action}")).await?;
+        if action == "launch" || action == "activate" {
+            self.known_foreground = Some((vec![bundle_id.to_string()], std::time::Instant::now()));
+        }
+        Ok(Some(value))
     }
 
     /// Bundle id of the foreground app (`GET /session/:sid/wda/apps/list`,
@@ -2074,7 +2081,7 @@ impl RunnerClient {
             .context("GET /wda/apps/list")?;
         // ensure_runner_success already unwraps the W3C `value`.
         let apps = ensure_runner_success(response, "GET /wda/apps/list").await?;
-        Ok(apps
+        let bundles: Vec<String> = apps
             .as_array()
             .map(|apps| {
                 apps.iter()
@@ -2082,7 +2089,17 @@ impl RunnerClient {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        self.known_foreground = Some((bundles.clone(), std::time::Instant::now()));
+        Ok(bundles)
+    }
+
+    /// Only recent positive evidence blocks input. Missing evidence is allowed.
+    pub(crate) fn owner_app_in_foreground(&self) -> bool {
+        self.known_foreground.as_ref().is_some_and(|(bundles, at)| {
+            at.elapsed() < Duration::from_secs(2)
+                && bundles.iter().any(|bundle| crate::owner_confirm::protected_bundle(bundle))
+        })
     }
 
     /// Open a URL on the device via runner's **session-scoped** `POST /session/:sid/url`.
@@ -2521,6 +2538,10 @@ impl RunnerClient {
 
     /// Flatten a tree read and remember it (window size, last tree).
     fn rows_from_tree(&mut self, tree: &serde_json::Value, lite: bool) -> Vec<ElementRow> {
+        // Use explicit bundle identity only, never an app's user-facing label.
+        if let Some(bundle) = tree.get("bundleId").and_then(serde_json::Value::as_str) {
+            self.known_foreground = Some((vec![bundle.to_string()], std::time::Instant::now()));
+        }
         let mut rows = Vec::new();
         flatten_tree(tree, 0, &mut rows);
         if lite {
@@ -2766,6 +2787,7 @@ impl RunnerClient {
     fn mark_post(&mut self, url: &str) {
         let path = url.split('?').next().unwrap_or(url);
         if post_mutates_screen(path) {
+            self.known_foreground = None;
             self.pending_input.clear();
             // A new app or the Home Screen is a screen of unknown size.
             if path.ends_with("/wda/apps/launch")
@@ -2960,6 +2982,7 @@ impl RunnerClient {
     /// Drop the cached session (e.g. after an error that suggests it went
     /// stale); the next call re-creates one via [`Self::ensure_session`].
     pub fn invalidate_session(&mut self) {
+        self.known_foreground = None;
         self.activity_rebound_rect=None;
         self.session = None;
         self.value_read = false;
@@ -4865,6 +4888,25 @@ mod tests {
         assert!(only_springboard_or_spotlight(&v(&["com.apple.Spotlight", "com.apple.springboard"])));
         assert!(!only_springboard_or_spotlight(&v(&["com.apple.shortcuts", "com.apple.springboard"])));
         assert!(!only_springboard_or_spotlight(&v(&[])));
+    }
+
+    #[test]
+    fn owner_foreground_evidence_is_recent_and_invalidated_by_mutations() {
+        let mut client = RunnerClient::new("http://127.0.0.1:1").unwrap();
+        assert!(!client.owner_app_in_foreground());
+        let tree = serde_json::json!({"type":"XCUIElementTypeApplication",
+            "bundleId":"com.leeguoo.iphone-use.remote"});
+        client.rows_from_tree(&tree, true);
+        assert!(client.owner_app_in_foreground());
+        client.known_foreground.as_mut().unwrap().1 =
+            std::time::Instant::now() - Duration::from_secs(3);
+        assert!(!client.owner_app_in_foreground());
+        client.rows_from_tree(&tree, true);
+        client.mark_post("http://runner/session/S/actions");
+        assert!(!client.owner_app_in_foreground());
+        client.rows_from_tree(&tree, true);
+        client.invalidate_session();
+        assert!(!client.owner_app_in_foreground());
     }
 
     #[test]
