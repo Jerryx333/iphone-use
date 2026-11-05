@@ -712,7 +712,7 @@ static BOOL IPURTextSelectionSynthesisAvailable(void)
            @"can_select": IPURTextSelectionSynthesisAvailable() ? @YES : @NO};
 }
 
-+ (nullable NSDictionary<NSString *, id> *)selectAllTextForAXElement:(id)element pid:(int)pid retryState:(NSDictionary<NSString *, id> *)retryState error:(NSString **)errorMessage
++ (nullable NSDictionary<NSString *, id> *)selectAllTextForAXElement:(id)element pid:(int)pid axPID:(int)axPID retryState:(NSDictionary<NSString *, id> *)retryState error:(NSString **)errorMessage
 {
   id client = [self axClient];
   NSDictionary *before = IPURReadTextSelection(client, element, errorMessage);
@@ -723,7 +723,7 @@ static BOOL IPURTextSelectionSynthesisAvailable(void)
     if (errorMessage) *errorMessage = @"value changed before selection retry; no further key was sent";
     return nil;
   }
-  if (pid <= 0 || [self pidForAXElement:element] != pid) {
+  if (!IPURElementProcessIsLive(pid, axPID, [self pidForAXElement:element])) {
     if (errorMessage) *errorMessage = @"selection process no longer matches; nothing was sent";
     return nil;
   }
@@ -1364,7 +1364,7 @@ static NSString *IPURSynthesize(id record, id path)
   } @catch (__unused NSException *exception) { return NO; }
 }
 
-+ (nullable NSString *)synthesizeFocusTapForAXElement:(id)element atPoint:(CGPoint)point pid:(int)pid
++ (nullable NSString *)synthesizeFocusTapForAXElement:(id)element atPoint:(CGPoint)point pid:(int)pid axPID:(int)axPID
                                     allowDispatch:(BOOL (NS_NOESCAPE ^)(void))allowDispatch
 {
   @try {
@@ -1373,7 +1373,7 @@ static NSString *IPURSynthesize(id record, id path)
     NSString *failure = IPURCreateGestureRecord(@"ipu-original-field-focus", pid, &record);
     if (failure != nil) return failure;
     id path = IPURNewTouchPath(point, 0.0);
-    if (path == nil || pid <= 0 || [self pidForAXElement:element] != pid) {
+    if (path == nil || !IPURElementProcessIsLive(pid, axPID, [self pidForAXElement:element])) {
       return @"original focus target unavailable; nothing was tapped";
     }
     IPURLift(path, 0.05);
@@ -1400,7 +1400,7 @@ static NSString *IPURSynthesize(id record, id path)
     }
     NSError *error = nil;
     id hit = ((IPURMsgSendHitTestSnapshot)objc_msgSend)(client, selector, applicationSnapshot, point, &error);
-    if (error != nil || hit == nil || [self pidForAXElement:hit] != pid || ![hit isEqual:element]) {
+    if (error != nil || hit == nil || !IPURFocusHitMatches(axPID, [self pidForAXElement:hit], [hit isEqual:element])) {
       return @"original focus target occluded or changed; nothing was tapped";
     }
     if (!allowDispatch()) return @"original focus binding or scene changed; nothing was tapped";

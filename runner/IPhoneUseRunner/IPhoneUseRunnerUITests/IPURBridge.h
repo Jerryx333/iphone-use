@@ -13,6 +13,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <XCTest/XCTest.h>
+#import "IPURProcessCheck.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -78,9 +79,9 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 /// Pid of an XCAccessibilityElement, or 0.
 + (BOOL)sameAXElement:(id)left other:(id)right NS_SWIFT_NAME(sameAXElement(_:_:));
 + (BOOL)focusRecoveryAvailable;
-+ (nullable NSString *)synthesizeFocusTapForAXElement:(id)element atPoint:(CGPoint)point pid:(int)pid
++ (nullable NSString *)synthesizeFocusTapForAXElement:(id)element atPoint:(CGPoint)point pid:(int)pid axPID:(int)axPID
   allowDispatch:(BOOL (NS_NOESCAPE ^)(void))allowDispatch
-  NS_SWIFT_NAME(synthesizeFocusTap(forAXElement:at:pid:allowDispatch:));
+  NS_SWIFT_NAME(synthesizeFocusTap(forAXElement:at:pid:axPID:allowDispatch:));
 
 + (int)pidForAXElement:(id)element;
 
@@ -133,9 +134,10 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 /// Retry state is internal only and must never be serialized or logged.
 + (nullable NSDictionary<NSString *, id> *)selectAllTextForAXElement:(id)element
                                                                pid:(int)pid
+                                                             axPID:(int)axPID
                                                         retryState:(nullable NSDictionary<NSString *, id> *)retryState
                                                              error:(NSString *_Nullable *_Nullable)error
-    NS_SWIFT_NAME(selectAllText(for:pid:retryState:error:));
+    NS_SWIFT_NAME(selectAllText(for:pid:axPID:retryState:error:));
 
 
 /// Snapshots `axElement` through XCAXClient_iOS requestSnapshotForElement:attributes:parameters:error:

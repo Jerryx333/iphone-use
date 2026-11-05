@@ -430,12 +430,20 @@ enum InputTargetCheck {
 
 // MARK: - Registry
 
+/// App identity and AX host identity are distinct for WebKit content. A retained handle must
+/// still belong to the process recorded at registration, even when it differs from the app.
+enum ElementProcessCheck {
+  static func isLive(appPID: Int32, axPID: Int32, currentAXPID: Int32) -> Bool {
+    IPURElementProcessIsLive(appPID, axPID, currentAXPID)
+  }
+}
+
 /// Element ids handed out by the find routes, runner style. Entries keep the node they were found
 /// as; reads re-snapshot the live element so rects and values are fresh. Each node retains its
 /// whole tree (parents, AX elements), so entries are bounded by count and dropped by age when the
 /// screen may have changed.
 final class ElementRegistry {
-  private var entries: [String: (node: UINode, at: Date)] = [:]
+  private var entries: [String: (node: UINode, axPID: Int32, at: Date)] = [:]
   private var order: [String] = []
   let capacity: Int
   /// Ids older than this are dropped at the next screen-changing request. Callers use an id
@@ -448,7 +456,9 @@ final class ElementRegistry {
 
   func register(_ node: UINode, now: Date = Date()) -> String {
     let id = UUID().uuidString
-    entries[id] = (node, now)
+    // Only registered nodes need this AX call, not every node in the snapshot tree.
+    let axPID = node.axElement.map { IPURBridge.pid(forAXElement: $0) } ?? 0
+    entries[id] = (node, axPID, now)
     order.append(id)
     if order.count > capacity {
       let drop = max(1, capacity / 4)
@@ -459,11 +469,13 @@ final class ElementRegistry {
   }
 
   func node(_ id: String) -> UINode? { entries[id]?.node }
+  func axPID(_ id: String) -> Int32? { entries[id]?.axPID }
 
   /// Only acknowledged activity on a still-live handle can extend its lifetime.
   func renew(_ id: String, node: UINode, now: Date = Date()) {
     guard let entry = entries[id], now.timeIntervalSince(entry.at) <= Self.maxAgeSeconds else { return }
-    entries[id] = (node, now)
+    // Refreshing the snapshot must not rebind the id to a different AX host.
+    entries[id] = (node, entry.axPID, now)
     order.removeAll { $0 == id }
     order.append(id)
   }

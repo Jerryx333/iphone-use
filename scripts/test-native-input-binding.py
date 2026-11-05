@@ -24,12 +24,14 @@ methods = '\n'.join(block(routes, '  private func ' + name + '(').replace('priva
                     for name in ['inputTarget', 'checkInputTarget', 'checkedInputTarget',
                                  'boundKeys', 'boundClearState', 'clearBoundInput',
                                  'selectedInputTarget', 'checkedReplacementTarget', 'focusReplacementTarget'])
-helpers = block((SOURCE / 'RunnerElements.swift').read_text(), 'enum InputTargetCheck')
+helpers = '\n'.join(block((SOURCE / 'RunnerElements.swift').read_text(), marker)
+                    for marker in ['enum InputTargetCheck', 'enum ElementProcessCheck'])
 error = block((SOURCE / 'RunnerHTTP.swift').read_text(), 'struct RunnerError: Error')
 program = r'''
 import Foundation
 import CoreGraphics
 import CoreFoundation
+final class FixtureAX: NSObject { var pid: Int32 = 42 }
 final class UINode {
   var parent: UINode?
   var children: [UINode] = []
@@ -44,7 +46,7 @@ final class UINode {
   var isEnabled: Bool? = true
   var editableState: Bool?
   var pid: Int32 = 42
-  var axElement: AnyObject? = NSObject()
+  var axElement: AnyObject? = FixtureAX()
   var treeComplete = true
   var nodes: [UINode] = []
   func descendants() -> [UINode] { nodes }
@@ -62,11 +64,18 @@ struct HTTPResponse {
 }
 final class Registry {
   var entries: [String:UINode] = [:]
-  func register(_ node: UINode) -> String { let id = UUID().uuidString; entries[id] = node; return id }
+  var hosts: [String:Int32] = [:]
+  func axPID(_ id:String) -> Int32? { hosts[id] }
+  func register(_ node: UINode) -> String {
+    let id = UUID().uuidString; entries[id] = node
+    hosts[id] = node.axElement.map { IPURBridge.pid(forAXElement:$0) } ?? 0
+    return id
+  }
   func prune() {}
   func renew(_ id:String, node:UINode) { if entries[id] != nil { entries[id] = node } }
 }
 var shortKeys: String? = "delete"
+var shortReadEffect: (() -> Void)?
 var canSelect = true
 var selectionConfirmed = true
 var selectionWrong = false
@@ -76,17 +85,19 @@ var focusEffect: (() -> Void)?
 var focusError: String?
 enum IPURBridge {
   static func invalidateRequestCache() {}
-  static func pid(forAXElement element:AnyObject) -> Int32 { 42 }
-  static func synthesizeFocusTap(forAXElement element:AnyObject,at point:CGPoint,pid:Int32,
+  static func pid(forAXElement element:AnyObject) -> Int32 { (element as! FixtureAX).pid }
+  static func synthesizeFocusTap(forAXElement element:AnyObject,at point:CGPoint,pid:Int32,axPID:Int32,
       allowDispatch:() -> Bool) -> String? {
+    precondition(pid == 42 && axPID == self.pid(forAXElement:element))
     guard allowDispatch() else { return "blocked" }
     focusTaps += 1;focusEffect?();return focusError
   }
-  static func shortClearKeys(for element:AnyObject,error:inout NSString?) -> String? { shortKeys }
+  static func shortClearKeys(for element:AnyObject,error:inout NSString?) -> String? { shortReadEffect?(); return shortKeys }
   static func textSelection(for element:AnyObject,error:inout NSString?) -> [String:NSNumber]? {
     ["can_select":NSNumber(value:canSelect),"location":NSNumber(value:selectionWrong && selectionCalls>0 ? 1 : 0),"length":3,"utf16_length":3]
   }
-  static func selectAllText(for element:AnyObject,pid:Int32,retryState:[String:Any]?,error:inout NSString?) -> [String:Any]? {
+  static func selectAllText(for element:AnyObject,pid:Int32,axPID:Int32,retryState:[String:Any]?,error:inout NSString?) -> [String:Any]? {
+    precondition(pid == 42 && axPID == self.pid(forAXElement:element))
     selectionCalls += 1
     return ["confirmed":selectionConfirmed,"utf16_length":3]
   }
@@ -154,6 +165,43 @@ do {
   _ = try r.boundKeys("\u{E007}",token:t,frequency:60)
   check(r.lastMapKeys == false,"bound text never maps private-use input into Return or editing keys")
 }
+// Native and WebContent hosts both bind; renewal retains the registered host.
+for host in [Int32(42),77] {
+  for selectAll in [false,true] {
+    let r = RunnerTests(); (r.node.axElement as! FixtureAX).pid = host
+    let t = try token(r)
+    _ = try r.boundKeys("web",token:t,frequency:60)
+    shortKeys = selectAll ? nil : "delete"
+    _ = try r.clearBoundInput(t)
+    check(r.sends == 2 && r.elements.axPID(t) == host,"registered host supports bound typing and clear to App PID")
+  }
+}
+shortKeys = "delete"
+for host in [Int32(42),77] {
+  for operation in 0..<4 {
+    let r = RunnerTests(); (r.node.axElement as! FixtureAX).pid = host
+    let t = try token(r)
+    if operation == 3 {
+      shortReadEffect = { (r.node.axElement as! FixtureAX).pid = 99 }
+    } else if operation == 2 {
+      r.elements.hosts.removeValue(forKey:t)
+    } else {
+      (r.node.axElement as! FixtureAX).pid = 99
+    }
+    let before = selectionCalls
+    if operation == 0 || operation == 2 {
+      do { _ = try r.checkedInputTarget(t); check(false,"changed/missing host must refuse") }
+      catch let e as RunnerError {
+        check(e.status == 400 && e.message == "input_target_expired_or_invalidated; nothing was sent","checkedInputTarget reports expired host")
+      }
+      refused({_ = try r.boundKeys("stop",token:t,frequency:60)},status:400,"changed/missing host blocks bound keys")
+    } else {
+      refused({_ = try r.clearBoundInput(t)},status:400,"changed host blocks short clear")
+    }
+    shortReadEffect = nil
+    check(r.sends == 0 && selectionCalls == before,"host mismatch dispatches no keys or selection")
+  }
+}
 for reason in 0..<8 {
   let r = RunnerTests();let t = try token(r)
   switch reason {
@@ -217,8 +265,11 @@ for path in ["/session/s/wda/keys","/session/s/element/id/clear"] {
 for path in ["/tap","/home","/session/s/wda/keys","/session/s/element/other/clear"] {
   check(!InputTargetCheck.preservesBinding(path:path,binding:"id",body:["inputTarget":"other"]),"another mutation invalidates token")
 }
+for host in [Int32(42),77] {
 for focused in [true,false] {
-  let r=RunnerTests();r.node.isFocused=focused;let selected=r.elements.register(r.node)
+  let r=RunnerTests();r.node.isFocused=focused
+  (r.node.axElement as! FixtureAX).pid=host
+  let selected=r.elements.register(r.node)
   focusTaps=0;focusError=nil;focusEffect={r.node.isFocused=true}
   let response=try r.selectedInputTarget(selected,HTTPRequest(body:["multiline":false]))
   let bound=(response.value as! [String:String])["token"]!
@@ -226,6 +277,7 @@ for focused in [true,false] {
   check(focusTaps == (focused ? 0 : 1) && r.sends == 0,"at most one initial focus tap; no text yet")
   _ = try r.clearBoundInput(bound)
   check(r.sends == 1,"selected binding supports confirmed clear")
+}
 }
 for reason in 0..<4 {
   let r=RunnerTests();r.node.isFocused=false;let selected=r.elements.register(r.node)
@@ -266,5 +318,5 @@ print("Native input binding: \(checks) production-logic checks passed; synthetic
 with tempfile.TemporaryDirectory(prefix='ipu-input-binding-') as folder:
     path = Path(folder)
     (path / 'main.swift').write_text(program)
-    subprocess.run(['xcrun', 'swiftc', str(path / 'main.swift'), '-o', str(path / 'probe')], check=True)
+    subprocess.run(['xcrun', 'swiftc', '-import-objc-header', str(SOURCE / 'IPURProcessCheck.h'), str(path / 'main.swift'), '-o', str(path / 'probe')], check=True)
     subprocess.run([str(path / 'probe')], check=True)

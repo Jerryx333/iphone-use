@@ -1074,6 +1074,103 @@ do {
   check(false, "strict identifier predicate: \(error)")
 }
 
+// Retained AX handles keep their registration-time host, independently of the foreground app.
+do {
+  let registry = ElementRegistry()
+  let webAX = IPURAXElementStub()
+  webAX.pid = 84
+  let nativeAX = IPURAXElementStub()
+  nativeAX.pid = 42
+  let tree = UINode(raw: ["children": [
+    ["type": "XCUIElementTypeTextField", "isEnabled": "1", "isFocused": "1", IPURNodeAXElementKey: webAX],
+    ["type": "XCUIElementTypeButton", IPURNodeAXElementKey: nativeAX],
+  ]], parent: nil, pid: 42)
+  check(webAX.pidReadCount == 0 && nativeAX.pidReadCount == 0, "building a tree does not query AX host PIDs")
+  let web = registry.register(tree.children[0])
+  check(registry.axPID(web) == 84 && registry.node(web)?.pid == 42, "registration records WebContent host separately from app PID")
+  check(webAX.pidReadCount == 1 && nativeAX.pidReadCount == 0, "registration queries only the registered handle once")
+  func isLive(_ id: String) -> Bool {
+    guard let stored = registry.node(id), let ax = stored.axElement else { return false }
+    return ElementProcessCheck.isLive(appPID: stored.pid, axPID: registry.axPID(id) ?? 0,
+      currentAXPID: IPURBridge.pid(forAXElement: ax))
+  }
+  check(isLive(web), "liveElement process gate accepts a retained WebContent handle")
+  check(InputTargetCheck.replacementRefusal(original: tree.children[0], current: tree.children[0],
+    foregroundPID: 42, visible: true, bindingMatches: true, requireFocus: true) == nil,
+    "web input retains foreground app identity")
+  check(InputTargetCheck.replacementRefusal(original: tree.children[0], current: tree.children[0],
+    foregroundPID: 84, visible: true, bindingMatches: true, requireFocus: true) == "input_target_app_changed",
+    "AX host PID cannot substitute for foreground app PID")
+  webAX.pid = 85
+  check(!isLive(web), "changed WebContent host is stale")
+  webAX.pid = 42
+  check(!isLive(web), "changing the host to the app PID is also stale")
+  webAX.pid = 0
+  check(!isLive(web), "unavailable current AX host is stale")
+  webAX.pid = 84
+  let refreshed = UINode(raw: tree.children[0].attributes.merging([IPURNodeAXElementKey: webAX]) { _, new in new },
+    parent: nil, pid: 42)
+  let reads = webAX.pidReadCount
+  registry.renew(web, node: refreshed)
+  check(registry.node(web) === refreshed && registry.axPID(web) == 84 && webAX.pidReadCount == reads,
+    "renew updates the snapshot without rereading or replacing the registered host")
+  check(isLive(web), "same WebContent host stays live after renewal")
+  webAX.pid = 85
+  registry.renew(web, node: refreshed)
+  check(registry.axPID(web) == 84 && !isLive(web), "renew cannot bless a changed AX host")
+
+  let native = registry.register(tree.children[1])
+  check(registry.axPID(native) == 42 && isLive(native), "native element with app PID equal to AX PID stays live")
+  nativeAX.pid = 43
+  check(!isLive(native), "native element still becomes stale when its host changes")
+  for invalid: Int32 in [0, -1] {
+    webAX.pid = invalid
+    let invalidHost = registry.register(refreshed)
+    check(!isLive(invalidHost), "nonpositive registered AX host is stale even when unchanged")
+    webAX.pid = 84
+    check(!isLive(invalidHost), "later positive AX host cannot repair an invalid registration")
+    let invalidApp = registry.register(UINode(raw: [IPURNodeAXElementKey: webAX], parent: nil, pid: invalid))
+    check(!isLive(invalidApp), "nonpositive app PID remains stale despite a valid AX host")
+  }
+  let noAX = registry.register(UINode(raw: [:], parent: nil, pid: 42))
+  check(registry.axPID(noAX) == 0 && !isLive(noAX), "missing handle cannot establish a live host")
+  registry.prune(now: Date(timeIntervalSinceNow: ElementRegistry.maxAgeSeconds + 1))
+  check(registry.axPID(web) == nil && !isLive(web), "pruning removes the registered AX host with the node")
+}
+
+// Select-all and focus recovery use the bridge's shared process gates.
+do {
+  func selectionAllowed(app: Int32 = 42, host: Int32 = 84, current: Int32 = 84) -> Bool {
+    IPURElementProcessIsLive(app, host, current)
+  }
+  func focusAllowed(app: Int32 = 42, host: Int32 = 84, current: Int32 = 84,
+                    hit: Int32 = 84, same: Bool = true) -> Bool {
+    IPURElementProcessIsLive(app, host, current) && IPURFocusHitMatches(host, hit, same)
+  }
+  check(selectionAllowed(), "select-all accepts registered WebContent host distinct from app PID")
+  check(focusAllowed(), "focus recovery accepts original WebContent hit distinct from app PID")
+  check(!selectionAllowed(current: 85) && !focusAllowed(current: 85),
+    "select-all and focus recovery reject changed AX host")
+  check(!selectionAllowed(current: 42) && !focusAllowed(current: 42),
+    "app PID cannot replace the registered WebContent host")
+  check(!focusAllowed(hit: 85) && !focusAllowed(hit: 42) && !focusAllowed(same: false),
+    "focus hit requires both registered host and original element identity")
+  for invalid: Int32 in [0, -1] {
+    check(!selectionAllowed(host: invalid, current: invalid) &&
+          !focusAllowed(host: invalid, current: invalid, hit: invalid),
+      "select-all and focus recovery reject nonpositive registered host even when unchanged")
+    check(!selectionAllowed(current: invalid) && !focusAllowed(current: invalid) && !focusAllowed(hit: invalid),
+      "select-all and focus recovery reject nonpositive current or hit host")
+    check(!selectionAllowed(app: invalid) && !focusAllowed(app: invalid),
+      "select-all and focus recovery require valid app PID independently of AX host")
+  }
+  check(selectionAllowed(host: 42, current: 42) && focusAllowed(host: 42, current: 42, hit: 42),
+    "native select-all and focus recovery retain same-pid behavior")
+  check(!selectionAllowed(host: 42, current: 43) && !focusAllowed(host: 42, current: 43, hit: 43) &&
+        !focusAllowed(host: 42, current: 42, hit: 43) && !focusAllowed(host: 42, current: 42, hit: 42, same: false),
+    "native select-all and focus recovery still reject host or hit identity changes")
+}
+
 // Guarded input uses live identity and focus, never labels or geometry.
 do {
   func replacementNode(_ changes: [String: Any] = [:], pid: Int32 = 42) -> UINode {

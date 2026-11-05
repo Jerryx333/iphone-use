@@ -16,7 +16,7 @@ program = r'''
 static NSString *text;
 static id range;
 static BOOL synthFailure, noEffect;
-static int synthCount, targetPID;
+static int synthCount, targetPID, currentAXPID=42;
 static const unsigned long long XCUIKeyModifierCommand=16;
 typedef void (*IPURMsgSendSetLongLong)(id,SEL,long long);
 @interface FixtureAX : NSObject
@@ -54,8 +54,9 @@ static Class fixtureClass(NSString *name){return [name isEqualToString:@"XCSynth
 @end
 @implementation IPURBridge
 + (id)axClient{return [FixtureAX new];}
-+ (int)pidForAXElement:(id)e{return 42;}
++ (int)pidForAXElement:(id)e{return currentAXPID;}
 '''
+program = '#import "' + str(ROOT / 'runner/IPhoneUseRunner/IPhoneUseRunnerUITests/IPURProcessCheck.h') + '"\n' + program
 program += methods + r'''
 @end
 static unsigned long long IPURMainDisplayID(void){return 1;}
@@ -68,14 +69,22 @@ int main(void){@autoreleasepool{
  range=[NSValue valueWithRange:NSMakeRange(1,0)];check([IPURBridge shortClearKeysForAXElement:@1 error:&error]==nil,"middle caret never authorizes suffix-blind backspaces");
  text=[@"x" stringByPaddingToLength:500 withString:@"x" startingAtIndex:0];range=@"{500,0}";
  check([IPURBridge shortClearKeysForAXElement:@1 error:&error]==nil,"long field selects constant-size path");
- NSDictionary *selected=[IPURBridge selectAllTextForAXElement:@1 pid:42 retryState:nil error:&error];
+ NSDictionary *selected=[IPURBridge selectAllTextForAXElement:@1 pid:42 axPID:42 retryState:nil error:&error];
  check([selected[@"confirmed"] boolValue] && [selected[@"length"] intValue]==500,"readback confirms whole original range");
  check(synthCount==1 && targetPID==42,"one selection event targets original process");
  NSDictionary *read=[IPURBridge textSelectionForAXElement:@1 error:&error];check([read[@"location"] intValue]==0&&[read[@"length"] intValue]==500,"selection metadata preserves UTF16 range");
  range=@"{501,0}";check([IPURBridge textSelectionForAXElement:@1 error:&error]==nil,"out-of-range selection cannot pass");
  range=@"{0,500}junk";check([IPURBridge textSelectionForAXElement:@1 error:&error]==nil,"trailing range data cannot pass");
- range=@"{500,0}";int before=synthCount;check([IPURBridge selectAllTextForAXElement:@1 pid:99 retryState:nil error:&error]==nil&&synthCount==before,"wrong PID dispatches nothing");
- synthFailure=YES;check([IPURBridge selectAllTextForAXElement:@1 pid:42 retryState:nil error:&error]==nil&&synthCount==before+1,"uncertain selection is not replayed");
+ range=@"{500,0}";int before=synthCount;
+ currentAXPID=77;
+ selected=[IPURBridge selectAllTextForAXElement:@1 pid:42 axPID:77 retryState:nil error:&error];
+ check([selected[@"confirmed"] boolValue] && synthCount==before+1 && targetPID==42,"WebContent host selects all while event targets App PID");
+ range=@"{500,0}";before=synthCount;
+ check([IPURBridge selectAllTextForAXElement:@1 pid:42 axPID:42 retryState:nil error:&error]==nil&&synthCount==before,"changed AX host dispatches nothing");
+ check([IPURBridge selectAllTextForAXElement:@1 pid:42 axPID:0 retryState:nil error:&error]==nil&&synthCount==before,"missing registered AX host dispatches nothing");
+ check([IPURBridge selectAllTextForAXElement:@1 pid:0 axPID:77 retryState:nil error:&error]==nil&&synthCount==before,"invalid App PID dispatches nothing");
+ currentAXPID=42;
+ synthFailure=YES;check([IPURBridge selectAllTextForAXElement:@1 pid:42 axPID:42 retryState:nil error:&error]==nil&&synthCount==before+1,"uncertain selection is not replayed");
  printf("Native text selection: %d production ObjC checks passed; synthetic AX/events only\n",checks);
 }return 0;}
 '''
