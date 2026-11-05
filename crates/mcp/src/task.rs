@@ -844,8 +844,9 @@ const APPROVED_PRESS_TTL: Duration = Duration::from_secs(120);
 /// create it.
 static APPROVED_PRESS: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
-/// Allow one press on `label` (the owner just confirmed it). The task
-/// engine calls this, and only after the owner's answer.
+/// Allow one press on `label` (`""`: any). The task engine calls this
+/// after the owner's answer, or for a task whose caller accepted every
+/// step (`confirm: "never"`).
 pub fn approve_press(label: &str) {
     *APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((label.trim().to_string(), Instant::now() + APPROVED_PRESS_TTL));
@@ -870,6 +871,24 @@ pub fn take_approved_press(label: &str) -> bool {
         slot.take();
     }
     matches
+}
+
+/// The press the daemon's guard should let through for this step: the
+/// confirmed target, or, when the caller accepted every step
+/// (`confirm: "never"`), whatever this press or Return lands on (`""`).
+fn press_allowance<'a>(
+    confirmed: bool,
+    policy: ConfirmPolicy,
+    operation: &str,
+    label: Option<&'a str>,
+) -> Option<&'a str> {
+    if confirmed {
+        Some(label.unwrap_or(""))
+    } else if policy == ConfirmPolicy::Never && matches!(operation, "CLICK" | "PRESS_RETURN") {
+        Some("")
+    } else {
+        None
+    }
 }
 
 fn risky_words(label: &str) -> impl Iterator<Item = &'static str> + '_ {
@@ -1170,11 +1189,12 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             screen = jev::read_screen(daemon).await?;
             continue; // Fresh model decision, including a new risky confirmation.
         }
-        if confirmed {
-            approve_press(target.as_ref().map_or("", |t| t.label.as_str()));
+        let allowance = press_allowance(confirmed, request.confirm, &operation, target.as_ref().map(|t| t.label.as_str())).map(str::to_string);
+        if let Some(label) = &allowance {
+            approve_press(label);
         }
         let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text, &request.goal, &mut history, &mut text_ms, by, started, reason, confirmed).await;
-        if confirmed {
+        if allowance.is_some() {
             clear_approved_press();
         }
         let step = step?;
@@ -1649,6 +1669,13 @@ mod tests {
         approve_press("立即购买");
         clear_approved_press();
         assert!(!take_approved_press("立即购买"), "cleared after the step");
+
+        use ConfirmPolicy::{Never, Risky};
+        assert_eq!(press_allowance(true, Risky, "CLICK", Some("立即购买")), Some("立即购买"));
+        assert_eq!(press_allowance(false, Risky, "CLICK", Some("立即购买")), None, "not confirmed");
+        assert_eq!(press_allowance(false, Never, "CLICK", Some("商品")), Some(""), "caller accepted every step");
+        assert_eq!(press_allowance(false, Never, "PRESS_RETURN", None), Some(""));
+        assert_eq!(press_allowance(false, Never, "TYPE_TEXT", Some("支付密码")), None, "typing secrets is never allowed");
     }
 
     #[test]
