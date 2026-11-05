@@ -2094,6 +2094,14 @@ impl RunnerClient {
         Ok(bundles)
     }
 
+    /// Foreground evidence already known to the daemon; never probes the phone.
+    pub(crate) fn confirmation_foreground(&self) -> Option<&[String]> {
+        self.known_foreground
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(2))
+            .map(|(bundles, _)| bundles.as_slice())
+    }
+
     /// Only recent positive evidence blocks input. Missing evidence is allowed.
     pub(crate) fn owner_app_in_foreground(&self) -> bool {
         self.known_foreground.as_ref().is_some_and(|(bundles, at)| {

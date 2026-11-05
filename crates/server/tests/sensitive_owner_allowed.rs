@@ -75,13 +75,13 @@ fn the_press_the_owner_allowed_runs_once() {
         assert_eq!(status, StatusCode::FORBIDDEN, "not allowed yet: {json}");
         assert_eq!(*posts.lock().unwrap(), 0);
 
-        let token = iphone_use_mcp::task::approve_press("立即购买").unwrap();
+        let token = iphone_use_mcp::task::approve_press("任务父控件").unwrap();
         let (status, json) = tap(None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "missing capability: {json}");
         assert_eq!(*posts.lock().unwrap(), 0);
-        let wrong = iphone_use_mcp::task::approve_press("确认转账").unwrap();
+        let wrong = "not-a-minted-token".to_string();
         let (status, json) = tap(Some(wrong.clone())).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "wrong target: {json}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "wrong token: {json}");
         iphone_use_mcp::task::clear_approved_press(&wrong);
         let (status, json) = tap(Some(token.clone())).await;
         assert_eq!(status, StatusCode::OK, "allowed by the owner: {json}");

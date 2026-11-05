@@ -197,6 +197,55 @@ fn control_open_mode_requires_signature_and_allows_exactly_once() {
     });
 }
 #[test]
+fn control_approval_rejects_changed_rect_identifier_or_foreground() {
+    support::block(async {
+        let version = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let current = version.clone();
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = posts.clone();
+        let runner = support::mock_runner(move |request, _| {
+            let line = request.lines().next().unwrap_or("");
+            let body = if line.starts_with("POST /session ") {
+                json!({"value":{"sessionId":"SESSION"}})
+            } else if line.contains("/source") {
+                let v = current.load(std::sync::atomic::Ordering::SeqCst);
+                json!({"value":{"type":"XCUIElementTypeApplication","bundleId":if v == 3 {"com.example.other"} else {"com.example.shop"},"label":"商城","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeButton","label":"立即购买","rawIdentifier":if v == 2 {"transaction-b"} else {"transaction-a"},"rect":{"x":if v == 1 {199} else {200},"y":780,"width":190,"height":64},"isEnabled":"1"}]}})
+            } else if line.contains("/window/size") {
+                json!({"value":{"width":390,"height":844}})
+            } else {
+                if line.starts_with("POST ") && line.contains("/actions") {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                json!({"value":null})
+            };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let mut state = support::build_state_with_runner(runner.url());
+        let dir = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().owner_confirm =
+            Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
+        let k = key();
+        bind(&mut state.owner_confirm.lock().unwrap(), &k);
+        let action = json!({"type":"tap","x":0.75,"y":0.96,"ttl_ms":2500});
+        let (status, body) = call(&state, "/control", action.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let id = body["owner_confirm_id"].as_str().unwrap().to_owned();
+        approve(&mut state.owner_confirm.lock().unwrap(), &k, &id);
+        for changed in 1..=3 {
+            version.store(changed, std::sync::atomic::Ordering::SeqCst);
+            let (status, body) = call(&state, "/control", action.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "version {changed}: {body}");
+            assert_ne!(body["owner_confirm_id"], id);
+            assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        version.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = call(&state, "/control", action).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
 fn owner_app_cannot_be_launched_or_driven() {
     support::block(async {
         let runner = support::mock_runner_with_apps(
@@ -217,7 +266,15 @@ fn owner_app_cannot_be_launched_or_driven() {
         let state = support::build_state_with_runner(runner.url());
         // Ordinary observation already identified the foreground app. The
         // input guard must reuse it rather than issuing its own apps-list read.
-        state.runner.as_ref().unwrap().lock().await.active_bundles().await.unwrap();
+        state
+            .runner
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .active_bundles()
+            .await
+            .unwrap();
         for action in [
             json!({"type":"home"}),
             json!({"type":"launch_app","bundle":"com.leeguoo.iphone-use.remote"}),

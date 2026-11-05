@@ -26,9 +26,9 @@ Swift 使用 SecKeyCreateSignature(.ecdsaSignatureMessageX962SHA256)，daemon �
 
 流程 grant 绑定 daemon 读出的保存流程及其输入，另绑定确切回放请求。未获主人签名的流程逐步执行敏感守卫；命中敏感步骤时返回 owner_confirm_id。主人确认过的流程对象摘要保存于 owner-approved-flows.json；更改内容或输入会产生不同摘要。既有 sensitive_guard::installed_flow_grants_are_bound_and_single_use 测试增加主人签名准备步骤，原有成功、过期、内容不符和一次性断言保持不变。
 
-任务进入 needs_confirm 时创建带任务 id、当前操作及独立确认序号的确认单。agent 的 approve:true 始终返回 403。手机签名确认后 daemon 核对任务仍在等待同一问题，再在任务答案锁内核对当前问题并调用 answer_owner；confirm:"never" 不生成确认单，保留既有行为。
+任务进入 needs_confirm 时创建带任务 id、当前操作及独立确认序号的确认单。agent 的 approve:true 始终返回 403。手机签名确认后 daemon 核对任务仍在等待同一问题，再在任务答案锁内核对当前问题并调用 answer_owner；confirm:"never" 不生成确认单，保留既有行为。任务放行只校验进程内令牌及有效期，不比对标签（标签仅供日志）；令牌仅附在任务当前步骤的 DaemonClient 上，步骤结束清除且只能消费一次。无令牌或错令牌不能按标签获得权限。
 
-/control 在请求级和执行前检查敏感动作。确认能力绑定完整控制消息及实际命中标签，签名后两分钟内可消费一次。重发必须保留原始消息，包含 issued_at_ms 等字段；服务器 freshness 仍按收到请求后的单调时钟检查。intent 忽略 operator_confirmed；operator 类型能力绑定 name + args，同样只能消费一次。
+/control 在请求级和执行前检查敏感动作。确认能力绑定除 issued_at_ms/ttl_ms 外的完整控制消息、守卫实际读到的控件身份（label、identifier、rect）以及 daemon 已知的近期前台 bundle（未知绑定 null）。执行前重新解析；身份或前台变化，包括未知与已知互变，都需要重新确认。签名后两分钟内可消费一次。重发时执行字段必须保持一致，issued_at_ms/ttl_ms 可变化；服务器 freshness 仍按收到请求后的单调时钟检查。intent 忽略 operator_confirmed；operator 类型能力绑定 name + args，同样只能消费一次。
 
 输入分发复用已有 apps/list、成功 launch_app 和 /source 中明确 bundleId 的近期前台证据（2 秒），不为每次动作新增 runner 请求。确认前台是遥控 App 时拒绝；前台未知或证据过期时放行。遥控 App 的默认 bundle com.leeguoo.iphone-use.remote 及其签名后缀都受保护，直接 launch_app 打开该 bundle 也拒绝，返回 owner_app_protected。保护独立于敏感步骤许可；它是尽力而为的第二层防线，主防线仍是生物识别签名。屏幕变更派发或 session 失效清除缓存。
 

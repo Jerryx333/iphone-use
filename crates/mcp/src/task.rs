@@ -841,7 +841,7 @@ const APPROVED_PRESS_TTL: Duration = Duration::from_secs(120);
 /// Process-local capabilities, never serialized into task state or responses.
 static APPROVED_PRESS: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
 
-/// Mint a capability for exactly this control. Randomness failure fails closed.
+/// Mint a capability for this task step. Randomness failure fails closed.
 pub fn approve_press(label: &str) -> anyhow::Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
@@ -864,27 +864,28 @@ pub fn clear_approved_press(token: &str) {
         .retain(|s| s.0 != token);
 }
 
-/// Missing/wrong tokens or labels cannot consume another request's capability.
+/// Only the process-local, unexpired token grants this step; labels are diagnostic.
 pub fn take_approved_press(token: Option<&str>, label: &str) -> bool {
     let Some(token) = token else {
         return false;
     };
     let mut slots = APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner());
     slots.retain(|s| s.2 > Instant::now());
-    if let Some(i) = slots
-        .iter()
-        .position(|s| s.0 == token && s.1 == label.trim())
-    {
-        slots.swap_remove(i);
+    if let Some(i) = slots.iter().position(|s| s.0 == token) {
+        let (_, approved_label, _) = slots.swap_remove(i);
+        tracing::debug!(
+            approved_label,
+            guard_label = label,
+            "consumed task press capability"
+        );
         true
     } else {
         false
     }
 }
 
-/// The press the daemon's guard should let through for this step: the
-/// exact observed target, including for `confirm: "never"`. Empty labels
-/// never act as a wildcard.
+/// Mint a step-scoped capability for confirmed presses and `confirm: "never"`.
+/// The observed target is diagnostic; authorization comes only from the token.
 fn press_allowance<'a>(
     confirmed: bool,
     policy: ConfirmPolicy,
@@ -1751,20 +1752,15 @@ mod tests {
     }
 
     #[test]
-    fn an_allowed_press_is_used_once_and_only_on_its_control() {
+    fn an_allowed_press_uses_only_its_step_token_once() {
         let token = approve_press("立即购买").unwrap();
         assert!(!take_approved_press(None, "立即购买"));
         assert!(!take_approved_press(Some("wrong"), "立即购买"));
-        assert!(
-            !take_approved_press(Some(&token), "确认转账"),
-            "another control"
-        );
-        assert!(
-            !take_approved_press(Some(&token), "立即购买更多"),
-            "no substring match"
-        );
-        assert!(take_approved_press(Some(&token), "立即购买"));
+        assert!(take_approved_press(Some(&token), "购买子控件 identifier"));
         assert!(!take_approved_press(Some(&token), "立即购买"), "one use");
+        let return_token = approve_press("转账金额").unwrap();
+        assert!(take_approved_press(Some(&return_token), "确认付款"));
+        assert!(!take_approved_press(Some(&return_token), "确认付款"));
         let token = approve_press("立即购买").unwrap();
         clear_approved_press(&token);
         assert!(

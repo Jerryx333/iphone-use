@@ -122,7 +122,11 @@ pub enum Refusal {
     /// The foreground could not be read, so a blocked app cannot be ruled out.
     ForegroundUnknown,
     /// The run's budget would be exceeded.
-    Budget { max: u32, used: u32, wanted: u32 },
+    Budget {
+        max: u32,
+        used: u32,
+        wanted: u32,
+    },
     /// `open_url` of a scheme the owner has not allowed.
     UrlScheme(String),
     /// An app install whose bundle id could not be read while the owner
@@ -809,6 +813,29 @@ pub fn check_point(rows: &[ElementRow], x: f64, y: f64) -> Option<Result<(), Ref
 
 /// All sensitive words in the actual hit control, including its children.
 pub fn point_sensitive_labels(rows: &[ElementRow], x: f64, y: f64) -> Option<Vec<String>> {
+    let (control, text) = point_rows(rows, x, y);
+    let control_words = control.is_some_and(|index| {
+        rows[index..subtree_end(rows, index)]
+            .iter()
+            .any(|row| row_words(row).next().is_some())
+    });
+    if !control_words && text.is_none() {
+        return None;
+    }
+    let mut labels = control.map(|i| pressed_labels(rows, i)).unwrap_or_default();
+    if let Some(index) = text {
+        for label in row_words(&rows[index]).filter(|t| paying_word(t).is_some()) {
+            let label = label.trim().to_owned();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+    }
+    Some(labels)
+}
+
+/// The exact rows used by the coordinate guard (control and text hit).
+pub(crate) fn point_rows(rows: &[ElementRow], x: f64, y: f64) -> (Option<usize>, Option<usize>) {
     let holds = |row: &ElementRow| {
         let [rx, ry, rw, rh] = row.rect;
         row.visible != Some(false)
@@ -829,24 +856,7 @@ pub fn point_sensitive_labels(rows: &[ElementRow], x: f64, y: f64) -> Option<Vec
     };
     let control = smallest(&|row| CONTROL_KINDS.contains(&row.kind.as_str()));
     let text = smallest(&|row| row_words(row).next().is_some());
-    let control_words = control.is_some_and(|index| {
-        rows[index..subtree_end(rows, index)]
-            .iter()
-            .any(|row| row_words(row).next().is_some())
-    });
-    if !control_words && text.is_none() {
-        return None;
-    }
-    let mut labels = control.map(|i| pressed_labels(rows, i)).unwrap_or_default();
-    if let Some(index) = text {
-        for label in row_words(&rows[index]).filter(|t| paying_word(t).is_some()) {
-            let label = label.trim().to_owned();
-            if !labels.contains(&label) {
-                labels.push(label);
-            }
-        }
-    }
-    Some(labels)
+    (control, text)
 }
 
 /// The focused text field, if the tree marks one.

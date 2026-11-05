@@ -11757,6 +11757,7 @@ async fn direct_control(
     // probe or previous gesture must never execute after its browser was already
     // told it timed out or after release began.
     let mut sensitive_refusal = None;
+    let mut confirmation_object = serde_json::Value::Null;
     let outcome = tokio::time::timeout_at(deadline, async {
         let mut client = runner.lock().await;
         if tokio::time::Instant::now() >= deadline
@@ -11765,7 +11766,16 @@ async fn direct_control(
         {
             return None;
         }
-        let checked = match guard_sensitive(&mut client, &value).await {
+        let mut observed = serde_json::Value::Null;
+        let mut checked = guard_sensitive_observed(&mut client, &value, &mut observed).await;
+        // A refused press may be about to spend the owner's approval: bind
+        // that to a fresh read of the screen, never to a tree read before it.
+        if matches!(checked, Err(crate::guard::Refusal::Sensitive(_))) {
+            client.forget_tree();
+            observed = serde_json::Value::Null;
+            checked = guard_sensitive_observed(&mut client, &value, &mut observed).await;
+        }
+        let checked = match checked {
             Err(refusal) => Err(refusal),
             Ok(()) => request_refusal.clone().map_or(Ok(()), Err),
         };
@@ -11800,7 +11810,13 @@ async fn direct_control(
                 sensitive_refusal = Some(refusal);
                 return None;
             }
-            let object = control_confirmation_object(&value, &refusal);
+            let object = control_confirmation_object(
+                &value,
+                &refusal,
+                &observed,
+                client.confirmation_foreground(),
+            );
+            confirmation_object = object.clone();
             if !recover(state.owner_confirm.lock()).consume("control_press", &object) {
                 sensitive_refusal = Some(refusal);
                 return None;
@@ -11834,7 +11850,7 @@ async fn direct_control(
     })
     .await;
     if let Some(refusal) = sensitive_refusal {
-        return control_owner_required(&state, &value, &refusal);
+        return control_owner_required(&state, &value, &refusal, confirmation_object);
     }
     let outcome = match outcome {
         Ok(Some((outcome, recorded_locator))) => {
@@ -11859,7 +11875,10 @@ async fn direct_control(
             locked,
         };
         let mut body = serde_json::json!({"ok":true});
-        if let Some(capture) = detail.as_ref().and_then(|value| value.get("system_capture")) {
+        if let Some(capture) = detail
+            .as_ref()
+            .and_then(|value| value.get("system_capture"))
+        {
             body["system_capture"] = capture.clone();
         }
         if let Some(rebound) = detail.as_ref().and_then(|value| value.get("rebound")) {
@@ -11874,7 +11893,8 @@ async fn direct_control(
     }
 
     if outcome == RunnerControlOutcome::ScopeInterrupted {
-        return with_app_lifecycle_receipt(control_scope_interrupted_response(), detail.as_ref()).await;
+        return with_app_lifecycle_receipt(control_scope_interrupted_response(), detail.as_ref())
+            .await;
     }
     if outcome == RunnerControlOutcome::Failed {
         let locked = recover(state.runner_health.lock()).locked;
@@ -12208,17 +12228,43 @@ async fn guard_sensitive(
     client: &mut crate::runner::RunnerClient,
     action: &serde_json::Value,
 ) -> Result<(), crate::guard::Refusal> {
+    crate::guard::check_sensitive_request(action)?;
+    guard_sensitive_observed(client, action, &mut serde_json::Value::Null).await
+}
+
+/// Run the sensitive guard and retain the exact target identities it reads.
+async fn guard_sensitive_observed(
+    client: &mut crate::runner::RunnerClient,
+    action: &serde_json::Value,
+    observed: &mut serde_json::Value,
+) -> Result<(), crate::guard::Refusal> {
     use crate::guard::SensitiveRead;
     use tokio::time::timeout as within;
-    crate::guard::check_sensitive_request(action)?;
+    // Read the actual target even when request-supplied words are sensitive.
+    let request_check = crate::guard::check_sensitive_request(action);
+    let mut identities = Vec::new();
+    let mut record = |row: &crate::runner::ElementRow| {
+        identities.push(serde_json::json!({"label":row.label,"identifier":row.identifier,"rect":row.rect,"kind":row.kind,
+            "secure":crate::guard::check_typed_row(row).is_err()}));
+        *observed = serde_json::json!(identities);
+    };
     let read = crate::guard::sensitive_read(action);
     match &read {
-        SensitiveRead::None => return Ok(()),
+        SensitiveRead::None => return request_check,
         SensitiveRead::Element => {
             // The rows the action itself resolves next (a fresh read is kept
             // for it to reuse).
-            if let Ok(Ok((rows, index, _))) = within(GUARD_SENSITIVE_READ_TIMEOUT, fetch_snapshot_row_reusing(client, action)).await {
-                return if action.get("type").and_then(serde_json::Value::as_str) == Some("set_value") {
+            if let Ok(Ok((rows, index, _))) = within(
+                GUARD_SENSITIVE_READ_TIMEOUT,
+                fetch_snapshot_row_reusing(client, action),
+            )
+            .await
+            {
+                record(&rows[index]);
+                request_check?;
+                return if action.get("type").and_then(serde_json::Value::as_str)
+                    == Some("set_value")
+                {
                     crate::guard::check_typed_row(&rows[index])
                 } else {
                     crate::guard::check_pressed_row(&rows, index)
@@ -12243,13 +12289,24 @@ async fn guard_sensitive(
     }
     let rows = match client.recent_tree(GUARD_SENSITIVE_TREE_AGE) {
         Some(rows) => Some(rows),
-        None => within(GUARD_SENSITIVE_READ_TIMEOUT, client.elements()).await.ok().and_then(Result::ok).map(Arc::new),
+        None => within(GUARD_SENSITIVE_READ_TIMEOUT, client.elements())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(Arc::new),
     };
     let Some(rows) = rows else {
         return guard_sensitive_unverified(client).await;
     };
     match read {
         SensitiveRead::Label { label, kind } => {
+            for row in rows
+                .iter()
+                .filter(|row| row.label == label && kind.as_ref().is_none_or(|k| row.kind == *k))
+            {
+                record(row);
+            }
+            request_check?;
             crate::guard::check_label_rows(&rows, &label, kind.as_deref())
         }
         SensitiveRead::Locator => {
@@ -12262,6 +12319,7 @@ async fn guard_sensitive(
             };
             for (index, row) in rows.iter().enumerate() {
                 if agent_locator_assessment(row, &locator) != Some(false) {
+                    record(row);
                     crate::guard::check_pressed_row(&rows, index)?;
                 }
             }
@@ -12270,20 +12328,34 @@ async fn guard_sensitive(
         SensitiveRead::Focused { submits } => {
             if action.get("type").and_then(serde_json::Value::as_str) == Some("text") {
                 if let Some(field) = crate::guard::focused_field(&rows) {
+                    record(field);
                     crate::guard::check_typed_row(field)?;
                 }
             }
             if submits {
+                // Return considers keyboard action keys and the focused field.
+                for row in rows.iter().filter(|row| {
+                    matches!(row.kind.as_str(), "Button" | "Key" | "Keyboard")
+                        || row.focused == Some(true)
+                }) {
+                    record(row);
+                }
                 crate::guard::check_return(&rows)?;
             }
             Ok(())
         }
         SensitiveRead::Points(points) => {
-            let Ok(Ok((width, height))) = within(GUARD_SENSITIVE_READ_TIMEOUT, client.window_size()).await else {
+            let Ok(Ok((width, height))) =
+                within(GUARD_SENSITIVE_READ_TIMEOUT, client.window_size()).await
+            else {
                 return guard_sensitive_unverified(client).await;
             };
             let mut unknown = false;
             for (x, y) in points {
+                let (control, text) = crate::guard::point_rows(&rows, x * width, y * height);
+                for index in control.into_iter().chain(text) {
+                    record(&rows[index]);
+                }
                 match crate::guard::check_point(&rows, x * width, y * height) {
                     Some(checked) => checked?,
                     None => unknown = true,
@@ -33139,6 +33211,7 @@ fn control_owner_required(
     state: &AppState,
     action: &serde_json::Value,
     refusal: &crate::guard::Refusal,
+    object: serde_json::Value,
 ) -> Response {
     if compound_control(action) {
         return agent_json_response(
@@ -33153,12 +33226,7 @@ fn control_owner_required(
         .as_str()
         .unwrap_or("敏感控件")
         .to_string();
-    owner_required(
-        state,
-        "control_press",
-        control_confirmation_object(action, refusal),
-        &label,
-    )
+    owner_required(state, "control_press", object, &label)
 }
 fn add_flow_confirmation(
     state: &AppState,
@@ -33212,6 +33280,8 @@ fn protect_owner_app(
 fn control_confirmation_object(
     action: &serde_json::Value,
     refusal: &crate::guard::Refusal,
+    observed: &serde_json::Value,
+    foreground: Option<&[String]>,
 ) -> serde_json::Value {
     let mut action = action.clone();
     if let Some(fields) = action.as_object_mut() {
@@ -33226,7 +33296,7 @@ fn control_confirmation_object(
         .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
         .map(|labels| serde_json::json!(labels))
         .unwrap_or(label);
-    serde_json::json!({"action":action,"target":target,"reason":refusal.error()})
+    serde_json::json!({"action":action,"target":target,"reason":refusal.error(),"controls":observed,"foreground":foreground})
 }
 
 fn compound_control(action: &serde_json::Value) -> bool {
@@ -33251,11 +33321,14 @@ mod owner_press_revision_tests {
     fn control_digest_ignores_only_transport_freshness() {
         let refusal = crate::guard::Refusal::Sensitive("立即购买".into());
         let action = json!({"type":"tap","x":0.75,"y":0.96,"label":"立即购买","issued_at_ms":1,"ttl_ms":2000});
-        let object = control_confirmation_object(&action, &refusal);
+        let object = control_confirmation_object(&action, &refusal, &json!(null), None);
         let mut retry = action.clone();
         retry["issued_at_ms"] = json!(9999);
         retry["ttl_ms"] = json!(1000);
-        assert_eq!(object, control_confirmation_object(&retry, &refusal));
+        assert_eq!(
+            object,
+            control_confirmation_object(&retry, &refusal, &json!(null), None)
+        );
         for (key, value) in [
             ("x", json!(0.76)),
             ("y", json!(0.95)),
@@ -33266,10 +33339,28 @@ mod owner_press_revision_tests {
             changed[key] = value;
             assert_ne!(
                 object,
-                control_confirmation_object(&changed, &refusal),
+                control_confirmation_object(&changed, &refusal, &json!(null), None),
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn control_digest_binds_observed_identity_and_known_or_unknown_foreground() {
+        let action = json!({"type":"tap","x":0.75,"y":0.96});
+        let refusal = crate::guard::Refusal::Sensitive("立即购买".into());
+        let observed = json!([{"label":"立即购买","identifier":"a","rect":[200,780,190,64]}]);
+        let bundles = vec!["com.example.shop".to_string()];
+        let object = control_confirmation_object(&action, &refusal, &observed, Some(&bundles));
+        for (key, value) in [("label", json!("确认购买")), ("identifier", json!("b")), ("rect", json!([199,780,190,64]))] {
+            let mut changed = observed.clone();
+            changed[0][key] = value;
+            assert_ne!(crate::owner_confirm::digest(&object), crate::owner_confirm::digest(&control_confirmation_object(&action, &refusal, &changed, Some(&bundles))));
+        }
+        let unknown = control_confirmation_object(&action, &refusal, &observed, None);
+        assert!(unknown["foreground"].is_null());
+        assert_ne!(object, unknown);
+        assert_ne!(object, control_confirmation_object(&action, &refusal, &observed, Some(&["com.example.other".into()])));
     }
 
     #[test]

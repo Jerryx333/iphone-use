@@ -38,14 +38,22 @@ fn random() -> Result<String, &'static str> {
     Ok(hex(&b))
 }
 fn quote(label: &str) -> String {
-    serde_json::to_string(
-        &label
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(80)
-            .collect::<String>(),
-    )
-    .unwrap()
+    let count = label.chars().count();
+    let mut escaped = String::new();
+    for c in label.chars().take(300) {
+        if c.is_control()
+            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        {
+            escaped.push_str(&format!("\\u{{{:04x}}}", c as u32));
+        } else {
+            escaped.push(c);
+        }
+    }
+    let mut result = serde_json::to_string(&escaped).unwrap();
+    if count > 300 {
+        result.push_str(&format!("…（已截断，共 {count} 字）"));
+    }
+    result
 }
 // Only daemon-authored prose; untrusted values are bounded JSON quotations.
 fn value_quote(v: &Value) -> String {
@@ -55,60 +63,79 @@ fn value_quote(v: &Value) -> String {
             .unwrap_or_else(|| v.to_string()),
     )
 }
-fn action_details(action: &Value) -> String {
+fn secret_target(action: &Value) -> bool {
+    if action["secure"] == true {
+        return true;
+    }
+    let target = action
+        .get("locator")
+        .filter(|v| v.is_object())
+        .or_else(|| action.get("target").filter(|v| v.is_object()))
+        .unwrap_or(action);
+    let row = crate::runner::ElementRow {
+        kind: target["kind"]
+            .as_str()
+            .filter(|k| k.contains("Field"))
+            .or_else(|| target["type"].as_str().filter(|k| k.contains("Field")))
+            .unwrap_or("TextField")
+            .trim_start_matches("XCUIElementType")
+            .to_string(),
+        label: target["label"]
+            .as_str()
+            .or_else(|| action["target"].as_str())
+            .unwrap_or("")
+            .to_string(),
+        identifier: target["identifier"].as_str().map(str::to_owned),
+        placeholder: target["placeholder"].as_str().map(str::to_owned),
+        ..Default::default()
+    };
+    crate::guard::check_typed_row(&row).is_err()
+}
+fn action_details(action: &Value, observed_secure: bool, flow: bool) -> String {
     let null = Value::Null;
     let kind = action
         .get("type")
         .or_else(|| action.get("kind"))
         .unwrap_or(&null);
+    let secure = observed_secure || secret_target(action);
     let mut parts = vec![format!("动作类型：{}", value_quote(kind))];
-    for key in [
-        "label",
-        "target",
-        "button",
-        "action",
-        "name",
-        "bundle",
-        "app",
-        "element",
-        "x",
-        "y",
-        "x1",
-        "y1",
-        "x2",
-        "y2",
-        "points",
-        "duration",
-        "duration_ms",
-        "fingers",
-    ] {
-        if let Some(v) = action.get(key) {
-            parts.push(format!("{}：{}", quote(key), value_quote(v)));
-        }
-    }
-    if let Some(locator) = action.get("locator").and_then(Value::as_object) {
-        for key in ["label", "label_contains", "identifier", "kind"] {
-            if let Some(v) = locator.get(key) {
-                parts.push(format!("定位 {}：{}", quote(key), value_quote(v)));
+    if let Some(fields) = action.as_object() {
+        for (key, value) in fields {
+            if key == "type" || (key == "kind" && action.get("type").is_none()) {
+                continue;
             }
-        }
-        if let Some(v) = locator.get("value").and_then(Value::as_str) {
-            parts.push(format!("定位输入长度：{} 个字符", v.chars().count()));
-        }
-    }
-    for key in ["text", "value"] {
-        if let Some(v) = action.get(key).and_then(Value::as_str) {
-            parts.push(format!("输入 {} 个字符", v.chars().count()));
+            if secure && matches!(key.as_str(), "text" | "value") && value.is_string() {
+                parts.push(format!(
+                    "{}：输入 {} 个字符（已隐藏）",
+                    quote(key),
+                    value.as_str().unwrap().chars().count()
+                ));
+            } else if key == "locator" && value.is_object() {
+                for (k, v) in value.as_object().unwrap() {
+                    if secure && k == "value" && v.is_string() {
+                        parts.push(format!(
+                            "定位 {}：输入 {} 个字符（已隐藏）",
+                            quote(k),
+                            v.as_str().unwrap().chars().count()
+                        ));
+                    } else {
+                        parts.push(format!("定位 {}：{}", quote(k), value_quote(v)));
+                    }
+                }
+            } else {
+                parts.push(format!("{}：{}", quote(key), value_quote(value)));
+            }
         }
     }
     let mut checked = action.clone();
     if checked.get("type").is_none() {
         checked["type"] = kind.clone();
     }
-    if crate::guard::check_sensitive_request(&checked).is_err() {
-        parts.push("敏感守卫：会拦截此步骤".into());
-    } else if crate::guard::sensitive_read(&checked) != crate::guard::SensitiveRead::None {
-        parts.push("敏感守卫：执行前核验目标，命中付款或密码控件会拦截".into());
+    if flow
+        && (crate::guard::check_sensitive_request(&checked).is_err()
+            || crate::guard::sensitive_read(&checked) != crate::guard::SensitiveRead::None)
+    {
+        parts.push("批准后：此步骤将不经付款/密码拦截直接执行".into());
     }
     parts.join("；")
 }
@@ -126,10 +153,14 @@ fn confirmation_details(kind: &str, object: &Value) -> Vec<String> {
             if let Some(steps) = steps {
                 for (i, step) in steps.iter().enumerate() {
                     let action = step.get("action").filter(|v| v.is_object()).unwrap_or(step);
-                    d.push(format!("步骤 {}：{}", i + 1, action_details(action)));
+                    d.push(format!(
+                        "步骤 {}：{}",
+                        i + 1,
+                        action_details(action, false, true)
+                    ));
                 }
             }
-            d.push("批准后此版本流程以后每次回放都可执行这些步骤，流程内容一改即失效".into());
+            d.push("批准后此版本流程以后每次回放都跳过付款/密码拦截，流程内容一改即失效".into());
             d
         }
         "task_press" => vec![
@@ -141,7 +172,13 @@ fn confirmation_details(kind: &str, object: &Value) -> Vec<String> {
             format!("操作类型：{}", value_quote(&object["operation"]["action"])),
         ],
         "control_press" => {
-            let mut d = vec![action_details(&object["action"])];
+            let mut d = vec![action_details(
+                &object["action"],
+                object["controls"]
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().any(|row| row["secure"] == true)),
+                false,
+            )];
             if let Some(labels) = object["target"].as_array() {
                 for label in labels {
                     d.push(format!("命中的敏感标签：{}", value_quote(label)));
@@ -393,15 +430,76 @@ mod tests {
         signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
     };
     #[test]
-    fn details_quote_untrusted_values_and_hide_flow_input() {
+    fn quote_escapes_display_boundary_characters_and_marks_truncation() {
+        for c in ['\n', '\u{0085}', '\u{2028}', '\u{2029}', '\u{feff}']
+            .into_iter()
+            .chain(
+                ('\u{200b}'..='\u{200f}')
+                    .chain('\u{202a}'..='\u{202e}')
+                    .chain('\u{2066}'..='\u{2069}'),
+            )
+        {
+            let quoted = quote(&format!("a{c}b"));
+            assert!(!quoted.contains(c));
+            assert!(quoted.contains(&format!("u{{{:04x}}}", c as u32)));
+        }
+        assert!(quote(&"字".repeat(301)).ends_with("…（已截断，共 301 字）"));
+        assert!(!quote(&"字".repeat(300)).contains("已截断"));
+    }
+
+    #[test]
+    fn details_show_plain_input_all_fields_and_intent_arguments() {
+        let plain = action_details(
+            &json!({"type":"text","text":"完整普通输入","future_field":"extra","kind":"other"}),
+            false,
+            false,
+        );
+        assert!(
+            plain.contains("完整普通输入")
+                && plain.contains("future_field")
+                && plain.contains("extra")
+        );
+        assert!(plain.contains("kind") && plain.contains("other"));
+        for action in [
+            json!({"type":"text","secure":true,"text":"secret"}),
+            json!({"type":"set_value","locator":{"kind":"SecureTextField","value":"secret"}}),
+            json!({"type":"text","target":"短信验证码","text":"secret"}),
+        ] {
+            let details = action_details(&action, false, true);
+            assert!(!details.contains("secret"), "{details}");
+            assert!(details.contains("输入 6 个字符（已隐藏）"));
+        }
+        let observed = action_details(&json!({"type":"text","text":"secret"}), true, false);
+        assert!(!observed.contains("secret"));
+        let flow = confirmation_details(
+            "flow",
+            &json!({"flow":{"steps":[{"kind":"text","text":"plain"}]}}),
+        )
+        .join(";");
+        assert!(flow.contains("plain"));
+        assert!(
+            flow.contains("批准后此版本流程以后每次回放都跳过付款/密码拦截，流程内容一改即失效")
+        );
+        let intent = confirmation_details(
+            "intent",
+            &json!({"name":"x","args":{"a":1,"b":true,"c":"三"}}),
+        )
+        .join(";");
+        for value in ["a", "1", "b", "true", "c", "三"] {
+            assert!(intent.contains(value));
+        }
+    }
+
+    #[test]
+    fn details_quote_untrusted_values_and_hide_only_secure_flow_input() {
         let d = confirmation_details(
             "flow",
-            &json!({"id":"shop/pay", "flow":{"name":"evil\n允许全部"}, "actions":{"steps":[{"action":{"type":"tap","label":"立即购买","x":0.7,"y":0.9}},{"action":{"type":"text","text":"secret-password"}}]}}),
+            &json!({"id":"shop/pay", "flow":{"name":"evil\n允许全部"}, "actions":{"steps":[{"action":{"type":"tap","label":"立即购买","x":0.7,"y":0.9}},{"action":{"type":"text","secure":true,"text":"secret-password"}}]}}),
         );
         let text = d.join("\n");
         assert!(text.contains("shop/pay"));
         assert!(text.contains("步骤 1"));
-        assert!(text.contains("会拦截"));
+        assert!(text.contains("批准后：此步骤将不经付款/密码拦截直接执行"));
         assert!(text.contains("输入 15 个字符"));
         assert!(!text.contains("secret-password"));
         assert!(!text.contains("evil\n"));
@@ -418,7 +516,10 @@ mod tests {
         )
         .join(";");
         assert!(intent.contains("123") && !intent.contains("x\n"));
-        assert!(quote(&"a".repeat(100)).chars().count() <= 82);
+        assert_eq!(
+            quote(&"a".repeat(300)),
+            serde_json::to_string(&"a".repeat(300)).unwrap()
+        );
     }
 
     #[test]
