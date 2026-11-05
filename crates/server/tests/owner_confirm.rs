@@ -292,6 +292,78 @@ fn owner_app_cannot_be_launched_or_driven() {
     });
 }
 #[test]
+fn selfrunner_bundles_are_refused_by_input_guard() {
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("IPU_SELFRUNNER_BUNDLE_ID", value),
+                None => std::env::remove_var("IPU_SELFRUNNER_BUNDLE_ID"),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os("IPU_SELFRUNNER_BUNDLE_ID"));
+    std::env::set_var("IPU_SELFRUNNER_BUNDLE_ID", "dev.example.owner");
+    support::block(async {
+        for bundle in [
+            "dev.iphoneuse.selfrunner.spike",
+            "dev.iphoneuse.selfrunner.spike.signed",
+            "dev.example.owner",
+            "dev.example.owner.signed",
+        ] {
+            let apps: &'static str = match bundle {
+                "dev.iphoneuse.selfrunner.spike" => {
+                    r#"[{"bundleId":"dev.iphoneuse.selfrunner.spike"}]"#
+                }
+                "dev.iphoneuse.selfrunner.spike.signed" => {
+                    r#"[{"bundleId":"dev.iphoneuse.selfrunner.spike.signed"}]"#
+                }
+                "dev.example.owner" => r#"[{"bundleId":"dev.example.owner"}]"#,
+                _ => r#"[{"bundleId":"dev.example.owner.signed"}]"#,
+            };
+            let runner = support::mock_runner_with_apps(apps, |request, _| {
+                assert!(!request.lines().next().unwrap_or("").contains("/actions"));
+                assert!(!request
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .contains("/apps/launch"));
+                Some((
+                    Duration::ZERO,
+                    if request.starts_with("POST /session ") {
+                        r#"{"value":{"sessionId":"SESSION"}}"#
+                    } else {
+                        r#"{"value":null}"#
+                    }
+                    .into(),
+                ))
+            });
+            let state = support::build_state_with_runner(runner.url());
+            // Explicit target must be refused even with no foreground evidence.
+            let (status, body) = call(
+                &state,
+                "/agent/input",
+                json!({"type":"launch_app","bundle":bundle}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["error"], "owner_app_protected");
+            state
+                .runner
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .active_bundles()
+                .await
+                .unwrap();
+            let (status, body) = call(&state, "/agent/input", json!({"type":"home"})).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["error"], "owner_app_protected");
+        }
+    });
+}
+#[test]
 fn agent_cannot_approve_tasks() {
     support::block(async {
         let state = support::build_state(None);

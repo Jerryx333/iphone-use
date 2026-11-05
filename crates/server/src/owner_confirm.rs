@@ -405,13 +405,56 @@ fn verify(key: &[u8], message: &[u8], signature: Option<&str>) -> Result<(), &'s
 }
 
 pub fn protected_bundle(bundle: &str) -> bool {
-    bundle == "com.leeguoo.iphone-use.remote"
-        || bundle.starts_with("com.leeguoo.iphone-use.remote.")
+    protected_bundle_with_custom(
+        bundle,
+        std::env::var("IPU_SELFRUNNER_BUNDLE_ID").ok().as_deref(),
+    )
+}
+
+fn protected_bundle_with_custom(bundle: &str, custom: Option<&str>) -> bool {
+    [
+        Some("com.leeguoo.iphone-use.remote"),
+        Some("dev.iphoneuse.selfrunner.spike"),
+        custom,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|base| !base.is_empty())
+    .any(|base| {
+        bundle == base
+            || bundle
+                .strip_prefix(base)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protects_owner_apps_and_signed_suffixes_with_custom_bundle() {
+        for base in [
+            "com.leeguoo.iphone-use.remote",
+            "dev.iphoneuse.selfrunner.spike",
+            "dev.example.owner",
+        ] {
+            for bundle in [base.to_owned(), format!("{base}.signed")] {
+                assert!(protected_bundle_with_custom(
+                    &bundle,
+                    Some("dev.example.owner")
+                ));
+            }
+            assert!(!protected_bundle_with_custom(
+                &format!("{base}other"),
+                Some("dev.example.owner")
+            ));
+        }
+        assert!(protected_bundle("dev.iphoneuse.selfrunner.spike"));
+        assert!(!protected_bundle_with_custom(
+            "com.apple.Preferences",
+            Some("")
+        ));
+    }
     use ring::{
         rand::SystemRandom,
         signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
