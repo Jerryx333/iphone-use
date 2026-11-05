@@ -24,6 +24,15 @@ final class RunnerCore: NSObject {
   var mjpeg: RunnerMJPEGServer?
   var onShutdown: (() -> Void)?
   var onListenFailure: ((Error) -> Void)?
+  /// Installed only by the Self Runner host; runs on main before remote mutations.
+  var ownerProtection = OwnerMutationProtection() {
+    didSet {
+      keepAwake.inputBlocked = { [weak self] in
+        guard let self else { return true }
+        return (try? self.ownerProtection.check()) == nil
+      }
+    }
+  }
   private(set) var port: UInt16 = RunnerCore.defaultPort
   /// Why the command listener stopped, when it failed rather than being shut down.
   var listenFailure: Error?
@@ -239,6 +248,12 @@ final class RunnerCore: NSObject {
   }
 
   func handleOnMain(_ request: HTTPRequest) -> HTTPResponse {
+    if request.method != "GET", Self.mayChangeScreen(request.path) {
+      let body = (try? request.jsonObject()) ?? [:]
+      do {
+        try ownerProtection.check(bundle: (body["bundleId"] ?? body["bundle"] ?? body["bundle_id"]) as? String)
+      } catch { return .from(error) }
+    }
     let started = Date()
     if request.method == "POST", KeepAwake.isInput(request.path) {
       keepAwake.noteCommand()
@@ -542,6 +557,7 @@ final class RunnerCore: NSObject {
     synthesized: () -> String?,
     fallback: (XCUIApplication) -> Void
   ) throws -> HTTPResponse {
+    try ownerProtection.check()
     let backend = try GestureDelivery.run(name, synthesisAvailable: IPURBridge.eventSynthesisAvailable(),
         synthesized: { timed("Synthesize", synthesized) }) {
       NSLog("ipu-runner: %@ synthesis unavailable before dispatch, using XCUICoordinate", name)
@@ -616,6 +632,7 @@ final class RunnerCore: NSObject {
   func home() throws -> HTTPResponse {
     defer { IPURBridge.invalidateRequestCache() }
     func checked(_ action: () -> Void) throws {
+      try ownerProtection.check()
       let issuesBefore = recordedIssues.count
       let exception = IPURBridge.catchException(action)
       if let failure = exception ?? (recordedIssues.count > issuesBefore ? recordedIssues.last : nil) {
@@ -643,17 +660,8 @@ final class RunnerCore: NSObject {
   func launch(_ request: HTTPRequest) throws -> HTTPResponse {
     let body = try request.jsonObject()
     let bundle = try requiredString(body, "bundle", "bundleId")
-    let application = XCUIApplication(bundleIdentifier: bundle)
-    let issuesBefore = recordedIssues.count
-    var exception: String?
-    IPURBridge.performWithoutQuiescence(application) {
-      exception = IPURBridge.catchException { application.activate() }
-      IPURBridge.invalidateRequestCache()
-    }
-    if let failure = exception ?? (recordedIssues.count > issuesBefore ? recordedIssues.last : nil) {
-      throw RunnerError.failed("launch \(bundle) failed: \(failure)")
-    }
-    return .value(["bundle": bundle, "pid": Int(IPURBridge.pid(for: application))])
+    let pid = try activate(bundle)
+    return .value(["bundle": bundle, "pid": Int(pid)])
   }
 
   func activeApp() throws -> HTTPResponse {
@@ -851,6 +859,7 @@ extension RunnerCore {
 /// (a phone its owner just locked must stay locked), and skips a beat when a command ran in the
 /// last interval: a tap or a swipe resets the idle timer by itself.
 final class KeepAwake {
+  var inputBlocked: (() -> Bool)?
   static let maxSeconds: TimeInterval = 900
   /// Auto-Lock's shortest setting is 30 s and the screen dims before that; 10 s stays clear of both.
   static let interval: TimeInterval = 10
@@ -941,12 +950,13 @@ final class KeepAwake {
     // Re-check on main: the phone may have locked while this beat waited behind a command.
     var known = ObjCBool(false)
     let locked = IPURBridge.isScreenLocked(&known)
-    let error = (!known.boolValue || locked) ? nil : IPURBridge.resetIdleTimer()
+    let blocked = inputBlocked?() == true
+    let error = (!known.boolValue || locked || blocked) ? nil : IPURBridge.resetIdleTimer()
     let took = Date().timeIntervalSince(started)
     lock.lock()
     defer { lock.unlock() }
     beatQueued = false
-    if !known.boolValue || locked {
+    if !known.boolValue || locked || blocked {
       skippedLocked += 1
       return
     }

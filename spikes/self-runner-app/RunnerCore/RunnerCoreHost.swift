@@ -53,6 +53,12 @@ final class RunnerCoreHost: NSObject {
     if let port = options["port"] as? NSNumber { environment["IPU_RUNNER_PORT"] = port.stringValue }
     if let port = options["mjpegPort"] as? NSNumber { environment["IPU_RUNNER_MJPEG_PORT"] = port.stringValue }
     let core = RunnerCore()
+    core.ownerProtection.blocksInput = { args in
+      // The app and this dynamically loaded bundle do not link Swift types to each other.
+      guard let protection = NSClassFromString("SelfRunnerOwnerProtection") as? NSObject.Type else { return true }
+      let value = (protection as AnyObject).perform(NSSelectorFromString("blocksInput:"), with: args as NSDictionary)?.takeUnretainedValue() as? NSNumber
+      return value?.boolValue ?? true
+    }
     core.onShutdown = {
       shutdownRequested = true
       NSLog("selfrunner-core: /shutdown received; stopping the runner API")

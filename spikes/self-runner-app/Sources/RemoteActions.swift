@@ -158,6 +158,7 @@ final class RemoteActions {
         lastRead = nil
         guard portrait else { return finish(code: "unsupported_orientation") }
         let launchStart = ProcessInfo.processInfo.systemUptime
+        if expired() { return finish(code: "expired") }
         actionSent = true
         let launchError = SpikeBridge.remoteLaunch(bundle: "com.apple.shortcuts")
         record("launch", started: launchStart, error: launchError)
@@ -434,6 +435,7 @@ final class RemoteActions {
             // another geometry or perform a second swipe/input attempt.
             let from = CGPoint(x: 196, y: 840), to = CGPoint(x: 196, y: 300)
             guard screen.contains(from), screen.contains(to), let target = (snapshot["pid"] as? NSNumber)?.int32Value else { return fail("target_unknown") }
+            if expired() { return fail("expired") }
             if SpikeBridge.swipeScreen(from: from, to: to, pid: target, duration: 0.3) != nil { return fail("swipe_failed") }
         }
         let keypadEnd = ProcessInfo.processInfo.systemUptime + 3
@@ -451,6 +453,7 @@ final class RemoteActions {
                   let target = (snapshot["pid"] as? NSNumber)?.int32Value else { return fail("unlock_unconfirmed") }
             if opened() { return RemoteActionResult(["unlocked": true]) }
             // Deliberately bypass general tap occlusion logic. Never return bridge text.
+            if expired() { return fail("expired") }
             if SpikeBridge.tapScreen(point: point, pid: target, log: { _ in }) != nil { return fail("tap_failed") }
             if i < digits.count - 1 {
                 let next = ProcessInfo.processInfo.systemUptime + 0.12
@@ -473,6 +476,24 @@ final class RemoteActions {
     }
     func execute(action: String, args: [String: Any], depth: Int, portrait: Bool,
                  status: [String: Any], expired: () -> Bool) -> RemoteActionResult {
+        let targetPID = (args["pid"] as? NSNumber)?.int32Value ?? snapshots.first {
+            guard let id = args["snapshot_id"] as? String else { return false }
+            return $0["snapshot_id"] as? String == id
+        }.flatMap { ($0["pid"] as? NSNumber)?.int32Value }
+        if OwnerUIProtection.blocks(action: action, args: args, foregroundPID: targetPID) {
+            return RemoteActionResult(code: "owner_app_protected")
+        }
+        // Recheck on every existing deadline checkpoint, including immediately before synthesis.
+        // Reads and local self-tests never enter this remote mutation guard.
+        var protected = false
+        let outcome = executeGuarded(action: action, args: args, depth: depth, portrait: portrait, status: status) {
+            protected = protected || OwnerUIProtection.blocks(action: action, args: args, foregroundPID: targetPID)
+            return expired() || protected
+        }
+        return protected ? RemoteActionResult(code: "owner_app_protected", details: outcome.result) : outcome
+    }
+    private func executeGuarded(action: String, args: [String: Any], depth: Int, portrait: Bool,
+                                status: [String: Any], expired: () -> Bool) -> RemoteActionResult {
         let requestStarted = ProcessInfo.processInfo.systemUptime
         if expired() { return RemoteActionResult(code: "expired") }
         switch action {
@@ -542,6 +563,7 @@ final class RemoteActions {
             guard args["strategy"] == nil || args["strategy"] is String,
                   ["auto", "shortcut", "hid", "device_event", "press_lock"].contains(strategy),
                   button == "lock" || (args["strategy"] == nil && args["shortcut_name"] == nil) else { return RemoteActionResult(code: "invalid_args") }
+            if expired() { return RemoteActionResult(code: "expired") }
             if button != "lock" { return sent(SpikeBridge.remotePress(button: button), expired: expired) }
             guard args["shortcut_name"] == nil || args["shortcut_name"] is String else { return RemoteActionResult(code: "invalid_args") }
             let name = args["shortcut_name"] as? String ?? "锁屏"

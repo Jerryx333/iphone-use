@@ -7,7 +7,7 @@ import UIKit
 import XCTest
 
 extension RunnerCore {
-  /// POSTs that can change what is on screen (everything except session setup, settings and finds).
+  /// Cache/binding invalidation classification; session activation is guarded in activate itself.
   static func mayChangeScreen(_ path: String) -> Bool {
     !(path == "/session" || path.hasSuffix("/appium/settings") || path.hasSuffix("/elements")
       || path.hasSuffix("/element") || path == "/shutdown")
@@ -175,11 +175,7 @@ extension RunnerCore {
   private func createSession(_ request: HTTPRequest) throws -> HTTPResponse {
     inputBinding = nil
     let body = (try? request.jsonObject()) ?? [:]
-    let capabilities = body["capabilities"] as? [String: Any]
-    let always = capabilities?["alwaysMatch"] as? [String: Any] ?? [:]
-    let first = (capabilities?["firstMatch"] as? [[String: Any]])?.first ?? [:]
-    let desired = body["desiredCapabilities"] as? [String: Any] ?? [:]
-    let bundle = (always["bundleId"] ?? first["bundleId"] ?? desired["bundleId"]) as? String
+    let bundle = OwnerMutationProtection.sessionBundle(body)
     if let bundle, !bundle.isEmpty {
       _ = try activate(bundle)
     }
@@ -449,6 +445,7 @@ extension RunnerCore {
   }
 
   private func focusReplacementTarget(_ token: String, original: UINode) throws -> (node: UINode, tapped: Bool) {
+    try ownerProtection.check(pid: original.pid)
     var before = try checkedReplacementTarget(token, original: original, requireFocus: false)
     if before.isFocused { return (before, false) }
     before = try actionNode(token, editing: true)
@@ -459,7 +456,10 @@ extension RunnerCore {
     guard let ax = before.axElement else { throw RunnerError.failed("replacement original AX handle unavailable") }
     if let error = IPURBridge.synthesizeFocusTap(forAXElement: ax, at: before.center, pid: before.pid,
         axPID: elements.axPID(token) ?? 0,
-        allowDispatch: { self.replacementFocusPointAllowed(token, original: original, point: before.center) }) {
+        allowDispatch: {
+          (try? self.ownerProtection.check(pid: before.pid)) != nil
+            && self.replacementFocusPointAllowed(token, original: original, point: before.center)
+        }) {
       throw RunnerError.failed("replacement focus tap outcome unknown: \(error)")
     }
     let deadline = ProcessInfo.processInfo.systemUptime + 0.75
@@ -762,6 +762,7 @@ extension RunnerCore {
 
   /// Types text (with WebDriver private-use key codes mapped) into whatever has focus.
   func typeIntoFocus(_ text: String, frequency: UInt = 60, mapKeys: Bool = true, targetPID: Int32? = nil) throws -> String {
+    try ownerProtection.check(pid: targetPID)
     let mapped = mapKeys ? Self.mapWebDriverKeys(text) : text
     if mapped.isEmpty { return "none" }
     // Select before dispatch. An error may follow delivery of a prefix, so never
@@ -897,6 +898,7 @@ extension RunnerCore {
             throw RunnerError.invalidArgument("targeted selection unavailable; nothing was sent")
           }
           _ = try checkedInputTarget(token)
+          try ownerProtection.check(pid: node.pid)
           started = true
           guard let selected = IPURBridge.selectAllText(for: ax, pid: node.pid, axPID: elements.axPID(token) ?? 0, retryState: nil, error: &readError),
                 (selected["confirmed"] as? NSNumber)?.boolValue == true,
@@ -974,6 +976,7 @@ extension RunnerCore {
   }
 
   private func adjust(_ node: UINode, _ id: String, _ body: (XCUIElement) -> Void) throws {
+    try ownerProtection.check(pid: node.pid)
     let current = try actionNode(id)
     let element = try xcuiElement(for: current)
     let application = IPURBridge.application(forPID: node.pid)
@@ -994,12 +997,14 @@ extension RunnerCore {
   }
 
   private func synthesizePaths(_ paths: [[[String: Any]]], name: String) throws {
+    try ownerProtection.check()
     if let error = timed("Synthesize", { IPURBridge.synthesizeTouchPaths(paths, name: name) }) {
       throw RunnerError.failed("\(name) failed: \(error)")
     }
   }
 
   private func elementGesture(_ id: String, _ action: String, _ request: HTTPRequest) throws -> HTTPResponse {
+    try ownerProtection.check()
     let body = try request.jsonObject()
     if action == "scrollTo" { return try revealElement(id) }
     let node = try actionNode(id)
@@ -1140,6 +1145,7 @@ extension RunnerCore {
       // the drag ended, so the element's frame is final at once and a tap right after lands — a
       // tap during a glide only stops the glide.
       let paths = try W3CActions.pointerPaths(ScrollDrag.actions(from: start, to: end)) { _ in .zero }
+      try ownerProtection.check()
       if let error = timed("Synthesize", { IPURBridge.synthesizeTouchPaths(paths, name: "ipu-scroll-to") }) {
         throw RunnerError.failed("scrollTo failed: \(error)")
       }
@@ -1202,6 +1208,7 @@ extension RunnerCore {
         "action point (\(Int(off.x)), \(Int(off.y))) is outside the \(Int(screen.width))x\(Int(screen.height)) screen; nothing was sent")
     }
     if !paths.isEmpty {
+      try ownerProtection.check()
       if let point = W3CActions.coordinateTapPoint(paths) {
         let response = try gesture("actions tap", synthesized: {
           IPURBridge.synthesizeTouchPaths(paths, name: "ipu-w3c-actions")
@@ -1226,6 +1233,7 @@ extension RunnerCore {
 
   /// 处理 runner 按键请求；Home 复用桌面激活逻辑，其余按键沿用设备事件。
   private func pressButton(_ request: HTTPRequest) throws -> HTTPResponse {
+    try ownerProtection.check()
     let body = try request.jsonObject()
     let name = (body["name"] as? String ?? "").lowercased()
     let button: XCUIDevice.Button
@@ -1252,7 +1260,8 @@ extension RunnerCore {
     return .value(NSNull())
   }
 
-  private func activate(_ bundle: String) throws -> Int32 {
+  func activate(_ bundle: String) throws -> Int32 {
+    try ownerProtection.check(bundle: bundle)
     let application = XCUIApplication(bundleIdentifier: bundle)
     let issuesBefore = recordedIssues.count
     var exception: String?
@@ -1271,6 +1280,7 @@ extension RunnerCore {
   private func terminateApp(_ request: HTTPRequest) throws -> HTTPResponse {
     let body = try request.jsonObject()
     let bundle = try requiredString(body, "bundleId", "bundle")
+    try ownerProtection.check(bundle: bundle)
     let application = XCUIApplication(bundleIdentifier: bundle)
     let wasRunning = application.state != .notRunning && application.state != .unknown
     if wasRunning {
@@ -1356,6 +1366,7 @@ extension RunnerCore {
   }
 
   private func openURL(_ request: HTTPRequest) throws -> HTTPResponse {
+    try ownerProtection.check()
     let body = try request.jsonObject()
     guard let string = body["url"] as? String, let url = URL(string: string) else {
       throw RunnerError.invalidArgument("'url' must be a valid URL string")
@@ -1403,6 +1414,7 @@ extension RunnerCore {
   }
 
   private func lockScreen() throws -> HTTPResponse {
+    try ownerProtection.check()
     if lockedOnMain() == true { return .value(NSNull()) }
     if let error = IPURBridge.pressLockButton() { throw RunnerError.failed(error) }
     return .value(NSNull())
@@ -1426,6 +1438,7 @@ extension RunnerCore {
     // screen (iPhone 13, iOS 27), the second opens it. Stop as soon as it is open — one press
     // more would leave the app it was showing for the Home screen.
     for _ in 0..<3 {
+      try ownerProtection.check()
       if let exception = IPURBridge.catchException({ XCUIDevice.shared.press(.home) }) {
         throw RunnerError.failed("unlock failed: \(exception)")
       }

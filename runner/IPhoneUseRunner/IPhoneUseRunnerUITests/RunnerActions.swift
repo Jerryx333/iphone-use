@@ -5,6 +5,29 @@ import CoreGraphics
 import CoreFoundation
 import Foundation
 
+/// Shared by every remote mutation, including session activation and keep-awake beats.
+/// A missing callback preserves the ordinary XCTest runner's behavior.
+struct OwnerMutationProtection {
+  var blocksInput: (([String: Any]) -> Bool)?
+
+  func check(bundle: String? = nil, pid: Int32? = nil) throws {
+    var args: [String: Any] = [:]
+    if let bundle { args["bundle_id"] = bundle }
+    if let pid { args["pid"] = pid }
+    if blocksInput?(args) == true {
+      throw RunnerError(status: 403, code: "owner_app_protected", message: "owner_app_protected")
+    }
+  }
+
+  static func sessionBundle(_ body: [String: Any]) -> String? {
+    let capabilities = body["capabilities"] as? [String: Any]
+    let always = capabilities?["alwaysMatch"] as? [String: Any] ?? [:]
+    let first = (capabilities?["firstMatch"] as? [[String: Any]])?.first ?? [:]
+    let desired = body["desiredCapabilities"] as? [String: Any] ?? [:]
+    return (always["bundleId"] ?? first["bundleId"] ?? desired["bundleId"]) as? String
+  }
+}
+
 /// A synthesis error may follow delivered input. Only capability absence,
 /// established before invoking synthesis, permits another implementation.
 enum GestureDelivery {

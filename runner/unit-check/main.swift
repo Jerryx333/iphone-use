@@ -39,6 +39,41 @@ func expectThrows(_ code: String, _ message: String, line: Int = #line, _ body: 
   }
 }
 
+// MARK: Owner mutation protection (device-independent gate and capability resolution)
+
+do {
+  let own = "dev.iphoneuse.selfrunner.spike"
+  for body: [String: Any] in [
+    ["capabilities": ["alwaysMatch": ["bundleId": own]]],
+    ["capabilities": ["firstMatch": [["bundleId": own]]]],
+    ["desiredCapabilities": ["bundleId": own]],
+  ] {
+    check(OwnerMutationProtection.sessionBundle(body) == own, "session bundle reaches mutation guard")
+  }
+  check(OwnerMutationProtection.sessionBundle([:]) == nil, "empty session does not activate")
+  check(OwnerMutationProtection.sessionBundle([
+    "capabilities": ["alwaysMatch": ["bundleId": "always"], "firstMatch": [["bundleId": "first"]]],
+    "desiredCapabilities": ["bundleId": "desired"],
+  ]) == "always", "existing capability precedence preserved")
+  var presented = false
+  var target: [String: Any] = [:]
+  var guardInput = OwnerMutationProtection()
+  guardInput.blocksInput = { args in target = args; return presented }
+  do { try guardInput.check(bundle: "other", pid: 123) }
+  catch { check(false, "hidden owner UI preserves input") }
+  check(target["bundle_id"] as? String == "other" && target["pid"] as? Int32 == 123,
+        "actual target bundle and PID reach host callback")
+  presented = true
+  expectThrows("owner_app_protected", "session activation blocked for any bundle") {
+    try guardInput.check(bundle: "other")
+  }
+  expectThrows("owner_app_protected", "input and keep-awake blocked after UI appears") {
+    try guardInput.check()
+  }
+  do { try OwnerMutationProtection().check() }
+  catch { check(false, "ordinary XCTest host remains unchanged") }
+}
+
 // MARK: Home event and fallback sequencing
 
 do {
