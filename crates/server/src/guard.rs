@@ -19,8 +19,9 @@
 //! control labelled 付款, 立即购买, 转账, 充值, 免密, Pay, Checkout, … — the list
 //! `iphone_use_mcp::task` keeps) and typing into a password or verification
 //! code field are refused as `sensitive_action`; the owner does those on the
-//! phone. Sending, deleting and sharing pass. A saved flow's replay
-//! (`X-Phone-Flow-Run`) passes too: the owner approved it when it was saved.
+//! phone. Sending, deleting and sharing pass. A saved flow's replay passes
+//! too, but only with the daemon's own one-time grant for that exact batch
+//! (`crate::flow_grants`); `X-Phone-Flow-Run` alone only marks a replay.
 //! So does the one press a daemon task's owner allowed on the phone
 //! ([`owner_allowed`]).
 

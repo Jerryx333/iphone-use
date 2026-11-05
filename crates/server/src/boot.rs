@@ -80,6 +80,7 @@ pub fn app_state(inputs: StateInputs<'_>) -> Arc<AppState> {
         element_snapshots: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         action_traces: Arc::new(Mutex::new(crate::action_trace::TraceStore::default())),
         owner_snapshots: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        flow_grants: Default::default(),
         flow_trail: Arc::new(Mutex::new(crate::flows::FlowTrail::default())),
         agent_focus: Arc::new(Mutex::new(crate::focus::AgentFocus::load(
             crate::focus::state_path(),

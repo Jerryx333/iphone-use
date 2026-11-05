@@ -56,8 +56,8 @@ pub fn valid_flow_id(id: &str) -> bool {
     }
 }
 
-/// Where flows live on this machine. Created 0700 on first use.
-pub fn store_dir() -> Result<PathBuf> {
+/// Where flows live on this machine, without creating or changing the store.
+pub(crate) fn store_dir_path() -> Result<PathBuf> {
     let dir = match std::env::var(STORE_ENV) {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => {
@@ -66,6 +66,12 @@ pub fn store_dir() -> Result<PathBuf> {
             PathBuf::from(home).join(".iphone-use").join("flows")
         }
     };
+    Ok(dir)
+}
+
+/// Where flows live on this machine. Created 0700 on first use.
+pub fn store_dir() -> Result<PathBuf> {
+    let dir = store_dir_path()?;
     ensure_private_dir(&dir)?;
     Ok(dir)
 }

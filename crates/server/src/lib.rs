@@ -68,3 +68,5 @@ pub mod runner;
 /// through this alias avoids that footgun.
 pub use ::core as core_crate;
 pub mod observation;
+
+pub mod flow_grants;

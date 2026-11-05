@@ -184,6 +184,8 @@ impl FlowMeta {
 
 #[derive(Debug)]
 pub struct ValidatedFlow {
+    /// Library identity, only set when loaded from the installed store.
+    pub stored_id: Option<String>,
     pub meta: FlowMeta,
     pub inputs: BTreeMap<String, FlowInputDefinition>,
     pub step_templates: Vec<serde_json::Value>,
@@ -191,6 +193,16 @@ pub struct ValidatedFlow {
 }
 
 impl ValidatedFlow {
+    /// The exact actions body used by both replay and daemon authorization.
+    pub fn actions_request(&self, inputs: &BTreeMap<String, String>) -> Result<serde_json::Value> {
+        phone_steps_request(materialize_steps(
+            &self.step_templates,
+            &self.inputs,
+            Some(inputs),
+        )?)
+        .map_err(anyhow::Error::msg)
+    }
+
     pub fn name(&self) -> &str {
         &self.meta.name
     }
@@ -470,7 +482,7 @@ pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
     // symlink without a metadata/open race. Flow files can contain text and
     // taps with real-world effects, so only regular, current-user-owned files
     // that are not group/world-writable are accepted.
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -480,6 +492,12 @@ pub fn read_flow_bytes(path: &Path) -> Result<Vec<u8>> {
                 path.display()
             )
         })?;
+    read_flow_file_bytes(file, path)
+}
+
+/// Validate an already-opened flow file, including ownership, mode and size.
+/// The caller must open it without following symlinks.
+pub fn read_flow_file_bytes(mut file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
     let metadata = file
         .metadata()
         .with_context(|| format!("inspect flow file: {}", path.display()))?;
@@ -550,6 +568,7 @@ pub fn parse_flow(bytes: &[u8], origin: &str) -> Result<ValidatedFlow> {
     let validated_steps = materialize_steps(&document.steps, &document.inputs, None)?;
     phone_steps_request(validated_steps).map_err(anyhow::Error::msg)?;
     Ok(ValidatedFlow {
+        stored_id: None,
         meta: FlowMeta {
             name: name.to_string(),
             description: document.description,
@@ -572,8 +591,27 @@ pub fn parse_flow(bytes: &[u8], origin: &str) -> Result<ValidatedFlow> {
 }
 
 pub fn load_flow(path: &Path) -> Result<ValidatedFlow> {
+    load_flow_with_bytes(path).map(|(flow, _)| flow)
+}
+
+// Keep identity detection shared by every replay entry point. Return the exact
+// bytes validated so CLI evidence hashes never require a second file read.
+fn load_flow_with_bytes(path: &Path) -> Result<(ValidatedFlow, Vec<u8>)> {
     let bytes = read_flow_bytes(path)?;
-    parse_flow(&bytes, &path.display().to_string())
+    let mut flow = parse_flow(&bytes, &path.display().to_string())?;
+    let store = registry::store_dir_path().ok();
+    if let Some((root, file)) =
+        store.and_then(|s| Some((s.canonicalize().ok()?, path.canonicalize().ok()?)))
+    {
+        if let Ok(relative) = file.strip_prefix(root) {
+            if let Some(id) = relative.to_str().and_then(|p| p.strip_suffix(".json")) {
+                if registry::valid_flow_id(id) {
+                    flow.stored_id = Some(id.to_string());
+                }
+            }
+        }
+    }
+    Ok((flow, bytes))
 }
 
 /// Write a draft flow to a NEW file (0600, never over an existing path) and
@@ -1496,8 +1534,7 @@ pub async fn run_for_task(
     confirm: bool,
 ) -> Result<(bool, serde_json::Value)> {
     let path = registry::resolve_target(target)?;
-    let bytes = read_flow_bytes(&path)?;
-    let flow = parse_flow(&bytes, &path.display().to_string())?;
+    let flow = load_flow(&path)?;
     let inputs = parse_input_assignments(assignments, &flow.inputs)?;
     compat_gate(&flow, daemon, false).await?;
     let (run, ran_id, _) = execute_with_fallback(target, &flow, &inputs, daemon, confirm).await?;
@@ -1521,9 +1558,8 @@ pub async fn run_command(
     // Hash the EXACT bytes this run parses. An index entry describes what was
     // downloaded once; it does not prove what is on disk now, and a local file
     // run directly has no index entry at all.
-    let bytes = read_flow_bytes(&path)?;
+    let (flow, bytes) = load_flow_with_bytes(&path)?;
     let sha256 = registry::sha256_hex(&bytes);
-    let flow = parse_flow(&bytes, &path.display().to_string())?;
     let inputs = parse_input_assignments(assignments, &flow.inputs)?;
     let daemon = DaemonClient::from_env();
     // One lookup, reused for the evidence record: asking twice would be a
@@ -1691,8 +1727,7 @@ pub async fn execute_flow_run(
             flow.name()
         );
     }
-    let steps = materialize_steps(&flow.step_templates, &flow.inputs, Some(inputs))?;
-    let request = phone_steps_request(steps).map_err(anyhow::Error::msg)?;
+    let request = flow.actions_request(inputs)?;
     let status_body = daemon
         .get_text("/agent/status")
         .await
@@ -1716,7 +1751,16 @@ pub async fn execute_flow_run(
         .get("version")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    let outcome = match daemon.flow_actions_outcome(&request).await {
+    // Grant failure deliberately falls back to the ordinary sensitive guard.
+    let grant = if let Some(id) = &flow.stored_id {
+        daemon.flow_run_grant(id, inputs).await.ok().flatten()
+    } else {
+        None
+    };
+    let outcome = match daemon
+        .flow_actions_with_grant(&request, grant.as_deref())
+        .await
+    {
         Ok(response) => RunAnswer::Answered(response),
         // A connection that never opened means nothing reached the phone, and
         // saying so is safe. Anything later — the request was already on the
@@ -1750,6 +1794,32 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
+
+    // Hold TEST_ENV before constructing this guard; restore even on assertion
+    // failure so a replay test cannot leak HOME, store, or daemon settings.
+    struct ReplayEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl ReplayEnv {
+        fn new() -> Self {
+            Self(
+                [registry::STORE_ENV, "HOME", "IPHONE_USE_URL"]
+                    .into_iter()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for ReplayEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     fn valid_flow() -> &'static str {
         r#"{
@@ -2755,6 +2825,144 @@ mod tests {
             0o700,
             "but this run's own directory is private"
         );
+    }
+
+    #[tokio::test]
+    async fn installed_replay_requests_grant_and_falls_back_when_unavailable() {
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReplayEnv::new();
+        let store = tempfile::tempdir().unwrap();
+        std::env::set_var(registry::STORE_ENV, store.path());
+        let path = registry::flow_path(store.path(), "shop/buy");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, valid_flow()).unwrap();
+        for (grant_status, grant_body, expected_token) in [
+            (
+                "200 OK",
+                r#"{"grant":"opaque-replay-token"}"#,
+                Some("opaque-replay-token"),
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":"flow_grant_unavailable"}"#,
+                None,
+            ),
+        ] {
+            let flow = load_flow(&registry::resolve_target("shop/buy").unwrap()).unwrap();
+            let (url, task, requests) = mock_daemon_sequence(&[
+                ("200 OK", r#"{"backend":"direct","drivable":true}"#),
+                (grant_status, grant_body),
+                ("200 OK", r#"{"ok":true}"#),
+            ]);
+            execute_flow_run(
+                &flow,
+                &BTreeMap::new(),
+                &DaemonClient::new(url, None),
+                false,
+            )
+            .await
+            .unwrap();
+            task.join().unwrap();
+            let requests: Vec<_> = requests.try_iter().collect();
+            assert!(requests[1].starts_with("POST /agent/flow-run/grant "));
+            assert!(requests[1].contains(r#""id":"shop/buy""#));
+            assert!(requests[2].starts_with("POST /agent/actions "));
+            assert!(requests[2].contains("x-phone-flow-run: 1"));
+            match expected_token {
+                Some(token) => {
+                    assert!(requests[2].contains(&format!("x-phone-flow-grant: {token}")))
+                }
+                None => assert!(!requests[2].contains("x-phone-flow-grant:")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_and_cli_replay_only_request_grants_for_installed_flows() {
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReplayEnv::new();
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::env::set_var(registry::STORE_ENV, store.path());
+        let installed = registry::flow_path(store.path(), "shop/buy");
+        // Even a valid app/flow-shaped path outside the store is an ordinary file.
+        let external = registry::flow_path(outside.path(), "shop/buy");
+        for path in [&installed, &external] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, valid_flow()).unwrap();
+        }
+
+        for cli in [false, true] {
+            // Both registry ids and explicit paths into the store keep identity.
+            for target in [
+                "shop/buy",
+                installed.to_str().unwrap(),
+                external.to_str().unwrap(),
+            ] {
+                let stored = target != external.to_str().unwrap();
+                let mut responses = vec![
+                    ("200 OK", "{}"), // compat: apps, then status without a udid
+                    ("200 OK", r#"{"ok":true}"#),
+                    ("200 OK", r#"{"backend":"direct","drivable":true}"#),
+                ];
+                if stored {
+                    responses.push(("200 OK", r#"{"grant":"replay-token"}"#));
+                }
+                responses.push(("200 OK", r#"{"ok":true}"#));
+                let (url, task, requests) = mock_daemon_sequence(&responses);
+                if cli {
+                    std::env::set_var("IPHONE_USE_URL", &url);
+                    run_command(target, &[], false, false, None, None)
+                        .await
+                        .unwrap();
+                } else {
+                    let (succeeded, _) =
+                        run_for_task(&DaemonClient::new(url, None), target, &[], false)
+                            .await
+                            .unwrap();
+                    assert!(succeeded);
+                }
+                task.join().unwrap();
+                let requests: Vec<_> = requests.try_iter().collect();
+                assert_eq!(requests.len(), if stored { 5 } else { 4 });
+                let action = requests.last().unwrap();
+                assert!(action.starts_with("POST /agent/actions "));
+                assert!(action.contains("x-phone-flow-run: 1"));
+                assert_eq!(action.contains("x-phone-flow-grant: replay-token"), stored);
+                if stored {
+                    assert!(requests[3].starts_with("POST /agent/flow-run/grant "));
+                    assert!(requests[3].contains(r#""id":"shop/buy""#));
+                } else {
+                    assert!(!requests.iter().any(|r| r.contains("/agent/flow-run/grant")));
+                    assert!(!action.contains("x-phone-flow-grant:"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blank_store_override_identifies_home_flows_without_creating_a_store() {
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = ReplayEnv::new();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let store = home.path().join(".iphone-use/flows");
+        let external = home.path().join("draft.json");
+        fs::write(&external, valid_flow()).unwrap();
+        for value in ["", " \t "] {
+            std::env::set_var(registry::STORE_ENV, value);
+            assert!(load_flow(&external).unwrap().stored_id.is_none());
+            assert!(!store.exists(), "loading a draft must not create the store");
+        }
+        let installed = registry::flow_path(&store, "shop/buy");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, valid_flow()).unwrap();
+        for value in ["", " \t "] {
+            std::env::set_var(registry::STORE_ENV, value);
+            let flow = load_flow(&registry::resolve_target("shop/buy").unwrap()).unwrap();
+            assert_eq!(flow.stored_id.as_deref(), Some("shop/buy"));
+            assert!(load_flow(&external).unwrap().stored_id.is_none());
+        }
     }
 
     /// A failure body survives as a RESULT, with everything a caller needs to

@@ -463,6 +463,8 @@ pub struct AppState {
     /// observed action that names no baseline diffs against it, so a client
     /// gets only what changed without having to carry the token itself.
     pub owner_snapshots: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Daemon-issued, single-use saved replay capabilities. Never persisted.
+    pub flow_grants: Arc<Mutex<crate::flow_grants::FlowGrants>>,
     /// What the driving agent did in the current app, for `registry` hints,
     /// `flow_suggestion` and `GET /agent/flow/draft` (see `crate::flows`).
     pub flow_trail: Arc<Mutex<crate::flows::FlowTrail>>,
@@ -1109,6 +1111,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/agent/runner-handoff", post(agent_runner_handoff))
         .route("/agent/input", post(agent_input))
         .route("/agent/actions", post(agent_actions))
+        .route("/agent/flow-run/grant", post(agent_flow_run_grant))
         .route("/agent/screenshot", get(agent_screenshot))
         .route("/agent/mjpeg", get(agent_mjpeg))
         .route("/agent/h264", get(agent_h264))
@@ -13712,6 +13715,10 @@ async fn agent_actions_generation(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
+    let authorized_replay = headers
+        .get(crate::flow_grants::HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|token| recover(state.flow_grants.lock()).consume(token, &body));
     if body.len() > AGENT_ACTIONS_MAX_BODY_BYTES {
         return agent_actions_invalid(format!(
             "request body exceeds {AGENT_ACTIONS_MAX_BODY_BYTES} bytes"
@@ -13745,6 +13752,7 @@ async fn agent_actions_generation(
         headers,
         body,
         request,
+        authorized_replay,
         privacy_generation,
         capture_scope.clone(),
     )
@@ -13760,8 +13768,13 @@ async fn agent_actions_generation(
 }
 
 async fn agent_actions_scoped(
-    state: Arc<AppState>, headers: HeaderMap, body: String, mut request: AgentActionsRequest,
-    privacy_generation: u64, capture_scope: ScreenReadScope,
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: String,
+    mut request: AgentActionsRequest,
+    authorized_replay: bool,
+    privacy_generation: u64,
+    capture_scope: ScreenReadScope,
 ) -> Response {
     let observes_screen = batch_needs_private_scope(&request);
     if batch_privacy_revoked(&state, observes_screen, privacy_generation, &capture_scope) {
@@ -13806,9 +13819,9 @@ async fn agent_actions_scoped(
     let policy = crate::guard::Policy::get();
     // The link-scheme policy holds with or without the other limits, and so
     // does the sensitive-action check: one step that pays refuses the whole
-    // batch. A saved flow's replay was approved when it was saved.
+    // batch. Only daemon-verified saved replay authority skips this check.
     // A press the owner allowed passes its step's checks, used once.
-    let sensitive_checked = !headers.contains_key(FLOW_RUN_HEADER);
+    let sensitive_checked = !authorized_replay;
     let mut owner_allowed_step = None;
     for (step_index, step) in request.steps.iter().enumerate() {
         if let AgentActionStep::Action { action, .. } = step {
@@ -17267,8 +17280,78 @@ async fn release_agent_focus(state: &AppState) -> Option<serde_json::Value> {
     }
 }
 
-/// Header a flow runner sets on its batch: the steps are already a flow, so
-/// they end the current trail instead of joining it.
+/// Only a registry id is accepted: never a caller-provided filesystem path.
+async fn agent_flow_run_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(refusal) = auth_refusal(agent_auth(&state, &headers)) {
+        return refusal;
+    }
+    if !has_phone_control_header(&headers) {
+        return missing_phone_control_header_response();
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GrantRequest {
+        id: String,
+        #[serde(default)]
+        inputs: std::collections::BTreeMap<String, String>,
+    }
+    let issue = || -> Option<String> {
+        if body.len() > AGENT_ACTIONS_MAX_BODY_BYTES {
+            return None;
+        }
+        let req: GrantRequest = serde_json::from_str(&body).ok()?;
+        if !iphone_use_mcp::registry::valid_flow_id(&req.id) {
+            return None;
+        }
+        let root = crate::flows::store_dir()?.canonicalize().ok()?;
+        let path = iphone_use_mcp::registry::flow_path(&root, &req.id);
+        // Pin the app directory with O_NOFOLLOW: a rename/symlink swap cannot
+        // redirect the final read outside the daemon's store.
+        use std::os::unix::{
+            fs::OpenOptionsExt,
+            io::{AsRawFd, FromRawFd},
+        };
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path.parent()?)
+            .ok()?;
+        let name = std::ffi::CString::new(path.file_name()?.to_str()?).ok()?;
+        // SAFETY: directory and name live across openat; a successful fd is
+        // transferred exactly once into File and closed on every return path.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let bytes = iphone_use_mcp::flow::read_flow_file_bytes(file, &path).ok()?;
+        let flow = iphone_use_mcp::flow::parse_flow(&bytes, "daemon flow library").ok()?;
+        let request = flow.actions_request(&req.inputs).ok()?;
+        recover(state.flow_grants.lock()).issue(&request.to_string())
+    };
+    match issue() {
+        Some(grant) => agent_json_response(
+            StatusCode::OK,
+            serde_json::json!({"grant": grant, "expires_in_secs": 120}),
+        ),
+        None => agent_json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "flow_grant_unavailable"}),
+        ),
+    }
+}
+
+/// Replay marker for trail/metrics only; it conveys no sensitive authority.
 const FLOW_RUN_HEADER: &str = "x-phone-flow-run";
 
 /// `registry` block for the first tree read in a newly entered app.

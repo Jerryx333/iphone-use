@@ -730,7 +730,7 @@ impl DaemonClient {
     /// A TRANSPORT failure is still an error: when the request never completed
     /// we do not know what the phone did, and must not pretend otherwise.
     pub async fn actions_outcome(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
-        self.post_actions(body, false).await
+        self.post_actions(body, false, None).await
     }
 
     /// [`Self::actions_outcome`] for a flow run: `X-Phone-Flow-Run` tells the
@@ -740,13 +740,45 @@ impl DaemonClient {
         &self,
         body: &serde_json::Value,
     ) -> anyhow::Result<DaemonResponse> {
-        self.post_actions(body, true).await
+        self.post_actions(body, true, None).await
+    }
+
+    pub async fn flow_run_grant(
+        &self,
+        id: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Option<String>> {
+        let response = self
+            .request_json(
+                reqwest::Method::POST,
+                "/agent/flow-run/grant",
+                Some(&serde_json::json!({"id": id, "inputs": inputs})),
+            )
+            .await?;
+        Ok(if response.ok() {
+            response
+                .json
+                .as_ref()
+                .and_then(|v| v["grant"].as_str())
+                .map(str::to_owned)
+        } else {
+            None
+        })
+    }
+
+    pub async fn flow_actions_with_grant(
+        &self,
+        body: &serde_json::Value,
+        grant: Option<&str>,
+    ) -> anyhow::Result<DaemonResponse> {
+        self.post_actions(body, true, grant).await
     }
 
     async fn post_actions(
         &self,
         body: &serde_json::Value,
         flow_run: bool,
+        grant: Option<&str>,
     ) -> anyhow::Result<DaemonResponse> {
         let mut req = self
             .auth(self.http().post(self.url("/agent/actions")))
@@ -756,6 +788,9 @@ impl DaemonClient {
             .body(body.to_string());
         if flow_run {
             req = req.header("x-phone-flow-run", "1");
+        }
+        if let Some(grant) = grant {
+            req = req.header("x-phone-flow-grant", grant);
         }
         let response = read_response(req.send().await?).await?;
         // An observed batch ends on a new screen: the next observed tap

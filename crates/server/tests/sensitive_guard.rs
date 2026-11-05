@@ -113,13 +113,26 @@ async fn call(
     body: &str,
     flow_run: bool,
 ) -> (StatusCode, serde_json::Value) {
+    call_grant(state, uri, body, flow_run.then_some("1"), None).await
+}
+
+async fn call_grant(
+    state: &Arc<AppState>,
+    uri: &str,
+    body: &str,
+    marker: Option<&str>,
+    grant: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let mut request = Request::builder()
         .method(if body.is_empty() { "GET" } else { "POST" })
         .uri(uri)
         .header("x-phone-control", "1")
         .header(header::CONTENT_TYPE, "application/json");
-    if flow_run {
-        request = request.header("x-phone-flow-run", "1");
+    if let Some(marker) = marker {
+        request = request.header("x-phone-flow-run", marker);
+    }
+    if let Some(grant) = grant {
+        request = request.header("x-phone-flow-grant", grant);
     }
     let response = server::http::router(state.clone())
         .oneshot(request.body(Body::from(body.to_string())).unwrap())
@@ -294,15 +307,17 @@ fn ordinary_and_send_buttons_and_flow_replays_still_run() {
             assert!(!sent(&seen).is_empty(), "{what}: the tap reached the phone");
         }
 
-        // A saved flow presses 立即购买: its owner approved it when saving.
+        // A caller's replay marker carries no sensitive authority.
         seen.lock().unwrap().clear();
         let body = format!(
             r#"{{"steps":[{{"kind":"action","action":{{"type":"tap",{}}}}}]}}"#,
             at(200.0, 780.0, 190.0, 64.0)
         );
-        let (status, json) = call(&state, "/agent/actions", &body, true).await;
-        assert_eq!(status, StatusCode::OK, "flow replay: {json}");
-        assert!(!sent(&seen).is_empty(), "flow replay reached the phone");
+        for marker in ["1", "random-forged-token"] {
+            let (status, json) =
+                call_grant(&state, "/agent/actions", &body, Some(marker), Some(marker)).await;
+            assert_refused(status, &json, &seen, marker);
+        }
         // The same batch without the flow header is refused.
         seen.lock().unwrap().clear();
         let (status, json) = call(&state, "/agent/actions", &body, false).await;
@@ -369,5 +384,119 @@ fn alert_buttons_that_pay_are_refused() {
             "{:?}",
             sent(&seen)
         );
+    });
+}
+
+#[test]
+fn installed_flow_grants_are_bound_and_single_use() {
+    // This integration-test binary has only one environment-mutating test.
+    // Restore it even if an assertion panics; other tests never grant from disk.
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("IPHONE_USE_FLOWS_DIR", v),
+                None => std::env::remove_var("IPHONE_USE_FLOWS_DIR"),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os("IPHONE_USE_FLOWS_DIR"));
+    let store = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", store.path());
+    std::fs::create_dir(store.path().join("shop")).unwrap();
+    let path = store.path().join("shop/buy.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"name":"Buy","steps":[{"kind":"tap","x":0.76,"y":0.96}]}"#,
+    )
+    .unwrap();
+    let flow = iphone_use_mcp::flow::load_flow(&path).unwrap();
+    let request = flow.actions_request(&Default::default()).unwrap();
+    block(async {
+        let seen: Seen = Arc::default();
+        let mock = runner("[]", Some(TREE), seen.clone());
+        let state = build_state_with_runner(mock.url());
+        for id in ["../buy", "/tmp/buy.json", "shop/missing"] {
+            let (status, _) = call(
+                &state,
+                "/agent/flow-run/grant",
+                &serde_json::json!({"id":id}).to_string(),
+                false,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let expired = state
+            .flow_grants
+            .lock()
+            .unwrap()
+            .issue_at(
+                &request.to_string(),
+                std::time::Instant::now() - Duration::from_secs(121),
+            )
+            .unwrap();
+        let (status, response) = call_grant(
+            &state,
+            "/agent/actions",
+            &request.to_string(),
+            Some("1"),
+            Some(&expired),
+        )
+        .await;
+        assert_refused(status, &response, &seen, "expired grant");
+        let grant = || {
+            call(
+                &state,
+                "/agent/flow-run/grant",
+                r#"{"id":"shop/buy","inputs":{}}"#,
+                false,
+            )
+        };
+        let (status, response) = grant().await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let token = response["grant"].as_str().unwrap();
+        seen.lock().unwrap().clear();
+        let (status, response) = call_grant(
+            &state,
+            "/agent/actions",
+            &request.to_string(),
+            Some("1"),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(!sent(&seen).is_empty());
+        seen.lock().unwrap().clear();
+        let (status, response) = call_grant(
+            &state,
+            "/agent/actions",
+            &request.to_string(),
+            Some("1"),
+            Some(token),
+        )
+        .await;
+        assert_refused(status, &response, &seen, "used grant");
+        let (_, response) = grant().await;
+        let token = response["grant"].as_str().unwrap();
+        let mut different = request.clone();
+        different["steps"][0]["action"]["x"] = serde_json::json!(0.77);
+        let (status, response) = call_grant(
+            &state,
+            "/agent/actions",
+            &different.to_string(),
+            Some("1"),
+            Some(token),
+        )
+        .await;
+        assert_refused(status, &response, &seen, "different steps");
+        let (status, response) = call_grant(
+            &state,
+            "/agent/actions",
+            &request.to_string(),
+            Some("1"),
+            Some(token),
+        )
+        .await;
+        assert_refused(status, &response, &seen, "mismatch consumed grant");
     });
 }

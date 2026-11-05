@@ -224,6 +224,8 @@ fn phone_flow_run_hands_an_agent_the_structured_failure_and_its_diagnosis() {
         ("200 OK", r#"{"ok":true}"#),
         // the run's own pre-flight
         ("200 OK", r#"{"ok":true,"backend":"direct","drivable":true,"version":"0.6.4"}"#),
+        // a library flow asks the daemon for its replay grant first
+        ("200 OK", r#"{"grant":"test-grant"}"#),
         ("409 Conflict", failure),
         // the single diagnostic read
         ("200 OK", r#"{"ok":true,"snapshot":"S","elements":[{"index":0,"kind":"TextField","label":"搜索"}]}"#),
@@ -277,6 +279,14 @@ fn phone_flow_run_hands_an_agent_the_structured_failure_and_its_diagnosis() {
         1,
         "exactly one diagnostic read: {sent:?}"
     );
+    let actions = sent
+        .iter()
+        .find(|request| request.starts_with("POST /agent/actions"))
+        .expect("the run's batch");
+    assert!(
+        actions.contains("x-phone-flow-grant: test-grant"),
+        "the library replay carries its daemon-issued grant: {actions}"
+    );
     // The pre-flight status is reused rather than re-fetched after the failure.
     assert_eq!(
         sent.iter()
@@ -298,6 +308,8 @@ fn a_lost_answer_reaches_the_agent_as_unknown_and_not_retry_safe() {
         ("200 OK", "{}"),
         ("200 OK", r#"{"ok":true}"#),
         ("200 OK", r#"{"ok":true,"backend":"direct","drivable":true,"version":"0.6.4"}"#),
+        // a library flow asks the daemon for its replay grant first
+        ("200 OK", r#"{"grant":"test-grant"}"#),
         ("200 OK", LOST),
     ]);
 
@@ -349,6 +361,8 @@ fn a_body_without_a_verdict_reaches_the_agent_as_unknown() {
         ("200 OK", "{}"),
         ("200 OK", r#"{"ok":true}"#),
         ("200 OK", r#"{"ok":true,"backend":"direct","drivable":true,"version":"0.6.4"}"#),
+        // a library flow asks the daemon for its replay grant first
+        ("200 OK", r#"{"grant":"test-grant"}"#),
         ("500 Internal Server Error", r#"{"unrelated":1}"#),
     ]);
 
