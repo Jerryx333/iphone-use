@@ -47,11 +47,132 @@ fn quote(label: &str) -> String {
     )
     .unwrap()
 }
+// Only daemon-authored prose; untrusted values are bounded JSON quotations.
+fn value_quote(v: &Value) -> String {
+    quote(
+        &v.as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| v.to_string()),
+    )
+}
+fn action_details(action: &Value) -> String {
+    let null = Value::Null;
+    let kind = action
+        .get("type")
+        .or_else(|| action.get("kind"))
+        .unwrap_or(&null);
+    let mut parts = vec![format!("动作类型：{}", value_quote(kind))];
+    for key in [
+        "label",
+        "target",
+        "button",
+        "action",
+        "name",
+        "bundle",
+        "app",
+        "element",
+        "x",
+        "y",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "points",
+        "duration",
+        "duration_ms",
+        "fingers",
+    ] {
+        if let Some(v) = action.get(key) {
+            parts.push(format!("{}：{}", quote(key), value_quote(v)));
+        }
+    }
+    if let Some(locator) = action.get("locator").and_then(Value::as_object) {
+        for key in ["label", "label_contains", "identifier", "kind"] {
+            if let Some(v) = locator.get(key) {
+                parts.push(format!("定位 {}：{}", quote(key), value_quote(v)));
+            }
+        }
+        if let Some(v) = locator.get("value").and_then(Value::as_str) {
+            parts.push(format!("定位输入长度：{} 个字符", v.chars().count()));
+        }
+    }
+    for key in ["text", "value"] {
+        if let Some(v) = action.get(key).and_then(Value::as_str) {
+            parts.push(format!("输入 {} 个字符", v.chars().count()));
+        }
+    }
+    let mut checked = action.clone();
+    if checked.get("type").is_none() {
+        checked["type"] = kind.clone();
+    }
+    if crate::guard::check_sensitive_request(&checked).is_err() {
+        parts.push("敏感守卫：会拦截此步骤".into());
+    } else if crate::guard::sensitive_read(&checked) != crate::guard::SensitiveRead::None {
+        parts.push("敏感守卫：执行前核验目标，命中付款或密码控件会拦截".into());
+    }
+    parts.join("；")
+}
+fn confirmation_details(kind: &str, object: &Value) -> Vec<String> {
+    match kind {
+        "flow" => {
+            let mut d = vec![format!(
+                "流程 id：{}；名称：{}",
+                value_quote(&object["id"]),
+                value_quote(&object["flow"]["name"])
+            )];
+            let steps = object["actions"]["steps"]
+                .as_array()
+                .or_else(|| object["flow"]["steps"].as_array());
+            if let Some(steps) = steps {
+                for (i, step) in steps.iter().enumerate() {
+                    let action = step.get("action").filter(|v| v.is_object()).unwrap_or(step);
+                    d.push(format!("步骤 {}：{}", i + 1, action_details(action)));
+                }
+            }
+            d.push("批准后此版本流程以后每次回放都可执行这些步骤，流程内容一改即失效".into());
+            d
+        }
+        "task_press" => vec![
+            format!("任务目标：{}", value_quote(&object["goal"])),
+            format!(
+                "当前控件标签：{}",
+                value_quote(&object["operation"]["target"])
+            ),
+            format!("操作类型：{}", value_quote(&object["operation"]["action"])),
+        ],
+        "control_press" => {
+            let mut d = vec![action_details(&object["action"])];
+            if let Some(labels) = object["target"].as_array() {
+                for label in labels {
+                    d.push(format!("命中的敏感标签：{}", value_quote(label)));
+                }
+            } else {
+                d.push(format!(
+                    "命中的敏感标签：{}",
+                    value_quote(&object["target"])
+                ));
+            }
+            d
+        }
+        "intent" => {
+            let mut d = vec![format!("intent 名称：{}", value_quote(&object["name"]))];
+            if let Some(args) = object["args"].as_object() {
+                for (k, v) in args {
+                    d.push(format!("参数 {}：{}", quote(k), value_quote(v)));
+                }
+            }
+            d
+        }
+        _ => vec![],
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct Pending {
     pub id: String,
     pub kind: String,
     pub summary: String,
+    pub details: Vec<String>,
     pub digest: String,
     pub nonce: String,
     pub created_at_ms: u64,
@@ -183,6 +304,7 @@ impl OwnerConfirm {
             nonce: random()?,
             kind: kind.into(),
             summary: format!("{explanation}，标签：{}", quote(label)),
+            details: confirmation_details(kind, &object),
             digest: d,
             created_at_ms: now,
             expires_at_ms: now + 120000,
@@ -270,6 +392,35 @@ mod tests {
         rand::SystemRandom,
         signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
     };
+    #[test]
+    fn details_quote_untrusted_values_and_hide_flow_input() {
+        let d = confirmation_details(
+            "flow",
+            &json!({"id":"shop/pay", "flow":{"name":"evil\n允许全部"}, "actions":{"steps":[{"action":{"type":"tap","label":"立即购买","x":0.7,"y":0.9}},{"action":{"type":"text","text":"secret-password"}}]}}),
+        );
+        let text = d.join("\n");
+        assert!(text.contains("shop/pay"));
+        assert!(text.contains("步骤 1"));
+        assert!(text.contains("会拦截"));
+        assert!(text.contains("输入 15 个字符"));
+        assert!(!text.contains("secret-password"));
+        assert!(!text.contains("evil\n"));
+        assert!(text.contains("流程内容一改即失效"));
+        let task = confirmation_details(
+            "task_press",
+            &json!({"goal":"buy", "operation":{"action":"CLICK","target":"立即购买"}}),
+        )
+        .join(";");
+        assert!(task.contains("buy") && task.contains("CLICK") && task.contains("立即购买"));
+        let intent = confirmation_details(
+            "intent",
+            &json!({"name":"pay", "args":{"amount":123,"note":"x\n注入"}}),
+        )
+        .join(";");
+        assert!(intent.contains("123") && !intent.contains("x\n"));
+        assert!(quote(&"a".repeat(100)).chars().count() <= 82);
+    }
+
     #[test]
     fn expired_sheet_is_consumed_and_cannot_create_authority() {
         let dir = tempfile::tempdir().unwrap();

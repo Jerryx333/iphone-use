@@ -1,6 +1,6 @@
 //! A daemon task asks the owner before a press that pays (`needs_confirm`);
 //! once they allow it, that one press passes the sensitive-action guard,
-//! and only once. Its own binary: the allowance is process-wide.
+//! and only once. A request without the private step capability cannot consume it.
 
 mod support;
 
@@ -44,36 +44,50 @@ fn the_press_the_owner_allowed_runs_once() {
             reply(r#"{"value":null}"#)
         });
         let state = build_state_with_runner(runner.url());
-        let tap = || async {
-            let request = Request::builder()
-                .method("POST")
-                .uri("/agent/input")
-                .header("x-phone-control", "1")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"type":"tap","x":0.75,"y":0.96}"#))
-                .unwrap();
-            let response = server::http::router(state.clone())
-                .oneshot(request)
-                .await
-                .unwrap();
-            let status = response.status();
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            (
-                status,
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
-            )
+        let tap = |token: Option<String>| {
+            let state = state.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/agent/input")
+                    .header("x-phone-control", "1")
+                    .header(header::CONTENT_TYPE, "application/json");
+                if let Some(token) = token {
+                    request = request.header("x-phone-owner-press", token);
+                }
+                let request = request
+                    .body(Body::from(r#"{"type":"tap","x":0.75,"y":0.96}"#))
+                    .unwrap();
+                let response = server::http::router(state.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                )
+            }
         };
 
-        let (status, json) = tap().await;
+        let (status, json) = tap(None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "not allowed yet: {json}");
         assert_eq!(*posts.lock().unwrap(), 0);
 
-        iphone_use_mcp::task::approve_press("立即购买");
-        let (status, json) = tap().await;
+        let token = iphone_use_mcp::task::approve_press("立即购买").unwrap();
+        let (status, json) = tap(None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "missing capability: {json}");
+        assert_eq!(*posts.lock().unwrap(), 0);
+        let wrong = iphone_use_mcp::task::approve_press("确认转账").unwrap();
+        let (status, json) = tap(Some(wrong.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "wrong target: {json}");
+        iphone_use_mcp::task::clear_approved_press(&wrong);
+        let (status, json) = tap(Some(token.clone())).await;
         assert_eq!(status, StatusCode::OK, "allowed by the owner: {json}");
         assert_eq!(*posts.lock().unwrap(), 1, "the tap reached the phone");
 
-        let (status, json) = tap().await;
+        let (status, json) = tap(Some(token.clone())).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "used up: {json}");
         assert_eq!(json["error"], "sensitive_action", "{json}");
         assert_eq!(*posts.lock().unwrap(), 1);

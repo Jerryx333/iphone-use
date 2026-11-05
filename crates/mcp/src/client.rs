@@ -205,9 +205,18 @@ pub struct DaemonClient {
     /// Sent as `X-Agent-Call` so the daemon's task metrics can tell a flow
     /// replay from a hand-driven call.
     call_kind: Option<&'static str>,
+    owner_press: Option<OwnerPress>,
     /// The explicit run this session opened with `phone_run_start`, sent as
     /// `X-Agent-Run` on every request until `phone_run_end`.
     run_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[derive(Clone)]
+struct OwnerPress(String);
+impl std::fmt::Debug for OwnerPress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -357,6 +366,7 @@ impl DaemonClient {
                 .unwrap_or_else(|| format!("mcp-{}", std::process::id())),
             last_snapshot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             call_kind: None,
+            owner_press: None,
             run_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -422,11 +432,23 @@ impl DaemonClient {
         format!("{}{}", self.base_url, path)
     }
 
+    pub(crate) fn with_owner_press(mut self, token: &str) -> Self {
+        self.owner_press = Some(OwnerPress(token.to_owned()));
+        self
+    }
+
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         // Every request names this session's owner — mutations need it for
         // the lease, reads and polls for attribution (task metrics, the
         // owner's last screen).
         let req = req.header("x-phone-owner", &self.owner);
+        let req = if let Some(token) = &self.owner_press {
+            let mut value = header::HeaderValue::from_str(&token.0).expect("hex capability");
+            value.set_sensitive(true);
+            req.header("x-phone-owner-press", value)
+        } else {
+            req
+        };
         let req = match self.call_kind {
             Some(kind) => req.header("x-agent-call", kind),
             None => req,
@@ -2314,6 +2336,29 @@ pub(crate) mod tests {
             }
         });
         (format!("http://{address}"), task, rx)
+    }
+
+    #[tokio::test]
+    async fn owner_press_header_is_scoped_to_step_client_and_redacted() {
+        let (url, task, requests) =
+            mock_daemon_sequence(&[("200 OK", r#"{"ok":true}"#), ("200 OK", r#"{"ok":true}"#)]);
+        let client = DaemonClient::new(url, None);
+        let step = client.clone().with_owner_press("private-capability");
+        assert!(!format!("{step:?}").contains("private-capability"));
+        let action = serde_json::json!({"type":"key","name":"return"});
+        step.request_json(reqwest::Method::POST, "/agent/input", Some(&action))
+            .await
+            .unwrap();
+        client
+            .request_json(reqwest::Method::POST, "/agent/input", Some(&action))
+            .await
+            .unwrap();
+        task.join().unwrap();
+        assert!(requests
+            .recv()
+            .unwrap()
+            .contains("x-phone-owner-press: private-capability"));
+        assert!(!requests.recv().unwrap().contains("x-phone-owner-press"));
     }
 
     #[tokio::test]

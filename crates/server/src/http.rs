@@ -1059,7 +1059,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let weak = Arc::downgrade(&state);
     iphone_use_mcp::task::set_owner_confirmation_hook(Arc::new(move |id, question| {
         if let Some(state) = weak.upgrade() {
-            let object = serde_json::json!({"task_id":id,"operation":question});
+            let object = serde_json::json!({"task_id":id,"operation":question,"goal":iphone_use_mcp::task::get(id, None).and_then(|t| t["goal"].as_str().map(str::to_owned))});
             let label = question["target"].as_str().unwrap_or("任务当前操作");
             let _ = recover(state.owner_confirm.lock()).request("task_press", object, label);
         }
@@ -11769,7 +11769,37 @@ async fn direct_control(
             Err(refusal) => Err(refusal),
             Ok(()) => request_refusal.clone().map_or(Ok(()), Err),
         };
+        let checked = if let Err(crate::guard::Refusal::Sensitive(first)) = &checked {
+            let mut labels = vec![first.clone()];
+            if let (crate::guard::SensitiveRead::Points(points), Some(rows)) = (
+                crate::guard::sensitive_read(&value),
+                client.recent_tree(GUARD_SENSITIVE_TREE_AGE),
+            ) {
+                if let Ok((width, height)) = client.window_size().await {
+                    for (x, y) in points {
+                        for label in
+                            crate::guard::point_sensitive_labels(&rows, x * width, y * height)
+                                .unwrap_or_default()
+                        {
+                            if !labels.contains(&label) {
+                                labels.push(label);
+                            }
+                        }
+                    }
+                }
+            }
+            // JSON array preserves distinct labels without ambiguous delimiters.
+            Err(crate::guard::Refusal::Sensitive(
+                serde_json::to_string(&labels).unwrap(),
+            ))
+        } else {
+            checked
+        };
         if let Err(refusal) = checked {
+            if compound_control(&value) {
+                sensitive_refusal = Some(refusal);
+                return None;
+            }
             let object = control_confirmation_object(&value, &refusal);
             if !recover(state.owner_confirm.lock()).consume("control_press", &object) {
                 sensitive_refusal = Some(refusal);
@@ -13888,7 +13918,12 @@ async fn agent_actions_scoped(
                 continue;
             }
             if let Err(refusal) = guard_sensitive_request(&state, action) {
-                match crate::guard::owner_allowed(refusal) {
+                match crate::guard::owner_allowed(
+                    refusal,
+                    headers
+                        .get("x-phone-owner-press")
+                        .and_then(|v| v.to_str().ok()),
+                ) {
                     Ok(()) => owner_allowed_step = Some(step_index),
                     Err(refusal) => {
                         return flow_owner_refusal(&state, replay_flow.as_ref(), &refusal, true)
@@ -14022,7 +14057,14 @@ async fn agent_actions_scoped(
                 let guarded = async {
                     guard_foreground(&mut w, action).await?;
                     if sensitive_checked && owner_allowed_step != Some(index) {
-                        guard_sensitive(&mut w, action).await.or_else(crate::guard::owner_allowed)
+                        guard_sensitive(&mut w, action).await.or_else(|r| {
+                            crate::guard::owner_allowed(
+                                r,
+                                headers
+                                    .get("x-phone-owner-press")
+                                    .and_then(|v| v.to_str().ok()),
+                            )
+                        })
                     } else {
                         Ok(())
                     }
@@ -16608,7 +16650,12 @@ async fn agent_input_inner(
     // A press the owner allowed passes both sensitive checks, used once.
     let mut owner_allowed = false;
     if let Err(refusal) = guard_sensitive_request(&state, &value) {
-        match crate::guard::owner_allowed(refusal) {
+        match crate::guard::owner_allowed(
+            refusal,
+            headers
+                .get("x-phone-owner-press")
+                .and_then(|v| v.to_str().ok()),
+        ) {
             Ok(()) => owner_allowed = true,
             Err(refusal) => return guard_refusal(&refusal, false),
         }
@@ -16703,7 +16750,14 @@ async fn agent_input_inner(
             let checked = if owner_allowed {
                 Ok(())
             } else {
-                guard_sensitive(&mut client, &value).await.or_else(crate::guard::owner_allowed)
+                guard_sensitive(&mut client, &value).await.or_else(|r| {
+                    crate::guard::owner_allowed(
+                        r,
+                        headers
+                            .get("x-phone-owner-press")
+                            .and_then(|v| v.to_str().ok()),
+                    )
+                })
             };
             if let Err(refusal) = checked {
                 sensitive = Some(refusal);
@@ -17396,7 +17450,7 @@ async fn agent_flow_run_grant(
         let bytes = iphone_use_mcp::flow::read_flow_file_bytes(file, &path).ok()?;
         let flow = iphone_use_mcp::flow::parse_flow(&bytes, "daemon flow library").ok()?;
         let request = flow.actions_request(&req.inputs).ok()?;
-        recover(state.flow_grants.lock()).issue_flow(&request.to_string(), serde_json::json!({"flow": serde_json::from_slice::<serde_json::Value>(&bytes).ok()?, "inputs": req.inputs}))
+        recover(state.flow_grants.lock()).issue_flow(&request.to_string(), serde_json::json!({"flow": serde_json::from_slice::<serde_json::Value>(&bytes).ok()?, "inputs": req.inputs, "id": req.id, "actions": request}))
     };
     match issue() {
         Some(grant) => agent_json_response(
@@ -32994,7 +33048,7 @@ async fn owner_key_post(
         Ok(()) => agent_json_response(StatusCode::OK, serde_json::json!({"ok":true})),
         Err(error) => agent_json_response(
             StatusCode::CONFLICT,
-            serde_json::json!({"ok":false,"error":error}),
+            serde_json::json!({"ok":false,"error":error,"retry_safe":false}),
         ),
     }
 }
@@ -33003,7 +33057,7 @@ fn task_confirmation_object(id: &str) -> Option<serde_json::Value> {
     if task["status"] != "needs_confirm" {
         return None;
     }
-    Some(serde_json::json!({"task_id":id,"operation":task["confirm"].clone()}))
+    Some(serde_json::json!({"task_id":id,"operation":task["confirm"].clone(),"goal":task["goal"]}))
 }
 fn task_owner_required(state: &AppState, id: &str) -> Response {
     match task_confirmation_object(id) {
@@ -33013,7 +33067,7 @@ fn task_owner_required(state: &AppState, id: &str) -> Response {
         },
         None => agent_json_response(
             StatusCode::FORBIDDEN,
-            serde_json::json!({"ok":false,"error":"owner_confirmation_required"}),
+            serde_json::json!({"ok":false,"error":"owner_confirmation_required","retry_safe":false}),
         ),
     }
 }
@@ -33038,7 +33092,7 @@ async fn owner_confirm_post(
     let Some(approve) = body["approve"].as_bool() else {
         return agent_json_response(
             StatusCode::BAD_REQUEST,
-            serde_json::json!({"error":"invalid_request"}),
+            serde_json::json!({"error":"invalid_request","retry_safe":false}),
         );
     };
     let result =
@@ -33050,21 +33104,22 @@ async fn owner_confirm_post(
                 if task_confirmation_object(task_id).as_ref() != Some(&p.object) {
                     return agent_json_response(
                         StatusCode::FORBIDDEN,
-                        serde_json::json!({"error":"owner_confirmation_object_changed"}),
+                        serde_json::json!({"error":"owner_confirmation_object_changed","retry_safe":false}),
                     );
                 }
                 if let Err(error) = iphone_use_mcp::task::answer_owner(task_id, &p.object["operation"], approve) {
                     return agent_json_response(
                         StatusCode::CONFLICT,
-                        serde_json::json!({"error":error}),
+                        serde_json::json!({"error":error,"retry_safe":false}),
                     );
                 }
             }
             agent_json_response(StatusCode::OK, serde_json::json!({"ok":true}))
         }
-        Err(error) => {
-            agent_json_response(StatusCode::FORBIDDEN, serde_json::json!({"error":error}))
-        }
+        Err(error) => agent_json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error":error,"retry_safe":false}),
+        ),
     }
 }
 fn owner_required(
@@ -33073,8 +33128,7 @@ fn owner_required(
     object: serde_json::Value,
     label: &str,
 ) -> Response {
-    let mut body =
-        serde_json::json!({"ok":false,"error":"owner_confirmation_required","outcome":"not_sent"});
+    let mut body = serde_json::json!({"ok":false,"error":"owner_confirmation_required","retry_safe":false,"outcome":"not_sent"});
     match recover(state.owner_confirm.lock()).request(kind, object, label) {
         Ok(id) => body["owner_confirm_id"] = id.into(),
         Err(hint) => body["hint"] = hint.into(),
@@ -33086,6 +33140,15 @@ fn control_owner_required(
     action: &serde_json::Value,
     refusal: &crate::guard::Refusal,
 ) -> Response {
+    if compound_control(action) {
+        return agent_json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "ok":false,"error":"sensitive_compound_action","retry_safe":false,
+                "outcome":"not_sent","hint":"复合动作命中敏感控件，请拆成单个动作后重试"
+            }),
+        );
+    }
     let label = refusal.to_json()["label"]
         .as_str()
         .unwrap_or("敏感控件")
@@ -33150,5 +33213,73 @@ fn control_confirmation_object(
     action: &serde_json::Value,
     refusal: &crate::guard::Refusal,
 ) -> serde_json::Value {
-    serde_json::json!({"action":action,"target":refusal.to_json()["label"].clone(),"reason":refusal.error()})
+    let mut action = action.clone();
+    if let Some(fields) = action.as_object_mut() {
+        // Only transport freshness changes on a manual retry. All execution
+        // fields, including unknown/new fields, remain bound by the digest.
+        fields.remove("issued_at_ms");
+        fields.remove("ttl_ms");
+    }
+    let label = refusal.to_json()["label"].clone();
+    let target = label
+        .as_str()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .map(|labels| serde_json::json!(labels))
+        .unwrap_or(label);
+    serde_json::json!({"action":action,"target":target,"reason":refusal.error()})
+}
+
+fn compound_control(action: &serde_json::Value) -> bool {
+    action["type"] == "multi_longpress"
+        || action
+            .get("points")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|p| p.len() > 1)
+        || action
+            .get("fingers")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|n| n > 1)
+        || action["type"] == "two_finger_tap"
+}
+
+#[cfg(test)]
+mod owner_press_revision_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn control_digest_ignores_only_transport_freshness() {
+        let refusal = crate::guard::Refusal::Sensitive("立即购买".into());
+        let action = json!({"type":"tap","x":0.75,"y":0.96,"label":"立即购买","issued_at_ms":1,"ttl_ms":2000});
+        let object = control_confirmation_object(&action, &refusal);
+        let mut retry = action.clone();
+        retry["issued_at_ms"] = json!(9999);
+        retry["ttl_ms"] = json!(1000);
+        assert_eq!(object, control_confirmation_object(&retry, &refusal));
+        for (key, value) in [
+            ("x", json!(0.76)),
+            ("y", json!(0.95)),
+            ("label", json!("确认支付")),
+            ("future_execution_field", json!(true)),
+        ] {
+            let mut changed = retry.clone();
+            changed[key] = value;
+            assert_ne!(
+                object,
+                control_confirmation_object(&changed, &refusal),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_control_recognizes_multiple_points_and_fingers() {
+        let action =
+            json!({"type":"multi_longpress","points":[{"x":0.7,"y":0.9},{"x":0.8,"y":0.9}]});
+        assert!(compound_control(&action));
+        assert!(!compound_control(&json!({"type":"tap","x":0.7,"y":0.9})));
+        assert!(compound_control(
+            &json!({"type":"longpress","fingers":2,"x":0.7,"y":0.9})
+        ));
+    }
 }

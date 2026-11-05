@@ -514,9 +514,11 @@ const RETURN_KEYS: &[&str] = &["return", "enter", "send", "go", "search"];
 /// Pass a paying press the owner just allowed on the phone, through a
 /// task's confirmation (`iphone_use_mcp::task::approve_press`): once, and
 /// only that control. Every other refusal stands.
-pub fn owner_allowed(refusal: Refusal) -> Result<(), Refusal> {
+pub fn owner_allowed(refusal: Refusal, token: Option<&str>) -> Result<(), Refusal> {
     match &refusal {
-        Refusal::Sensitive(label) if iphone_use_mcp::task::take_approved_press(label) => Ok(()),
+        Refusal::Sensitive(label) if iphone_use_mcp::task::take_approved_press(token, label) => {
+            Ok(())
+        }
         _ => Err(refusal),
     }
 }
@@ -720,6 +722,13 @@ pub fn check_pressed_row(rows: &[ElementRow], index: usize) -> Result<(), Refusa
     if index >= rows.len() {
         return Ok(());
     }
+    match pressed_labels(rows, index).into_iter().next() {
+        Some(label) => Err(Refusal::Sensitive(label)),
+        None => Ok(()),
+    }
+}
+
+fn pressed_labels(rows: &[ElementRow], index: usize) -> Vec<String> {
     // Unlabelled containers are not rows, so depth alone can make a later
     // sibling's child look like this row's: inside means drawn inside too.
     let [x0, y0, w0, h0] = rows[index].rect;
@@ -729,14 +738,18 @@ pub fn check_pressed_row(rows: &[ElementRow], index: usize) -> Result<(), Refusa
         (x0..=x0 + w0).contains(&cx) && (y0..=y0 + h0).contains(&cy)
     };
     let end = subtree_end(rows, index);
+    let mut labels = Vec::new();
     for row in
         std::iter::once(&rows[index]).chain(rows[index + 1..end].iter().filter(|row| inside(row)))
     {
-        if let Some(label) = row_words(row).find(|text| paying_word(text).is_some()) {
-            return Err(Refusal::Sensitive(label.trim().to_string()));
+        for label in row_words(row).filter(|text| paying_word(text).is_some()) {
+            let label = label.trim().to_owned();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
         }
     }
-    Ok(())
+    labels
 }
 
 /// A `tap` by `label`: every row it could name, with what is inside it (a
@@ -788,6 +801,14 @@ const CONTROL_KINDS: &[&str] = &[
 /// (text drawn on a bare view). `None`: no words there, so the target is
 /// unknown.
 pub fn check_point(rows: &[ElementRow], x: f64, y: f64) -> Option<Result<(), Refusal>> {
+    point_sensitive_labels(rows, x, y).map(|labels| match labels.into_iter().next() {
+        Some(label) => Err(Refusal::Sensitive(label)),
+        None => Ok(()),
+    })
+}
+
+/// All sensitive words in the actual hit control, including its children.
+pub fn point_sensitive_labels(rows: &[ElementRow], x: f64, y: f64) -> Option<Vec<String>> {
     let holds = |row: &ElementRow| {
         let [rx, ry, rw, rh] = row.rect;
         row.visible != Some(false)
@@ -816,17 +837,16 @@ pub fn check_point(rows: &[ElementRow], x: f64, y: f64) -> Option<Result<(), Ref
     if !control_words && text.is_none() {
         return None;
     }
-    Some((|| {
-        if let Some(index) = control {
-            check_pressed_row(rows, index)?;
+    let mut labels = control.map(|i| pressed_labels(rows, i)).unwrap_or_default();
+    if let Some(index) = text {
+        for label in row_words(&rows[index]).filter(|t| paying_word(t).is_some()) {
+            let label = label.trim().to_owned();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
         }
-        if let Some(label) =
-            text.and_then(|index| row_words(&rows[index]).find(|t| paying_word(t).is_some()))
-        {
-            return Err(Refusal::Sensitive(label.trim().to_string()));
-        }
-        Ok(())
-    })())
+    }
+    Some(labels)
 }
 
 /// The focused text field, if the tree marks one.
@@ -1116,6 +1136,19 @@ mod tests {
             depth,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn point_details_include_all_sensitive_labels_in_hit_control() {
+        let rows = vec![
+            row("Button", "立即购买", [0., 0., 100., 100.], 0),
+            row("StaticText", "确认付款", [10., 10., 80., 80.], 1),
+        ];
+        assert_eq!(
+            point_sensitive_labels(&rows, 50., 50.).unwrap(),
+            vec!["立即购买", "确认付款"]
+        );
+        assert!(check_point(&rows, 50., 50.).unwrap().is_err());
     }
 
     #[test]

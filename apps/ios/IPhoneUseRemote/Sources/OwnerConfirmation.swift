@@ -8,6 +8,7 @@ struct OwnerConfirmation: Decodable, Identifiable, Sendable {
     let id: String
     let kind: String
     let summary: String
+    let details: [String]
     let digest: String
     let nonce: String
     let object: ObjectBinding
@@ -103,6 +104,9 @@ struct OwnerConfirmationView: View {
             ForEach(pending) { sheet in
                 Section {
                     Text(sheet.summary)
+                    ForEach(Array(sheet.details.enumerated()), id: \.offset) { _, detail in
+                        Text(detail).fixedSize(horizontal: false, vertical: true)
+                    }
                     Button("允许（面容 ID）") { perform { try await client.ownerAnswer(sheet, approve: true) } }
                     Button("拒绝", role: .destructive) { perform { try await client.ownerAnswer(sheet, approve: false) } }
                 }

@@ -838,54 +838,63 @@ pub fn paying_word(label: &str) -> Option<&'static str> {
 /// How long a press the owner allowed stays allowed.
 const APPROVED_PRESS_TTL: Duration = Duration::from_secs(120);
 
-/// The one press the owner allowed on the phone (`needs_confirm` answered
-/// yes), and until when. Held in this process only: the daemon's guard
-/// lets exactly this press through once, and nothing a caller sends can
-/// create it.
-static APPROVED_PRESS: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+/// Process-local capabilities, never serialized into task state or responses.
+static APPROVED_PRESS: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
 
-/// Allow one press on `label` (`""`: any). The task engine calls this
-/// after the owner's answer, or for a task whose caller accepted every
-/// step (`confirm: "never"`).
-pub fn approve_press(label: &str) {
-    *APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((label.trim().to_string(), Instant::now() + APPROVED_PRESS_TTL));
+/// Mint a capability for exactly this control. Randomness failure fails closed.
+pub fn approve_press(label: &str) -> anyhow::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("owner press randomness unavailable"))?;
+    let token = hex::encode(bytes);
+    let mut slots = APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|s| s.2 > Instant::now());
+    slots.push((
+        token.clone(),
+        label.trim().to_owned(),
+        Instant::now() + APPROVED_PRESS_TTL,
+    ));
+    Ok(token)
 }
 
-/// Drop an allowed press that was not used.
-pub fn clear_approved_press() {
-    APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner()).take();
+pub fn clear_approved_press(token: &str) {
+    APPROVED_PRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|s| s.0 != token);
 }
 
-/// Use the allowed press, if it is still fresh and names this control
-/// (`label`: the paying words the guard found on it, which may be the
-/// confirmed target's own label or text inside it). One use.
-pub fn take_approved_press(label: &str) -> bool {
-    let mut slot = APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner());
-    let label = label.trim();
-    let matches = slot.as_ref().is_some_and(|(allowed, until)| {
-        Instant::now() < *until
-            && (allowed.is_empty() || allowed.contains(label) || label.contains(allowed.as_str()))
-    });
-    if matches {
-        slot.take();
+/// Missing/wrong tokens or labels cannot consume another request's capability.
+pub fn take_approved_press(token: Option<&str>, label: &str) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    let mut slots = APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|s| s.2 > Instant::now());
+    if let Some(i) = slots
+        .iter()
+        .position(|s| s.0 == token && s.1 == label.trim())
+    {
+        slots.swap_remove(i);
+        true
+    } else {
+        false
     }
-    matches
 }
 
 /// The press the daemon's guard should let through for this step: the
-/// confirmed target, or, when the caller accepted every step
-/// (`confirm: "never"`), whatever this press or Return lands on (`""`).
+/// exact observed target, including for `confirm: "never"`. Empty labels
+/// never act as a wildcard.
 fn press_allowance<'a>(
     confirmed: bool,
     policy: ConfirmPolicy,
     operation: &str,
     label: Option<&'a str>,
 ) -> Option<&'a str> {
-    if confirmed {
+    if confirmed
+        || (policy == ConfirmPolicy::Never && matches!(operation, "CLICK" | "PRESS_RETURN"))
+    {
         Some(label.unwrap_or(""))
-    } else if policy == ConfirmPolicy::Never && matches!(operation, "CLICK" | "PRESS_RETURN") {
-        Some("")
     } else {
         None
     }
@@ -1166,9 +1175,26 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
                         continue;
                     }
                     let target = again.and_then(|i| screen.targets.get(i)).cloned();
-                    approve_press(target.as_ref().map_or("", |t| t.label.as_str()));
-                    let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text.clone(), &request.goal, &mut history, &mut text_ms, by, started, reason.clone(), true).await;
-                    clear_approved_press();
+                    let token = approve_press(target.as_ref().map_or("", |t| t.label.as_str()))?;
+                    let step_daemon = daemon.clone().with_owner_press(&token);
+                    let step = execute(
+                        task,
+                        &step_daemon,
+                        jev_models.as_ref(),
+                        &screen,
+                        &operation,
+                        target,
+                        text.clone(),
+                        &request.goal,
+                        &mut history,
+                        &mut text_ms,
+                        by,
+                        started,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    clear_approved_press(&token);
                     let step = step?;
                     match step {
                         Some(stop) => {
@@ -1189,13 +1215,40 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             screen = jev::read_screen(daemon).await?;
             continue; // Fresh model decision, including a new risky confirmation.
         }
-        let allowance = press_allowance(confirmed, request.confirm, &operation, target.as_ref().map(|t| t.label.as_str())).map(str::to_string);
-        if let Some(label) = &allowance {
-            approve_press(label);
-        }
-        let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text, &request.goal, &mut history, &mut text_ms, by, started, reason, confirmed).await;
-        if allowance.is_some() {
-            clear_approved_press();
+        let allowance = press_allowance(
+            confirmed,
+            request.confirm,
+            &operation,
+            target.as_ref().map(|t| t.label.as_str()).or_else(|| {
+                screen
+                    .targets
+                    .iter()
+                    .find(|t| paying_word(&t.label).is_some())
+                    .map(|t| t.label.as_str())
+            }),
+        )
+        .map(str::to_string);
+        let token = allowance.as_deref().map(approve_press).transpose()?;
+        let step_daemon = token.as_deref().map(|t| daemon.clone().with_owner_press(t));
+        let step = execute(
+            task,
+            step_daemon.as_ref().unwrap_or(daemon),
+            jev_models.as_ref(),
+            &screen,
+            &operation,
+            target,
+            text,
+            &request.goal,
+            &mut history,
+            &mut text_ms,
+            by,
+            started,
+            reason,
+            confirmed,
+        )
+        .await;
+        if let Some(token) = token {
+            clear_approved_press(&token);
         }
         let step = step?;
         if let Some((stop, why)) = step {
@@ -1680,21 +1733,69 @@ mod tests {
     }
 
     #[test]
+    fn expired_press_token_cannot_be_used_and_tokens_are_independent() {
+        let expired = approve_press("立即购买").unwrap();
+        APPROVED_PRESS
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.0 == expired)
+            .unwrap()
+            .2 = Instant::now() - Duration::from_secs(1);
+        assert!(!take_approved_press(Some(&expired), "立即购买"));
+        let first = approve_press("立即购买").unwrap();
+        let second = approve_press("立即购买").unwrap();
+        assert_ne!(first, second);
+        clear_approved_press(&first);
+        assert!(take_approved_press(Some(&second), "立即购买"));
+    }
+
+    #[test]
     fn an_allowed_press_is_used_once_and_only_on_its_control() {
-        approve_press("立即购买");
-        assert!(!take_approved_press("确认转账"), "another control");
-        assert!(take_approved_press("立即购买"));
-        assert!(!take_approved_press("立即购买"), "one use");
-        approve_press("立即购买");
-        clear_approved_press();
-        assert!(!take_approved_press("立即购买"), "cleared after the step");
+        let token = approve_press("立即购买").unwrap();
+        assert!(!take_approved_press(None, "立即购买"));
+        assert!(!take_approved_press(Some("wrong"), "立即购买"));
+        assert!(
+            !take_approved_press(Some(&token), "确认转账"),
+            "another control"
+        );
+        assert!(
+            !take_approved_press(Some(&token), "立即购买更多"),
+            "no substring match"
+        );
+        assert!(take_approved_press(Some(&token), "立即购买"));
+        assert!(!take_approved_press(Some(&token), "立即购买"), "one use");
+        let token = approve_press("立即购买").unwrap();
+        clear_approved_press(&token);
+        assert!(
+            !take_approved_press(Some(&token), "立即购买"),
+            "cleared after the step"
+        );
 
         use ConfirmPolicy::{Never, Risky};
-        assert_eq!(press_allowance(true, Risky, "CLICK", Some("立即购买")), Some("立即购买"));
-        assert_eq!(press_allowance(false, Risky, "CLICK", Some("立即购买")), None, "not confirmed");
-        assert_eq!(press_allowance(false, Never, "CLICK", Some("商品")), Some(""), "caller accepted every step");
-        assert_eq!(press_allowance(false, Never, "PRESS_RETURN", None), Some(""));
-        assert_eq!(press_allowance(false, Never, "TYPE_TEXT", Some("支付密码")), None, "typing secrets is never allowed");
+        assert_eq!(
+            press_allowance(true, Risky, "CLICK", Some("立即购买")),
+            Some("立即购买")
+        );
+        assert_eq!(
+            press_allowance(false, Risky, "CLICK", Some("立即购买")),
+            None,
+            "not confirmed"
+        );
+        assert_eq!(
+            press_allowance(false, Never, "CLICK", Some("商品")),
+            Some("商品"),
+            "caller accepted every step"
+        );
+        assert_eq!(
+            press_allowance(false, Never, "PRESS_RETURN", None),
+            Some("")
+        );
+        assert_eq!(
+            press_allowance(false, Never, "TYPE_TEXT", Some("支付密码")),
+            None,
+            "typing secrets is never allowed"
+        );
     }
 
     #[test]

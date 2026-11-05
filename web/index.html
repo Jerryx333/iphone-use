@@ -3484,6 +3484,9 @@ function sendDirectControl(obj) {
         return controlResult(false, 'phone_owned');
       }
       if (!r.ok) {
+        if (result.error === 'owner_confirmation_required') {
+          toast('已发到手机，请在 iPhone Use App 用面容 ID 确认后再点一次');
+        }
         const failure = result.error === 'stale_element_snapshot'
           ? 'stale_element_snapshot'
           : result.error === 'invalid_element_snapshot'

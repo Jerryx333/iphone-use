@@ -440,7 +440,9 @@ fn installed_flow_grants_are_bound_and_single_use() {
         );
         let mut owner = state.owner_confirm.lock().unwrap();
         owner.bind(&public, Some(&proof)).unwrap();
-        let object = serde_json::json!({"flow":serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),"inputs":{}});
+        // The same object the daemon binds: the flow file, its inputs, its id
+        // and the batch it expands to.
+        let object = serde_json::json!({"flow":serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),"inputs":{},"id":"shop/buy","actions":request});
         let id = owner.request("flow", object, "Buy").unwrap();
         let pending = owner.pending()[0].clone();
         owner

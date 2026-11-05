@@ -157,9 +157,10 @@ fn control_open_mode_requires_signature_and_allows_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         Arc::get_mut(&mut state).unwrap().owner_confirm =
             Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
-        let action = json!({"type":"tap","x":0.75,"y":0.96,"ttl_ms":2500});
+        let mut action = json!({"type":"tap","x":0.75,"y":0.96,"ttl_ms":2500});
         let (status, body) = call(&state, "/control", action.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["retry_safe"], false);
         assert!(body["hint"].as_str().unwrap().contains("绑定主人"));
         let k = key();
         bind(&mut state.owner_confirm.lock().unwrap(), &k);
@@ -168,6 +169,26 @@ fn control_open_mode_requires_signature_and_allows_exactly_once() {
         assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 0);
         let id = body["owner_confirm_id"].as_str().unwrap();
         approve(&mut state.owner_confirm.lock().unwrap(), &k, id);
+        for changed in [
+            json!({"type":"tap","x":0.76,"y":0.96,"ttl_ms":2500}),
+            json!({"type":"tap","label":"确认支付","ttl_ms":2500}),
+        ] {
+            let (status, body) = call(&state, "/control", changed).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "changed action: {body}");
+        }
+        let compound = json!({"type":"multi_longpress","points":[{"x":0.75,"y":0.96},{"x":0.76,"y":0.96}],"duration_ms":100,"ttl_ms":2500});
+        let before = state.owner_confirm.lock().unwrap().pending().len();
+        let (status, body) = call(&state, "/control", compound).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "sensitive_compound_action");
+        assert_eq!(body["retry_safe"], false);
+        assert!(body.get("owner_confirm_id").is_none());
+        assert_eq!(state.owner_confirm.lock().unwrap().pending().len(), before);
+        action["ttl_ms"] = json!(2400);
+        action["issued_at_ms"] = json!(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64);
         let (status, body) = call(&state, "/control", action.clone()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = call(&state, "/control", action).await;
