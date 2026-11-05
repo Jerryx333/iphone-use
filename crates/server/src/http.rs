@@ -13807,13 +13807,22 @@ async fn agent_actions_scoped(
     // The link-scheme policy holds with or without the other limits, and so
     // does the sensitive-action check: one step that pays refuses the whole
     // batch. A saved flow's replay was approved when it was saved.
+    // A press the owner allowed passes its step's checks, used once.
     let sensitive_checked = !headers.contains_key(FLOW_RUN_HEADER);
-    for step in &request.steps {
+    let mut owner_allowed_step = None;
+    for (step_index, step) in request.steps.iter().enumerate() {
         if let AgentActionStep::Action { action, .. } = step {
-            if let Err(refusal) = policy.check_url(action).and_then(|()| {
-                if sensitive_checked { guard_sensitive_request(&state, action) } else { Ok(()) }
-            }) {
+            if let Err(refusal) = policy.check_url(action) {
                 return guard_refusal(&refusal, true);
+            }
+            if !sensitive_checked {
+                continue;
+            }
+            if let Err(refusal) = guard_sensitive_request(&state, action) {
+                match crate::guard::owner_allowed(refusal) {
+                    Ok(()) => owner_allowed_step = Some(step_index),
+                    Err(refusal) => return guard_refusal(&refusal, true),
+                }
             }
         }
     }
@@ -13941,7 +13950,11 @@ async fn agent_actions_scoped(
 
                 let guarded = async {
                     guard_foreground(&mut w, action).await?;
-                    if sensitive_checked { guard_sensitive(&mut w, action).await } else { Ok(()) }
+                    if sensitive_checked && owner_allowed_step != Some(index) {
+                        guard_sensitive(&mut w, action).await.or_else(crate::guard::owner_allowed)
+                    } else {
+                        Ok(())
+                    }
                 };
                 if let Err(refusal) = scoped_observation(&state, &capture_scope, guarded).await {
                     let mut body = agent_actions_failure_body(
@@ -16517,9 +16530,16 @@ async fn agent_input_inner(
     if let Err(refusal) = crate::guard::Policy::get()
         .check_launch(&value)
         .and_then(|()| crate::guard::Policy::get().check_url(&value))
-        .and_then(|()| guard_sensitive_request(&state, &value))
     {
         return guard_refusal(&refusal, false);
+    }
+    // A press the owner allowed passes both sensitive checks, used once.
+    let mut owner_allowed = false;
+    if let Err(refusal) = guard_sensitive_request(&state, &value) {
+        match crate::guard::owner_allowed(refusal) {
+            Ok(()) => owner_allowed = true,
+            Err(refusal) => return guard_refusal(&refusal, false),
+        }
     }
     // The MCP client waits 30 seconds. Keep the daemon's complete Direct runner
     // budget comfortably below that so the authoritative HTTP outcome arrives
@@ -16608,7 +16628,12 @@ async fn agent_input_inner(
                 }
             }
             // Read on the screen the action lands on, after any unlock.
-            if let Err(refusal) = guard_sensitive(&mut client, &value).await {
+            let checked = if owner_allowed {
+                Ok(())
+            } else {
+                guard_sensitive(&mut client, &value).await.or_else(crate::guard::owner_allowed)
+            };
+            if let Err(refusal) = checked {
                 sensitive = Some(refusal);
                 return RunnerControlOutcome::NotSent;
             }

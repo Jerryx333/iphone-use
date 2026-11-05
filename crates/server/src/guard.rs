@@ -21,6 +21,8 @@
 //! code field are refused as `sensitive_action`; the owner does those on the
 //! phone. Sending, deleting and sharing pass. A saved flow's replay
 //! (`X-Phone-Flow-Run`) passes too: the owner approved it when it was saved.
+//! So does the one press a daemon task's owner allowed on the phone
+//! ([`owner_allowed`]).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -502,6 +504,16 @@ const PRESS_SLOP: f64 = 0.03;
 
 /// Key names the runner sends as Return (`RunnerClient::named_key`).
 const RETURN_KEYS: &[&str] = &["return", "enter", "send", "go", "search"];
+
+/// Pass a paying press the owner just allowed on the phone, through a
+/// task's confirmation (`iphone_use_mcp::task::approve_press`): once, and
+/// only that control. Every other refusal stands.
+pub fn owner_allowed(refusal: Refusal) -> Result<(), Refusal> {
+    match &refusal {
+        Refusal::Sensitive(label) if iphone_use_mcp::task::take_approved_press(label) => Ok(()),
+        _ => Err(refusal),
+    }
+}
 
 /// The word in `label` that pays or places an order.
 pub fn paying_word(label: &str) -> Option<&'static str> {

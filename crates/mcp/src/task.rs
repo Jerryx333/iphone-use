@@ -835,6 +835,43 @@ pub fn paying_word(label: &str) -> Option<&'static str> {
     risky_words(label).find(|word| risk_verb(word) == PAY_VERB)
 }
 
+/// How long a press the owner allowed stays allowed.
+const APPROVED_PRESS_TTL: Duration = Duration::from_secs(120);
+
+/// The one press the owner allowed on the phone (`needs_confirm` answered
+/// yes), and until when. Held in this process only: the daemon's guard
+/// lets exactly this press through once, and nothing a caller sends can
+/// create it.
+static APPROVED_PRESS: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// Allow one press on `label` (the owner just confirmed it). The task
+/// engine calls this, and only after the owner's answer.
+pub fn approve_press(label: &str) {
+    *APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((label.trim().to_string(), Instant::now() + APPROVED_PRESS_TTL));
+}
+
+/// Drop an allowed press that was not used.
+pub fn clear_approved_press() {
+    APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
+/// Use the allowed press, if it is still fresh and names this control
+/// (`label`: the paying words the guard found on it, which may be the
+/// confirmed target's own label or text inside it). One use.
+pub fn take_approved_press(label: &str) -> bool {
+    let mut slot = APPROVED_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let label = label.trim();
+    let matches = slot.as_ref().is_some_and(|(allowed, until)| {
+        Instant::now() < *until
+            && (allowed.is_empty() || allowed.contains(label) || label.contains(allowed.as_str()))
+    });
+    if matches {
+        slot.take();
+    }
+    matches
+}
+
 fn risky_words(label: &str) -> impl Iterator<Item = &'static str> + '_ {
     let label = label.trim();
     let lower = label.to_lowercase();
@@ -1110,7 +1147,10 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
                         continue;
                     }
                     let target = again.and_then(|i| screen.targets.get(i)).cloned();
-                    let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text.clone(), &request.goal, &mut history, &mut text_ms, by, started, reason.clone(), true).await?;
+                    approve_press(target.as_ref().map_or("", |t| t.label.as_str()));
+                    let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text.clone(), &request.goal, &mut history, &mut text_ms, by, started, reason.clone(), true).await;
+                    clear_approved_press();
+                    let step = step?;
                     match step {
                         Some(stop) => {
                             finish(task, daemon, &chat, request, stop.0, stop.1).await;
@@ -1130,7 +1170,14 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
             screen = jev::read_screen(daemon).await?;
             continue; // Fresh model decision, including a new risky confirmation.
         }
-        let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text, &request.goal, &mut history, &mut text_ms, by, started, reason, confirmed).await?;
+        if confirmed {
+            approve_press(target.as_ref().map_or("", |t| t.label.as_str()));
+        }
+        let step = execute(task, daemon, jev_models.as_ref(), &screen, &operation, target, text, &request.goal, &mut history, &mut text_ms, by, started, reason, confirmed).await;
+        if confirmed {
+            clear_approved_press();
+        }
+        let step = step?;
         if let Some((stop, why)) = step {
             if stop == Status::Blocked && by == "jev" && chat.available() {
                 jev_misses += 1;
@@ -1591,6 +1638,17 @@ mod tests {
         assert_eq!(paying_word("发送"), None, "sending is not paying");
         assert_eq!(paying_word("Delete"), None);
         assert_eq!(paying_word("   "), None);
+    }
+
+    #[test]
+    fn an_allowed_press_is_used_once_and_only_on_its_control() {
+        approve_press("立即购买");
+        assert!(!take_approved_press("确认转账"), "another control");
+        assert!(take_approved_press("立即购买"));
+        assert!(!take_approved_press("立即购买"), "one use");
+        approve_press("立即购买");
+        clear_approved_press();
+        assert!(!take_approved_press("立即购买"), "cleared after the step");
     }
 
     #[test]
