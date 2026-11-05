@@ -496,6 +496,10 @@ const PRESSING_PERFORMS: &[&str] = &[
     "force_press",
 ];
 
+/// How far (as a fraction of the screen) a swipe may move and still land
+/// as a press.
+const PRESS_SLOP: f64 = 0.03;
+
 /// Key names the runner sends as Return (`RunnerClient::named_key`).
 const RETURN_KEYS: &[&str] = &["return", "enter", "send", "go", "search"];
 
@@ -559,10 +563,12 @@ pub fn check_sensitive_request(action: &Value) -> Result<(), Refusal> {
 pub enum SensitiveRead {
     /// Nothing: the action presses nothing that could pay.
     None,
+    /// The rows a `tap` `label` names (and their contents), of `kind` if given.
+    Label { label: String, kind: Option<String> },
     /// The snapshot row it names (`tap`/`perform` press it, `set_value` types into it).
     Element,
-    /// The rows a `tap_locator` with `label_contains` could match.
-    LabelContains(String),
+    /// Every row the `tap_locator`'s locator could match.
+    Locator,
     /// The controls under these normalized points.
     Points(Vec<(f64, f64)>),
     /// The focused field (typing) and, with `submits`, the Return key too.
@@ -572,14 +578,24 @@ pub enum SensitiveRead {
 }
 
 pub fn sensitive_read(action: &Value) -> SensitiveRead {
+    // Only points the action would act on: an invalid one is refused by its
+    // own validation, with nothing read or sent.
     let point = |value: &Value| {
-        Some((
-            value.get("x").and_then(Value::as_f64)?,
-            value.get("y").and_then(Value::as_f64)?,
-        ))
+        let x = value.get("x").and_then(Value::as_f64)?;
+        let y = value.get("y").and_then(Value::as_f64)?;
+        ((0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)).then_some((x, y))
     };
+    let field = |key: &str| action.get(key).and_then(Value::as_str).map(str::to_string);
     match kind(action) {
-        "tap" if action.get("label").is_some() => SensitiveRead::None,
+        "tap" if action.get("label").is_some() => match field("label") {
+            Some(label) if !label.is_empty() => SensitiveRead::Label {
+                label,
+                kind: field("kind")
+                    .map(|kind| kind.trim_start_matches("XCUIElementType").to_string())
+                    .filter(|kind| !kind.is_empty()),
+            },
+            _ => SensitiveRead::None,
+        },
         "tap" if action.get("element").is_some() => SensitiveRead::Element,
         "set_value" => SensitiveRead::Element,
         "perform" => {
@@ -590,28 +606,62 @@ pub fn sensitive_read(action: &Value) -> SensitiveRead {
                 SensitiveRead::None
             }
         }
+        "longpress"
+            if action.get("fingers").is_some_and(|f| f.as_u64() != Some(1))
+                || action.get("points").is_some() =>
+        {
+            SensitiveRead::None
+        }
         "tap" | "longpress" => {
             point(action).map_or(SensitiveRead::None, |p| SensitiveRead::Points(vec![p]))
         }
-        "multi_longpress" => SensitiveRead::Points(
-            action
-                .get("points")
-                .and_then(Value::as_array)
+        "multi_longpress" => {
+            let all = action.get("points").and_then(Value::as_array);
+            let points: Vec<(f64, f64)> = all
                 .map(|points| points.iter().filter_map(point).collect())
-                .unwrap_or_default(),
-        ),
-        "tap_locator" => action
-            .get("locator")
-            .and_then(|locator| locator.get("label_contains"))
-            .and_then(Value::as_str)
-            .map_or(SensitiveRead::None, |part| {
-                SensitiveRead::LabelContains(part.to_string())
-            }),
+                .unwrap_or_default();
+            if (2..=5).contains(&points.len()) && all.is_some_and(|all| all.len() == points.len()) {
+                SensitiveRead::Points(points)
+            } else {
+                SensitiveRead::None
+            }
+        }
+        "tap_locator" => SensitiveRead::Locator,
+        // A swipe that barely moves is a press where it starts and ends.
+        "swipe" | "drag" => {
+            let ends: Vec<(f64, f64)> = match action.get("points").and_then(Value::as_array) {
+                Some(points) => points.iter().filter_map(point).collect(),
+                None => [("x1", "y1"), ("x2", "y2")]
+                    .iter()
+                    .filter_map(|(x, y)| {
+                        Some((
+                            action.get(*x).and_then(Value::as_f64)?,
+                            action.get(*y).and_then(Value::as_f64)?,
+                        ))
+                    })
+                    .collect(),
+            };
+            let still = ends
+                .iter()
+                .all(|&(x, y)| point(&serde_json::json!({"x": x, "y": y})).is_some())
+                && ends.first().is_some_and(|&(x0, y0)| {
+                    ends.iter()
+                        .all(|&(x, y)| (x - x0).abs() < PRESS_SLOP && (y - y0).abs() < PRESS_SLOP)
+                });
+            if still {
+                SensitiveRead::Points(ends)
+            } else {
+                SensitiveRead::None
+            }
+        }
+        // A continuation types text the request does not carry: it may
+        // hold a newline.
         "text" => SensitiveRead::Focused {
-            submits: action
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains(['\n', '\r'])),
+            submits: action.get("continue_token").is_some()
+                || action
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(['\n', '\r'])),
         },
         "key" => {
             let name = action.get("name").and_then(Value::as_str).unwrap_or("");
@@ -652,9 +702,35 @@ pub fn check_pressed_row(rows: &[ElementRow], index: usize) -> Result<(), Refusa
     if index >= rows.len() {
         return Ok(());
     }
-    for row in &rows[index..subtree_end(rows, index)] {
+    // Unlabelled containers are not rows, so depth alone can make a later
+    // sibling's child look like this row's: inside means drawn inside too.
+    let [x0, y0, w0, h0] = rows[index].rect;
+    let inside = |row: &ElementRow| {
+        let [x, y, w, h] = row.rect;
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        (x0..=x0 + w0).contains(&cx) && (y0..=y0 + h0).contains(&cy)
+    };
+    let end = subtree_end(rows, index);
+    for row in
+        std::iter::once(&rows[index]).chain(rows[index + 1..end].iter().filter(|row| inside(row)))
+    {
         if let Some(label) = row_words(row).find(|text| paying_word(text).is_some()) {
             return Err(Refusal::Sensitive(label.trim().to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// A `tap` by `label`: every row it could name, with what is inside it (a
+/// Cell named 商品详情 whose middle is a 立即购买 button).
+pub fn check_label_rows(
+    rows: &[ElementRow],
+    label: &str,
+    kind: Option<&str>,
+) -> Result<(), Refusal> {
+    for (index, row) in rows.iter().enumerate() {
+        if row.label == label && kind.is_none_or(|kind| row.kind == kind) {
+            check_pressed_row(rows, index)?;
         }
     }
     Ok(())
@@ -670,19 +746,6 @@ pub fn check_typed_row(row: &ElementRow) -> Result<(), Refusal> {
     if row.kind == "SecureTextField" || words.iter().any(|text| secret_word(text)) {
         let name = words.first().copied().unwrap_or(row.kind.as_str());
         return Err(Refusal::SensitiveField(name.trim().to_string()));
-    }
-    Ok(())
-}
-
-/// Rows a `tap_locator` `label_contains` could press.
-pub fn check_label_contains(rows: &[ElementRow], part: &str) -> Result<(), Refusal> {
-    if part.is_empty() {
-        return Ok(());
-    }
-    for (index, row) in rows.iter().enumerate() {
-        if row.label.contains(part) {
-            check_pressed_row(rows, index)?;
-        }
     }
     Ok(())
 }
@@ -1070,8 +1133,28 @@ mod tests {
     #[test]
     fn what_each_action_reads_before_it_is_sent() {
         assert_eq!(
-            sensitive_read(&json!({"type":"tap","label":"x"})),
+            sensitive_read(&json!({"type":"tap","label":"x","kind":"XCUIElementTypeCell"})),
+            SensitiveRead::Label {
+                label: "x".into(),
+                kind: Some("Cell".into())
+            }
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"tap","x":1.5,"y":0.5})),
+            SensitiveRead::None,
+            "invalid"
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"multi_longpress","points":[{"x":0.3,"y":0.4}]})),
             SensitiveRead::None
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"longpress","x":0.5,"y":0.5,"fingers":3})),
+            SensitiveRead::None
+        );
+        assert_eq!(
+            sensitive_read(&json!({"type":"text","continue_token":"t"})),
+            SensitiveRead::Focused { submits: true }
         );
         assert_eq!(
             sensitive_read(&json!({"type":"tap","element":1,"snapshot":"s"})),
@@ -1134,6 +1217,23 @@ mod tests {
             check_point(&rows, 50.0, 330.0).is_none(),
             "no words under the finger"
         );
+        assert!(check_label_rows(&rows, "加入购物车", None).is_ok());
+        let cell = vec![
+            row("Cell", "商品详情", [0.0, 100.0, 390.0, 300.0], 1),
+            row("Button", "立即购买", [100.0, 200.0, 190.0, 60.0], 2),
+        ];
+        assert!(
+            check_label_rows(&cell, "商品详情", None).is_err(),
+            "the buy button is inside"
+        );
+        assert!(check_label_rows(&cell, "商品详情", Some("Button")).is_ok());
+        // 取消 then a row one level deeper that is drawn elsewhere: the child
+        // of an unlabelled sibling container, not 取消's.
+        let siblings = vec![
+            row("Button", "取消", [0.0, 100.0, 100.0, 44.0], 1),
+            row("StaticText", "立即付款", [200.0, 100.0, 100.0, 44.0], 2),
+        ];
+        assert!(check_pressed_row(&siblings, 0).is_ok());
     }
 
     #[test]

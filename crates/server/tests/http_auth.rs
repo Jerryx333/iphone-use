@@ -2133,8 +2133,9 @@ fn agent_actions_wait_for_retries_one_stale_source_read() {
 fn agent_actions_stops_before_later_steps_when_an_element_is_missing() {
     block(async {
         // session, Home, source (reads go straight to the lite tree; no
-        // front-app lookup after Home any more).
-        let (base, server) = mock_runner(3, |request, _| {
+        // front-app lookup after Home any more), and the sensitive-action
+        // guard's read of the label's row before the tap.
+        let (base, server) = mock_runner(4, |request, _| {
             let body = if request.starts_with("POST /session ") {
                 r#"{"value":{"sessionId":"SESSION"}}"#
             } else if request.contains("/wda/pressButton") {

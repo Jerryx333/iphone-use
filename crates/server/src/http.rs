@@ -12083,6 +12083,10 @@ async fn guard_foreground(
 /// How long the sensitive check waits for each read it needs.
 const GUARD_SENSITIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// The oldest tree the sensitive check judges by; older, it reads afresh.
+/// The screen can change without a POST (a page load, a person's finger).
+const GUARD_SENSITIVE_TREE_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The sensitive-action checks that need no phone: what `action` names, and
 /// the snapshot row it points at when that snapshot is still held.
 fn guard_sensitive_request(
@@ -12144,7 +12148,13 @@ async fn guard_sensitive(
         }
         _ => {}
     }
-    let rows = match client.recent_tree(SNAPSHOT_TREE_REUSE) {
+    // An invalid hold is refused by its own validation, with nothing read.
+    if action.get("type").and_then(serde_json::Value::as_str) == Some("multi_longpress")
+        && multi_hold_points(action).is_none()
+    {
+        return Ok(());
+    }
+    let rows = match client.recent_tree(GUARD_SENSITIVE_TREE_AGE) {
         Some(rows) => Some(rows),
         None => within(GUARD_SENSITIVE_READ_TIMEOUT, client.elements()).await.ok().and_then(Result::ok).map(Arc::new),
     };
@@ -12152,7 +12162,24 @@ async fn guard_sensitive(
         return guard_sensitive_unverified(client).await;
     };
     match read {
-        SensitiveRead::LabelContains(part) => crate::guard::check_label_contains(&rows, &part),
+        SensitiveRead::Label { label, kind } => {
+            crate::guard::check_label_rows(&rows, &label, kind.as_deref())
+        }
+        SensitiveRead::Locator => {
+            let Some(locator) = action
+                .get("locator")
+                .cloned()
+                .and_then(|locator| serde_json::from_value::<AgentElementLocator>(locator).ok())
+            else {
+                return Ok(());
+            };
+            for (index, row) in rows.iter().enumerate() {
+                if agent_locator_assessment(row, &locator) != Some(false) {
+                    crate::guard::check_pressed_row(&rows, index)?;
+                }
+            }
+            Ok(())
+        }
         SensitiveRead::Focused { submits } => {
             if action.get("type").and_then(serde_json::Value::as_str) == Some("text") {
                 if let Some(field) = crate::guard::focused_field(&rows) {
@@ -12168,11 +12195,15 @@ async fn guard_sensitive(
             let Ok(Ok((width, height))) = within(GUARD_SENSITIVE_READ_TIMEOUT, client.window_size()).await else {
                 return guard_sensitive_unverified(client).await;
             };
+            let mut unknown = false;
             for (x, y) in points {
                 match crate::guard::check_point(&rows, x * width, y * height) {
                     Some(checked) => checked?,
-                    None => guard_sensitive_unverified(client).await?,
+                    None => unknown = true,
                 }
+            }
+            if unknown {
+                guard_sensitive_unverified(client).await?;
             }
             Ok(())
         }

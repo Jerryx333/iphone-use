@@ -532,7 +532,9 @@ fn a_locator_tap_fully_covered_after_reveal_never_taps_or_authorizes_replay() {
         assert_ne!(json["outcome"], "not_sent", "reveal was attempted: {json}");
         assert_eq!(json["error"], "outcome_unknown", "{json}");
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.iter().filter(|r| r.starts_with("POST ") && r.contains("/elements ")).count(), 2, "re-resolve after reveal: {seen:?}");
+        // At least twice: the sensitive-action guard's tree read lets the
+        // first resolve try the reused tree before the fresh one.
+        assert!(seen.iter().filter(|r| r.starts_with("POST ") && r.contains("/elements ")).count() >= 2, "re-resolve after reveal: {seen:?}");
         assert!(seen.iter().filter(|r| r.contains("/element/E1/rect")).count() >= 4, "reach the post-reveal live-frame guard: {seen:?}");
         assert!(!seen.iter().any(|r| r.contains("/E1/ipu/tap") || r.contains("/E1/click")), "{seen:?}");
         assert!(

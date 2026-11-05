@@ -40,7 +40,7 @@ const TREE: &str = r#"{"value":{
         {"type":"XCUIElementTypeButton","label":"确认付款","rect":{"x":260,"y":550,"width":130,"height":50},"isEnabled":"1"}
       ]},
       {"type":"XCUIElementTypeButton","label":"加入购物车","rect":{"x":0,"y":780,"width":190,"height":64},"isEnabled":"1"},
-      {"type":"XCUIElementTypeButton","label":"立即购买","rect":{"x":200,"y":780,"width":190,"height":64},"isEnabled":"1"}
+      {"type":"XCUIElementTypeButton","label":"立即购买","rawIdentifier":"buyNow","rect":{"x":200,"y":780,"width":190,"height":64},"isEnabled":"1"}
     ]}}"#;
 
 /// Every request that reaches the runner, first line and body.
@@ -202,6 +202,14 @@ fn every_way_to_press_pay_is_refused_before_the_phone_sees_it() {
             (
                 "tap_locator",
                 r#"{"type":"tap_locator","locator":{"label_contains":"立即"}}"#.to_string(),
+            ),
+            (
+                "tap_locator by identifier",
+                r#"{"type":"tap_locator","locator":{"identifier":"buyNow"}}"#.to_string(),
+            ),
+            (
+                "a swipe that does not move",
+                r#"{"type":"swipe","x1":0.75,"y1":0.96,"x2":0.76,"y2":0.96}"#.to_string(),
             ),
             (
                 "keyboard return",
