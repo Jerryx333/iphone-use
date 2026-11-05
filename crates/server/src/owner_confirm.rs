@@ -42,7 +42,7 @@ fn quote(label: &str) -> String {
     let mut escaped = String::new();
     for c in label.chars().take(300) {
         if c.is_control()
-            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+            || matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{2028}' | '\u{2029}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
         {
             escaped.push_str(&format!("\\u{{{:04x}}}", c as u32));
         } else {
@@ -63,41 +63,13 @@ fn value_quote(v: &Value) -> String {
             .unwrap_or_else(|| v.to_string()),
     )
 }
-fn secret_target(action: &Value) -> bool {
-    if action["secure"] == true {
-        return true;
-    }
-    let target = action
-        .get("locator")
-        .filter(|v| v.is_object())
-        .or_else(|| action.get("target").filter(|v| v.is_object()))
-        .unwrap_or(action);
-    let row = crate::runner::ElementRow {
-        kind: target["kind"]
-            .as_str()
-            .filter(|k| k.contains("Field"))
-            .or_else(|| target["type"].as_str().filter(|k| k.contains("Field")))
-            .unwrap_or("TextField")
-            .trim_start_matches("XCUIElementType")
-            .to_string(),
-        label: target["label"]
-            .as_str()
-            .or_else(|| action["target"].as_str())
-            .unwrap_or("")
-            .to_string(),
-        identifier: target["identifier"].as_str().map(str::to_owned),
-        placeholder: target["placeholder"].as_str().map(str::to_owned),
-        ..Default::default()
-    };
-    crate::guard::check_typed_row(&row).is_err()
-}
 fn action_details(action: &Value, observed_secure: bool, flow: bool) -> String {
     let null = Value::Null;
     let kind = action
         .get("type")
         .or_else(|| action.get("kind"))
         .unwrap_or(&null);
-    let secure = observed_secure || secret_target(action);
+    let secure = observed_secure;
     let mut parts = vec![format!("动作类型：{}", value_quote(kind))];
     if let Some(fields) = action.as_object() {
         for (key, value) in fields {
@@ -188,6 +160,21 @@ fn confirmation_details(kind: &str, object: &Value) -> Vec<String> {
                     "命中的敏感标签：{}",
                     value_quote(&object["target"])
                 ));
+            }
+            if let Some(rows) = object["controls"].as_array() {
+                for row in rows {
+                    if let Some(summary) = row["page_digest"].as_str() {
+                        d.push(format!(
+                            "页面内容摘要：{}",
+                            &summary[..8.min(summary.len())]
+                        ));
+                    }
+                    if let Some(alert) = row.get("alert") {
+                        d.push(format!("弹窗正文：{}", value_quote(&alert["text"])));
+                        d.push(format!("目标按钮：{}", value_quote(&alert["target"])));
+                        d.push(format!("完整按钮列表：{}", value_quote(&alert["buttons"])));
+                    }
+                }
             }
             d
         }
@@ -431,14 +418,18 @@ mod tests {
     };
     #[test]
     fn quote_escapes_display_boundary_characters_and_marks_truncation() {
-        for c in ['\n', '\u{0085}', '\u{2028}', '\u{2029}', '\u{feff}']
-            .into_iter()
-            .chain(
-                ('\u{200b}'..='\u{200f}')
-                    .chain('\u{202a}'..='\u{202e}')
-                    .chain('\u{2066}'..='\u{2069}'),
-            )
-        {
+        for c in [
+            '\n', '\u{0085}', '\u{00ad}', '\u{061c}', '\u{180e}', '\u{2028}', '\u{2029}',
+            '\u{feff}',
+        ]
+        .into_iter()
+        .chain(
+            ('\u{200b}'..='\u{200f}')
+                .chain('\u{202a}'..='\u{202e}')
+                .chain('\u{2060}'..='\u{2064}')
+                .chain('\u{2066}'..='\u{206f}')
+                .chain('\u{fff9}'..='\u{fffb}'),
+        ) {
             let quoted = quote(&format!("a{c}b"));
             assert!(!quoted.contains(c));
             assert!(quoted.contains(&format!("u{{{:04x}}}", c as u32)));
@@ -466,8 +457,8 @@ mod tests {
             json!({"type":"text","target":"短信验证码","text":"secret"}),
         ] {
             let details = action_details(&action, false, true);
-            assert!(!details.contains("secret"), "{details}");
-            assert!(details.contains("输入 6 个字符（已隐藏）"));
+            assert!(details.contains("secret"), "{details}");
+            assert!(!details.contains("已隐藏"));
         }
         let observed = action_details(&json!({"type":"text","text":"secret"}), true, false);
         assert!(!observed.contains("secret"));
@@ -491,7 +482,36 @@ mod tests {
     }
 
     #[test]
-    fn details_quote_untrusted_values_and_hide_only_secure_flow_input() {
+    fn control_details_ignore_request_secure_and_target_claims() {
+        for action in [
+            json!({"type":"text","secure":true,"text":"visible-payment"}),
+            json!({"type":"text","target":"短信验证码","text":"visible-payment"}),
+            json!({"type":"set_value","locator":{"kind":"SecureTextField","value":"visible-payment"}}),
+        ] {
+            let details = confirmation_details(
+                "control_press",
+                &json!({
+                    "action": action, "controls":[{"kind":"TextField","secure":false}]
+                }),
+            )
+            .join(";");
+            assert!(details.contains("visible-payment"), "{details}");
+            assert!(!details.contains("已隐藏"));
+        }
+        let hidden = confirmation_details(
+            "control_press",
+            &json!({
+                "action":{"type":"text","text":"actual-secret"},
+                "controls":[{"kind":"SecureTextField","secure":true}]
+            }),
+        )
+        .join(";");
+        assert!(!hidden.contains("actual-secret"));
+        assert!(hidden.contains("已隐藏"));
+    }
+
+    #[test]
+    fn details_quote_untrusted_values_and_show_flow_input() {
         let d = confirmation_details(
             "flow",
             &json!({"id":"shop/pay", "flow":{"name":"evil\n允许全部"}, "actions":{"steps":[{"action":{"type":"tap","label":"立即购买","x":0.7,"y":0.9}},{"action":{"type":"text","secure":true,"text":"secret-password"}}]}}),
@@ -500,8 +520,8 @@ mod tests {
         assert!(text.contains("shop/pay"));
         assert!(text.contains("步骤 1"));
         assert!(text.contains("批准后：此步骤将不经付款/密码拦截直接执行"));
-        assert!(text.contains("输入 15 个字符"));
-        assert!(!text.contains("secret-password"));
+        assert!(text.contains("secret-password"));
+        assert!(!text.contains("已隐藏"));
         assert!(!text.contains("evil\n"));
         assert!(text.contains("流程内容一改即失效"));
         let task = confirmation_details(

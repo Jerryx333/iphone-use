@@ -695,12 +695,7 @@ pub fn sensitive_read(action: &Value) -> SensitiveRead {
                 SensitiveRead::None
             }
         }
-        "alert"
-            if action.get("button").is_none()
-                && action.get("action").and_then(Value::as_str) == Some("accept") =>
-        {
-            SensitiveRead::Alert
-        }
+        "alert" => SensitiveRead::Alert,
         _ => SensitiveRead::None,
     }
 }
@@ -1251,7 +1246,7 @@ mod tests {
         );
         assert_eq!(
             sensitive_read(&json!({"type":"alert","action":"dismiss"})),
-            SensitiveRead::None
+            SensitiveRead::Alert
         );
         assert_eq!(
             sensitive_read(&json!({"type":"swipe","x":0.5,"y":0.5})),

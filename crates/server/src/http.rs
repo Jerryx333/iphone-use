@@ -11817,7 +11817,10 @@ async fn direct_control(
                 client.confirmation_foreground(),
             );
             confirmation_object = object.clone();
-            if !recover(state.owner_confirm.lock()).consume("control_press", &object) {
+            if (crate::guard::sensitive_read(&value) == crate::guard::SensitiveRead::Alert
+                && observed[0].get("alert").is_none())
+                || !recover(state.owner_confirm.lock()).consume("control_press", &object)
+            {
                 sensitive_refusal = Some(refusal);
                 return None;
             }
@@ -11830,6 +11833,16 @@ async fn direct_control(
             None
         };
         *recover(dispatch_marker.lock()) = Some(client.last_post());
+        // Dispatch exactly the alert target bound above, including default
+        // accept/dismiss (last/first in runner button order). Never let a
+        // second native default resolution choose a different button.
+        let mut dispatch_value = value.clone();
+        if value["type"] == "alert" {
+            if let Some(target) = observed[0]["alert"]["target"].as_str() {
+                dispatch_value.as_object_mut().unwrap().remove("action");
+                dispatch_value["button"] = serde_json::json!(target);
+            }
+        }
         let dispatch_allowed =
             || capture_scope.current(&state) && tokio::time::Instant::now() < deadline;
         let outcome = scoped_runner_action(
@@ -11839,7 +11852,7 @@ async fn direct_control(
             runner_control_with_client(
                 &mut client,
                 &state.runner_actionable,
-                &value,
+                &dispatch_value,
                 &mut detail,
                 false,
                 Some(&dispatch_allowed),
@@ -12243,10 +12256,17 @@ async fn guard_sensitive_observed(
     // Read the actual target even when request-supplied words are sensitive.
     let request_check = crate::guard::check_sensitive_request(action);
     let mut identities = Vec::new();
-    let mut record = |row: &crate::runner::ElementRow| {
+    let mut record = |row: &crate::runner::ElementRow, rows: &[crate::runner::ElementRow]| {
         identities.push(serde_json::json!({"label":row.label,"identifier":row.identifier,"rect":row.rect,"kind":row.kind,
             "secure":crate::guard::check_typed_row(row).is_err()}));
+        let page = rows
+            .iter()
+            .map(|r| (&r.kind, &r.label, &r.value))
+            .collect::<Vec<_>>();
         *observed = serde_json::json!(identities);
+        observed.as_array_mut().unwrap().push(serde_json::json!({
+            "page_digest": crate::owner_confirm::digest(&serde_json::json!(page))
+        }));
     };
     let read = crate::guard::sensitive_read(action);
     match &read {
@@ -12260,7 +12280,7 @@ async fn guard_sensitive_observed(
             )
             .await
             {
-                record(&rows[index]);
+                record(&rows[index], &rows);
                 request_check?;
                 return if action.get("type").and_then(serde_json::Value::as_str)
                     == Some("set_value")
@@ -12275,8 +12295,30 @@ async fn guard_sensitive_observed(
         SensitiveRead::Alert => {
             client.forget_alert_probe();
             return match within(GUARD_SENSITIVE_READ_TIMEOUT, client.alert_summary()).await {
-                Ok(Ok(Some((_, buttons)))) => crate::guard::check_alert_buttons(&buttons),
-                _ => Ok(()),
+                Ok(Ok(Some((text, buttons)))) if !buttons.is_empty() => {
+                    let target = action["button"].as_str().or_else(|| {
+                        (if action["action"] == "dismiss" {
+                            buttons.first()
+                        } else {
+                            buttons.last()
+                        }).map(String::as_str)
+                    });
+                    if let Some(target) = target.filter(|t| buttons.iter().any(|b| b == t)) {
+                        *observed = serde_json::json!([{"alert": {
+                            "text": text, "buttons": buttons, "target": target
+                        }}]);
+                    }
+                    request_check?;
+                    if action.get("button").is_some() || action["action"] == "dismiss" {
+                        match target {
+                            Some(target) => crate::guard::check_alert_buttons(&[target.to_owned()]),
+                            None => Ok(()),
+                        }
+                    } else {
+                        crate::guard::check_alert_buttons(&buttons)
+                    }
+                }
+                _ => request_check,
             };
         }
         _ => {}
@@ -12298,13 +12340,19 @@ async fn guard_sensitive_observed(
     let Some(rows) = rows else {
         return guard_sensitive_unverified(client).await;
     };
-    match read {
+    // Bind all screen text even if a request-level sensitive label did not
+    // resolve to a row in this snapshot.
+    let page = rows.iter().map(|r| (&r.kind, &r.label, &r.value)).collect::<Vec<_>>();
+    // `record` owns the mutable observation borrow until its last use below;
+    // page metadata is attached by it whenever a target was found.
+    let page_digest = crate::owner_confirm::digest(&serde_json::json!(page));
+    let result = match read {
         SensitiveRead::Label { label, kind } => {
             for row in rows
                 .iter()
                 .filter(|row| row.label == label && kind.as_ref().is_none_or(|k| row.kind == *k))
             {
-                record(row);
+                record(row, &rows);
             }
             request_check?;
             crate::guard::check_label_rows(&rows, &label, kind.as_deref())
@@ -12319,7 +12367,7 @@ async fn guard_sensitive_observed(
             };
             for (index, row) in rows.iter().enumerate() {
                 if agent_locator_assessment(row, &locator) != Some(false) {
-                    record(row);
+                    record(row, &rows);
                     crate::guard::check_pressed_row(&rows, index)?;
                 }
             }
@@ -12328,7 +12376,7 @@ async fn guard_sensitive_observed(
         SensitiveRead::Focused { submits } => {
             if action.get("type").and_then(serde_json::Value::as_str) == Some("text") {
                 if let Some(field) = crate::guard::focused_field(&rows) {
-                    record(field);
+                    record(field, &rows);
                     crate::guard::check_typed_row(field)?;
                 }
             }
@@ -12338,7 +12386,7 @@ async fn guard_sensitive_observed(
                     matches!(row.kind.as_str(), "Button" | "Key" | "Keyboard")
                         || row.focused == Some(true)
                 }) {
-                    record(row);
+                    record(row, &rows);
                 }
                 crate::guard::check_return(&rows)?;
             }
@@ -12354,7 +12402,7 @@ async fn guard_sensitive_observed(
             for (x, y) in points {
                 let (control, text) = crate::guard::point_rows(&rows, x * width, y * height);
                 for index in control.into_iter().chain(text) {
-                    record(&rows[index]);
+                    record(&rows[index], &rows);
                 }
                 match crate::guard::check_point(&rows, x * width, y * height) {
                     Some(checked) => checked?,
@@ -12367,7 +12415,11 @@ async fn guard_sensitive_observed(
             Ok(())
         }
         SensitiveRead::None | SensitiveRead::Element | SensitiveRead::Alert => Ok(()),
+    };
+    if observed.is_null() {
+        *observed = serde_json::json!([{"page_digest":page_digest}]);
     }
+    result
 }
 
 /// A target that could not be read: refused only in a payment or bank app.

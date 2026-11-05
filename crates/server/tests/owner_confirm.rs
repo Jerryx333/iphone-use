@@ -197,7 +197,7 @@ fn control_open_mode_requires_signature_and_allows_exactly_once() {
     });
 }
 #[test]
-fn control_approval_rejects_changed_rect_identifier_or_foreground() {
+fn control_approval_rejects_changed_rect_identifier_foreground_or_page_amount() {
     support::block(async {
         let version = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let current = version.clone();
@@ -209,7 +209,7 @@ fn control_approval_rejects_changed_rect_identifier_or_foreground() {
                 json!({"value":{"sessionId":"SESSION"}})
             } else if line.contains("/source") {
                 let v = current.load(std::sync::atomic::Ordering::SeqCst);
-                json!({"value":{"type":"XCUIElementTypeApplication","bundleId":if v == 3 {"com.example.other"} else {"com.example.shop"},"label":"商城","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeButton","label":"立即购买","rawIdentifier":if v == 2 {"transaction-b"} else {"transaction-a"},"rect":{"x":if v == 1 {199} else {200},"y":780,"width":190,"height":64},"isEnabled":"1"}]}})
+                json!({"value":{"type":"XCUIElementTypeApplication","bundleId":if v == 3 {"com.example.other"} else {"com.example.shop"},"label":"商城","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeStaticText","label":if v == 4 {"金额 200 元"} else {"金额 100 元"},"rect":{"x":0,"y":100,"width":200,"height":40}},{"type":"XCUIElementTypeButton","label":"立即购买","rawIdentifier":if v == 2 {"transaction-b"} else {"transaction-a"},"rect":{"x":if v == 1 {199} else {200},"y":780,"width":190,"height":64},"isEnabled":"1"}]}})
             } else if line.contains("/window/size") {
                 json!({"value":{"width":390,"height":844}})
             } else {
@@ -230,8 +230,14 @@ fn control_approval_rejects_changed_rect_identifier_or_foreground() {
         let (status, body) = call(&state, "/control", action.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         let id = body["owner_confirm_id"].as_str().unwrap().to_owned();
+        let pending = state.owner_confirm.lock().unwrap().pending();
+        let sheet = pending.iter().find(|p| p.id == id).unwrap();
+        assert!(sheet
+            .details
+            .iter()
+            .any(|d| d.starts_with("页面内容摘要：") && d.chars().count() == 15));
         approve(&mut state.owner_confirm.lock().unwrap(), &k, &id);
-        for changed in 1..=3 {
+        for changed in 1..=4 {
             version.store(changed, std::sync::atomic::Ordering::SeqCst);
             let (status, body) = call(&state, "/control", action.clone()).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "version {changed}: {body}");
@@ -416,6 +422,93 @@ fn saved_flow_requires_owner_signature_and_edits_invalidate_approval() {
             let (status, body) = replay().await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert!(posts.load(std::sync::atomic::Ordering::SeqCst) > before);
+        }
+    });
+}
+
+#[test]
+fn control_alert_approval_binds_body_buttons_and_target_and_is_single_use() {
+    support::block(async {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let version = Arc::new(AtomicUsize::new(0));
+        let current = version.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+        let runner = support::mock_runner(move |request, _| {
+            let line = request.lines().next().unwrap_or("");
+            let v = current.load(SeqCst);
+            let body = if line.starts_with("POST /session ") {
+                json!({"value":{"sessionId":"SESSION"}})
+            } else if line.contains("/alert/text") {
+                if v == 3 {
+                    json!({"value":null})
+                } else {
+                    json!({"value":if v == 1 {"向乙支付 200 元"} else {"向甲支付 100 元"}})
+                }
+            } else if line.contains("/wda/alert/buttons") {
+                json!({"value":if v == 3 {vec![]} else if v == 2 {vec!["立即购买", "确认支付"]} else {vec!["确认转账", "确认支付"]}})
+            } else {
+                if line.starts_with("POST ")
+                    && (line.contains("/alert/accept") || line.contains("/alert/dismiss"))
+                {
+                    count.fetch_add(1, SeqCst);
+                }
+                json!({"value":null})
+            };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let mut state = support::build_state_with_runner(runner.url());
+        let dir = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().owner_confirm =
+            Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
+        let k = key();
+        bind(&mut state.owner_confirm.lock().unwrap(), &k);
+        for action in [
+            json!({"type":"alert","button":"确认支付","ttl_ms":2500}),
+            json!({"type":"alert","action":"accept","ttl_ms":2500}),
+            json!({"type":"alert","action":"dismiss","ttl_ms":2500}),
+        ] {
+            version.store(0, SeqCst);
+            let before = posts.load(SeqCst);
+            let (status, body) = call(&state, "/control", action.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            let id = body["owner_confirm_id"].as_str().unwrap().to_owned();
+            let pending = state.owner_confirm.lock().unwrap().pending();
+            let sheet = pending.iter().find(|p| p.id == id).unwrap();
+            assert!(sheet
+                .details
+                .iter()
+                .any(|d| d.contains("弹窗正文：") && d.contains("向甲支付 100 元")));
+            assert!(sheet.details.iter().any(|d| d.contains("目标按钮：")));
+            approve(&mut state.owner_confirm.lock().unwrap(), &k, &id);
+            for changed in 1..=2 {
+                version.store(changed, SeqCst);
+                let (status, body) = call(&state, "/control", action.clone()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert_ne!(body["owner_confirm_id"], id);
+                assert_eq!(posts.load(SeqCst), before);
+            }
+            // An unreadable alert must not consume an explicit payment approval.
+            if action.get("button").is_some() {
+                version.store(3, SeqCst);
+                let (status, body) = call(&state, "/control", action.clone()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                let unreadable = body["owner_confirm_id"].as_str().unwrap().to_owned();
+                approve(&mut state.owner_confirm.lock().unwrap(), &k, &unreadable);
+                assert_eq!(
+                    call(&state, "/control", action.clone()).await.0,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(posts.load(SeqCst), before);
+            }
+            version.store(0, SeqCst);
+            let (status, body) = call(&state, "/control", action.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(posts.load(SeqCst), before + 1);
+            assert_eq!(
+                call(&state, "/control", action).await.0,
+                StatusCode::FORBIDDEN
+            );
         }
     });
 }
