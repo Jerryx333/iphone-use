@@ -10165,6 +10165,7 @@ async fn runner_control_with_client(
     detail: &mut Option<serde_json::Value>,
     guard_alert: bool,
     dispatch_allowed: Option<&(dyn Fn() -> bool + Sync)>,
+    approved_alert: Option<&serde_json::Value>,
 ) -> RunnerControlOutcome {
     use std::sync::atomic::Ordering;
     if let Err(refusal) = protect_owner_app(w, v) {
@@ -10253,7 +10254,24 @@ async fn runner_control_with_client(
             // An explicit alert action reads the alert live, never the
             // probe's reused "no alert".
             w.forget_alert_probe();
-            let current = match w.alert_summary().await {
+            let probe = if approved_alert.is_some() {
+                w.alert_summary_for_confirmation().await
+            } else {
+                w.alert_summary().await
+            };
+            if let Some(approved) = approved_alert {
+                let observed = match &probe {
+                    Ok(Some((text, buttons))) if button.is_some_and(|name| buttons.iter().any(|b| b == name)) => {
+                        serde_json::json!([{"alert":{"text":text,"buttons":buttons,"target":button}}])
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                if observed[0].get("alert") != Some(approved) {
+                    *detail = Some(serde_json::json!({"alert_confirmation_observed":observed}));
+                    return RunnerControlOutcome::Refused("owner_confirmation_required", "弹窗已变化或读不到，请重新确认");
+                }
+            }
+            let current = match probe {
                 Ok(current) => current,
                 Err(error) => {
                     w.invalidate_session();
@@ -11606,7 +11624,7 @@ async fn direct_agent_action(
     };
 
     let Some(result) = custom_result else {
-        return runner_control_with_client(w, actionable, value, detail, true, dispatch_allowed).await;
+        return runner_control_with_client(w, actionable, value, detail, true, dispatch_allowed, None).await;
     };
     match result {
         Ok(()) => {
@@ -11805,6 +11823,8 @@ async fn direct_control(
         } else {
             checked
         };
+        let mut approved_alert = None;
+        let mut approved_refusal = None;
         if let Err(refusal) = checked {
             if compound_control(&value) {
                 sensitive_refusal = Some(refusal);
@@ -11823,6 +11843,10 @@ async fn direct_control(
             {
                 sensitive_refusal = Some(refusal);
                 return None;
+            }
+            if value["type"] == "alert" {
+                approved_alert = observed[0].get("alert").cloned();
+                approved_refusal = Some(refusal);
             }
         }
         // A recording turns a person's coordinate tap into the element under
@@ -11856,9 +11880,20 @@ async fn direct_control(
                 &mut detail,
                 false,
                 Some(&dispatch_allowed),
+                approved_alert.as_ref(),
             ),
         )
         .await;
+        if let (RunnerControlOutcome::Refused("owner_confirmation_required", _), Some(refusal)) =
+            (outcome, approved_refusal)
+        {
+            let fresh = &detail.as_ref().unwrap()["alert_confirmation_observed"];
+            confirmation_object = control_confirmation_object(
+                &value, &refusal, fresh, client.confirmation_foreground(),
+            );
+            sensitive_refusal = Some(refusal);
+            return None;
+        }
         Some((outcome, recorded_locator))
     })
     .await;
@@ -12294,7 +12329,7 @@ async fn guard_sensitive_observed(
         }
         SensitiveRead::Alert => {
             client.forget_alert_probe();
-            return match within(GUARD_SENSITIVE_READ_TIMEOUT, client.alert_summary()).await {
+            return match within(GUARD_SENSITIVE_READ_TIMEOUT, client.alert_summary_for_confirmation()).await {
                 Ok(Ok(Some((text, buttons)))) if !buttons.is_empty() => {
                     let target = action["button"].as_str().or_else(|| {
                         (if action["action"] == "dismiss" {
@@ -12318,7 +12353,10 @@ async fn guard_sensitive_observed(
                         crate::guard::check_alert_buttons(&buttons)
                     }
                 }
-                _ => request_check,
+                _ => {
+                    request_check?;
+                    guard_sensitive_unverified(client).await
+                }
             };
         }
         _ => {}
@@ -24291,7 +24329,7 @@ mod tests {
             .split("async fn direct_control(")
             .next()
             .unwrap();
-        assert!(agent.contains("value, detail, true, dispatch_allowed)"));
+        assert!(agent.contains("value, detail, true, dispatch_allowed, None)"));
     }
     #[test]
     fn scroll_alert_error_keeps_full_json_and_buttons() {

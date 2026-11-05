@@ -2914,6 +2914,15 @@ impl RunnerClient {
     }
 
     pub async fn alert_summary(&mut self) -> Result<Option<(String, Vec<String>)>> {
+        self.read_alert_summary(false).await
+    }
+
+    /// Confirmation identities require the complete, unmodified native values.
+    pub async fn alert_summary_for_confirmation(&mut self) -> Result<Option<(String, Vec<String>)>> {
+        self.read_alert_summary(true).await
+    }
+
+    async fn read_alert_summary(&mut self, strict: bool) -> Result<Option<(String, Vec<String>)>> {
         if self.no_alert_known() {
             return Ok(None);
         }
@@ -2926,6 +2935,7 @@ impl RunnerClient {
             .await
             .context("GET /alert/text")?;
         let text = match ensure_runner_success(response, "GET /alert/text").await {
+            Ok(value) if strict => value.as_str().context("alert text is not a string")?.to_string(),
             Ok(value) => value.as_str().unwrap_or("").to_string(),
             // W3C maps "no such alert" to HTTP 404.
             Err(error) if runner_error_is_not_found(&error) => {
@@ -2941,6 +2951,13 @@ impl RunnerClient {
             .await
             .context("GET /wda/alert/buttons")?;
         let buttons = match ensure_runner_success(response, "GET /wda/alert/buttons").await {
+            Ok(value) if strict => {
+                let items = value.as_array().context("alert buttons is not an array")?;
+                anyhow::ensure!(!items.is_empty(), "alert buttons is empty");
+                items.iter().map(|item| {
+                    item.as_str().map(String::from).context("alert button is not a string")
+                }).collect::<Result<Vec<_>>>()?
+            }
             Ok(value) => value
                 .as_array()
                 .map(|items| {
@@ -2950,6 +2967,7 @@ impl RunnerClient {
                         .collect()
                 })
                 .unwrap_or_default(),
+            Err(error) if strict => return Err(error),
             Err(_) => Vec::new(),
         };
         Ok(Some((text, buttons)))

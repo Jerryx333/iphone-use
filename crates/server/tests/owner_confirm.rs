@@ -512,3 +512,166 @@ fn control_alert_approval_binds_body_buttons_and_target_and_is_single_use() {
         }
     });
 }
+
+// Each /control attempt reads twice in the sensitive guard, then once in execution.
+fn control_alert_confirmation_case(change: &str, during_execution: bool) {
+    support::block(async {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_count = reads.clone();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let current_phase = phase.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+        let change_is_unchanged = change == "unchanged";
+        let change = change.to_owned();
+        let mock_change = change.clone();
+        let runner = support::mock_runner(move |request, _| {
+            let change = mock_change.as_str();
+            let line = request.lines().next().unwrap_or("");
+            let phase = current_phase.load(SeqCst);
+            let changed = phase == 1 && (!during_execution || read_count.load(SeqCst) >= 3);
+            let body = if line.starts_with("POST /session ") {
+                json!({"value":{"sessionId":"SESSION"}})
+            } else if line.contains("/alert/text") {
+                let n = read_count.fetch_add(1, SeqCst);
+                let changed = phase == 1 && (!during_execution || n >= 2);
+                json!({"value":if changed && change == "null_text" {Value::Null}
+                    else if changed && change == "body" {json!("B：支付 200 元")}
+                    else if change == "null_text" {json!("")}
+                    else {json!("A：支付 100 元")}})
+            } else if line.contains("/wda/alert/buttons") {
+                json!({"value":if changed && change == "mixed_buttons" {json!(["取消", 7, "确认支付"])}
+                    else if changed && change == "buttons" {json!(["返回", "确认支付"])}
+                    else if changed && change == "order" {json!(["确认支付", "取消"])}
+                    else if changed && change == "empty_buttons" {json!([])}
+                    else {json!(["取消", "确认支付"])}})
+            } else {
+                if line.starts_with("POST ")
+                    && (line.contains("/alert/accept") || line.contains("/alert/dismiss"))
+                {
+                    count.fetch_add(1, SeqCst);
+                }
+                json!({"value":null})
+            };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let mut state = support::build_state_with_runner(runner.url());
+        let dir = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().owner_confirm =
+            Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
+        let k = key();
+        bind(&mut state.owner_confirm.lock().unwrap(), &k);
+        let action = json!({"type":"alert","button":"确认支付","ttl_ms":2500});
+        let (status, body) = call(&state, "/control", action.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let id = body["owner_confirm_id"].as_str().unwrap().to_owned();
+        let original_controls = state
+            .owner_confirm
+            .lock()
+            .unwrap()
+            .pending()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .object["controls"]
+            .clone();
+        approve(&mut state.owner_confirm.lock().unwrap(), &k, &id);
+        reads.store(0, SeqCst);
+        phase.store(1, SeqCst);
+        let (status, body) = call(&state, "/control", action.clone()).await;
+        if change_is_unchanged {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(reads.load(SeqCst), 3);
+            assert_eq!(posts.load(SeqCst), 1);
+            assert_eq!(
+                call(&state, "/control", action).await.0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(posts.load(SeqCst), 1);
+            return;
+        }
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "owner_confirmation_required");
+        assert_eq!(body["outcome"], "not_sent");
+        assert_eq!(body["retry_safe"], false);
+        assert_eq!(posts.load(SeqCst), 0);
+        let fresh_id = body["owner_confirm_id"].as_str().unwrap();
+        assert_ne!(fresh_id, id);
+        let pending = state.owner_confirm.lock().unwrap().pending();
+        let fresh = pending.iter().find(|p| p.id == fresh_id).unwrap();
+        if during_execution {
+            assert_eq!(reads.load(SeqCst), 3);
+            if fresh.object["controls"][0].get("alert").is_some() {
+                assert_ne!(fresh.object["controls"], original_controls);
+                let alert = &fresh.object["controls"][0]["alert"];
+                assert_eq!(alert["target"], "确认支付");
+                match change.as_str() {
+                    "body" => assert_eq!(alert["text"], "B：支付 200 元"),
+                    "buttons" => assert_eq!(alert["buttons"], json!(["返回", "确认支付"])),
+                    "order" => assert_eq!(alert["buttons"], json!(["确认支付", "取消"])),
+                    _ => panic!("malformed execution read produced an identity"),
+                }
+            }
+        } else {
+            // An unreadable identity may produce a sheet, but never a consumable one.
+            assert!(fresh.object["controls"][0].get("alert").is_none());
+            approve(&mut state.owner_confirm.lock().unwrap(), &k, fresh_id);
+            assert_eq!(
+                call(&state, "/control", action.clone()).await.0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(posts.load(SeqCst), 0);
+        }
+        phase.store(0, SeqCst);
+        let (status, body) = call(&state, "/control", action.clone()).await;
+        if during_execution {
+            // The old approval was consumed before execution detected the change.
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            let next = body["owner_confirm_id"].as_str().unwrap();
+            approve(&mut state.owner_confirm.lock().unwrap(), &k, next);
+        } else {
+            // Malformed reads did not consume the original, exact approval.
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(posts.load(SeqCst), 1);
+            return;
+        }
+        let (status, body) = call(&state, "/control", action).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(posts.load(SeqCst), 1);
+    });
+}
+
+#[test]
+fn control_alert_approved_execution_rechecks_body_buttons_and_order() {
+    for change in [
+        "body",
+        "buttons",
+        "order",
+        "null_text",
+        "mixed_buttons",
+        "empty_buttons",
+    ] {
+        control_alert_confirmation_case(change, true);
+    }
+}
+
+#[test]
+fn control_alert_null_text_cannot_consume_approval() {
+    control_alert_confirmation_case("null_text", false);
+}
+
+#[test]
+fn control_alert_mixed_buttons_cannot_consume_approval() {
+    control_alert_confirmation_case("mixed_buttons", false);
+}
+
+#[test]
+fn control_alert_empty_buttons_cannot_consume_approval() {
+    control_alert_confirmation_case("empty_buttons", false);
+}
+
+#[test]
+fn control_alert_approved_execution_unchanged_clicks_once() {
+    control_alert_confirmation_case("unchanged", true);
+}
