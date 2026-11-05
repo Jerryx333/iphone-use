@@ -116,6 +116,40 @@ async fn logs_do_not_include_secrets_or_body() {
     let _guard = tracing::subscriber::set_default(subscriber);
     // Parallel tests without a subscriber may have cached callsite interest as "never".
     tracing::callsite::rebuild_interest_cache();
+    // Owner forwarding never emits configuration values, nonce or signature payloads.
+    let owner_secret = "FAKE-OWNER-PASSWORD-LOG-CHECK";
+    std::env::set_var(
+        "PHONE_GATEWAY_OWNER_URL",
+        format!("http://{owner_secret}@127.0.0.1"),
+    );
+    std::env::set_var("PHONE_GATEWAY_OWNER_TOKEN", owner_secret);
+    let owner = phone_gateway::owner::OwnerRelay::from_env();
+    std::env::remove_var("PHONE_GATEWAY_OWNER_URL");
+    std::env::remove_var("PHONE_GATEWAY_OWNER_TOKEN");
+    let owner_frame = json!({"t":"owner_req","id":"owner-log-test","method":"POST",
+        "path":"/owner/key","body_b64":STANDARD.encode(br#"{ "signature": "PRIVATE_SIGNATURE", "nonce": "PRIVATE_NONCE" }"#)});
+    let result = owner.request(&owner_frame).await;
+    assert_eq!(result["error"]["code"], "owner_config_invalid");
+    let owner_log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    for secret in [
+        owner_secret,
+        "PRIVATE_SIGNATURE",
+        "PRIVATE_NONCE",
+        owner_frame["body_b64"].as_str().unwrap(),
+    ] {
+        assert!(!owner_log.contains(secret));
+        assert!(!result.to_string().contains(secret));
+    }
+    std::env::set_var("PHONE_GATEWAY_OWNER_URL", "http://127.0.0.1:9");
+    std::env::set_var("PHONE_GATEWAY_OWNER_TOKEN", owner_secret);
+    let configured_owner = phone_gateway::owner::OwnerRelay::from_env();
+    std::env::remove_var("PHONE_GATEWAY_OWNER_URL");
+    std::env::remove_var("PHONE_GATEWAY_OWNER_TOKEN");
+    let result = configured_owner.request(&owner_frame).await;
+    assert_eq!(result["error"]["code"], "owner_daemon_unavailable");
+    let owner_log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(!owner_log.contains(owner_secret));
+    assert!(!result.to_string().contains(owner_secret));
     let f = Fixture::new();
     let g = f.gateway();
     let marker = "PRIVATE_SCREEN_CONTENT";

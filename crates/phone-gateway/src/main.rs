@@ -202,6 +202,7 @@ async fn main() -> Result<()> {
                 usage_error("--ws-bind must be loopback");
             }
             Gateway::new(Config::load(&dir)?, Timing::default())
+                .with_owner_relay(phone_gateway::owner::OwnerRelay::from_env())
                 .with_ws_bind(ws_bind)?
                 .with_forwards(runner_forward, mjpeg_forward)?
                 .serve(bind, http)

@@ -108,6 +108,8 @@ pub struct Gateway {
     tunnels: crate::tunnel::Tunnels,
     forwards: [Option<SocketAddr>; 2],
     ws_bind: Option<SocketAddr>,
+    owner: crate::owner::OwnerRelay,
+    owner_rate: Arc<Mutex<VecDeque<Instant>>>,
 }
 // Never propagate security's stdout/stderr or an OS error: either can contain secrets.
 fn keychain_passcode(device_id: &str) -> std::result::Result<String, ()> {
@@ -191,7 +193,13 @@ impl Gateway {
             tunnels: crate::tunnel::Tunnels::default(),
             forwards: [None, None],
             ws_bind: None,
+            owner: crate::owner::OwnerRelay::default(),
+            owner_rate: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+    pub fn with_owner_relay(mut self, owner: crate::owner::OwnerRelay) -> Self {
+        self.owner = owner;
+        self
     }
     pub fn with_ws_bind(mut self, bind: Option<SocketAddr>) -> Result<Self> {
         if bind.is_some_and(|a| !a.ip().is_loopback()) {
@@ -507,7 +515,7 @@ impl Gateway {
         // Keep frame reads intact across select cancellation (partial length/data reads matter).
         let reading = tokio::spawn(async move {
             loop {
-                let frame = protocol::read_frame(&mut reader, protocol::FRAME_LIMIT).await;
+                let frame = protocol::read_frame_with_len(&mut reader, protocol::FRAME_LIMIT).await;
                 let failed = frame.is_err();
                 if tx.send(frame).await.is_err() || failed {
                     break;
@@ -519,6 +527,14 @@ impl Gateway {
         let mut last_ack = Instant::now();
         let mut sequence = 0u64;
         let mut outstanding = VecDeque::new();
+        // Connection-local tasks are aborted on close/replacement; nothing is replayed.
+        // The rate budget is gateway-wide so reconnecting cannot reset it.
+        let mut owner_jobs = tokio::task::JoinSet::new();
+        let mut owner_busy = false;
+        let mut pending_busy = false;
+        let mut pending_changes = crate::owner::PendingChanges::default();
+        let mut owner_poll = tokio::time::interval(Duration::from_secs(3));
+        owner_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -608,8 +624,28 @@ impl Gateway {
             tokio::select! {
                 biased;
                 frame = rx.recv() => {
-                    let Some(Ok(frame)) = frame else { break; };
+                    let Some(Ok((frame, raw_len))) = frame else { break; };
                     match frame["t"].as_str() {
+                        Some("owner_req") => {
+                            let id = frame["id"].as_str().unwrap_or("");
+                            let mut rate = self.owner_rate.lock().await;
+                            let now = Instant::now();
+                            rate.retain(|at| now.duration_since(*at) < Duration::from_secs(1));
+                            let code = if rate.len() >= 4 { Some("owner_rate_limited") }
+                                else if raw_len > 24 * 1024 { Some("owner_request_too_large") }
+                                else if owner_busy { Some("owner_busy") } else { None };
+                            rate.push_back(now);
+                            drop(rate);
+                            if let Some(code) = code {
+                                let response = crate::owner::failure(id, code);
+                                if timeout(Duration::from_secs(3), protocol::write_frame(&mut writer, &response)).await.map_or(true, |r| r.is_err()) { break; }
+                                if code == "owner_rate_limited" { break; }
+                            } else {
+                                owner_busy = true;
+                                let owner = self.owner.clone();
+                                owner_jobs.spawn(async move { (false, Some(owner.request(&frame).await), None) });
+                            }
+                        },
                         Some("pong") => {
                             if let Some(seq) = frame["seq"].as_u64() {
                                 if let Some(index) = outstanding.iter().position(|s| *s == seq) {
@@ -634,6 +670,21 @@ impl Gateway {
                     }
                 },
                 _ = notified => {},
+                result = owner_jobs.join_next(), if !owner_jobs.is_empty() => {
+                    let Some(Ok((poll, response, body))) = result else { break; };
+                    let response = if poll {
+                        pending_busy = false;
+                        body.and_then(|body: Vec<u8>| pending_changes.update(&body).ok().flatten())
+                    } else { owner_busy = false; response };
+                    if let Some(response) = response {
+                        if timeout(Duration::from_secs(3), protocol::write_frame(&mut writer, &response)).await.map_or(true, |r| r.is_err()) { break; }
+                    }
+                },
+                _ = owner_poll.tick(), if !pending_busy => {
+                    pending_busy = true;
+                    let owner = self.owner.clone();
+                    owner_jobs.spawn(async move { (true, None, owner.pending().await.ok()) });
+                },
                 _ = tokio::time::sleep_until(last_ack + self.timing.offline) => break,
                 _ = heartbeat.tick() => {
                     sequence += 1; outstanding.push_back(sequence);
@@ -641,6 +692,7 @@ impl Gateway {
                 },
             }
         }
+        owner_jobs.abort_all();
         // A write (heartbeat, request) can fail while the response to the in-flight request is still
         // on its way through the reader; give the reader a moment to deliver it before calling the
         // action unknown.
@@ -650,7 +702,7 @@ impl Gateway {
         };
         if waiting {
             let late = timeout(Duration::from_millis(500), async {
-                while let Some(Ok(frame)) = rx.recv().await {
+                while let Some(Ok((frame, _))) = rx.recv().await {
                     if frame["t"] == "res" {
                         return Some(frame);
                     }
@@ -1274,5 +1326,189 @@ mod unlock_tests {
             ),
             json!({"id":"id","ok":true,"result":{"unlocked":true}})
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    fn gateway() -> Gateway {
+        let dir = std::env::temp_dir().join(format!("owner-gateway-{}", uuid::Uuid::new_v4()));
+        crate::config::pair(
+            &dir,
+            false,
+            "localhost".into(),
+            7381,
+            &dir.join("pair.json"),
+        )
+        .unwrap();
+        let config = Config::load(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        Gateway::new(config, Timing::default())
+    }
+    #[tokio::test]
+    async fn owner_messages_cannot_authenticate_or_enter_http_action_queue() {
+        let g = gateway();
+        let (server, mut phone) = tokio::io::duplex(4096);
+        let clone = g.clone();
+        let task = tokio::spawn(async move { clone.authenticate(Box::new(server)).await });
+        assert_eq!(
+            protocol::read_frame(&mut phone, 4096).await.unwrap()["t"],
+            "challenge"
+        );
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"owner_req","id":"r","method":"POST","path":"/owner/key","body_b64":""}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            task.await.unwrap().err().unwrap().to_string(),
+            "authentication rejected"
+        );
+        assert_eq!(g.snapshot().await["transport"], "offline");
+        for action in [
+            "owner_req",
+            "owner_key",
+            "owner_pending",
+            "owner_confirm",
+            "/owner/key",
+            "/owner/pending",
+            "/owner/confirm/x",
+        ] {
+            let response = g
+                .router()
+                .oneshot(
+                    Request::post("/v1/command")
+                        .header("authorization", format!("Bearer {}", g.config.token))
+                        .body(Body::from(
+                            json!({"action":action,"args":{},"deadline_ms":100}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let value: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(value["error"]["code"], "unsupported", "{value}");
+            assert_eq!(g.snapshot().await["queue_length"], 0);
+        }
+        for path in ["/owner/key", "/owner/pending", "/owner/confirm/x"] {
+            let response = g
+                .router()
+                .oneshot(
+                    Request::post(path)
+                        .header("authorization", format!("Bearer {}", g.config.token))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+    #[tokio::test]
+    async fn authenticated_owner_requests_are_bounded_and_other_commands_remain_available() {
+        let g = gateway();
+        let (server, mut phone) = tokio::io::duplex(64 * 1024);
+        let clone = g.clone();
+        let task = tokio::spawn(async move {
+            let (stream, tunnel) = clone.authenticate(Box::new(server)).await.unwrap();
+            clone.established(stream, tunnel, "lan").await;
+        });
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let challenge = protocol::read_frame(&mut phone, 4096).await.unwrap();
+        let nonce = STANDARD
+            .decode(challenge["nonce"].as_str().unwrap())
+            .unwrap();
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"hello","v":1,"device_id":g.config.device_id,
+            "mac":STANDARD.encode(protocol::mac(&g.config.psk,&nonce,&g.config.device_id))}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            protocol::read_frame(&mut phone, 4096).await.unwrap()["t"],
+            "welcome"
+        );
+        use tokio::io::AsyncWriteExt;
+        let compact =
+            r#"{"t":"owner_req","id":"r","method":"GET","path":"/owner/key","body_b64":""}"#;
+        for (raw, expected) in [
+            (
+                format!("{compact}{}", " ".repeat(24 * 1024 - compact.len())),
+                "owner_unconfigured",
+            ),
+            (
+                format!("{compact}{}", " ".repeat(24 * 1024 + 1 - compact.len())),
+                "owner_request_too_large",
+            ),
+            (
+                format!(
+                    r#"{{"padding":0,{}"t":"owner_req","id":"r","method":"GET","path":"/owner/key","body_b64":""}}"#,
+                    "\"padding\":0,".repeat(2100)
+                ),
+                "owner_request_too_large",
+            ),
+            (
+                format!(
+                    r#"{{"t":"owner_req","id":"r","padding":"{}"}}"#,
+                    "\\u0061".repeat(4200)
+                ),
+                "owner_request_too_large",
+            ),
+        ] {
+            let parsed: Value = serde_json::from_str(&raw).unwrap();
+            assert!(serde_json::to_vec(&parsed).unwrap().len() < 24 * 1024);
+            phone.write_u32(raw.len() as u32).await.unwrap();
+            phone.write_all(raw.as_bytes()).await.unwrap();
+            let response = loop {
+                let response = protocol::read_frame(&mut phone, 4096).await.unwrap();
+                if response["t"] == "ping" {
+                    protocol::write_frame(&mut phone, &json!({"t":"pong","seq":response["seq"]}))
+                        .await
+                        .unwrap();
+                } else {
+                    break response;
+                }
+            };
+            assert_eq!(response["error"]["code"], expected, "{response}");
+        }
+        // A fresh connection would still share the rate budget. Let this window expire here.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        for n in 0..5 {
+            protocol::write_frame(
+                &mut phone,
+                &json!({"t":"owner_req","id":"r","method":"GET","path":"/owner/key","body_b64":""}),
+            )
+            .await
+            .unwrap();
+            let response = loop {
+                let response = protocol::read_frame(&mut phone, 4096).await.unwrap();
+                if response["t"] == "ping" {
+                    protocol::write_frame(&mut phone, &json!({"t":"pong","seq":response["seq"]}))
+                        .await
+                        .unwrap();
+                } else {
+                    break response;
+                }
+            };
+            assert_eq!(response["t"], "owner_res");
+            assert_eq!(
+                response["error"]["code"],
+                if n == 4 {
+                    "owner_rate_limited"
+                } else {
+                    "owner_unconfigured"
+                }
+            );
+        }
+        task.await.unwrap();
+        assert_eq!(g.snapshot().await["transport"], "offline");
     }
 }

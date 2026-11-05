@@ -8,13 +8,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PRE_AUTH_LIMIT: usize = 4096;
 pub const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, limit: usize) -> Result<Value> {
+    Ok(read_frame_with_len(r, limit).await?.0)
+}
+/// Preserve the wire JSON length: whitespace, duplicate keys and escapes count toward limits.
+pub async fn read_frame_with_len<R: AsyncRead + Unpin>(
+    r: &mut R,
+    limit: usize,
+) -> Result<(Value, usize)> {
     let len = r.read_u32().await? as usize;
     if len == 0 || len > limit {
         return Err("frame length rejected".into());
     }
     let mut bytes = vec![0; len];
     r.read_exact(&mut bytes).await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok((serde_json::from_slice(&bytes)?, len))
 }
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;

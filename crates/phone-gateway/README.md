@@ -18,7 +18,7 @@ cargo run -p phone-gateway --offline -- cmd screenshot --format compact
 
 配置目录默认 `~/.config/phone-gateway/`，可用 `PHONE_GATEWAY_HOME` 覆盖。目录 0700，文件从创建起为 0600：`server.crt`、`server.key`、`psk`（base64）、`device_id`（32 位小写 hex）、`client-token`（base64）。使用系统 `/usr/bin/openssl` 生成 P-256、CN=phone-gateway、3650 天自签证书。随机源为 `/dev/urandom`。配置残缺时拒绝默认复用，需要显式轮换。轮换由多个文件 rename 完成，不保证进程被中途终止时跨文件原子性。
 
-`serve --bind 0.0.0.0:7381 --http 127.0.0.1:7382`：HTTP 地址必须是 loopback；`cmd --endpoint <host:port>` 指定 HTTP 入口，优先级为命令行 > `PHONE_GATEWAY_ENDPOINT` > 默认 `127.0.0.1:7382`。支持回环 IP、`localhost` 和 IPv6（如 `[::1]:7382`）；解析结果必须全部为回环地址，连接时只使用已校验的地址。格式错误、解析失败或非回环地址均报错并退出 64。持有 client-token 的任何程序都有完整控制权，调用方的审批不能约束其它持有 token 的程序（第 11.C 节）。只接受 POST、不开 CORS，两条路由均需 Bearer token：
+`serve --bind 0.0.0.0:7381 --http 127.0.0.1:7382`：HTTP 地址必须是 loopback；`cmd --endpoint <host:port>` 指定 HTTP 入口，优先级为命令行 > `PHONE_GATEWAY_ENDPOINT` > 默认 `127.0.0.1:7382`。支持回环 IP、`localhost` 和 IPv6（如 `[::1]:7382`）；解析结果必须全部为回环地址，连接时只使用已校验的地址。格式错误、解析失败或非回环地址均报错并退出 64。持有 client-token 的任何程序都有现有动作白名单内的控制权（不含主人签名确认），调用方的审批不能约束其它持有 token 的程序（第 11.C 节）。只接受 POST、不开 CORS，两条路由均需 Bearer token：
 
 - `/v1/command`：`{"action":"read","args":{},"deadline_ms":30000,"id":"可选稳定ID"}`，默认 deadline 30 秒，id 默认 UUID。动作限于设计第 5 节白名单；结果是否支持由手机决定。id 最多 128 字符，可含 ASCII 字母、数字、`-_:`, gateway 不缓存/去重，重复 id 透传手机。
 - `/v1/status`：不需要手机在线，返回 `transport`、`last_pong_at`（Unix 毫秒或 null）、`device_id`（前 8 位）、`queue_length`。手机 XCTest/VPN 状态应使用 command 的 `status`，两层状态不同（第 11.D 节）。
@@ -30,6 +30,10 @@ token 在读取 body 前校验，body 最大 1 MiB。FIFO 排队上限 8（不�
 手机入口 accept 的暂时性错误会记录一行 stderr 日志并继续监听：ECONNABORTED/EINTR 立即重试，EMFILE/ENFILE/ENOBUFS/ENOMEM（以及 WouldBlock）退避 100 ms；不可恢复的监听错误才会从 accept 循环上抛并使服务退出。
 
 HMAC 消息字节顺序为 ASCII `selfrunner-v1` + 解码 nonce 的 32 字节 + 配对文件中 device_id 的 **32 字符 UTF-8 hex 文本**（不再 hex 解码）；key 是解码 PSK 的 32 字节。hello 必须带 `t=hello`、`v=1`、匹配的 `device_id`、base64 `mac`；成功后回 welcome，才替换旧连接。每来源连接尝试至少间隔 100 ms，来源跟踪最大 1024 条。
+
+主人确认使用独立的手机发起消息 `owner_req` / `owner_res`，仅在控制连接 welcome 后可用；`owner_pending` 每约 3 秒检查列表变化后推送。body_b64 封装原始 HTTP body，逐字节转发到本机 daemon 的 GET/POST `/owner/key`、GET `/owner/pending`、POST `/owner/confirm/<id>`，不生成、修改、缓存或重试签名。HTTP `/v1/command` 白名单不包含这些操作，client-token 不能调用它们。
+
+启用配置：`PHONE_GATEWAY_OWNER_URL`（仅 http + 数字回环 IP + 根路径），以及 `PHONE_GATEWAY_OWNER_TOKEN_FILE` 或 `PHONE_GATEWAY_OWNER_TOKEN` 二选一。未配置/配置错误只使主人请求返回 `owner_unconfigured` / `owner_config_invalid`；不影响现有动作。请求体 16 KiB、owner 帧 24 KiB、响应体 256 KiB、每秒最多 4 请求（重连不重置）、每连接最多一个手机请求在途；HTTP 超时 3 秒，禁用代理、重定向和自动重试。只在线查询，不离线排队；断线取消任务，新连接只读当前 pending。完整协议、错误码、指纹及配置说明见 [主人确认](../../docs/owner-confirmation.md)。这些消息和凭据不进入动作日志。
 
 gateway 每 15 秒发 `{"t":"ping","seq":N}`；仅未确认序号对应的 pong 能更新活性，已确认序号不能重放。45 秒未确认则断开。手机主动 ping 也回同序号 pong，但不会刷新 gateway 判活。
 
@@ -58,12 +62,14 @@ pid=37 snapshot=snap-1 truncated=false nodes=2 shown=1
 
 日志到 stderr，记录白名单动作、id、耗时、经筛选的结果码，以及 accept 的系统错误和重试退避时间，不记录 args、PSK、token、截图或读屏文本。unlock 在两种输出格式下都沿用网关闭合响应，只转发固定布尔字段及允许的错误码，绝不输出密码或手机自由文本。
 
-离线验收（heavy-cargo 存在时 build/test 请用它；否则裸 cargo）：
+离线验收（build/test 必须使用全局或仓库 heavy-cargo）：
 
 ```sh
-cargo test -p phone-gateway --offline
+heavy_cargo=./scripts/heavy-cargo
+[ ! -x ~/.local/bin/heavy-cargo ] || heavy_cargo=~/.local/bin/heavy-cargo
+"$heavy_cargo" test -p phone-gateway --offline
 cargo clippy -p phone-gateway --offline --all-targets -- -D warnings
-cargo build -p phone-gateway --release --offline
+"$heavy_cargo" build -p phone-gateway --release --offline
 ```
 
 测试全部使用临时配置目录；真实 TLS 集成测试需要本地监听权限。假手机客户端在 `src/fake_phone.rs`，可用来对照 Swift 与离线验证，测试不依赖手机。CLI 集成测试使用 `127.0.0.1:0` 自动分配端口并传入 `--endpoint`，不会占用生产 gateway 的 7382 端口。launchd 可设置 ProgramArguments 为可执行文件路径和 `serve`，KeepAlive=true、RunAtLoad=true；仅文档化，不自动安装。

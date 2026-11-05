@@ -2013,6 +2013,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "rand_core 0.6.4",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
