@@ -2444,7 +2444,8 @@ named_plist_env() {
 }
 
 # Our settings in a daemon plist, one name per line: everything spelled
-# IPHONE_USE_* or IPU_RUNNER_*, plus the phone-specific DEVELOPER_DIR. An upgrade
+# IPHONE_USE_* or IPU_RUNNER_*, plus the phone-specific DEVELOPER_DIR and the
+# task engine's TEXT_MODEL_BASE_URL / TEXT_MODEL / TEXT_MODEL_API_KEY. An upgrade
 # carries forward the ones it does not set itself, so a setting added by hand
 # (or one this installer does not know)
 # survives the nightly auto-update. Keep the native direct backend marker that
@@ -2476,6 +2477,9 @@ plist_own_env_keys() {
                         printf '%s\n' "$key"
                     fi ;;
                 DEVELOPER_DIR|IPHONE_USE_?*|IPU_RUNNER_?*) printf '%s\n' "$key" ;;
+                # The task engine's text model (crates/mcp/src/task.rs reads
+                # these exact names), set by hand on the daemon.
+                TEXT_MODEL_BASE_URL|TEXT_MODEL|TEXT_MODEL_API_KEY) printf '%s\n' "$key" ;;
             esac
         done
     done

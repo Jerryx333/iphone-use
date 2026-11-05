@@ -78,6 +78,31 @@ IPHONE_USE_SELFRUNNER_GATEWAY_TOKEN_FILE=/x/client-token" ] \
     || bad "an upgrade dropped the Self Runner gateway settings (got '$got')"
 ok_t "an upgrade carries the Self Runner gateway settings forward"
 
+# The task engine's text model is set by hand on the daemon (exact names, not
+# a prefix); an upgrade that dropped it sends the task engine back to a
+# default model it has no key for.
+OWN_KEYS="$(sed -n '/^plist_own_env_keys() {$/,/^}$/p' "$ROOT/install.sh")"
+[ -n "$OWN_KEYS" ] || bad "plist_own_env_keys not found in install.sh"
+cat > "$TMP/model.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
+<key>TEXT_MODEL_BASE_URL</key><string>https://relay.example/v1</string>
+<key>TEXT_MODEL</key><string>model-a</string>
+<key>TEXT_MODEL_API_KEY</key><string>sk-test-0123-abc</string>
+<key>TEXT_MODEL_EXTRA</key><string>dropped</string>
+</dict></dict></plist>
+PLIST
+got="$(env -i HOME="$TMP" PATH=/usr/bin:/bin bash -c "$READERS
+$OWN_KEYS
+for key in \$(plist_own_env_keys '$TMP/model.plist'); do
+    printf '%s=%s\n' \"\$key\" \"\$(plist_env_get_from '$TMP/model.plist' \"\$key\")\"
+done" | LC_ALL=C sort)"
+[ "$got" = "TEXT_MODEL=model-a
+TEXT_MODEL_API_KEY=sk-test-0123-abc
+TEXT_MODEL_BASE_URL=https://relay.example/v1" ] \
+    || bad "an upgrade did not carry exactly the text model settings (got '$got')"
+ok_t "an upgrade carries the task engine's text model settings, and only those names"
+
 got="$(bash -c "$DAEMON_ENV
 daemon_env '$TMP/old.plist'")"
 [ "$got" = "45432 old-token 0.0.0.0" ] || bad "auto-update read '$got' from an old plist"
