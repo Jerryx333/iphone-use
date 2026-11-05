@@ -23,6 +23,7 @@ let IPURTreeOkKey = "ok", IPURTreeRootKey = "root", IPURTreeTruncatedKey = "trun
 enum RunnerElementTypes { static func rawValue(of name: String) -> Int { 1 } }
 '''
 program += block((BASE / 'RunnerHTTP.swift').read_text(), 'struct RunnerError: Error') + '\n'
+program += block(elements, 'enum ElementProcessCheck {') + '\n'
 program += block(elements, 'final class UINode {') + '\n'
 # Inject only clock/wait dependencies: exercise the production sampling state
 # machine without assuming the CI scheduler can run four AX reads in 200 ms.
@@ -41,6 +42,8 @@ struct HTTPResponse {
   }
 }
 final class Registry {
+  var registeredAXPID: Int32? = 42
+  func axPID(_ id: String) -> Int32? { registeredAXPID }
   var stored: UINode?
   func node(_ id: String) -> UINode? { stored }
 }
@@ -186,6 +189,12 @@ let absent = probe(); absent.elements.stored = nil
 refused(404) { _ = try absent.elementSubtree("E",HTTPRequest()) }
 let stalePID = probe(); IPURBridge.pid = 7
 refused(404) { _ = try stalePID.elementSubtree("E",HTTPRequest()) }
+let webHost = probe(); webHost.elements.registeredAXPID = 77; IPURBridge.pid = 77
+_ = try webHost.elementSubtree("E",HTTPRequest())
+require(IPURBridge.calls.count == 1,"registered WebContent host should allow scoped read")
+IPURBridge.pid = 78
+refused(404) { _ = try webHost.elementSubtree("E",HTTPRequest()) }
+require(IPURBridge.calls.count == 1,"changed WebContent host must not dispatch AX read")
 let noAX = probe(node(handle:false))
 refused(501) { _ = try noAX.elementSubtree("E",HTTPRequest()) }
 require(IPURBridge.calls.isEmpty,"missing AX fell back")
@@ -201,7 +210,7 @@ print("Native element evidence/subtree: \(checks) assertions passed; synthetic A
 with tempfile.TemporaryDirectory(prefix='ipu-element-evidence-') as work:
     work = Path(work)
     (work/'probe.swift').write_text(program)
-    subprocess.run(['xcrun','swiftc',str(work/'probe.swift'),'-o',str(work/'probe')],check=True)
+    subprocess.run(['xcrun','swiftc','-import-objc-header',str(BASE/'IPURProcessCheck.h'),str(work/'probe.swift'),'-o',str(work/'probe')],check=True)
     subprocess.run([str(work/'probe')],check=True)
 
 # Exercise the actual optional AX attribute bridge: mapping/read failures and

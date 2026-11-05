@@ -434,7 +434,7 @@ enum InputTargetCheck {
 /// still belong to the process recorded at registration, even when it differs from the app.
 enum ElementProcessCheck {
   static func isLive(appPID: Int32, axPID: Int32, currentAXPID: Int32) -> Bool {
-    appPID > 0 && axPID > 0 && currentAXPID == axPID
+    IPURElementProcessIsLive(appPID, axPID, currentAXPID)
   }
 }
 

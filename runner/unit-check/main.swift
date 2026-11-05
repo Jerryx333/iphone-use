@@ -1138,6 +1138,39 @@ do {
   check(registry.axPID(web) == nil && !isLive(web), "pruning removes the registered AX host with the node")
 }
 
+// Select-all and focus recovery use the bridge's shared process gates.
+do {
+  func selectionAllowed(app: Int32 = 42, host: Int32 = 84, current: Int32 = 84) -> Bool {
+    IPURElementProcessIsLive(app, host, current)
+  }
+  func focusAllowed(app: Int32 = 42, host: Int32 = 84, current: Int32 = 84,
+                    hit: Int32 = 84, same: Bool = true) -> Bool {
+    IPURElementProcessIsLive(app, host, current) && IPURFocusHitMatches(host, hit, same)
+  }
+  check(selectionAllowed(), "select-all accepts registered WebContent host distinct from app PID")
+  check(focusAllowed(), "focus recovery accepts original WebContent hit distinct from app PID")
+  check(!selectionAllowed(current: 85) && !focusAllowed(current: 85),
+    "select-all and focus recovery reject changed AX host")
+  check(!selectionAllowed(current: 42) && !focusAllowed(current: 42),
+    "app PID cannot replace the registered WebContent host")
+  check(!focusAllowed(hit: 85) && !focusAllowed(hit: 42) && !focusAllowed(same: false),
+    "focus hit requires both registered host and original element identity")
+  for invalid: Int32 in [0, -1] {
+    check(!selectionAllowed(host: invalid, current: invalid) &&
+          !focusAllowed(host: invalid, current: invalid, hit: invalid),
+      "select-all and focus recovery reject nonpositive registered host even when unchanged")
+    check(!selectionAllowed(current: invalid) && !focusAllowed(current: invalid) && !focusAllowed(hit: invalid),
+      "select-all and focus recovery reject nonpositive current or hit host")
+    check(!selectionAllowed(app: invalid) && !focusAllowed(app: invalid),
+      "select-all and focus recovery require valid app PID independently of AX host")
+  }
+  check(selectionAllowed(host: 42, current: 42) && focusAllowed(host: 42, current: 42, hit: 42),
+    "native select-all and focus recovery retain same-pid behavior")
+  check(!selectionAllowed(host: 42, current: 43) && !focusAllowed(host: 42, current: 43, hit: 43) &&
+        !focusAllowed(host: 42, current: 42, hit: 43) && !focusAllowed(host: 42, current: 42, hit: 42, same: false),
+    "native select-all and focus recovery still reject host or hit identity changes")
+}
+
 // Guarded input uses live identity and focus, never labels or geometry.
 do {
   func replacementNode(_ changes: [String: Any] = [:], pid: Int32 = 42) -> UINode {

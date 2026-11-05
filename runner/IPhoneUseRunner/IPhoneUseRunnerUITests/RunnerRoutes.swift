@@ -458,6 +458,7 @@ extension RunnerCore {
     }
     guard let ax = before.axElement else { throw RunnerError.failed("replacement original AX handle unavailable") }
     if let error = IPURBridge.synthesizeFocusTap(forAXElement: ax, at: before.center, pid: before.pid,
+        axPID: elements.axPID(token) ?? 0,
         allowDispatch: { self.replacementFocusPointAllowed(token, original: original, point: before.center) }) {
       throw RunnerError.failed("replacement focus tap outcome unknown: \(error)")
     }
@@ -534,7 +535,9 @@ extension RunnerCore {
   private func checkedInputTarget(_ token: String) throws -> UINode {
     IPURBridge.invalidateRequestCache()
     elements.prune()
-    guard inputBinding == token, let node = try? freshNode(token) else {
+    guard inputBinding == token, let node = try? freshNode(token), let ax = node.axElement,
+          ElementProcessCheck.isLive(appPID: node.pid, axPID: elements.axPID(token) ?? 0,
+            currentAXPID: IPURBridge.pid(forAXElement: ax)) else {
       throw RunnerError.invalidArgument("input_target_expired_or_invalidated; nothing was sent")
     }
     try checkInputTarget(node)
@@ -895,7 +898,7 @@ extension RunnerCore {
           }
           _ = try checkedInputTarget(token)
           started = true
-          guard let selected = IPURBridge.selectAllText(for: ax, pid: node.pid, retryState: nil, error: &readError),
+          guard let selected = IPURBridge.selectAllText(for: ax, pid: node.pid, axPID: elements.axPID(token) ?? 0, retryState: nil, error: &readError),
                 (selected["confirmed"] as? NSNumber)?.boolValue == true,
                 let length = selected["utf16_length"] as? NSNumber else {
             throw RunnerError.failed("select-all not confirmed; no deletion was dispatched")
