@@ -270,7 +270,8 @@ extension RunnerCore {
     guard let ax = stored.axElement else {
       throw RunnerError(status: 501, code: "unsupported operation", message: "element has no live AX handle")
     }
-    guard stored.pid > 0, IPURBridge.pid(forAXElement: ax) == stored.pid else { throw RunnerError.staleElement(id) }
+    guard ElementProcessCheck.isLive(appPID: stored.pid, axPID: elements.axPID(id) ?? 0,
+        currentAXPID: IPURBridge.pid(forAXElement: ax)) else { throw RunnerError.staleElement(id) }
     return stored
   }
 
@@ -403,7 +404,9 @@ extension RunnerCore {
     IPURBridge.invalidateRequestCache()
     elements.prune()
     let current = try freshNode(token)
-    guard let ax = current.axElement, IPURBridge.pid(forAXElement: ax) == original.pid else {
+    guard let ax = current.axElement,
+          ElementProcessCheck.isLive(appPID: original.pid, axPID: elements.axPID(token) ?? 0,
+            currentAXPID: IPURBridge.pid(forAXElement: ax)) else {
       throw RunnerError.failed("replacement original AX process unavailable")
     }
     if let refusal = InputTargetCheck.replacementRefusal(original: original, current: current,

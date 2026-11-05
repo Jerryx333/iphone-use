@@ -8,7 +8,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 
+@interface IPURAXElementStub : NSObject
+@property(nonatomic) int pid;
+@property(nonatomic) NSUInteger pidReadCount;
+@end
+
 @interface IPURBridge : NSObject
++ (int)pidForAXElement:(id)element;
 + (NSString *)elementTypeName:(NSInteger)elementType;
 + (nullable NSString *)catchException:(void (NS_NOESCAPE ^)(void))block;
 + (nullable CGImageRef)screenImageWithQuality:(double)quality

@@ -3,7 +3,18 @@
 
 NSString *const IPURNodeAXElementKey = @"__axElement";
 
+@implementation IPURAXElementStub
+@end
+
 @implementation IPURBridge
+
++ (int)pidForAXElement:(id)element
+{
+  if (![element isKindOfClass:IPURAXElementStub.class]) return 0;
+  IPURAXElementStub *ax = element;
+  ax.pidReadCount += 1;
+  return ax.pid;
+}
 
 + (NSString *)elementTypeName:(NSInteger)elementType
 {
