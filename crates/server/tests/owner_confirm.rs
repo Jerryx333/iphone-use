@@ -747,3 +747,269 @@ fn control_alert_empty_buttons_cannot_consume_approval() {
 fn control_alert_approved_execution_unchanged_clicks_once() {
     control_alert_confirmation_case("unchanged", true);
 }
+
+#[test]
+fn gateway_guard_resolves_targets_and_consumes_exact_approval_once() {
+    support::block(async {
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let page = changed.clone();
+        let runner = support::mock_runner(move |request, _| {
+            let line = request.lines().next().unwrap_or("");
+            let body = if line.starts_with("POST /session ") {
+                json!({"value":{"sessionId":"SESSION"}})
+            } else if line.contains("/source") {
+                json!({"value":{"type":"XCUIElementTypeApplication","label":if page.load(std::sync::atomic::Ordering::SeqCst) {"changed"} else {"商城"},"rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                    {"type":"XCUIElementTypeButton","label":"立即购买","name":"buy","rect":{"x":0,"y":100,"width":100,"height":50}},
+                    {"type":"XCUIElementTypeButton","label":"支付","rect":{"x":100,"y":100,"width":100,"height":50}},
+                    {"type":"XCUIElementTypeButton","label":"取消","rect":{"x":200,"y":100,"width":100,"height":50}},
+                    {"type":"XCUIElementTypeSecureTextField","label":"密码","rect":{"x":0,"y":200,"width":100,"height":50}}
+                ]}})
+            } else if line.contains("/window/size") {
+                json!({"value":{"width":390,"height":844}})
+            } else if line.contains("/wda/apps/list") {
+                json!({"value":[{"bundleId":"com.example.shop"}]})
+            } else {
+                json!({"value":null})
+            };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let mut state = support::build_state_with_runner(runner.url());
+        let dir = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().owner_confirm =
+            Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
+        let k = key();
+        bind(&mut state.owner_confirm.lock().unwrap(), &k);
+        for args in [
+            json!({"label":"立即购买"}),
+            json!({"label":"支付"}),
+            json!({"x":50,"y":125}),
+            json!({"x":150,"y":125}),
+            json!({"label":"立即购买","index":0}),
+            json!({"label":"支付","index":0}),
+        ] {
+            let command = json!({"action":"tap","args":args});
+            let (status, body) = call(&state, "/guard/gateway-command", command.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            let id = body["owner_confirm_id"].as_str().unwrap();
+            approve(&mut state.owner_confirm.lock().unwrap(), &k, id);
+            assert_eq!(
+                call(&state, "/guard/gateway-command", command.clone())
+                    .await
+                    .1["allow"],
+                true
+            );
+            assert_eq!(
+                call(&state, "/guard/gateway-command", command.clone())
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        let command = json!({"action":"tap","args":{"label":"支付"}});
+        let (_, body) = call(&state, "/guard/gateway-command", command.clone()).await;
+        approve(
+            &mut state.owner_confirm.lock().unwrap(),
+            &k,
+            body["owner_confirm_id"].as_str().unwrap(),
+        );
+        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            call(&state, "/guard/gateway-command", command).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &state,
+                "/guard/gateway-command",
+                json!({"action":"tap","args":{"label":"取消"}})
+            )
+            .await
+            .1["allow"],
+            true
+        );
+        let (status, body) = call(
+            &state,
+            "/guard/gateway-command",
+            json!({"action":"type","args":{"text":"1234"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["owner_confirm_id"].is_string());
+    });
+}
+
+#[test]
+fn gateway_confirmation_pool_does_not_displace_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = OwnerConfirm::new(dir.path().into());
+    let k = key();
+    bind(&mut owner, &k);
+    for i in 0..8 {
+        owner
+            .request("gateway_press", json!({"i":i}), "gateway")
+            .unwrap();
+    }
+    assert_eq!(
+        owner
+            .request("gateway_press", json!({"i":8}), "gateway")
+            .unwrap_err(),
+        "owner_confirmation_limit"
+    );
+    for i in 0..16 {
+        owner
+            .request("control_press", json!({"i":i}), "control")
+            .unwrap();
+    }
+    assert_eq!(owner.pending().len(), 24);
+}
+
+#[test]
+fn gateway_swipe_candidates_type_coverage_and_busy() {
+    support::block(async {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mode = Arc::new(AtomicUsize::new(0));
+        let source_mode = mode.clone();
+        let runner = support::mock_runner(move |request, _| {
+            let line = request.lines().next().unwrap_or("");
+            let body = if line.starts_with("POST /session ") {
+                json!({"value":{"sessionId":"SESSION"}})
+            } else if line.contains("/source") {
+                let body = json!({"value":{"type":"XCUIElementTypeApplication","label":"shop","rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                    {"type":"XCUIElementTypeButton","label":"继续","rect":{"x":0,"y":100,"width":100,"height":50}},
+                    {"type":"XCUIElementTypeButton","label":"继续","rect":{"x":100,"y":100,"width":100,"height":50},"children":[
+                        {"type":"XCUIElementTypeStaticText","label":"确认付款","rect":{"x":110,"y":110,"width":80,"height":20}}]},
+                    {"type":"XCUIElementTypeTextField","label":"搜索","isFocused":true,"rect":{"x":0,"y":200,"width":100,"height":50}}
+                ]}}).to_string();
+                let coverage = match source_mode.load(Ordering::SeqCst) {
+                    1 => "X-IPU-Truncated: 1\r\nX-IPU-Tree-Complete: 0\r\n",
+                    2 => "",
+                    _ => "X-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\n",
+                };
+                return Some((Duration::ZERO, format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{coverage}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())));
+            } else {
+                json!({"value":null})
+            };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let mut state = support::build_state_with_runner(runner.url());
+        let dir = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().owner_confirm =
+            Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
+        let k = key();
+        bind(&mut state.owner_confirm.lock().unwrap(), &k);
+        for index in [json!(0), json!(1), Value::Null] {
+            let (_, body) = call(
+                &state,
+                "/guard/gateway-command",
+                json!({"action":"tap","args":{"label":"继续","index":index}}),
+            )
+            .await;
+            assert!(body["owner_confirm_id"].is_string(), "{body}");
+        }
+        let (_, body) = call(
+            &state,
+            "/guard/gateway-command",
+            json!({"action":"swipe","args":{"from":{"x":150,"y":125},"to":{"x":150,"y":125}}}),
+        )
+        .await;
+        assert!(body["owner_confirm_id"].is_string(), "{body}");
+        assert_eq!(
+            call(
+                &state,
+                "/guard/gateway-command",
+                json!({"action":"press","args":{"button":"lock","shortcut_name":"付款"}})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        for m in [1, 2, 0] {
+            mode.store(m, Ordering::SeqCst);
+            let (status, body) = call(
+                &state,
+                "/guard/gateway-command",
+                json!({"action":"type","args":{"text":"hello"}}),
+            )
+            .await;
+            if m == 0 {
+                assert_eq!(body["allow"], true, "{body}");
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            }
+        }
+        // The first request holds runner lock, hence is still inside admission.
+        let runner_lock = state.runner.as_ref().unwrap().lock().await;
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            call(
+                &first_state,
+                "/guard/gateway-command",
+                json!({"action":"type","args":{"text":"pending"}}),
+            )
+            .await
+        });
+        while !state.gateway_guard_busy.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let (status, body) = call(
+            &state,
+            "/guard/gateway-command",
+            json!({"action":"type","args":{"text":"second"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "guard_busy");
+        drop(runner_lock);
+        first.await.unwrap();
+    });
+}
+
+#[test]
+fn gateway_type_newline_checks_keyboard_submit_key() {
+    support::block(async {
+        let runner = support::mock_runner(move |request, _| {
+            let line = request.lines().next().unwrap_or("");
+            let body = if line.starts_with("POST /session ") {
+                json!({"value":{"sessionId":"SESSION"}})
+            } else if line.contains("/source") {
+                let body = json!({"value":{"type":"XCUIElementTypeApplication","label":"shop","rect":{"x":0,"y":0,"width":390,"height":844},"children":[
+                    {"type":"XCUIElementTypeTextField","label":"备注","isFocused":true,"rect":{"x":0,"y":200,"width":300,"height":50}},
+                    {"type":"XCUIElementTypeKeyboard","rect":{"x":0,"y":544,"width":390,"height":300},"children":[
+                        {"type":"XCUIElementTypeKey","label":"a","rect":{"x":0,"y":560,"width":39,"height":50}},
+                        {"type":"XCUIElementTypeKey","label":"删除","rect":{"x":340,"y":700,"width":50,"height":50}},
+                        {"type":"XCUIElementTypeKey","label":"123","rect":{"x":0,"y":780,"width":50,"height":50}},
+                        {"type":"XCUIElementTypeButton","label":"支付","rect":{"x":290,"y":780,"width":100,"height":50}}]}
+                ]}}).to_string();
+                return Some((Duration::ZERO, format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-IPU-Truncated: 0\r\nX-IPU-Tree-Complete: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())));
+            } else {
+                json!({"value":null})
+            };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let mut state = support::build_state_with_runner(runner.url());
+        let dir = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().owner_confirm =
+            Arc::new(std::sync::Mutex::new(OwnerConfirm::new(dir.path().into())));
+        let k = key();
+        bind(&mut state.owner_confirm.lock().unwrap(), &k);
+        // Plain text without a newline does not submit: allowed.
+        let (_, body) = call(
+            &state,
+            "/guard/gateway-command",
+            json!({"action":"type","args":{"text":"hello"}}),
+        )
+        .await;
+        assert_eq!(body["allow"], true, "{body}");
+        // A newline presses the keyboard's 支付 action key: owner confirmation.
+        for text in ["\n", "hello\r"] {
+            let (status, body) = call(
+                &state,
+                "/guard/gateway-command",
+                json!({"action":"type","args":{"text":text}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body["owner_confirm_id"].is_string(), "{body}");
+        }
+    });
+}

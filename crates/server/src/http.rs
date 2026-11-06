@@ -25,6 +25,9 @@
 // `Response` by design, so its size is not worth boxing everywhere.
 #![allow(clippy::result_large_err)]
 
+#[path = "gateway_guard.rs"]
+mod gateway_guard;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -464,6 +467,7 @@ pub struct AppState {
     /// gets only what changed without having to carry the token itself.
     pub owner_snapshots: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Owner signatures and pending capabilities, independent of HTTP auth.
+    pub gateway_guard_busy: std::sync::atomic::AtomicBool,
     pub owner_confirm: Arc<Mutex<crate::owner_confirm::OwnerConfirm>>,
     /// Daemon-issued, single-use saved replay capabilities. Never persisted.
     pub flow_grants: Arc<Mutex<crate::flow_grants::FlowGrants>>,
@@ -1118,6 +1122,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/owner/pending", get(owner_pending))
         .route("/owner/confirm/:id", post(owner_confirm_post))
         .route("/control", post(direct_control))
+        .route("/guard/gateway-command", post(gateway_guard::command))
         // Agent operation entry (connect-in). Bearer-token auth; see
         // `agent_input` / `agent_status`.
         .route("/agent/status", get(agent_status))

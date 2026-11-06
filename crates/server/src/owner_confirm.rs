@@ -143,7 +143,7 @@ fn confirmation_details(kind: &str, object: &Value) -> Vec<String> {
             ),
             format!("操作类型：{}", value_quote(&object["operation"]["action"])),
         ],
-        "control_press" => {
+        "control_press" | "gateway_press" => {
             let mut d = vec![action_details(
                 &object["action"],
                 object["controls"]
@@ -309,13 +309,16 @@ impl OwnerConfirm {
         {
             return Ok(p.id.clone());
         }
-        if self.pending.len() + self.allowances.len() >= 16 {
+        let gateway = kind == "gateway_press";
+        let used = self.pending.iter().filter(|p| (p.kind == "gateway_press") == gateway).count()
+            + self.allowances.iter().filter(|a| (a.0 == "gateway_press") == gateway).count();
+        if used >= if gateway { 8 } else { 16 } {
             return Err("owner_confirmation_limit");
         }
         let explanation = match kind {
             "flow" => "允许此版本流程执行敏感步骤",
             "task_press" => "允许任务执行当前待确认操作",
-            "control_press" => "允许重发一次相同控制操作",
+            "control_press" | "gateway_press" => "允许重发一次相同控制操作",
             "intent" => "允许执行一次此快捷指令",
             _ => return Err("invalid_kind"),
         };

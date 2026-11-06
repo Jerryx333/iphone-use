@@ -2491,6 +2491,16 @@ impl RunnerClient {
         Ok(self.element_snapshot().await?.rows)
     }
 
+    /// Gateway admission retains raw fields as well as normalized rows from one read.
+    pub async fn gateway_element_snapshot(&mut self) -> Result<(ElementSnapshot, serde_json::Value)> {
+        let tree = self.source_excluding(None).await?;
+        let snapshot = ElementSnapshot {
+            rows: self.rows_from_tree(&tree, false),
+            coverage: SnapshotCoverage::from_tree(&tree),
+        };
+        Ok((snapshot, tree))
+    }
+
     pub async fn element_snapshot(&mut self) -> Result<ElementSnapshot> {
         let (tree, lite) = self.bounded_source().await?;
         let coverage = SnapshotCoverage::from_tree(&tree);

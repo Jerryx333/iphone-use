@@ -55,6 +55,7 @@ fn fixture_app_state(password: Option<&str>) -> Arc<AppState> {
         agent_focus: std::sync::Arc::new(std::sync::Mutex::new(
             srv::focus::AgentFocus::default(),
         )),
+        gateway_guard_busy: Default::default(),
         owner_confirm: Default::default(),
         flow_grants: Default::default(),
         flow_trail: std::sync::Arc::new(std::sync::Mutex::new(
