@@ -45,7 +45,25 @@ impl Fixture {
         )
     }
     async fn start(&self) -> (Gateway, Pairing, tokio::task::JoinHandle<()>) {
-        let g = self.gateway();
+        // Transport regressions use an explicit allowing daemon; admission
+        // failures are exercised separately below.
+        let daemon = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = phone_gateway::owner::OwnerRelay::new(
+            &format!("http://{}", daemon.local_addr().unwrap()),
+            "test-token",
+        );
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = daemon.accept().await.unwrap();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut bytes = [0; 8192];
+                    let _ = stream.read(&mut bytes).await.unwrap();
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"allow\":true}").await.unwrap();
+                });
+            }
+        });
+        let g = self.gateway().with_owner_relay(relay);
         // Port sandbox errors intentionally fail this test; never skip or weaken it.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let p = self
@@ -893,4 +911,140 @@ async fn cmd_then_read_invalid_args_sends_no_requests() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn gateway_writes_require_explicit_daemon_admission() {
+    use phone_gateway::owner::OwnerRelay;
+    let f = Fixture::new();
+    let (g, pairing, task) = f.start().await;
+    let mut phone = fake_phone::connect(&pairing).await.unwrap();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let device = tokio::spawn(async move {
+        loop {
+            let frame = protocol::read_frame(&mut phone, protocol::FRAME_LIMIT)
+                .await
+                .unwrap();
+            if frame["t"] == "ping" {
+                protocol::write_frame(&mut phone, &json!({"t":"pong","seq":frame["seq"]}))
+                    .await
+                    .unwrap();
+            } else if frame["t"] == "req" {
+                seen_tx.send(frame.clone()).unwrap();
+                protocol::write_frame(
+                    &mut phone,
+                    &json!({"t":"res","id":frame["id"],"ok":true,"result":{}}),
+                )
+                .await
+                .unwrap();
+            }
+        }
+    });
+    let g = g.with_owner_relay(OwnerRelay::default());
+    wait_online(&g, "online").await;
+    for action in ["tap", "type", "swipe", "press", "launch", "open_url"] {
+        let args = match action {
+            "tap" => json!({"label":"支付"}),
+            "type" => json!({"text":"hello"}),
+            "swipe" => json!({"from":{"x":1,"y":1},"to":{"x":2,"y":2}}),
+            "press" => json!({"button":"home"}),
+            "launch" => json!({"bundle_id":"com.example.app"}),
+            _ => json!({"url":"https://example.com"}),
+        };
+        assert_eq!(
+            http(&g, &f.config.token, json!({"action":action,"args":args})).await["error"]["code"],
+            "guard_unconfigured"
+        );
+    }
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", unavailable.local_addr().unwrap());
+    drop(unavailable);
+    for relay in [
+        OwnerRelay::new(&url, "test-token"),
+        OwnerRelay::new("http://192.0.2.1", "test-token"),
+    ] {
+        let guarded = g.clone().with_owner_relay(relay);
+        assert_eq!(
+            http(
+                &guarded,
+                &f.config.token,
+                json!({"action":"tap","args":{"label":"普通"}})
+            )
+            .await["error"]["code"],
+            "guard_unavailable"
+        );
+        assert_eq!(
+            http(&guarded, &f.config.token, json!({"action":"read"})).await["ok"],
+            true
+        );
+        assert_eq!(seen_rx.recv().await.unwrap()["action"], "read");
+        assert!(seen_rx.try_recv().is_err());
+    }
+    for (status, body, delay, expected) in [
+        (
+            403,
+            json!({"error":"owner_confirmation_required","owner_confirm_id":"pending-1"}),
+            0,
+            "owner_confirm_required",
+        ),
+        (200, json!({"allow":"true"}), 0, "guard_unavailable"),
+        (200, json!({"allow":true}), 200, "expired"),
+        (200, json!({"allow":true}), 0, "ok"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = OwnerRelay::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "test-token",
+        );
+        let daemon = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 8192];
+            let n = stream.read(&mut bytes).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes[..n]).starts_with("POST /guard/gateway-command ")
+            );
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let body = body.to_string();
+            let _ = stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+        });
+        let guarded = g.clone().with_owner_relay(relay);
+        let token = f.config.token.clone();
+        let request = tokio::spawn(async move {
+            http(
+                &guarded,
+                &token,
+                json!({"action":"tap","args":{"label":"普通"},"deadline_ms":100}),
+            )
+            .await
+        });
+        if expected == "ok" {
+            assert_eq!(seen_rx.recv().await.unwrap()["action"], "tap");
+            assert_eq!(request.await.unwrap()["ok"], true);
+        } else {
+            let response = request.await.unwrap();
+            assert_eq!(response["error"]["code"], expected);
+            if expected == "owner_confirm_required" {
+                let output = phone_gateway::output::render(
+                    "tap",
+                    response,
+                    phone_gateway::output::OutputFormat::Compact,
+                    1,
+                    None,
+                )
+                .unwrap();
+                assert!(output.starts_with("error owner_confirm_required "));
+                assert!(output.contains("owner_confirm_id=pending-1"));
+            }
+        }
+        daemon.await.unwrap();
+        assert!(seen_rx.try_recv().is_err(), "denied request reached phone");
+        assert_eq!(
+            http(&g, &f.config.token, json!({"action":"read"})).await["ok"],
+            true
+        );
+        assert_eq!(seen_rx.recv().await.unwrap()["action"], "read");
+    }
+    device.abort();
+    task.abort();
 }

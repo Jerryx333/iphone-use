@@ -170,6 +170,10 @@ pub fn render(
     } else {
         format!("error {} {ms}ms", text(&response["error"]["code"]))
     }];
+    if let Some(id) = response["owner_confirm_id"].as_str() {
+        lines.push(format!("owner_confirm_id={}", clean(id)));
+        lines.push(text(&response["hint"]));
+    }
     if let Some(result) = response["result"].as_object() {
         let mut small = result.clone();
         small.remove("nodes");

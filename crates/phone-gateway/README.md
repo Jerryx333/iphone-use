@@ -33,7 +33,7 @@ HMAC 消息字节顺序为 ASCII `selfrunner-v1` + 解码 nonce 的 32 字节 + 
 
 主人确认使用独立的手机发起消息 `owner_req` / `owner_res`，仅在控制连接 welcome 后可用；`owner_pending` 每约 3 秒检查列表变化后推送。body_b64 封装原始 HTTP body，逐字节转发到本机 daemon 的 GET/POST `/owner/key`、GET `/owner/pending`、POST `/owner/confirm/<id>`，不生成、修改、缓存或重试签名。HTTP `/v1/command` 白名单不包含这些操作，client-token 不能调用它们。
 
-启用配置：`PHONE_GATEWAY_OWNER_URL`（仅 http + 数字回环 IP + 根路径），以及 `PHONE_GATEWAY_OWNER_TOKEN_FILE` 或 `PHONE_GATEWAY_OWNER_TOKEN` 二选一。未配置/配置错误只使主人请求返回 `owner_unconfigured` / `owner_config_invalid`；不影响现有动作。请求体 16 KiB、owner 帧 24 KiB、响应体 256 KiB、每秒最多 4 请求（重连不重置）、每连接最多一个手机请求在途；HTTP 超时 3 秒，禁用代理、重定向和自动重试。只在线查询，不离线排队；断线取消任务，新连接只读当前 pending。完整协议、错误码、指纹及配置说明见 [主人确认](../../docs/owner-confirmation.md)。这些消息和凭据不进入动作日志。
+启用配置：`PHONE_GATEWAY_OWNER_URL`（仅 http + 数字回环 IP + 根路径），以及 `PHONE_GATEWAY_OWNER_TOKEN_FILE` 或 `PHONE_GATEWAY_OWNER_TOKEN` 二选一。未配置/配置错误使主人请求返回 `owner_unconfigured` / `owner_config_invalid`；写动作按下述守卫规则失败关闭。请求体 16 KiB、owner 帧 24 KiB、响应体 256 KiB、每秒最多 4 请求（重连不重置）、每连接最多一个手机请求在途；HTTP 超时 3 秒，禁用代理、重定向和自动重试。只在线查询，不离线排队；断线取消任务，新连接只读当前 pending。完整协议、错误码、指纹及配置说明见 [主人确认](../../docs/owner-confirmation.md)。这些消息和凭据不进入动作日志。
 
 gateway 每 15 秒发 `{"t":"ping","seq":N}`；仅未确认序号对应的 pong 能更新活性，已确认序号不能重放。45 秒未确认则断开。手机主动 ping 也回同序号 pong，但不会刷新 gateway 判活。
 
@@ -75,3 +75,15 @@ cargo clippy -p phone-gateway --offline --all-targets -- -D warnings
 测试全部使用临时配置目录；真实 TLS 集成测试需要本地监听权限。假手机客户端在 `src/fake_phone.rs`，可用来对照 Swift 与离线验证，测试不依赖手机。CLI 集成测试使用 `127.0.0.1:0` 自动分配端口并传入 `--endpoint`，不会占用生产 gateway 的 7382 端口。launchd 可设置 ProgramArguments 为可执行文件路径和 `serve`，KeepAlive=true、RunAtLoad=true；仅文档化，不自动安装。
 
 `cmd unlock --args '{"timeout_ms":4000}'` 使用 Mac 登录钥匙串的 `phone-gateway.passcode`（account=完整 device_id）；密码仅允许 4–6 位数字，调用方不得传 passcode，不自动重试，日志/结果/缓存不含密码；交互写入命令和内存清零限制见设计文档「数字密码解锁」。
+
+## Gateway 写动作守卫
+
+`tap/type/swipe/press/launch/open_url` 出队并持有 gateway 单命令执行闸后、派发手机之前，请求 daemon `POST /guard/gateway-command`。前一条手机响应已结束；判定和主人批准消费期间持续占闸。复用 OWNER 回环配置和 Bearer 鉴权，禁代理、重定向、重试。daemon 总预算 8 秒，单次完整读屏预算 2.5 秒；gateway 调用预算为 min(10 秒, 命令剩余 deadline)，期限含排队与判定。只有严格的 `200 {"allow":true}` 才派发。未配置返回 `guard_unconfigured`；配置错误、不可达、超时、非法响应返回 `guard_unavailable`（命令期限耗尽可返回 `expired`），均不派发。读动作和钥匙串 unlock 不变。
+
+一次请求只取一次完整快照，保留 coverage、原始树和规范化行供 tap/type/swipe 复用。label/identifier 点按检查所有规范化匹配行及原始字段匹配所对应的行，忽略 index 的顺序；任一候选敏感即要求主人确认，绑定全部候选身份、原始树摘要、页面摘要和前台 bundle。不能对应到行或点按/滑动快照不完整时失败关闭。swipe 把手机绝对屏幕点按窗口大小换成 `/control` 归一化起止点，复用现有小位移按点按检查；缺参数或无法换算拒绝。长距离 swipe 与 `/control` 一致，这不是滑块支付保护。
+
+输入对所有字段执行现有密码框检查。快照截断、coverage 未知/不完整或无法读到焦点字段归属时，要求主人确认；只有完整且焦点明确、无敏感字段的快照直接放行。press 只允许 home/音量键，以及名为「锁屏」的快捷指令或硬件锁屏路径；自定义 shortcut_name 和未知 press 参数均在 gateway 返回 `invalid_args`，daemon 同样校验。auto/shortcut 默认「锁屏」；hid/device_event/press_lock 为硬件路径。
+
+敏感动作返回 `owner_confirm_required` 和 `owner_confirm_id`；请主人在手机 Self Runner 刷脸允许后，两分钟内原样重发同一命令。重发仍在出队后的闸内重新读屏判定并消费一次批准。完整 action/args、身份、页面或前台变化须重新确认。使用独立 `gateway_press` 能力池，待确认及已批准未消费合计最多 8 张，不占用 /control、任务、流程的 16 张配额。入口同一时刻只处理一个请求，多余直接返回 429 `guard_busy`。任务 confirm:"never" 和保存流程许可不变。
+
+残余窗口仅为「daemon 判定读屏 → 手机执行」，与 daemon `/control` 的读屏→执行同级；不包含队列等待。gateway 给已判定 tap 强制设置内部 `gateway_guarded` 标志，手机遇遮挡立即返回 `occluded`，不再等待、自动上滑或重新定位。`expect_label/expect_identifier` 仍是执行后等待条件。手机本地 `snapshot_id` 无法由 daemon 解析，带该字段的写请求失败关闭。威胁模型不包含本机任意 shell 直接连接 runner 转发端口。

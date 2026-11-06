@@ -155,12 +155,28 @@ async fn logs_do_not_include_secrets_or_body() {
     let marker = "PRIVATE_SCREEN_CONTENT";
     let result = http(&g,&f.config.token,json!({"action":"read","id":"log-test","deadline_ms":10,"args":{"text":marker,"psk":STANDARD.encode(&f.config.psk),"token":f.config.token}})).await;
     assert_eq!(result["error"]["code"], "expired");
+    let daemon = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let guarded = g
+        .clone()
+        .with_owner_relay(phone_gateway::owner::OwnerRelay::new(
+            &format!("http://{}", daemon.local_addr().unwrap()),
+            "test-token",
+        ));
+    let admission = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let (mut stream, _) = daemon.accept().await.unwrap();
+        let mut bytes = [0; 8192];
+        let _ = stream.read(&mut bytes).await.unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"allow\":true}").await.unwrap();
+    });
     let typed = http(
-        &g,
+        &guarded,
         &f.config.token,
         json!({"action":"type","id":"type-log-test","deadline_ms":10,"args":{"text":marker}}),
     )
     .await;
+    // deadline 10ms 在派发前就过期，守护进程判定不会被调用。
+    admission.abort();
     assert_eq!(typed["error"]["code"], "expired");
     let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert!(log.contains("log-test"));
@@ -213,5 +229,77 @@ async fn logs_do_not_include_secrets_or_body() {
     assert!(log.contains("unlock-log-test"));
     assert!(log.contains("unlock_unconfirmed"));
     assert!(!log.contains(fake_passcode));
+
+    // Online phone, admission really completes: allowed and refused type
+    // requests both keep the typed text, token and PSK out of the log.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let app = axum::Router::new().route(
+        "/guard/gateway-command",
+        axum::routing::post(move || {
+            let counted = counted.clone();
+            async move {
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (StatusCode::OK, axum::Json(json!({"allow":true})))
+                } else {
+                    (
+                        StatusCode::FORBIDDEN,
+                        axum::Json(json!({"error":"owner_confirmation_required","owner_confirm_id":"typed"})),
+                    )
+                }
+            }
+        }),
+    );
+    let daemon = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", daemon.local_addr().unwrap());
+    let daemon = tokio::spawn(async move { axum::serve(daemon, app).await.unwrap() });
+    let guarded = g
+        .clone()
+        .with_owner_relay(phone_gateway::owner::OwnerRelay::new(&url, "test-token"));
+    let typed_marker = "PRIVATE_TYPED_TEXT";
+    for (id, allowed) in [
+        ("type-allowed-log-test", true),
+        ("type-refused-log-test", false),
+    ] {
+        let clone = guarded.clone();
+        let token = f.config.token.clone();
+        let request = tokio::spawn(async move {
+            http(
+                &clone,
+                &token,
+                json!({"action":"type","id":id,"args":{"text":typed_marker},"deadline_ms":5000}),
+            )
+            .await
+        });
+        if allowed {
+            loop {
+                let frame = protocol::read_frame(&mut phone, protocol::FRAME_LIMIT)
+                    .await
+                    .unwrap();
+                if frame["t"] == "req" {
+                    assert_eq!(frame["args"]["text"], typed_marker);
+                    protocol::write_frame(
+                        &mut phone,
+                        &json!({"t":"res","id":frame["id"],"ok":true,"result":{}}),
+                    )
+                    .await
+                    .unwrap();
+                    break;
+                }
+            }
+            assert_eq!(request.await.unwrap()["ok"], true);
+        } else {
+            let result = request.await.unwrap();
+            assert_eq!(result["error"]["code"], "owner_confirm_required");
+            assert!(!result.to_string().contains(typed_marker));
+        }
+    }
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("type-allowed-log-test"));
+    assert!(log.contains("type-refused-log-test"));
+    assert!(!log.contains(typed_marker));
+    assert!(!log.contains(&f.config.token));
+    assert!(!log.contains(&STANDARD.encode(&f.config.psk)));
+    daemon.abort();
     task.abort();
 }

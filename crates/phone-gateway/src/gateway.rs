@@ -59,6 +59,40 @@ struct Pending {
     args: Value,
     deadline: Instant,
     reply: oneshot::Sender<Value>,
+    owner: crate::owner::OwnerRelay,
+    /// Set just before the request frame is written to the phone. Only a
+    /// dispatched request accepts a phone `res`; one that never left the
+    /// gateway is reported as not executed rather than `unknown`.
+    dispatched: bool,
+}
+const GUARDED_ACTIONS: [&str; 6] = ["tap", "type", "swipe", "press", "launch", "open_url"];
+/// Reply code for an in-flight request whose link ended.
+fn undelivered(p: &Pending) -> &'static str {
+    if !p.dispatched && GUARDED_ACTIONS.contains(&p.action.as_str()) {
+        "guard_unavailable"
+    } else {
+        "unknown"
+    }
+}
+/// Daemon admission of one gateway write, polled inside the link's select!.
+type Admission = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (uuid::Uuid, Value, std::result::Result<(), Value>)>
+            + Send,
+    >,
+>;
+/// Take the in-flight request only if it is still this link's, this very
+/// request, and not yet written to the phone.
+fn take_undispatched(s: &mut Inner, generation: u64, ticket: uuid::Uuid) -> Option<Pending> {
+    if s.generation == generation
+        && s.inflight
+            .as_ref()
+            .is_some_and(|p| p.ticket == ticket && !p.dispatched)
+    {
+        s.inflight.take()
+    } else {
+        None
+    }
 }
 #[derive(Default)]
 struct Inner {
@@ -496,7 +530,8 @@ impl Gateway {
         let (generation, stale_before) = {
             let mut s = self.inner.lock().await;
             if let Some(p) = s.inflight.take() {
-                let _ = p.reply.send(error(&p.id, "unknown"));
+                let code = undelivered(&p);
+                let _ = p.reply.send(error(&p.id, code));
             }
             s.generation += 1;
             s.online = true;
@@ -535,6 +570,8 @@ impl Gateway {
         let mut pending_changes = crate::owner::PendingChanges::default();
         let mut owner_poll = tokio::time::interval(Duration::from_secs(3));
         owner_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut admission: Option<Admission> = None;
+        let mut admitted: Option<(uuid::Uuid, Value)> = None;
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -557,8 +594,9 @@ impl Gateway {
                         // The in-flight record retains identity, never the injected secret.
                         let args = std::mem::take(&mut p.args);
                         let req = json!({"t":"req","id":p.id,"action":p.action,"args":args,"deadline_ms":p.deadline.saturating_duration_since(Instant::now()).as_millis()});
+                        let (ticket, owner) = (p.ticket, p.owner.clone());
                         s.inflight = Some(p);
-                        Some(req)
+                        Some((ticket, req, owner))
                     } else {
                         None
                     }
@@ -566,14 +604,73 @@ impl Gateway {
                     None
                 }
             };
-            if let Some(mut req) = dispatch {
+            // Taking inflight is the execution gate. Keep it through admission,
+            // including approval consumption, until the phone has replied. The
+            // admission runs as a select! branch so heartbeats, owner requests and
+            // other phone frames keep flowing while the daemon reads the screen.
+            let ready = match dispatch {
+                Some((ticket, req, owner))
+                    if GUARDED_ACTIONS.contains(&req["action"].as_str().unwrap_or("")) =>
+                {
+                    let deadline = self
+                        .inner
+                        .lock()
+                        .await
+                        .inflight
+                        .as_ref()
+                        .map(|p| p.deadline);
+                    let Some(deadline) = deadline else { continue };
+                    admission = Some(Box::pin(async move {
+                        let result = tokio::time::timeout_at(
+                            deadline,
+                            owner.guard(req["action"].as_str().unwrap_or(""), &req["args"]),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(json!({"code":"expired"})));
+                        (ticket, req, result)
+                    }));
+                    None
+                }
+                Some((ticket, req, _)) => Some((ticket, req)),
+                None => admitted.take(),
+            };
+            if let Some((ticket, mut req)) = ready {
+                let deadline = {
+                    let s = self.inner.lock().await;
+                    if s.generation != generation {
+                        break;
+                    }
+                    // The gate must still hold this very request.
+                    s.inflight
+                        .as_ref()
+                        .filter(|p| p.ticket == ticket)
+                        .map(|p| p.deadline)
+                };
+                let Some(deadline) = deadline else { continue };
+                if deadline <= Instant::now() {
+                    let p = take_undispatched(&mut *self.inner.lock().await, generation, ticket);
+                    if let Some(p) = p {
+                        let _ = p.reply.send(error(&p.id, "expired"));
+                    }
+                    continue;
+                }
+                req["deadline_ms"] = json!(deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis());
+                if req["action"] == "tap" {
+                    // Internal transport flag is overwritten after binding caller args.
+                    req["args"]["gateway_guarded"] = json!(true);
+                }
                 if req["action"] == "unlock" {
                     let deadline = {
                         let s = self.inner.lock().await;
                         if s.generation != generation {
                             break;
                         }
-                        s.inflight.as_ref().unwrap().deadline
+                        match s.inflight.as_ref().filter(|p| p.ticket == ticket) {
+                            Some(p) => p.deadline,
+                            None => continue,
+                        }
                     };
                     let injection =
                         tokio::time::timeout_at(deadline, self.inject_passcode(&mut req))
@@ -584,18 +681,16 @@ impl Gateway {
                         break;
                     }
                     if let Err(code) = injection {
-                        if let Some(p) = s.inflight.take() {
+                        if let Some(p) = take_undispatched(&mut s, generation, ticket) {
                             let _ = p.reply.send(error(&p.id, code));
                         }
                         continue;
                     }
                     if s.inflight
                         .as_ref()
-                        .is_none_or(|p| p.deadline <= Instant::now())
+                        .is_none_or(|p| p.ticket != ticket || p.deadline <= Instant::now())
                     {
-                        drop(s);
-                        let mut s = self.inner.lock().await;
-                        if let Some(p) = s.inflight.take() {
+                        if let Some(p) = take_undispatched(&mut s, generation, ticket) {
                             let _ = p.reply.send(error(&p.id, "expired"));
                         }
                         continue;
@@ -608,6 +703,16 @@ impl Gateway {
                         .deadline
                         .saturating_duration_since(Instant::now())
                         .as_millis());
+                }
+                {
+                    let mut s = self.inner.lock().await;
+                    if s.generation != generation {
+                        break;
+                    }
+                    match s.inflight.as_mut().filter(|p| p.ticket == ticket) {
+                        Some(p) => p.dispatched = true,
+                        None => continue,
+                    }
                 }
                 if timeout(
                     (last_ack + self.timing.offline).saturating_duration_since(Instant::now()),
@@ -659,7 +764,7 @@ impl Gateway {
                         Some("res") => {
                             let mut s = self.inner.lock().await;
                             if s.generation != generation { break; }
-                            if s.inflight.as_ref().is_some_and(|p| frame["id"] == p.id) {
+                            if s.inflight.as_ref().is_some_and(|p| p.dispatched && frame["id"] == p.id) {
                                 let p = s.inflight.take().unwrap();
                                 let mut response = if p.action == "unlock" { unlock_response(&p.id, &frame) } else { frame };
                                 response["id"] = json!(p.id); let _ = p.reply.send(response);
@@ -667,6 +772,22 @@ impl Gateway {
                         },
                         Some("event") => {},
                         _ => break,
+                    }
+                },
+                (ticket, req, result) = async { admission.as_mut().unwrap().await }, if admission.is_some() => {
+                    admission = None;
+                    match result {
+                        Ok(()) => admitted = Some((ticket, req)),
+                        Err(refusal) => {
+                            let mut s = self.inner.lock().await;
+                            if s.generation != generation { break; }
+                            if let Some(p) = take_undispatched(&mut s, generation, ticket) {
+                                let mut response = error(&p.id, refusal["code"].as_str().unwrap_or("guard_unavailable"));
+                                response["owner_confirm_id"] = refusal["owner_confirm_id"].clone();
+                                response["hint"] = refusal["hint"].clone();
+                                let _ = p.reply.send(response);
+                            }
+                        }
                     }
                 },
                 _ = notified => {},
@@ -693,17 +814,35 @@ impl Gateway {
             }
         }
         owner_jobs.abort_all();
+        // A request still in admission (or admitted but not yet written) never
+        // reached the phone; `undelivered` below reports it as not executed.
+        drop(admission.take());
+        drop(admitted.take());
+        // The phone keeps the last 64 results by caller id (in memory) and, while
+        // the id is still cached, answers a repeat from that cache without
+        // executing, so the caller id stays on the wire (retries stay idempotent
+        // within that window); a duplicate `res` for a reused, still-cached id
+        // carries the very result the phone gives the repeat. After eviction or an
+        // App restart a repeated id executes again, still behind daemon admission.
         // A write (heartbeat, request) can fail while the response to the in-flight request is still
         // on its way through the reader; give the reader a moment to deliver it before calling the
         // action unknown.
         let waiting = {
             let s = self.inner.lock().await;
-            s.generation == generation && s.inflight.is_some()
+            if s.generation == generation {
+                s.inflight
+                    .as_ref()
+                    .filter(|p| p.dispatched)
+                    .map(|p| p.id.clone())
+            } else {
+                None
+            }
         };
-        if waiting {
+        if let Some(wire_id) = waiting {
+            // Ignore unrelated late replies; wait the whole window for this one.
             let late = timeout(Duration::from_millis(500), async {
                 while let Some(Ok((frame, _))) = rx.recv().await {
-                    if frame["t"] == "res" {
+                    if frame["t"] == "res" && frame["id"].as_str() == Some(wire_id.as_str()) {
                         return Some(frame);
                     }
                 }
@@ -713,7 +852,9 @@ impl Gateway {
             if let Ok(Some(frame)) = late {
                 let mut s = self.inner.lock().await;
                 if s.generation == generation
-                    && s.inflight.as_ref().is_some_and(|p| frame["id"] == p.id)
+                    && s.inflight
+                        .as_ref()
+                        .is_some_and(|p| p.dispatched && frame["id"] == p.id)
                 {
                     let p = s.inflight.take().unwrap();
                     let mut response = if p.action == "unlock" {
@@ -731,7 +872,8 @@ impl Gateway {
         if s.generation == generation {
             s.online = false;
             if let Some(p) = s.inflight.take() {
-                let _ = p.reply.send(error(&p.id, "unknown"));
+                let code = undelivered(&p);
+                let _ = p.reply.send(error(&p.id, code));
             }
         }
     }
@@ -787,9 +929,13 @@ async fn command(State(g): State<Gateway>, req: Request) -> Response {
     let Ok(bytes) = to_bytes(req.into_body(), 1024 * 1024).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    let Ok(c) = serde_json::from_slice::<Command>(&bytes) else {
+    let Ok(mut c) = serde_json::from_slice::<Command>(&bytes) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Reserved transport flag: only the gateway sets it, after admission.
+    if let Some(args) = c.args.as_object_mut() {
+        args.remove("gateway_guarded");
+    }
     if !valid_phase_two_args(&c.action, &c.args) {
         return Json(error(c.id.as_deref().unwrap_or(""), "invalid_args")).into_response();
     }
@@ -841,6 +987,8 @@ async fn command(State(g): State<Gateway>, req: Request) -> Response {
             args: c.args,
             deadline,
             reply: tx,
+            owner: g.owner.clone(),
+            dispatched: false,
         });
     }
     g.notify.notify_waiters();
@@ -903,7 +1051,10 @@ pub fn valid_phase_two_args(action: &str, args: &Value) -> bool {
                 && integer("duration_ms", 300, 50, 5000)
         }
         "press" => {
-            matches!(
+            args.as_object().is_some_and(|m| {
+                m.keys()
+                    .all(|k| ["button", "strategy", "shortcut_name"].contains(&k.as_str()))
+            }) && matches!(
                 args["button"].as_str(),
                 Some("home" | "volume_up" | "volume_down" | "lock")
             ) && args.get("strategy").is_none_or(|strategy| {
@@ -912,12 +1063,9 @@ pub fn valid_phase_two_args(action: &str, args: &Value) -> bool {
                         strategy.as_str(),
                         Some("auto" | "shortcut" | "hid" | "device_event" | "press_lock")
                     )
-            }) && args.get("shortcut_name").is_none_or(|name| {
-                args["button"] == "lock"
-                    && name
-                        .as_str()
-                        .is_some_and(|s| !s.is_empty() && s.encode_utf16().count() <= 50)
-            })
+            }) && args
+                .get("shortcut_name")
+                .is_none_or(|name| args["button"] == "lock" && name.as_str() == Some("锁屏"))
         }
         "launch" => args["bundle_id"].as_str().is_some_and(|s| {
             !s.is_empty()
@@ -1126,11 +1274,18 @@ mod phase_two_tests {
                 ));
             }
         }
-        for name in ["锁屏", "A&B +?#", &"锁".repeat(50)] {
-            assert!(valid(
+        assert!(valid(
+            "press",
+            &json!({"button":"lock", "strategy":"shortcut", "shortcut_name":"锁屏"})
+        ));
+        // 只允许名为「锁屏」的快捷指令，别的名字可执行任意快捷指令，绕过守卫。
+        for name in ["A&B +?#", &"锁".repeat(50)] {
+            assert!(!valid(
                 "press",
                 &json!({"button":"lock", "strategy":"shortcut", "shortcut_name":name})
             ));
+        }
+        for name in ["锁屏", "A&B +?#", &"锁".repeat(50)] {
             assert!(!valid(
                 "press",
                 &json!({"button":"home", "shortcut_name":name})
@@ -1510,5 +1665,389 @@ mod owner_tests {
         }
         task.await.unwrap();
         assert_eq!(g.snapshot().await["transport"], "offline");
+    }
+}
+
+#[cfg(test)]
+mod execution_guard_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn queued_second_tap_is_checked_after_first_phone_response() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let changed = Arc::new(AtomicBool::new(false));
+        let page = changed.clone();
+        let app = axum::Router::new().route("/guard/gateway-command", axum::routing::post(move || {
+            let page = page.clone();
+            async move {
+                if page.load(Ordering::SeqCst) {
+                    (StatusCode::FORBIDDEN,Json(json!({"error":"owner_confirmation_required","owner_confirm_id":"buy"})))
+                } else { (StatusCode::OK,Json(json!({"allow":true}))) }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let daemon = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("execution-guard-{}", uuid::Uuid::new_v4()));
+        crate::config::pair(
+            &dir,
+            false,
+            "localhost".into(),
+            7381,
+            &dir.join("pair.json"),
+        )
+        .unwrap();
+        let mut g = Gateway::new(Config::load(&dir).unwrap(), Timing::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+        g.owner = crate::owner::OwnerRelay::new(&url, "test");
+        let (stream, mut phone) = tokio::io::duplex(65536);
+        let clone = g.clone();
+        let link = tokio::spawn(async move { clone.connected(stream).await });
+        let submit = |id: &'static str, args: Value| {
+            let g = g.clone();
+            tokio::spawn(async move {
+                let res = g
+                    .router()
+                    .oneshot(
+                        Request::post("/v1/command")
+                            .header("authorization", format!("Bearer {}", g.config.token))
+                            .body(Body::from(
+                                json!({"action":"tap","id":id,"args":args,"deadline_ms":5000})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(
+                    &res.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap()
+            })
+        };
+        let first = submit("first", json!({"x":50,"y":125}));
+        loop {
+            let frame = protocol::read_frame(&mut phone, 65536).await.unwrap();
+            if frame["t"] == "ping" {
+                protocol::write_frame(&mut phone, &json!({"t":"pong","seq":frame["seq"]}))
+                    .await
+                    .unwrap();
+            } else if frame["t"] == "req" {
+                assert_eq!(frame["id"], "first");
+                break;
+            }
+        }
+        let second = submit("second", json!({"x":50,"y":125}));
+        while g.inner.lock().await.queue.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        // First action navigates to a page with 立即购买 under the same point.
+        changed.store(true, Ordering::SeqCst);
+        protocol::write_frame(&mut phone, &json!({"t":"res","id":"first","ok":true}))
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap()["ok"], true);
+        assert_eq!(
+            second.await.unwrap()["error"]["code"],
+            "owner_confirm_required"
+        );
+        assert!(g.inner.lock().await.inflight.is_none());
+        let res = g
+            .router()
+            .oneshot(
+                Request::post("/v1/command")
+                    .header("authorization", format!("Bearer {}", g.config.token))
+                    .body(Body::from(
+                        json!({"action":"press","args":{"button":"lock","shortcut_name":"付款"}})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_args");
+        // Only heartbeat frames are permitted after admission refusal.
+        while let Ok(Ok(frame)) = tokio::time::timeout(
+            Duration::from_millis(30),
+            protocol::read_frame(&mut phone, 65536),
+        )
+        .await
+        {
+            assert_ne!(frame["t"], "req");
+        }
+        link.abort();
+        daemon.abort();
+    }
+
+    /// Daemon admission must not stall the phone link: heartbeats and owner
+    /// confirmation requests keep flowing while the daemon reads the screen.
+    #[tokio::test]
+    async fn slow_admission_keeps_link_alive_and_relays_owner_requests() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/guard/gateway-command",
+                axum::routing::post(move || {
+                    let counted = counted.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        // First call is allowed; later ones are refused, slowly.
+                        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::OK, Json(json!({"allow":true})))
+                        } else {
+                            (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({"error":"owner_confirmation_required","owner_confirm_id":"buy"})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/owner/key",
+                axum::routing::get(|| async { Json(json!({"bound":true})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let daemon = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("slow-admission-{}", uuid::Uuid::new_v4()));
+        crate::config::pair(
+            &dir,
+            false,
+            "localhost".into(),
+            7381,
+            &dir.join("pair.json"),
+        )
+        .unwrap();
+        let timing = Timing {
+            ping: Duration::from_millis(50),
+            offline: Duration::from_millis(250),
+            ..Timing::default()
+        };
+        let mut g = Gateway::new(Config::load(&dir).unwrap(), timing);
+        std::fs::remove_dir_all(&dir).unwrap();
+        g.owner = crate::owner::OwnerRelay::new(&url, "test");
+        let (stream, mut phone) = tokio::io::duplex(65536);
+        let clone = g.clone();
+        let link = tokio::spawn(async move { clone.connected(stream).await });
+        let submit = |id: String| {
+            let g = g.clone();
+            tokio::spawn(async move {
+                let res = g
+                    .router()
+                    .oneshot(
+                        Request::post("/v1/command")
+                            .header("authorization", format!("Bearer {}", g.config.token))
+                            .body(Body::from(
+                                json!({"action":"tap","id":id,"args":{"x":5,"y":5},"deadline_ms":5000})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(
+                    &res.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap()
+            })
+        };
+        let first = submit("first".into());
+        // Wait until admission is in flight, then ask the owner channel.
+        while g.inner.lock().await.inflight.is_none() {
+            tokio::task::yield_now().await;
+        }
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"owner_req","id":"own-1","method":"GET","path":"/owner/key","body_b64":""}),
+        )
+        .await
+        .unwrap();
+        let asked = Instant::now();
+        let mut owner_answered = None;
+        loop {
+            let frame = protocol::read_frame(&mut phone, 65536).await.unwrap();
+            match frame["t"].as_str() {
+                Some("ping") => {
+                    protocol::write_frame(&mut phone, &json!({"t":"pong","seq":frame["seq"]}))
+                        .await
+                        .unwrap()
+                }
+                Some("owner_res") => owner_answered = Some(asked.elapsed()),
+                Some("req") => {
+                    assert_eq!(frame["id"], "first");
+                    assert_eq!(frame["args"]["gateway_guarded"], true);
+                    protocol::write_frame(&mut phone, &json!({"t":"res","id":"first","ok":true}))
+                        .await
+                        .unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // The owner answer did not wait for the 400ms admission.
+        assert!(owner_answered.expect("owner_res before dispatch") < Duration::from_millis(300));
+        assert_eq!(first.await.unwrap()["ok"], true);
+        // Five slow refusals in a row (2s) exceed the 250ms offline window
+        // unless pongs are processed meanwhile.
+        let refused: Vec<_> = (0..5).map(|i| submit(format!("r{i}"))).collect();
+        let pump = tokio::spawn(async move {
+            loop {
+                let frame = protocol::read_frame(&mut phone, 65536).await.unwrap();
+                assert_ne!(frame["t"], "req", "refused tap reached the phone");
+                if frame["t"] == "ping" {
+                    protocol::write_frame(&mut phone, &json!({"t":"pong","seq":frame["seq"]}))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        for r in refused {
+            assert_eq!(r.await.unwrap()["error"]["code"], "owner_confirm_required");
+        }
+        assert!(
+            g.inner.lock().await.online,
+            "link dropped during admissions"
+        );
+        assert!(!link.is_finished());
+        pump.abort();
+        link.abort();
+        daemon.abort();
+    }
+
+    /// A late/duplicate phone `res` must not release the gate while the next
+    /// request (same caller id) is still in admission; a link replaced during
+    /// admission reports the request as not executed.
+    #[tokio::test]
+    async fn late_res_during_admission_keeps_gate_and_order() {
+        let app = axum::Router::new().route(
+            "/guard/gateway-command",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                (StatusCode::OK, Json(json!({"allow":true})))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let daemon = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("late-res-{}", uuid::Uuid::new_v4()));
+        crate::config::pair(
+            &dir,
+            false,
+            "localhost".into(),
+            7381,
+            &dir.join("pair.json"),
+        )
+        .unwrap();
+        let mut g = Gateway::new(Config::load(&dir).unwrap(), Timing::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+        g.owner = crate::owner::OwnerRelay::new(&url, "test");
+        let (stream, mut phone) = tokio::io::duplex(65536);
+        let clone = g.clone();
+        let link = tokio::spawn(async move { clone.connected(stream).await });
+        let submit = |id: &'static str, action: &'static str| {
+            let g = g.clone();
+            tokio::spawn(async move {
+                let args = if action == "read" {
+                    json!({})
+                } else {
+                    json!({"x":5,"y":5})
+                };
+                let res = g
+                    .router()
+                    .oneshot(
+                        Request::post("/v1/command")
+                            .header("authorization", format!("Bearer {}", g.config.token))
+                            .body(Body::from(
+                                json!({"action":action,"id":id,"args":args,"deadline_ms":5000})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(
+                    &res.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap()
+            })
+        };
+        async fn next_req(phone: &mut tokio::io::DuplexStream) -> Value {
+            loop {
+                let frame = protocol::read_frame(phone, 65536).await.unwrap();
+                if frame["t"] == "req" {
+                    return frame;
+                }
+            }
+        }
+        // A: a read with id "dup", answered normally.
+        let a = submit("dup", "read");
+        let frame = next_req(&mut phone).await;
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"res","id":frame["id"],"ok":true,"result":{"from":"a"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.await.unwrap()["result"]["from"], "a");
+        // B reuses "dup" and enters admission; C queues behind it.
+        let b = submit("dup", "tap");
+        while g.inner.lock().await.inflight.is_none() {
+            tokio::task::yield_now().await;
+        }
+        let c = submit("c", "tap");
+        // A duplicate of A's response arrives during B's admission.
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"res","id":"dup","ok":true,"result":{"from":"late"}}),
+        )
+        .await
+        .unwrap();
+        // B is the next request the phone sees, after its admission.
+        let frame = next_req(&mut phone).await;
+        assert_eq!(frame["id"], "dup");
+        assert_eq!(frame["action"], "tap");
+        assert!(!b.is_finished(), "late res answered B before dispatch");
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"res","id":"dup","ok":true,"result":{"from":"b"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.await.unwrap()["result"]["from"], "b");
+        let frame = next_req(&mut phone).await;
+        assert_eq!(frame["id"], "c");
+        protocol::write_frame(
+            &mut phone,
+            &json!({"t":"res","id":"c","ok":true,"result":{}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.await.unwrap()["ok"], true);
+        // D is in admission when a new phone link replaces this one.
+        let d = submit("d", "tap");
+        while g.inner.lock().await.inflight.is_none() {
+            tokio::task::yield_now().await;
+        }
+        let (stream2, _phone2) = tokio::io::duplex(65536);
+        let clone = g.clone();
+        let link2 = tokio::spawn(async move { clone.connected(stream2).await });
+        assert_eq!(d.await.unwrap()["error"]["code"], "guard_unavailable");
+        link.abort();
+        link2.abort();
+        daemon.abort();
     }
 }

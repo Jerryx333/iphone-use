@@ -21,6 +21,12 @@ impl Default for OwnerRelay {
     }
 }
 impl OwnerRelay {
+    /// Uses the same loopback-only validation and transport policy as environment configuration.
+    pub fn new(url: &str, token: &str) -> Self {
+        Self {
+            config: Self::configured(url, token),
+        }
+    }
     pub fn from_env() -> Self {
         let url = std::env::var("PHONE_GATEWAY_OWNER_URL").ok();
         let token = std::env::var("PHONE_GATEWAY_OWNER_TOKEN").ok();
@@ -100,11 +106,22 @@ impl OwnerRelay {
         path: &str,
         body: Vec<u8>,
     ) -> Result<(u16, Vec<u8>), &'static str> {
+        self.http_with_timeout(method, path, body, Duration::from_secs(3))
+            .await
+    }
+    async fn http_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+        budget: Duration,
+    ) -> Result<(u16, Vec<u8>), &'static str> {
         let (client, base, auth) = self.config.as_ref().map_err(|code| *code)?;
         let mut url = base.clone();
         url.set_path(path);
         let mut response = client
             .request(method, url)
+            .timeout(budget)
             .header(header::AUTHORIZATION, auth.clone())
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
@@ -147,6 +164,37 @@ impl OwnerRelay {
             }
             Err(code) => failure(id, code),
         }
+    }
+    /// Fail closed, retaining only the daemon's closed admission schema.
+    pub async fn guard(&self, action: &str, args: &Value) -> Result<(), Value> {
+        let result = self
+            .http_with_timeout(
+                Method::POST,
+                "/guard/gateway-command",
+                serde_json::to_vec(&json!({"action":action,"args":args})).unwrap(),
+                Duration::from_secs(10),
+            )
+            .await;
+        let (status, bytes) = result.map_err(|code| json!({"code":if code == "owner_unconfigured" {"guard_unconfigured"} else {"guard_unavailable"}}))?;
+        let body: Value =
+            serde_json::from_slice(&bytes).map_err(|_| json!({"code":"guard_unavailable"}))?;
+        if status == 200 && body == json!({"allow":true}) {
+            return Ok(());
+        }
+        if status == 403 && body["error"] == "owner_confirmation_required" {
+            if let Some(id) = body["owner_confirm_id"].as_str().filter(|id| valid_id(id)) {
+                return Err(
+                    json!({"code":"owner_confirm_required","owner_confirm_id":id,
+                    "hint":"请主人在手机 Self Runner 刷脸允许后，两分钟内原样重发同一命令"}),
+                );
+            }
+        }
+        if status == 429 && body["error"] == "guard_busy" {
+            return Err(json!({"code":"guard_busy"}));
+        }
+        Err(
+            json!({"code":if status == 403 && body["error"] == "owner_app_protected" {"owner_app_protected"} else {"guard_unavailable"}}),
+        )
     }
     pub async fn pending(&self) -> Result<Vec<u8>, &'static str> {
         let (status, body) = self.http(Method::GET, "/owner/pending", Vec::new()).await?;
