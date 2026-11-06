@@ -757,6 +757,11 @@ final class RemoteActions {
                        (system["pid"] as? NSNumber)?.int32Value == targetPID { break }
                     let blockers = occluders(system, at: point, screen: screen,
                                              targetPID: targetPID, targetFrame: targetFrame)
+                    if !blockers.isEmpty && args["gateway_guarded"] as? Bool == true {
+                        // Admission already observed the page: never wait, swipe, or
+                        // relocate after that observation. The caller must retry.
+                        return finish(RemoteActionResult(code: "occluded"))
+                    }
                     if !blockers.isEmpty {
                         if detectedAt == nil { detectedAt = ProcessInfo.processInfo.systemUptime }
                         clearedAt = nil

@@ -6,7 +6,7 @@ HTTP 密码、agent token、Cookie 仅授权普通 API，不代表主人同意�
 
 公钥格式为 base64 X9.63 未压缩 P-256 点。首次 POST /owner/key 的 signature 是新钥对 `iphone-use-owner-key/v1\n` 加 base64 公钥的 DER ECDSA SHA-256 签名，以证明持有私钥。已绑定时，同一消息必须由旧钥签名，否则 409。GET /owner/key 返回绑定状态和 SHA-256 公钥指纹。状态保存为实例 state_dir 下的 owner-key.json（0600，原子替换）。生物识别变化导致旧钥不可用时，由能访问本地 state_dir 的主人手动恢复绑定。
 
-GET /owner/pending 返回最多 16 张待确认单。每单有随机 id、nonce、kind、规范化 JSON 的 SHA-256 digest、daemon 生成的摘要、创建/过期时间和对象绑定。调用方标签仅以截断后 JSON 引号内的引用出现。批准需 POST /owner/confirm/<id>：
+GET /owner/pending 返回普通入口最多 16 张及 gateway 独立入口最多 8 张待确认单。每单有随机 id、nonce、kind、规范化 JSON 的 SHA-256 digest、daemon 生成的摘要、创建/过期时间和对象绑定。调用方标签仅以截断后 JSON 引号内的引用出现。批准需 POST /owner/confirm/<id>：
 
 ```json
 {"approve":true,"signature":"base64 DER signature"}
@@ -72,3 +72,15 @@ daemon 的 bundle 保护保持独立于敏感许可。已核实 setup 托管恢�
 弹窗的指定 button、默认 accept 和 dismiss 均在守卫阶段读取正文和完整有序按钮列表，批准绑定正文、完整按钮列表及目标按钮。默认 accept/dismiss 分别取 runner 按钮顺序的最后/第一个，并按该名称派发，确保执行目标与确认对象一致。详情按引用转义规则展示正文、目标和按钮列表。正文或列表变化须重新确认；读不到完整弹窗身份不能消费批准，显式付款按钮仍按付款语义拦截。
 
 /control 输入是否隐藏只依据守卫实际读到控件的 secure 判定，请求的 secure、target、locator 等声明不能隐藏普通输入。流程保存时无法观察目标，确认详情一律显示输入明文（流程文件原本也存储这些值）。引用除控制字符、行/段分隔符外，还转义 U+00AD、U+061C、U+180E、U+200B–U+200F、U+202A–U+202E、U+2060–U+2064、U+2066–U+206F、U+FEFF、U+FFF9–U+FFFB，防止不可见格式字符改变确认界面显示。
+
+## Gateway 写动作（#387）
+
+`tap/type/swipe/press/launch/open_url` 出队并持有 gateway 单命令执行闸后、派发手机之前，请求 daemon `POST /guard/gateway-command`。前一条手机响应已结束；判定和主人批准消费期间持续占闸。复用 OWNER 回环配置和 Bearer 鉴权，禁代理、重定向、重试。daemon 总预算 8 秒，单次完整读屏预算 2.5 秒；gateway 调用预算为 min(10 秒, 命令剩余 deadline)，期限含排队与判定。只有严格的 `200 {"allow":true}` 才派发。未配置返回 `guard_unconfigured`；配置错误、不可达、超时、非法响应返回 `guard_unavailable`（命令期限耗尽可返回 `expired`），均不派发。读动作和钥匙串 unlock 不变。
+
+一次请求只取一次完整快照，保留 coverage、原始树和规范化行供 tap/type/swipe 复用。label/identifier 点按检查所有规范化匹配行及原始字段匹配所对应的行，忽略 index 的顺序；任一候选敏感即要求主人确认，绑定全部候选身份、原始树摘要、页面摘要和前台 bundle。不能对应到行或点按/滑动快照不完整时失败关闭。swipe 把手机绝对屏幕点按窗口大小换成 `/control` 归一化起止点，复用现有小位移按点按检查；缺参数或无法换算拒绝。长距离 swipe 与 `/control` 一致，这不是滑块支付保护。
+
+输入对所有字段执行现有密码框检查。快照截断、coverage 未知/不完整或无法读到焦点字段归属时，要求主人确认；只有完整且焦点明确、无敏感字段的快照直接放行。press 只允许 home/音量键，以及名为「锁屏」的快捷指令或硬件锁屏路径；自定义 shortcut_name 和未知 press 参数均在 gateway 返回 `invalid_args`，daemon 同样校验。auto/shortcut 默认「锁屏」；hid/device_event/press_lock 为硬件路径。
+
+敏感动作返回 `owner_confirm_required` 和 `owner_confirm_id`；请主人在手机 Self Runner 刷脸允许后，两分钟内原样重发同一命令。重发仍在出队后的闸内重新读屏判定并消费一次批准。完整 action/args、身份、页面或前台变化须重新确认。使用独立 `gateway_press` 能力池，待确认及已批准未消费合计最多 8 张，不占用 /control、任务、流程的 16 张配额。入口同一时刻只处理一个请求，多余直接返回 429 `guard_busy`。任务 confirm:"never" 和保存流程许可不变。
+
+残余窗口仅为「daemon 判定读屏 → 手机执行」，与 daemon `/control` 的读屏→执行同级；不包含队列等待。gateway 给已判定 tap 强制设置内部 `gateway_guarded` 标志，手机遇遮挡立即返回 `occluded`，不再等待、自动上滑或重新定位。`expect_label/expect_identifier` 仍是执行后等待条件。手机本地 `snapshot_id` 无法由 daemon 解析，带该字段的写请求失败关闭。威胁模型不包含本机任意 shell 直接连接 runner 转发端口。
