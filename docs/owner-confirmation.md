@@ -6,7 +6,7 @@ HTTP 密码、agent token、Cookie 仅授权普通 API，不代表主人同意�
 
 公钥格式为 base64 X9.63 未压缩 P-256 点。首次 POST /owner/key 的 signature 是新钥对 `iphone-use-owner-key/v1\n` 加 base64 公钥的 DER ECDSA SHA-256 签名，以证明持有私钥。已绑定时，同一消息必须由旧钥签名，否则 409。GET /owner/key 返回绑定状态和 SHA-256 公钥指纹。状态保存为实例 state_dir 下的 owner-key.json（0600，原子替换）。生物识别变化导致旧钥不可用时，由能访问本地 state_dir 的主人手动恢复绑定。
 
-GET /owner/pending 返回普通入口最多 16 张及 gateway 独立入口最多 8 张待确认单。每单有随机 id、nonce、kind、规范化 JSON 的 SHA-256 digest、daemon 生成的摘要、创建/过期时间和对象绑定。调用方标签仅以截断后 JSON 引号内的引用出现。批准需 POST /owner/confirm/<id>：
+GET /owner/pending 返回普通入口最多 16 张及 gateway 独立入口最多 8 张待确认单。确认单出单后 10 分钟内可由主人允许或拒绝（2026-11-06 主人嫌两分钟太赶，#374）；任务引擎等待主人确认仍为 5 分钟（任务确认还未绑定交易页面内容，补上前不放宽），超时后迟到的批准不会放行；签名批准后的放行仍须在两分钟内消费一次。每单有随机 id、nonce、kind、规范化 JSON 的 SHA-256 digest、daemon 生成的摘要、创建/过期时间和对象绑定。调用方标签仅以截断后 JSON 引号内的引用出现。批准需 POST /owner/confirm/<id>：
 
 ```json
 {"approve":true,"signature":"base64 DER signature"}

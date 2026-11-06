@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// How long the owner has to answer a sheet on the phone (owner asked for more than two minutes, #374).
+const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+// How long a signed approval stays usable before the agent must consume it.
 const TTL: Duration = Duration::from_secs(120);
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -334,10 +337,10 @@ impl OwnerConfirm {
             details: confirmation_details(kind, &object),
             digest: d,
             created_at_ms: now,
-            expires_at_ms: now + 120000,
+            expires_at_ms: now + PENDING_TTL.as_millis() as u64,
             object,
             status: "pending".into(),
-            expires: Instant::now() + TTL,
+            expires: Instant::now() + PENDING_TTL,
         };
         let id = p.id.clone();
         self.pending.push(p);
@@ -618,5 +621,44 @@ mod tests {
         );
         assert!(owner.confirm(&id, true, None).is_err());
         assert!(!owner.consume("intent", &object));
+    }
+    #[test]
+    fn owner_gets_ten_minutes_to_answer_but_an_approval_still_lasts_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = OwnerConfirm::new(dir.path().into());
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let public = STANDARD.encode(key.public_key().as_ref());
+        let proof = key
+            .sign(
+                &rng,
+                format!("iphone-use-owner-key/v1\n{public}").as_bytes(),
+            )
+            .unwrap();
+        owner.bind(&public, Some(&STANDARD.encode(proof))).unwrap();
+        let object = json!({"name":"pay"});
+        let before = Instant::now();
+        let id = owner.request("intent", object.clone(), "pay").unwrap();
+        let sheet = owner.pending()[0].clone();
+        assert_eq!(sheet.expires_at_ms - sheet.created_at_ms, 10 * 60 * 1000);
+        assert!(sheet.expires >= before + Duration::from_secs(10 * 60 - 1));
+        // Nine minutes in, the sheet is still listed and still accepts the owner's signature.
+        owner.pending[0].expires = Instant::now() + Duration::from_secs(60);
+        assert_eq!(owner.pending().len(), 1);
+        let signature = key
+            .sign(&rng, owner.pending[0].message().as_bytes())
+            .unwrap();
+        owner
+            .confirm(&id, true, Some(&STANDARD.encode(signature)))
+            .unwrap();
+        let (_, _, until) = owner.allowances.last().unwrap().clone();
+        let left = until.saturating_duration_since(Instant::now());
+        assert!(
+            left <= TTL && left + Duration::from_secs(5) >= TTL,
+            "{left:?}"
+        );
+        assert!(owner.consume("intent", &object));
     }
 }
