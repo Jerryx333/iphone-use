@@ -12,7 +12,7 @@ use std::{
 };
 
 // How long the owner has to answer a sheet on the phone (owner asked for more than two minutes, #374).
-const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+const PENDING_TTL: Duration = iphone_use_mcp::task::CONFIRM_TIMEOUT;
 // How long a signed approval stays usable before the agent must consume it.
 const TTL: Duration = Duration::from_secs(120);
 pub fn hex(bytes: &[u8]) -> String {
@@ -138,14 +138,30 @@ fn confirmation_details(kind: &str, object: &Value) -> Vec<String> {
             d.push("批准后此版本流程以后每次回放都跳过付款/密码拦截，流程内容一改即失效".into());
             d
         }
-        "task_press" => vec![
-            format!("任务目标：{}", value_quote(&object["goal"])),
-            format!(
-                "当前控件标签：{}",
-                value_quote(&object["operation"]["target"])
-            ),
-            format!("操作类型：{}", value_quote(&object["operation"]["action"])),
-        ],
+        "task_press" => {
+            let operation = &object["operation"];
+            vec![
+                format!("任务目标：{}", value_quote(&object["goal"])),
+                format!(
+                    "当前控件标签：{}",
+                    value_quote(&object["operation"]["target"])
+                ),
+                format!("操作类型：{}", value_quote(&operation["action"])),
+                format!("前台 App：{}", value_quote(&operation["app"])),
+                format!("前台 bundle：{}", value_quote(&operation["bundle"])),
+                format!("控件身份：{}", value_quote(&operation["control"])),
+                format!("操作参数：{}", value_quote(&operation["parameters"])),
+                format!(
+                    "页面内容摘要：{}",
+                    operation["page_digest"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(8)
+                        .collect::<String>()
+                ),
+            ]
+        }
         "control_press" | "gateway_press" => {
             let mut d = vec![action_details(
                 &object["action"],
@@ -329,6 +345,17 @@ impl OwnerConfirm {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let expires_at_ms = if kind == "task_press" {
+            object["operation"]["expires_at_ms"]
+                .as_u64()
+                .unwrap_or(now + PENDING_TTL.as_millis() as u64)
+                .min(now + PENDING_TTL.as_millis() as u64)
+        } else {
+            now + PENDING_TTL.as_millis() as u64
+        };
+        if expires_at_ms <= now {
+            return Err("owner_confirmation_expired");
+        }
         let p = Pending {
             id: random()?,
             nonce: random()?,
@@ -337,10 +364,10 @@ impl OwnerConfirm {
             details: confirmation_details(kind, &object),
             digest: d,
             created_at_ms: now,
-            expires_at_ms: now + PENDING_TTL.as_millis() as u64,
+            expires_at_ms,
             object,
             status: "pending".into(),
-            expires: Instant::now() + PENDING_TTL,
+            expires: Instant::now() + Duration::from_millis(expires_at_ms - now),
         };
         let id = p.id.clone();
         self.pending.push(p);

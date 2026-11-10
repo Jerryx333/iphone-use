@@ -515,9 +515,9 @@ const PRESS_SLOP: f64 = 0.03;
 /// Key names the runner sends as Return (`RunnerClient::named_key`).
 const RETURN_KEYS: &[&str] = &["return", "enter", "send", "go", "search"];
 
-/// Pass a paying press the owner just allowed on the phone, through a
-/// task's confirmation (`iphone_use_mcp::task::approve_press`): once, and
-/// only that control. Every other refusal stands.
+/// Pass a paying press through the legacy `confirm:"never"` allowance:
+/// once, identified by its process-local
+/// token (labels are diagnostic). Signed steps use final-tree binding in http.
 pub fn owner_allowed(refusal: Refusal, token: Option<&str>) -> Result<(), Refusal> {
     match &refusal {
         Refusal::Sensitive(label) if iphone_use_mcp::task::take_approved_press(token, label) => {

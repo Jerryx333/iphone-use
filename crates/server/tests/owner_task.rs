@@ -127,5 +127,53 @@ fn signed_task_confirmation_answers_only_the_waiting_question() {
         assert_eq!(body["error"], "owner_confirmation_object_changed");
         assert!(later_receiver.try_recv().is_err());
         iphone_use_mcp::task::answer(&later_id, false).unwrap();
+
+        // Every binding remains part of the exact waiting-question check.
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 600_000;
+        let question = json!({"action":"CLICK","target":"立即购买","confirmation_id":"bound",
+            "app":"Shop","page_digest":"1234567890abcdef","control":{"label":"立即购买","identifier":"order","kind":"Button"},
+            "parameters":{"operation":"CLICK","text":null},"expires_at_ms":expires});
+        let (bound_id, mut bound_receiver) =
+            iphone_use_mcp::task::owner_confirmation_fixture(question.clone());
+        let pending = state
+            .owner_confirm
+            .lock()
+            .unwrap()
+            .pending()
+            .into_iter()
+            .find(|p| p.object["task_id"] == bound_id)
+            .unwrap();
+        assert_eq!(pending.expires_at_ms, expires);
+        assert!(pending
+            .details
+            .iter()
+            .any(|d| d == "页面内容摘要：12345678"));
+        for field in ["app", "page_digest", "control", "parameters"] {
+            let mut changed = question.clone();
+            changed[field] = json!("changed");
+            assert!(iphone_use_mcp::task::answer_owner(&bound_id, &changed, true).is_err());
+            assert!(bound_receiver.try_recv().is_err());
+        }
+        iphone_use_mcp::task::cancel(&bound_id).unwrap();
+        assert!(iphone_use_mcp::task::answer_owner(&bound_id, &question, true).is_err());
+        assert!(!bound_receiver.await.unwrap());
+        let mut expired = question.clone();
+        expired["expires_at_ms"] = json!(1);
+        let (expired_id, mut expired_receiver) =
+            iphone_use_mcp::task::owner_confirmation_fixture(expired.clone());
+        assert!(iphone_use_mcp::task::answer_owner(&expired_id, &expired, true).is_err());
+        assert!(expired_receiver.try_recv().is_err());
+        assert!(state
+            .owner_confirm
+            .lock()
+            .unwrap()
+            .pending()
+            .iter()
+            .all(|p| p.object["task_id"] != expired_id));
+        iphone_use_mcp::task::answer(&expired_id, false).unwrap();
     });
 }
