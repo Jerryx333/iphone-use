@@ -72,6 +72,7 @@ pub struct Options {
 pub(crate) struct Target {
     /// Row index in the element tree (for element + snapshot taps).
     pub(crate) row: usize,
+    pub(crate) identifier: String,
     pub(crate) kind: String,
     pub(crate) label: String,
     pub(crate) value: String,
@@ -82,6 +83,10 @@ pub(crate) struct Target {
 #[derive(Debug, Clone)]
 pub(crate) struct Screen {
     pub(crate) snapshot: String,
+    pub(crate) page_digest: String,
+    /// Unique focused input identity from the full tree, before target filtering.
+    pub(crate) return_control: Option<Value>,
+    pub(crate) bundle: Option<String>,
     pub(crate) app: String,
     /// The navigation bar's title: which page of the app this is.
     pub(crate) page: String,
@@ -163,6 +168,7 @@ pub(crate) fn observe_screen(tree: &Value) -> Screen {
         let fill = FILLABLE.contains(&kind);
         targets.push(Target {
             row: row_index,
+            identifier: str_of(row, "identifier").to_string(),
             kind: kind.to_string(),
             label: name,
             value: if fill || kind == "Switch" { value.to_string() } else { String::new() },
@@ -185,7 +191,30 @@ pub(crate) fn observe_screen(tree: &Value) -> Screen {
         text.chars().take(600).collect::<String>(),
         targets.iter().map(|t| format!("{}={}", t.label, t.value)).collect::<Vec<_>>().join(";")
     );
+    // Hash every row in tree order, before visibility/target limits and without geometry.
+    use sha2::{Digest, Sha256};
+    let page_rows = rows
+        .iter()
+        .map(|r| (str_of(r, "kind"), str_of(r, "label"), str_of(r, "value")))
+        .collect::<Vec<_>>();
+    let page_digest = hex::encode(Sha256::digest(serde_json::to_vec(&page_rows).unwrap()));
+    let identity = |r: &Value| json!({"label":str_of(r, "label"),
+        "identifier":str_of(r, "identifier"),"kind":str_of(r, "kind")});
+    let mut focused = rows.iter().filter(|r| r["focused"] == true);
+    let return_control = focused.next().and_then(|row| {
+        let control = identity(row);
+        (focused.next().is_none()
+            && FILLABLE.contains(&str_of(row, "kind"))
+            && rows.iter().filter(|r| identity(r) == control).count() == 1)
+            .then_some(control)
+    });
     Screen {
+        page_digest,
+        return_control,
+        bundle: tree["foreground_bundle"]
+            .as_str()
+            .filter(|b| !b.is_empty())
+            .map(str::to_owned),
         snapshot: str_of(tree, "snapshot").to_string(),
         app,
         page,
@@ -614,7 +643,7 @@ fn source_recovery_delay(error: &anyhow::Error) -> Option<Duration> {
 }
 
 pub(crate) async fn read_screen(daemon: &DaemonClient) -> Result<Screen> {
-    let body = match daemon.elements().await {
+    let body = match daemon.elements_with_foreground().await {
         Ok(body) => body,
         Err(error) => {
             let Some(delay) = source_recovery_delay(&error) else {
@@ -622,7 +651,7 @@ pub(crate) async fn read_screen(daemon: &DaemonClient) -> Result<Screen> {
             };
             tokio::time::sleep(delay).await;
             // Only retry the observation, once. The preceding action is never replayed.
-            daemon.elements().await.context("screen recovery failed after runner_source_timeout; previous action was not replayed")?
+            daemon.elements_with_foreground().await.context("screen recovery failed after runner_source_timeout; previous action was not replayed")?
         }
     };
     let tree: Value = serde_json::from_str(&body).context("parse the element tree")?;
@@ -988,6 +1017,23 @@ pub async fn run(daemon: &DaemonClient, opts: Options) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn confirmation_digest_covers_all_rows_in_order_but_excludes_rect() {
+        let mut tree = json!({"elements":[
+            {"kind":"Application","label":"Shop"},
+            {"kind":"StaticText","label":"¥55","value":"55","visible":false},
+            {"kind":"Button","label":"Buy","identifier":"order","rect":[0,0,1,1]}
+        ]});
+        let original = observe_screen(&tree);
+        tree["elements"][2]["rect"] = json!([1, 2, 3, 4]);
+        assert_eq!(original.page_digest, observe_screen(&tree).page_digest);
+        tree["elements"][1]["value"] = json!("999");
+        assert_ne!(original.page_digest, observe_screen(&tree).page_digest);
+        tree["elements"].as_array_mut().unwrap().swap(1, 2);
+        assert_ne!(original.page_digest, observe_screen(&tree).page_digest);
+        assert_eq!(original.targets[0].identifier, "order");
+    }
+
+    #[test]
     fn keyboard_occlusion_recovers_once_without_forcing_unknown_or_hidden_targets() {
         let screen = super::observe_screen(
             &serde_json::json!({"elements":[{"kind":"Keyboard","visible":true}]}),
@@ -1143,7 +1189,7 @@ mod tests {
         assert!(requests[0].starts_with("POST /agent/input "));
         assert!(requests[1..]
             .iter()
-            .all(|r| r.starts_with("GET /agent/elements ")));
+            .all(|r| r.starts_with("GET /agent/elements?foreground=1 ")));
     }
 
     #[tokio::test]

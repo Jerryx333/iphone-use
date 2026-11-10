@@ -65,6 +65,7 @@ anyhow = "1"
 thiserror = "2"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # Used in unit tests for JSON assertion helpers
 serde_json = "1"
 

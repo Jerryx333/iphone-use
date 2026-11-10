@@ -979,6 +979,12 @@ impl DaemonClient {
         self.elements_at("/agent/elements", None).await
     }
 
+    /// [`Self::elements`] plus the daemon-observed `foreground_bundle`, which
+    /// costs one extra runner request; the task engine binds confirmations to it.
+    pub async fn elements_with_foreground(&self) -> anyhow::Result<String> {
+        self.elements_at("/agent/elements?foreground=1", None).await
+    }
+
     /// One fresh read preserving known locator state. Older daemons may ignore
     /// the query; diagnosis treats their omitted values conservatively.
     pub async fn elements_for_diagnosis(&self) -> anyhow::Result<String> {

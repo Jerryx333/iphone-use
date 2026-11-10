@@ -28,7 +28,7 @@ pub type AssistDecision = (String, Option<usize>, Option<String>, Option<String>
 
 pub const MAX_STEPS_LIMIT: usize = 60;
 const RECENT_KEPT: usize = 20;
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SUMMARY_TEXT_CHARS: usize = 3_000;
 /// Jev answered outside the offer or repeated itself this many times in a row:
 /// the assist model decides the next step.
@@ -841,6 +841,60 @@ const APPROVED_PRESS_TTL: Duration = Duration::from_secs(120);
 /// Process-local capabilities, never serialized into task state or responses.
 static APPROVED_PRESS: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
 
+// Signed-step capabilities are separate from confirm:"never" allowances.
+static BOUND_PRESS: Mutex<Vec<(String, Value, Instant, bool)>> = Mutex::new(Vec::new());
+
+fn approve_bound_step(question: Value) -> anyhow::Result<String> {
+    if question["bundle"].as_str().is_none_or(str::is_empty) {
+        bail!("页面已变化，需重新确认：前台 bundle 未知");
+    }
+    let raw = approve_press("")?;
+    clear_approved_press(&raw);
+    let token = format!("bound-{raw}");
+    let mut slots = BOUND_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|s| s.2 > Instant::now());
+    slots.push((
+        token.clone(),
+        question,
+        Instant::now() + APPROVED_PRESS_TTL,
+        false,
+    ));
+    Ok(token)
+}
+
+pub fn bound_step(token: Option<&str>) -> Option<Value> {
+    let mut slots = BOUND_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|s| s.2 > Instant::now());
+    slots
+        .iter()
+        .find(|s| Some(s.0.as_str()) == token)
+        .map(|s| s.1.clone())
+}
+
+pub fn take_bound_step(token: Option<&str>, observed: &Value) -> bool {
+    let mut slots = BOUND_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|s| s.2 > Instant::now());
+    let Some(i) = slots.iter().position(|s| Some(s.0.as_str()) == token) else {
+        return false;
+    };
+    let (_, expected, _, _) = slots.swap_remove(i);
+    expected == *observed
+}
+
+/// The signed step grants exactly one return to its original bundle.
+pub fn take_bound_return(token: Option<&str>, action: &Value) -> bool {
+    let mut slots = BOUND_PRESS.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|s| s.2 > Instant::now());
+    let Some(slot) = slots.iter_mut().find(|s| Some(s.0.as_str()) == token) else {
+        return false;
+    };
+    if slot.3 || action != &json!({"type":"launch_app","bundle":slot.1["bundle"]}) {
+        return false;
+    }
+    slot.3 = true;
+    true
+}
+
 /// Mint a capability for this task step. Randomness failure fails closed.
 pub fn approve_press(label: &str) -> anyhow::Result<String> {
     let mut bytes = [0u8; 32];
@@ -858,6 +912,10 @@ pub fn approve_press(label: &str) -> anyhow::Result<String> {
 }
 
 pub fn clear_approved_press(token: &str) {
+    BOUND_PRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|s| s.0 != token);
     APPROVED_PRESS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1144,14 +1202,31 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
         }
 
         // Confirm risky steps with the person.
-        let mut confirmed = false;
+        let confirmed = false;
         if request.confirm == ConfirmPolicy::Risky {
             if let Some(why) = risky_step(&operation, target.as_ref().map(|t| t.label.as_str())) {
+                if operation == "PRESS_RETURN" && screen.return_control.is_none() {
+                    finish(task, daemon, &chat, request, Status::Blocked,
+                        Some("焦点字段未知或不唯一，需重新确认".into())).await;
+                    return Ok(());
+                }
+                if screen.bundle.is_none() {
+                    finish(
+                        task,
+                        daemon,
+                        &chat,
+                        request,
+                        Status::Blocked,
+                        Some("前台 bundle 未知，需重新确认".into()),
+                    )
+                    .await;
+                    return Ok(());
+                }
                 let approved = ask_person(
                     task,
                     daemon,
                     request,
-                    json!({"action": operation, "target": target.as_ref().map(|t| t.label.clone()), "reason": why, "app": screen.app}),
+                    step_confirmation(&screen, &operation, target.as_ref(), text.as_deref(), &why),
                 )
                 .await;
                 if !approved {
@@ -1160,24 +1235,52 @@ async fn run(task: &Arc<Task>, daemon: &DaemonClient, request: &TaskRequest) -> 
                     finish(task, daemon, &chat, request, stopped, None).await;
                     return Ok(());
                 }
-                confirmed = true;
                 // The app that asked is in front now: go back to where the
                 // step was decided and decide on the fresh screen again.
-                if request.return_bundle.is_some() {
-                    let _ = jev::act(daemon, json!({"type": "launch_app", "app": screen.app})).await;
-                    tokio::time::sleep(Duration::from_millis(800)).await;
-                    let fresh = jev::read_screen(daemon).await?;
-                    let again = target
-                        .as_ref()
-                        .and_then(|t| fresh.targets.iter().position(|f| f.label == t.label && f.kind == t.kind));
-                    screen = fresh;
-                    if again.is_none() {
-                        history.push(json!({"action": operation, "kind": "control", "target": target.as_ref().map(|t| t.label.clone()), "error": "the confirmed control is gone after returning"}));
-                        continue;
-                    }
-                    let target = again.and_then(|i| screen.targets.get(i)).cloned();
-                    let token = approve_press(target.as_ref().map_or("", |t| t.label.as_str()))?;
+                {
+                    let token = approve_bound_step(step_confirmation(
+                        &screen,
+                        &operation,
+                        target.as_ref(),
+                        text.as_deref(),
+                        "",
+                    ))?;
                     let step_daemon = daemon.clone().with_owner_press(&token);
+                    let refreshed = refresh_confirmed_step(
+                        &step_daemon,
+                        &screen,
+                        &operation,
+                        target.as_ref(),
+                        text.as_deref(),
+                    )
+                    .await;
+                    let (fresh, again) = match refreshed {
+                        Ok(value) if !task.cancelled() => value,
+                        result => {
+                            clear_approved_press(&token);
+                            let error = result
+                                .err()
+                                .map(|e| format!("{e:#}"))
+                                .unwrap_or_else(|| "task cancelled".into());
+                            task.push_step(json!({"action":operation,"target":target.as_ref().map(|t| &t.label),"confirmed":true,"ok":false,"error":error,"outcome":"not_sent"}));
+                            finish(
+                                task,
+                                daemon,
+                                &chat,
+                                request,
+                                if task.cancelled() {
+                                    Status::Cancelled
+                                } else {
+                                    Status::Blocked
+                                },
+                                Some(error),
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                    };
+                    screen = fresh;
+                    let target = again.and_then(|i| screen.targets.get(i)).cloned();
                     let step = execute(
                         task,
                         &step_daemon,
@@ -1294,6 +1397,9 @@ async fn execute(
     reason: Option<String>,
     confirmed: bool,
 ) -> Result<Option<Stop>> {
+    if task.cancelled() {
+        return Ok(Some((Status::Cancelled, None)));
+    }
     task.with(|s| {
         s.phase = "acting";
         s.planned_action = Some(json!({"action": operation, "target": target.as_ref().map(|t| t.label.clone())}));
@@ -1347,10 +1453,23 @@ async fn execute(
             let message = format!("{error:#}");
             step["ok"] = json!(false);
             step["error"] = json!(message);
+            if entry["action_outcome"] == "not_sent" {
+                step["outcome"] = json!("not_sent");
+            }
             entry["error"] = json!(message);
-            if uncertain_action_error(&message) {
-                Some((Status::Blocked, Some("the phone action outcome is unknown; verify the phone before retrying".into())))
-            } else { None }
+            if confirmed {
+                Some((Status::Blocked, Some(message)))
+            } else if uncertain_action_error(&message) {
+                Some((
+                    Status::Blocked,
+                    Some(
+                        "the phone action outcome is unknown; verify the phone before retrying"
+                            .into(),
+                    ),
+                ))
+            } else {
+                None
+            }
         }
     };
     if stop.is_none() {
@@ -1514,6 +1633,59 @@ async fn try_flow(task: &Arc<Task>, daemon: &DaemonClient, chat: &Chat, request:
     Ok(Some(if ok { FlowAttempt::Done } else { FlowAttempt::Continue }))
 }
 
+fn step_confirmation(
+    screen: &Screen,
+    operation: &str,
+    target: Option<&jev::Target>,
+    text: Option<&str>,
+    why: &str,
+) -> Value {
+    let control = if operation == "PRESS_RETURN" {
+        screen.return_control.clone()
+    } else {
+        target.map(|t| json!({"label":t.label,"identifier":t.identifier,"kind":t.kind}))
+    };
+    json!({"action":operation, "target":target.map(|t| &t.label), "reason":why,
+        "app":screen.app, "bundle":screen.bundle, "page_digest":screen.page_digest,
+        "control":control,
+        "parameters":{"operation":operation,"text":text}})
+}
+
+async fn refresh_confirmed_step(
+    daemon: &DaemonClient,
+    screen: &Screen,
+    operation: &str,
+    target: Option<&jev::Target>,
+    text: Option<&str>,
+) -> Result<(Screen, Option<usize>)> {
+    if operation == "PRESS_RETURN" && screen.return_control.is_none() {
+        bail!("焦点字段未知或不唯一，需重新确认");
+    }
+    let bundle = screen
+        .bundle
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("前台 bundle 未知，需重新确认"))?;
+    jev::act(daemon, json!({"type":"launch_app","bundle":bundle})).await?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let fresh = jev::read_screen(daemon).await?;
+    let mut matches = fresh.targets.iter().enumerate().filter(|(_, f)| {
+        target
+            .is_some_and(|t| f.label == t.label && f.kind == t.kind && f.identifier == t.identifier)
+    });
+    let again = matches.next().map(|(i, _)| i);
+    if target.is_some() && (again.is_none() || matches.next().is_some()) {
+        bail!("页面已变化，需重新确认：原控件消失或身份不唯一");
+    }
+    let fresh_target = again.and_then(|i| fresh.targets.get(i));
+    if step_confirmation(screen, operation, target, text, "")
+        != step_confirmation(&fresh, operation, fresh_target, text, "")
+    {
+        bail!("页面已变化，需重新确认");
+    }
+    Ok((fresh, again))
+}
+
 /// Wait for the person to allow a risky step. On the same phone, bring the
 /// app that started the task to the front so they see the question.
 async fn ask_person(
@@ -1523,6 +1695,8 @@ async fn ask_person(
     mut question: Value,
 ) -> bool {
     question["confirmation_id"] = json!(new_id());
+    let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+    question["expires_at_ms"] = json!(unix_ms() + CONFIRM_TIMEOUT.as_millis() as u64);
     let (sender, receiver) = tokio::sync::oneshot::channel();
     {
         let mut answer = task.answer.lock().unwrap_or_else(|e| e.into_inner());
@@ -1543,16 +1717,20 @@ async fn ask_person(
         let _ = jev::act(daemon, json!({"type": "launch_app", "bundle": bundle})).await;
     }
     let approved = matches!(
-        tokio::time::timeout(CONFIRM_TIMEOUT, receiver).await,
+        tokio::time::timeout_at(deadline, receiver).await,
         Ok(Ok(true))
     );
-    task.answer.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut answer = task.answer.lock().unwrap_or_else(|e| e.into_inner());
+    answer.take();
+    let approved = approved && !task.cancelled() && tokio::time::Instant::now() < deadline;
     task.with(|s| {
         s.confirm = None;
         if approved {
             s.status = Status::Running;
         } else if s.error.is_none() && !task.cancelled() {
-            s.error = Some("the owner did not allow the step (or did not answer within 5 minutes)".into());
+            s.error = Some(
+                "the owner did not allow the step (or did not answer within 10 minutes)".into(),
+            );
         }
     });
     approved
@@ -1640,6 +1818,55 @@ pub fn plain_summary(status: Status, steps: usize, error: Option<&str>) -> Strin
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn owner_wait_expires_at_ten_minutes_and_late_answer_is_closed() {
+        let task = Arc::new(Task {
+            state: Mutex::new(State {
+                id: "timeout-fixture".into(),
+                goal: "test".into(),
+                client_request_id: None,
+                request_fingerprint: String::new(),
+                status: Status::Running,
+                phase: "observing",
+                planned_action: None,
+                flow: None,
+                steps: vec![],
+                confirm: None,
+                summary: None,
+                error: None,
+                started_at_ms: unix_ms(),
+                started: Instant::now(),
+                finished_ms: None,
+                models_used: json!({}),
+            }),
+            cancel: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            cancel_signal: tokio::sync::Notify::new(),
+            answer: Mutex::new(None),
+        });
+        let waiting = task.clone();
+        let handle = tokio::spawn(async move {
+            ask_person(
+                &waiting,
+                &DaemonClient::new("http://127.0.0.1:1", None),
+                &TaskRequest::default(),
+                json!({"action":"CLICK"}),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(599)).await;
+        assert!(!handle.is_finished());
+        assert_eq!(task.with(|s| s.status), Status::NeedsConfirm);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!handle.await.unwrap());
+        assert!(task.answer.lock().unwrap().is_none());
+        assert!(task.with(|s| s.confirm.is_none()));
+        assert!(task
+            .with(|s| s.error.clone())
+            .unwrap()
+            .contains("10 minutes"));
+    }
     #[test]
     fn uncertain_action_requires_review_instead_of_replay() {
         assert!(uncertain_action_error(r#"the phone refused: {"error":"outcome_unknown","retry_safe":false}"#));
@@ -1693,6 +1920,41 @@ mod tests {
         let image = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP1sAAAAASUVORK5CYII=").unwrap();
         let text = chat.ask_one(&endpoint, "Reply exactly OK. Never call tools.", "Synthetic connection test with a one-pixel image.", Some(&image), 256).await.unwrap();
         assert_eq!(text.trim(), "OK");
+    }
+
+    #[test]
+    fn return_confirmation_binds_focus_instead_of_selected_button() {
+        let tree = json!({"elements":[
+            {"kind":"Button","label":"发送","identifier":"send"},
+            {"kind":"TextField","label":"消息","identifier":"message","focused":true},
+            {"kind":"TextField","label":"搜索","identifier":"search"}
+        ]});
+        let screen = jev::observe_screen(&tree);
+        let approved = step_confirmation(&screen, "PRESS_RETURN", screen.targets.first(), None, "");
+        assert_eq!(approved["control"], json!({"kind":"TextField","label":"消息","identifier":"message"}));
+        for change in ["switch", "unknown", "multiple", "duplicate"] {
+            let mut fresh = tree.clone();
+            match change {
+                "switch" => {
+                    fresh["elements"][1]["focused"] = json!(false);
+                    fresh["elements"][2]["focused"] = json!(true);
+                }
+                "unknown" => { fresh["elements"][1].as_object_mut().unwrap().remove("focused"); }
+                "multiple" => { fresh["elements"][2]["focused"] = json!(true); }
+                "duplicate" => {
+                    let mut duplicate = fresh["elements"][1].clone();
+                    duplicate["focused"] = json!(false);
+                    fresh["elements"].as_array_mut().unwrap().push(duplicate);
+                }
+                _ => unreachable!(),
+            }
+            let fresh = jev::observe_screen(&fresh);
+            if change != "switch" {
+                assert!(fresh.return_control.is_none(), "{change}");
+            }
+            assert_ne!(approved["control"], step_confirmation(&fresh, "PRESS_RETURN",
+                fresh.targets.first(), None, "")["control"], "{change}");
+        }
     }
 
     #[test]
@@ -1929,8 +2191,58 @@ pub fn owner_confirmation_fixture(
 pub fn answer_owner(id: &str, question: &Value, approve: bool) -> std::result::Result<(), &'static str> {
     let task = find(id).ok_or("not_found")?;
     let mut answer = task.answer.lock().unwrap_or_else(|e| e.into_inner());
-    if !task.with(|s| s.status == Status::NeedsConfirm && s.confirm.as_ref() == Some(question)) {
+    if task.cancelled()
+        || question["expires_at_ms"]
+            .as_u64()
+            .is_some_and(|end| unix_ms() >= end)
+        || !task.with(|s| s.status == Status::NeedsConfirm && s.confirm.as_ref() == Some(question))
+    {
         return Err("owner_confirmation_object_changed");
     }
     answer.take().ok_or("not_waiting")?.send(approve).map_err(|_| "not_waiting")
+}
+
+/// Server integration fixture; production cannot mint a signed-step capability externally.
+#[cfg(feature = "owner-confirm-test-hooks")]
+#[doc(hidden)]
+pub fn bound_step_fixture(question: Value) -> anyhow::Result<String> {
+    approve_bound_step(question)
+}
+
+#[cfg(test)]
+mod bound_capability_tests {
+    use super::*;
+    #[test]
+    fn signed_step_return_and_execution_are_bound_and_single_use() {
+        let object = json!({"bundle":"com.example.shop","page_digest":"approved","control":{"label":"付款","identifier":"pay","kind":"Button"},"parameters":{"operation":"CLICK","text":null}});
+        let token = approve_bound_step(object.clone()).unwrap();
+        assert!(!take_approved_press(Some(&token), "付款"));
+        assert!(!take_bound_return(
+            Some(&token),
+            &json!({"type":"launch_app","bundle":"com.example.other"})
+        ));
+        let launch = json!({"type":"launch_app","bundle":"com.example.shop"});
+        assert!(take_bound_return(Some(&token), &launch));
+        assert!(!take_bound_return(Some(&token), &launch));
+        assert!(take_bound_step(Some(&token), &object));
+        assert!(!take_bound_step(Some(&token), &object));
+        for field in ["bundle", "page_digest", "control", "parameters"] {
+            let token = approve_bound_step(object.clone()).unwrap();
+            let mut changed = object.clone();
+            changed[field] = json!("changed");
+            assert!(!take_bound_step(Some(&token), &changed));
+            assert!(!take_bound_step(Some(&token), &object));
+        }
+        let token = approve_bound_step(object.clone()).unwrap();
+        BOUND_PRESS
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.0 == token)
+            .unwrap()
+            .2 = Instant::now() - Duration::from_secs(1);
+        assert!(!take_bound_return(Some(&token), &launch));
+        assert!(!take_bound_step(Some(&token), &object));
+        assert!(approve_bound_step(json!({"bundle":null})).is_err());
+    }
 }

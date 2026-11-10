@@ -70,12 +70,12 @@ fn fake_daemon(phone: Arc<Phone>) -> String {
             ("GET", "/agent/status") => json!({"ok": true, "drivable": true, "backend": "direct"}),
             ("GET", "/agent/elements") => {
                 if *phone.paid.lock().unwrap() {
-                    json!({"snapshot": "s2", "elements": [
+                    json!({"snapshot": "s2", "foreground_bundle":"com.example.shop", "elements": [
                         {"kind": "Application", "label": "拼多多"},
                         {"kind": "StaticText", "label": "支付成功"}
                     ]})
                 } else {
-                    json!({"snapshot": "s1", "elements": [
+                    json!({"snapshot": "s1", "foreground_bundle":"com.example.shop", "elements": [
                         {"kind": "Application", "label": "拼多多"},
                         {"kind": "StaticText", "label": "凑单团价 ¥55.51"},
                         {"kind": "Button", "label": "确认支付 ¥55.51", "rect": [20, 800, 400, 50]}
@@ -374,4 +374,144 @@ async fn a_free_model_falls_through_the_gateways_free_list() {
     let first_good = asked.iter().position(|m| m == "good/model:free").unwrap();
     assert_eq!(&asked[..first_good], ["gone/model:free", "busy/model:free", "invalid/model:free"], "{asked:?}");
     assert!(asked[first_good..].iter().all(|m| m == "good/model:free"), "the one that answered is tried first afterwards: {asked:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_approval_revalidates_the_page_before_using_a_new_snapshot() {
+    let _serial = SERIAL.lock().await;
+    let flows = tempfile::tempdir().unwrap();
+    std::env::set_var("IPHONE_USE_FLOWS_DIR", flows.path());
+    for change in [
+        "none",
+        "return_bundle",
+        "bundle",
+        "unknown_bundle",
+        "gone",
+        "amount",
+        "identifier",
+        "app",
+        "deny",
+        "cancel",
+    ] {
+        let phone = Arc::new(Phone {
+            paid: Mutex::new(false),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let log = events.clone();
+        let changed_screen = changed.clone();
+        let daemon_phone = phone.clone();
+        let daemon_url = serve(move |method, path, body| {
+            let reply = match (method, path.split('?').next().unwrap_or("")) {
+                ("GET", "/agent/status") => json!({"ok":true,"drivable":true}),
+                ("GET", "/agent/elements") => {
+                    let fresh = changed_screen.load(std::sync::atomic::Ordering::SeqCst);
+                    let snapshot = if fresh { "fresh" } else { "old" };
+                    log.lock().unwrap().push(json!({"read":snapshot}));
+                    let mut rows = vec![
+                        json!({"kind":"Application","label":if fresh && change == "app" {"别的 App"} else {"拼多多"}}),
+                        json!({"kind":"StaticText","label":if fresh && change == "amount" {"¥999"} else {"¥55.51"}}),
+                    ];
+                    if !(fresh && change == "gone") {
+                        rows.push(json!({"kind":"Button","label":"确认支付 ¥55.51","identifier":if fresh && change == "identifier" {"new-order"} else {"order"}}));
+                    }
+                    json!({"snapshot":snapshot,"foreground_bundle":if fresh && change == "bundle" {Some("com.example.impostor")} else if fresh && change == "unknown_bundle" {None} else {Some("com.example.shop")},"elements":rows})
+                }
+                ("POST", "/agent/input") => {
+                    let action: Value = serde_json::from_str(body).unwrap();
+                    log.lock().unwrap().push(action.clone());
+                    if action["type"] == "tap" {
+                        *daemon_phone.paid.lock().unwrap() = true;
+                    }
+                    json!({"ok":true})
+                }
+                ("GET", "/agent/screenshot") => return (200, "PNG".into()),
+                ("POST", "/agent/owner") => json!({"ok":true}),
+                _ => return (404, "{}".into()),
+            };
+            (200, reply.to_string())
+        });
+        let model = fake_model(phone);
+        let mut req = request(&model);
+        if change == "return_bundle" {
+            req.return_bundle = Some("com.example.return".into());
+        }
+        let id = task::start(req, |owner| {
+            DaemonClient::new(daemon_url.clone(), None).with_owner(owner)
+        })
+        .ok()
+        .unwrap();
+        let waiting = wait_for(&id, "needs_confirm").await;
+        let question = &waiting["confirm"];
+        assert_eq!(
+            question["control"],
+            json!({"label":"确认支付 ¥55.51","identifier":"order","kind":"Button"})
+        );
+        assert_eq!(question["page_digest"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            question["parameters"],
+            json!({"operation":"CLICK","text":null})
+        );
+        let remaining = question["expires_at_ms"].as_u64().unwrap()
+            - waiting["started_at_ms"].as_u64().unwrap();
+        assert!((600_000..605_000).contains(&remaining));
+        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if change == "cancel" {
+            task::cancel(&id).unwrap();
+            assert!(task::answer_owner(&id, question, true).is_err());
+        } else {
+            task::answer_owner(&id, question, change != "deny").unwrap();
+        }
+        let end = wait_for(
+            &id,
+            if matches!(change, "none" | "return_bundle") {
+                "done"
+            } else if change == "cancel" {
+                "cancelled"
+            } else {
+                "blocked"
+            },
+        )
+        .await;
+        assert!(
+            task::answer_owner(&id, question, true).is_err(),
+            "old approval must never be reused"
+        );
+        let events = events.lock().unwrap();
+        let taps = events
+            .iter()
+            .filter(|e| e["type"] == "tap")
+            .collect::<Vec<_>>();
+        if matches!(change, "none" | "return_bundle") {
+            assert_eq!(taps.len(), 1);
+            assert_eq!(taps[0]["snapshot"], "fresh");
+            let launch = events
+                .iter()
+                .position(|e| e == &json!({"type":"launch_app","bundle":"com.example.shop"}))
+                .unwrap();
+            let read = events
+                .iter()
+                .position(|e| e == &json!({"read":"fresh"}))
+                .unwrap();
+            let tap = events.iter().position(|e| e["type"] == "tap").unwrap();
+            assert!(launch < read && read < tap, "{events:?}");
+        } else {
+            assert!(taps.is_empty(), "{change}: {events:?}");
+            if !matches!(change, "deny" | "cancel") {
+                assert!(
+                    end["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("页面已变化，需重新确认"),
+                    "{end}"
+                );
+                assert!(end["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["outcome"] == "not_sent"));
+            }
+        }
+    }
 }
