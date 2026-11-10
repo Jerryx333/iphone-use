@@ -437,7 +437,7 @@
 "操作" = "Action";
 "对象" = "On";
 "原因" = "Why";
-"允许只执行这一步一次。5 分钟内不回答，任务会停下。" = "Allow runs this one step once. Without an answer within 5 minutes, the task stops.";
+"允许只执行这一步一次。10 分钟内不回答，任务会停下。" = "Allow runs this one step once. Without an answer within 10 minutes, the task stops.";
 "允许这一步" = "Allow this step";
 "不允许" = "Don't allow";
 "让 agent 在这台 iPhone 上做事" = "Let the agent work on this iPhone";

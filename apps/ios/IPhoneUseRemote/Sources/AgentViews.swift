@@ -569,7 +569,7 @@ struct ConfirmStepSheet: View {
             }
             .padding(Theme.Space.m)
             .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
-            Text("允许只执行这一步一次。5 分钟内不回答，任务会停下。")
+            Text("允许只执行这一步一次。10 分钟内不回答，任务会停下。")
                 .font(.footnote).foregroundStyle(.secondary)
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")

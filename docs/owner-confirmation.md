@@ -6,7 +6,7 @@ HTTP 密码、agent token、Cookie 仅授权普通 API，不代表主人同意�
 
 公钥格式为 base64 X9.63 未压缩 P-256 点。首次 POST /owner/key 的 signature 是新钥对 `iphone-use-owner-key/v1\n` 加 base64 公钥的 DER ECDSA SHA-256 签名，以证明持有私钥。已绑定时，同一消息必须由旧钥签名，否则 409。GET /owner/key 返回绑定状态和 SHA-256 公钥指纹。状态保存为实例 state_dir 下的 owner-key.json（0600，原子替换）。生物识别变化导致旧钥不可用时，由能访问本地 state_dir 的主人手动恢复绑定。
 
-GET /owner/pending 返回普通入口最多 16 张及 gateway 独立入口最多 8 张待确认单。确认单出单后 10 分钟内可由主人允许或拒绝（2026-11-06 主人嫌两分钟太赶，#374）；任务引擎等待主人确认仍为 5 分钟（任务确认还未绑定交易页面内容，补上前不放宽），超时后迟到的批准不会放行；签名批准后的放行仍须在两分钟内消费一次。每单有随机 id、nonce、kind、规范化 JSON 的 SHA-256 digest、daemon 生成的摘要、创建/过期时间和对象绑定。调用方标签仅以截断后 JSON 引号内的引用出现。批准需 POST /owner/confirm/<id>：
+GET /owner/pending 返回普通入口最多 16 张及 gateway 独立入口最多 8 张待确认单。确认单出单后 10 分钟内可由主人允许或拒绝（2026-11-06 主人嫌两分钟太赶，#374）；任务引擎与任务确认单共用出题时确定的 10 分钟绝对截止时间，超时后迟到的批准不会放行；签名批准后的放行仍须在两分钟内消费一次。每单有随机 id、nonce、kind、规范化 JSON 的 SHA-256 digest、daemon 生成的摘要、创建/过期时间和对象绑定。调用方标签仅以截断后 JSON 引号内的引用出现。批准需 POST /owner/confirm/<id>：
 
 ```json
 {"approve":true,"signature":"base64 DER signature"}
@@ -26,7 +26,7 @@ Swift 使用 SecKeyCreateSignature(.ecdsaSignatureMessageX962SHA256)，daemon �
 
 流程 grant 绑定 daemon 读出的保存流程及其输入，另绑定确切回放请求。未获主人签名的流程逐步执行敏感守卫；命中敏感步骤时返回 owner_confirm_id。主人确认过的流程对象摘要保存于 owner-approved-flows.json；更改内容或输入会产生不同摘要。既有 sensitive_guard::installed_flow_grants_are_bound_and_single_use 测试增加主人签名准备步骤，原有成功、过期、内容不符和一次性断言保持不变。
 
-任务进入 needs_confirm 时创建带任务 id、当前操作及独立确认序号的确认单。agent 的 approve:true 始终返回 403。手机签名确认后 daemon 核对任务仍在等待同一问题，再在任务答案锁内核对当前问题并调用 answer_owner；confirm:"never" 不生成确认单，保留既有行为。任务放行只校验进程内令牌及有效期，不比对标签（标签仅供日志）；令牌仅附在任务当前步骤的 DaemonClient 上，步骤结束清除且只能消费一次。无令牌或错令牌不能按标签获得权限。
+任务进入 needs_confirm 时创建带任务 id、当前操作及独立确认序号的确认单。逐步任务另绑定作决定时的前台 App、整屏按树顺序 (kind,label,value) 的 SHA-256 页面摘要（不含 rect）、控件身份（label、identifier、kind）和实际操作参数；详情仅显示页面摘要前八位。批准后无论是否提供 return_bundle，先生成绑定这些内容的一次性放行能力（其中只许一次精确返回原 bundle 的恢复权限），凭它打开作决定时的 App、等待稳定、重新读屏并找到同一控件，再比对全部绑定，通过后才在 daemon 最终派发时核验并消费，使用新快照执行。控件消失、身份不唯一、页面或 App 变化时不执行，记录 not_sent 并停在 blocked，提示「页面已变化，需重新确认」；执行失败也停在 blocked，不交给 assist 继续寻找。agent 的 approve:true 始终返回 403。手机签名确认后 daemon 核对任务仍在等待同一问题，再在任务答案锁内核对当前问题并调用 answer_owner；confirm:"never" 不生成确认单，保留既有行为。签名任务放行校验进程内令牌、有效期及全部执行绑定；confirm:"never" 的旧许可中标签仍仅供日志；令牌仅附在任务当前步骤的 DaemonClient 上，步骤结束清除且只能消费一次。无令牌或错令牌不能按标签获得权限。
 
 /control 在请求级和执行前检查敏感动作。确认能力绑定除 issued_at_ms/ttl_ms 外的完整控制消息、守卫实际读到的控件身份（label、identifier、rect）、整屏按树顺序排列的 (kind, label, value) 的 SHA-256 页面摘要（不含 rect），以及 daemon 已知的近期前台 bundle（未知绑定 null）。执行前重新解析；身份或前台变化，包括未知与已知互变，都需要重新确认。被拦后清除树缓存并重新读取；金额、收款方、订单号等任意页面文字变化均使旧批准不匹配，重新出单。详情显示「页面内容摘要」前八位。签名后两分钟内可消费一次。重发时执行字段必须保持一致，issued_at_ms/ttl_ms 可变化；服务器 freshness 仍按收到请求后的单调时钟检查。intent 忽略 operator_confirmed；operator 类型能力绑定 name + args，同样只能消费一次。
 
@@ -84,3 +84,20 @@ daemon 的 bundle 保护保持独立于敏感许可。已核实 setup 托管恢�
 敏感动作返回 `owner_confirm_required` 和 `owner_confirm_id`；请主人在手机 Self Runner 刷脸允许后，两分钟内原样重发同一命令。重发仍在出队后的闸内重新读屏判定并消费一次批准。完整 action/args、身份、页面或前台变化须重新确认。使用独立 `gateway_press` 能力池，待确认及已批准未消费合计最多 8 张，不占用 /control、任务、流程的 16 张配额。入口同一时刻只处理一个请求，多余直接返回 429 `guard_busy`。任务 confirm:"never" 和保存流程许可不变。
 
 残余窗口仅为「daemon 判定读屏 → 手机执行」，与 daemon `/control` 的读屏→执行同级；不包含队列等待。gateway 给已判定 tap 强制设置内部 `gateway_guarded` 标志，手机遇遮挡立即返回 `occluded`，不再等待、自动上滑或重新定位。`expect_label/expect_identifier` 仍是执行后等待条件。手机本地 `snapshot_id` 无法由 daemon 解析，带该字段的写请求失败关闭。威胁模型不包含本机任意 shell 直接连接 runner 转发端口。
+
+## 任务批准后执行绑定（第二轮修复）
+
+逐步确认另绑定 `/agent/elements` 返回的 `foreground_bundle`：它来自 daemon 实际查询的前台 bundle，不从 Application 行显示名推断。无法确定唯一前台 bundle 时任务阻断，不点按。原 App 始终按 bundle 返回；同显示名、同树但 bundle 不同也不接受旧批准。
+
+签名步骤使用独立进程内能力，绑定原页面整树有序 `(kind,label,value)` SHA-256（缺失 value 规范为 `""`，不含 rect）、bundle、控件 label/identifier/kind 及实际操作。该能力不在请求级敏感检查消费；daemon 持执行锁，在动作最终解析出的完整新树上重新核验并一次性消费。禁止缓存树复用、宽松 snapshot rebind 和自动滚动揭露后点击。页面、bundle、身份或动作不符均返回 not_sent，任务停在 blocked。该路径也不自动解锁，避免核验前发送额外变更。`confirm:"never"` 保持原令牌与守卫行为。
+
+同一次签名另含两分钟内一次性的恢复权限，只接受精确 `launch_app {bundle: 原 bundle}`，不可 fresh 启动、不可换 App、不可打开受保护 bundle。恢复消费不消费最终步骤能力。Self Runner 手机端在提交已签名任务批准时同步准备同 bundle 的一次返回许可，提交失败或断线清除；内嵌 RunnerCore 只在 launch 路由消费该许可，其他输入继续保护。daemon 同时要求任务专有能力，普通 agent 没有该能力仍返回 owner_app_protected。前述“不为 agent 增加恢复豁免”在此收窄为“不为普通 agent 增加豁免”，签名任务有上述限定恢复路径。
+
+
+## 任务 Return 与 Focus（第三轮修复）
+
+`PRESS_RETURN` 的批准对象绑定作决定时实际唯一焦点输入字段的身份 `(label, identifier, kind)`，而非模型选中的按钮或任意控件。焦点从完整元素树提取，不受候选控件去重或数量上限影响。焦点未知、多个焦点、身份不唯一或 `control` 为 null 时失败关闭。恢复原 App 后重新读屏及 daemon 最终执行核验均要求唯一焦点字段身份仍与批准对象相同；即使页面 `(kind,label,value)` 摘要不变，焦点切换也不发送 Return。
+
+带 bound token 的 `/agent/input` 请求一律跳过 Focus 辅助流程，包含限定的恢复 App 请求；不会在主人 App 保护和最终核验前为勿扰模式发送 `open_url` 或 Home。原有精确 bundle 的一次恢复权限保持不变。
+
+残余窗口：daemon 最终核验到手机实际点击或发送 Return 之间，页面和焦点仍可能变化；手机端执行时核验不在本单范围。
