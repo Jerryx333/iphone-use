@@ -19,6 +19,12 @@ struct OwnerMutationProtection {
     }
   }
 
+  func checkReturn(bundle: String) throws {
+    if blocksInput?(["bundle_id": bundle, "owner_return": true]) == true {
+      throw RunnerError(status: 403, code: "owner_app_protected", message: "owner_app_protected")
+    }
+  }
+
   static func sessionBundle(_ body: [String: Any]) -> String? {
     let capabilities = body["capabilities"] as? [String: Any]
     let always = capabilities?["alwaysMatch"] as? [String: Any] ?? [:]

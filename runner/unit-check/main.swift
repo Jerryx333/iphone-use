@@ -70,6 +70,26 @@ do {
   expectThrows("owner_app_protected", "input and keep-awake blocked after UI appears") {
     try guardInput.check()
   }
+  var returnBundle: String? = "approved.app"
+  guardInput.blocksInput = { args in
+    if args["owner_return"] as? Bool == true, args["bundle_id"] as? String == returnBundle,
+       returnBundle != nil {
+      returnBundle = nil
+      return false
+    }
+    return true
+  }
+  expectThrows("owner_app_protected", "return cannot change approved bundle") {
+    try guardInput.checkReturn(bundle: "other")
+  }
+  do { try guardInput.checkReturn(bundle: "approved.app") }
+  catch { check(false, "signed return reaches approved bundle") }
+  expectThrows("owner_app_protected", "return is single use") {
+    try guardInput.checkReturn(bundle: "approved.app")
+  }
+  expectThrows("owner_app_protected", "return allowance never admits ordinary input") {
+    try guardInput.check()
+  }
   do { try OwnerMutationProtection().check() }
   catch { check(false, "ordinary XCTest host remains unchanged") }
 }

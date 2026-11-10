@@ -25,6 +25,7 @@ final class RunnerCore: NSObject {
   var onShutdown: (() -> Void)?
   var onListenFailure: ((Error) -> Void)?
   /// Installed only by the Self Runner host; runs on main before remote mutations.
+  var ownerReturnBundle: String?
   var ownerProtection = OwnerMutationProtection() {
     didSet {
       keepAwake.inputBlocked = { [weak self] in
@@ -248,10 +249,19 @@ final class RunnerCore: NSObject {
   }
 
   func handleOnMain(_ request: HTTPRequest) -> HTTPResponse {
+    ownerReturnBundle = nil
+    defer { ownerReturnBundle = nil }
     if request.method != "GET", Self.mayChangeScreen(request.path) {
       let body = (try? request.jsonObject()) ?? [:]
       do {
-        try ownerProtection.check(bundle: (body["bundleId"] ?? body["bundle"] ?? body["bundle_id"]) as? String)
+        let bundle = (body["bundleId"] ?? body["bundle"] ?? body["bundle_id"]) as? String
+        if request.path.hasSuffix("/wda/apps/launch"), let bundle {
+          // The host consumes its own signed, bundle-bound return allowance.
+          try ownerProtection.checkReturn(bundle: bundle)
+          ownerReturnBundle = bundle
+        } else {
+          try ownerProtection.check(bundle: bundle)
+        }
       } catch { return .from(error) }
     }
     let started = Date()

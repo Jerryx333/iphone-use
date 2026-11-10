@@ -1261,7 +1261,7 @@ extension RunnerCore {
   }
 
   func activate(_ bundle: String) throws -> Int32 {
-    try ownerProtection.check(bundle: bundle)
+    if ownerReturnBundle != bundle { try ownerProtection.check(bundle: bundle) }
     let application = XCUIApplication(bundleIdentifier: bundle)
     let issuesBefore = recordedIssues.count
     var exception: String?

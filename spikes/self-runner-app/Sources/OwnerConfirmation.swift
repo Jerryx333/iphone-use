@@ -13,6 +13,11 @@ struct OwnerSheet: Decodable, Identifiable {
     let details: [String]
     let nonce: String
     let digest: String
+    struct ConfirmationObject: Decodable {
+        struct Operation: Decodable { let bundle: String? }
+        let operation: Operation?
+    }
+    let object: ConfirmationObject?
     let expires_at_ms: UInt64
     var message: Data { Data("iphone-use-owner-confirm/v1\n\(id)\n\(nonce)\n\(digest)\n\(kind)".utf8) }
 }
@@ -21,10 +26,19 @@ struct OwnerSheet: Decodable, Identifiable {
 // It is deliberately separate from XCTest readiness and the local self-test controls.
 enum OwnerUIProtection {
     static var presented = false
+    static var returnBundle: String?
+    static var returnUntil: TimeInterval = 0
+    static func clearReturn() { returnBundle = nil; returnUntil = 0 }
     static func blocks(action: String, args: [String: Any], foregroundPID: Int32?) -> Bool {
-        guard ["tap", "type", "swipe", "press", "launch", "open_url", "unlock"].contains(action) else { return false }
+        guard ["tap", "type", "swipe", "press", "launch", "open_url", "unlock", "owner_return"].contains(action) else { return false }
         var blocked = false
         let check = {
+            if action == "owner_return",
+               let bundle = args["bundle_id"] as? String,
+               bundle == returnBundle, ProcessInfo.processInfo.systemUptime < returnUntil {
+                clearReturn()
+                return
+            }
             blocked = presented && (UIApplication.shared.applicationState != .background
                 || args["bundle_id"] as? String == Bundle.main.bundleIdentifier
                 || foregroundPID == getpid())
@@ -37,7 +51,7 @@ enum OwnerUIProtection {
 @objc(SelfRunnerOwnerProtection)
 final class SelfRunnerOwnerProtection: NSObject {
     @objc(blocksInput:) static func blocksInput(_ args: NSDictionary) -> NSNumber {
-        NSNumber(value: OwnerUIProtection.blocks(action: "tap", args: args as? [String: Any] ?? [:], foregroundPID: (args["pid"] as? NSNumber)?.int32Value))
+        NSNumber(value: OwnerUIProtection.blocks(action: args["owner_return"] as? Bool == true ? "owner_return" : "tap", args: args as? [String: Any] ?? [:], foregroundPID: (args["pid"] as? NSNumber)?.int32Value))
     }
 }
 
@@ -141,6 +155,7 @@ final class OwnerConfirmationModel: NSObject, ObservableObject, UNUserNotificati
         link.ownerDisconnected = { [weak self] in
             guard let self else { return }
             self.epoch += 1; self.pending = []; self.seen = []
+            OwnerUIProtection.clearReturn()
             self.bound = nil; self.daemonFingerprint = ""
             self.removeNotifications()
         }
@@ -246,8 +261,20 @@ final class OwnerConfirmationModel: NSObject, ObservableObject, UNUserNotificati
                 guard epoch == self.epoch else { throw RemoteLink.OwnerLinkError.code("owner_connection_changed") }
                 body["signature"] = signed.signature
             }
+            // Arm locally before submitting: daemon still requires the matching
+            // signed task token, so an ordinary agent cannot use this window.
+            if approve, sheet.kind == "task_press", let bundle = sheet.object?.operation?.bundle,
+               bundle != Bundle.main.bundleIdentifier {
+                OwnerUIProtection.returnBundle = bundle
+                OwnerUIProtection.returnUntil = ProcessInfo.processInfo.systemUptime + 120
+            }
             // Never replay or automatically retry this request, including an unknown outcome.
-            _ = try await self.request("POST", "/owner/confirm/\(sheet.id)", body: body)
+            do {
+                _ = try await self.request("POST", "/owner/confirm/\(sheet.id)", body: body)
+            } catch {
+                OwnerUIProtection.clearReturn()
+                throw error
+            }
             self.message = approve ? "已提交主人签名。" : "已拒绝。"
             self.receive(try await self.request("GET", "/owner/pending"))
         }
