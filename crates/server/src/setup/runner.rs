@@ -530,6 +530,17 @@ pub fn log_shows_automation_revoked(path: &Path, from: u64) -> bool {
     read_log_since(path, from).contains("Not authorized for performing UI testing actions")
 }
 
+/// The test process ended under iOS without the person: xcodebuild's
+/// "Restarting after unexpected exit, crash, or test timeout" (#413: a
+/// watchdog kill on a heavy accessibility tree), logged after `from`.
+/// xcodebuild restarts the test in the same launch, so only the last restart
+/// counts, and only when the runner did not serve again after it.
+pub fn log_shows_runner_crash(path: &Path, from: u64) -> bool {
+    let log = read_log_since(path, from);
+    log.rfind("Restarting after unexpected exit, crash, or test timeout")
+        .is_some_and(|at| !log[at..].contains("ServerURLHere->"))
+}
+
 fn read_log_since(path: &Path, from: u64) -> String {
     use std::io::{Read as _, Seek as _};
     let Ok(mut file) = std::fs::File::open(path) else { return String::new(); };
@@ -544,6 +555,42 @@ fn read_log_since(path: &Path, from: u64) -> String {
 /// The log's current length, the `from` for [`log_shows_automation_revoked`].
 pub fn log_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The phone has no room for the runner app: MobileInstallation's
+/// `Insufficient storage. Requires N bytes; only M bytes available` (#402,
+/// a phone whose System Data filled the disk). The product is fine; only
+/// space on the phone fixes it, so this is checked before the product
+/// failure that would evict it and rebuild every round.
+pub fn log_shows_storage_full(path: &Path) -> bool {
+    storage_full_line(&read_log(path)).is_some()
+}
+
+fn storage_full_line(text: &str) -> Option<&str> {
+    text.lines().find(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("insufficient storage") || lower.contains("not enough storage")
+    })
+}
+
+/// (bytes required, bytes available) from that line, when it names them.
+pub fn storage_full_bytes(path: &Path) -> (Option<u64>, Option<u64>) {
+    let text = read_log(path);
+    let Some(line) = storage_full_line(&text) else { return (None, None) };
+    let lower = line.to_lowercase();
+    let required = lower.find("requires ").and_then(|at| {
+        let digits: String = lower[at + "requires ".len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    });
+    let available = lower.find(" bytes available").and_then(|at| {
+        let head = &lower[..at];
+        let start = head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        head[start..].parse().ok()
+    });
+    (required, available)
 }
 
 /// A failure of the product itself (install/launch/signing), the only kind
@@ -1366,6 +1413,23 @@ mod tests {
     }
 
     #[test]
+    fn a_full_phone_is_told_apart_from_a_broken_product() {
+        let full = log("2026-11-05 11:02:03.1+0800 xcodebuild[1:2] Failed to install the app on the device. (MIInstallerErrorDomain error 4: Insufficient storage. Requires 52887552 bytes; only 756000 bytes available.)\n");
+        assert!(log_shows_storage_full(full.path()));
+        // Still a product-level failure by the old test, which is why the
+        // storage check has to come first.
+        assert!(log_shows_product_failure(full.path()));
+        assert_eq!(storage_full_bytes(full.path()), (Some(52_887_552), Some(756_000)));
+        let bare = log("Error: Not enough storage is available on the device\n");
+        assert!(log_shows_storage_full(bare.path()));
+        assert_eq!(storage_full_bytes(bare.path()), (None, None));
+        let broken = log("Failed to install the app on the device. (0xe8008001)\n");
+        assert!(!log_shows_storage_full(broken.path()));
+        // A full Mac disk is not the phone's storage.
+        assert!(!log_shows_storage_full(log("error: No space left on device\n").path()));
+    }
+
+    #[test]
     fn runner_launch_turns_diagnostics_off_only_when_xcodebuild_has_the_flag() {
         assert!(supports_no_test_diagnostics("    -collect-test-diagnostics on-failure|never   Whether or not testing collects"));
         assert!(!supports_no_test_diagnostics("usage: xcodebuild [-project <projectname>]"));
@@ -1388,6 +1452,26 @@ mod tests {
     }
 
     #[test]
+    fn a_watchdog_restart_in_the_current_window_reads_as_a_crash() {
+        // #413: the runner vanished between two polls; xcodebuild says why.
+        let old = "13:32:21.098  ipu-runner: GET /wda/locked -> 200 (1.2 ms)\n";
+        let crash = "Restarting after unexpected exit, crash, or test timeout; summary will include totals from previous launches.\n";
+        let file = log(&format!("{crash}{old}"));
+        let mark = (crash.len() + old.len()) as u64;
+        assert!(log_shows_runner_crash(file.path(), 0));
+        assert!(!log_shows_runner_crash(file.path(), mark));
+        std::fs::write(file.path(), format!("{crash}{old}{crash}")).unwrap();
+        assert!(log_shows_runner_crash(file.path(), mark));
+        assert!(!log_shows_automation_revoked(file.path(), mark));
+        // A restart the runner came back from is not why it ended later.
+        let served = "ServerURLHere->http://10.0.0.2:8100<-ServerURLHere\n";
+        std::fs::write(file.path(), format!("{crash}{old}{crash}{served}")).unwrap();
+        assert!(!log_shows_runner_crash(file.path(), mark));
+        std::fs::write(file.path(), format!("{crash}{old}{crash}{served}{crash}")).unwrap();
+        assert!(log_shows_runner_crash(file.path(), mark));
+    }
+
+    #[test]
     fn the_cache_key_carries_the_embed_library_hash() {
         let ctx = crate::setup::ctx::tests_support::ctx();
         let key = |embed: &str| cache_key(&ctx, "src", "b", "t", "u", "16", "18.0", "", embed);
@@ -1397,7 +1481,7 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             super::super::embed::EmbedLib {
                 path: path.clone(),
-                sha256: format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes)),
+                sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)),
             }
         };
         let component = super::super::embed::cache_component;

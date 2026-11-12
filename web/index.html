@@ -3,7 +3,7 @@
   iphone-use — remote-control web client  (web/index.html)
   ==========================================================
   Served at /phone (auth-gated).
-  WebDriverAgent only: H.264 via WebCodecs (/agent/h264) when the browser can
+  Runner only: H.264 via WebCodecs (/agent/h264) when the browser can
   decode it, else MJPEG (/agent/mjpeg); /agent/screenshot stills as fallback
   + cookie-authenticated POST /control (one JSON action per gesture, ACKed)
   Touch: Pointer Events → normalized [0,1] content-rect coords
@@ -1195,7 +1195,7 @@
 
 <script>
 /* ================================================================
-   iphone-use — WebDriverAgent client
+   iphone-use — runner client
    Contract legend:
      [TOUCH] Pointer Events  [iOS] Safari notes  [v1] parity affordance
    ================================================================ */
@@ -1372,6 +1372,8 @@ const I18N_EN = {
   'iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了': 'iOS 15 and 16 need no update, but they need an App Store Connect API key from a paid developer account (IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID); set it and run iphone-use setup again. iOS 14 and earlier can only be fixed by updating the phone. A new cable, retrying or reconnecting won’t help',
   '请重启一次 iPhone': 'Restart the iPhone once',
   'iPhone 上残留了旧的开发者磁盘映像，开发者服务起不来；重启手机、解锁并保持插线后会自动接着连接': 'An old developer disk image is left on the iPhone, so developer services cannot start; restart the phone, unlock it and keep it plugged in, and it connects automatically',
+  'iPhone 存储空间不足': 'The iPhone is out of storage',
+  '手机没有空间安装设备服务；在 设置 › 通用 › iPhone 储存空间 里清出空间（重启一次 iPhone 也能收回部分「系统数据」），之后每隔几分钟会自动再试': 'There is no room on the phone to install the device runner; free space under Settings › General › iPhone Storage (restarting the iPhone also gives back some System Data); it retries on its own every few minutes',
   '请用数据线连接 iPhone': 'Connect the iPhone with a cable',
   '这台 iOS 15/16 的 iPhone 没插线，这台 Mac 也连不到它的 Wi-Fi；插一次线并保持解锁，大约 20 秒连上；之后只要手机和这台 Mac 在同一网络就可以拔线（状态里 unplug_ok 为 true 时）': 'This iOS 15/16 iPhone is not plugged in and this Mac cannot reach it over Wi-Fi; plug it in once and keep it unlocked, and it connects in about 20 seconds. After that you can unplug it as long as the phone and this Mac are on the same network (when unplug_ok is true in the status)',
   'Xcode 版本太旧': 'Xcode is too old',
@@ -1426,7 +1428,7 @@ const I18N_EN = {
   '会锁屏 · 自动解锁': 'Will lock · auto-unlock',
   '{tag}：{text}': '{tag}: {text}',
   '锁屏提示：{tag}': 'Lock screen notice: {tag}',
-  '设备实时画面暂不可用 — 每 2.5 秒刷新，仍可点按操作': 'Live screen unavailable — refreshing every 2.5 s; you can still tap',
+  '设备实时画面暂不可用 — 每 {secs} 秒刷新，仍可点按操作': 'Live screen unavailable — refreshing every {secs} s; you can still tap',
   '设备实时画面正在连接…': 'Connecting the live screen…',
   '正在获取设备状态…': 'Getting device status…',
   '正在重新连接设备…': 'Reconnecting the device…',
@@ -1727,6 +1729,22 @@ const DIRECT_CONTROL_MAX_QUEUE = 4;
 const DIRECT_CONTROL_MAX_AGE_MS = 2000;
 const RECONNECT_REQUEST_TIMEOUT_MS = 15000;
 const RECONNECT_COOLDOWN_MS = 3000;
+// Who this browser is to the daemon's owner lease (X-Phone-Owner, see
+// crates/server/src/http.rs claim_phone_owner): one id per browser profile,
+// generated once, so this page's taps renew its own lease like the iOS app's
+// ("ios-remote") do, and the owner badge knows when the holder is this page.
+// The daemon accepts 1–64 printable ASCII characters without quotes.
+const WEB_OWNER = (() => {
+  const KEY = 'iphone_use_owner';
+  const fresh = () => 'web-' + Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, '0')).join('');
+  try {
+    const stored = localStorage.getItem(KEY);
+    if (/^web-[0-9a-f]{12}$/.test(stored || '')) return stored;
+    const id = fresh();
+    localStorage.setItem(KEY, id);
+    return id;
+  } catch { return fresh(); }
+})();
 
 /* ── DOM refs ─────────────────────────────────────────────────── */
 const videoArea      = document.getElementById('videoArea');
@@ -1991,6 +2009,8 @@ function setupBlockerCopy(blockedOn) {
       return [t('这台 Mac 还驱动不了这台 iPhone 的系统'), t('iOS 15 和 16 不用升级，但需要付费开发者账号的 App Store Connect API 密钥（IPU_RUNNER_ASC_KEY_PATH / IPU_RUNNER_ASC_KEY_ID / IPU_RUNNER_ASC_ISSUER_ID），配好后重新运行 iphone-use setup；iOS 14 及更早的系统只能升级手机；换线、重试和重连都解决不了')];
     case 'ddi_needs_reboot':
       return [t('请重启一次 iPhone'), t('iPhone 上残留了旧的开发者磁盘映像，开发者服务起不来；重启手机、解锁并保持插线后会自动接着连接')];
+    case 'phone_storage_full':
+      return [t('iPhone 存储空间不足'), t('手机没有空间安装设备服务；在 设置 › 通用 › iPhone 储存空间 里清出空间（重启一次 iPhone 也能收回部分「系统数据」），之后每隔几分钟会自动再试')];
     case 'legacy_needs_usb':
       return [t('请用数据线连接 iPhone'), t('这台 iOS 15/16 的 iPhone 没插线，这台 Mac 也连不到它的 Wi-Fi；插一次线并保持解锁，大约 20 秒连上；之后只要手机和这台 Mac 在同一网络就可以拔线（状态里 unplug_ok 为 true 时）')];
     case 'xcode_too_old':
@@ -2011,7 +2031,7 @@ function setupBlockerCopy(blockedOn) {
    managedSetupWillRetry for the same reason, and neither is
    `wifi_automation_refused`: inspect the tunnel or try USB recovery; its backoff is long. */
 const ACTIONABLE_SETUP_BLOCKERS = new Set(
-  ['locked', 'needs_passcode_on_phone', 'locked_after_restart', 'trust', 'automation_mode_disabled', 'automation_not_allowed', 'wifi_automation_refused', 'not_connected', 'usb', 'ddi', 'warp', 'proxy', 'xcode_too_old', 'ios_too_old', 'ddi_needs_reboot', 'legacy_needs_usb'],
+  ['locked', 'needs_passcode_on_phone', 'locked_after_restart', 'trust', 'automation_mode_disabled', 'automation_not_allowed', 'wifi_automation_refused', 'not_connected', 'usb', 'ddi', 'warp', 'proxy', 'xcode_too_old', 'ios_too_old', 'ddi_needs_reboot', 'phone_storage_full', 'legacy_needs_usb'],
 );
 /* The managed retry loop alternates between building and its backoff, and it
    publishes the blocker only during the backoff. Reading each poll on its own
@@ -2351,7 +2371,7 @@ function syncDeviceIdentity(status) {
 }
 
 /* ── Device status ───────────────────────────────────────────────
-   The phone is served only over WebDriverAgent: H.264 or MJPEG (with
+   The phone is served only over the runner: H.264 or MJPEG (with
    screenshot stills as fallback) for video and cookie-authenticated POST /control for
    input, each gesture explicitly acknowledged. */
 const STATUS_REQUEST_TIMEOUT_MS = 8000;
@@ -2528,9 +2548,17 @@ const h264Frame = document.getElementById('h264Frame');
 const MJPEG_RETRY_BASE_MS = 5000;
 const MJPEG_RETRY_MAX_MS = 30000;
 const MJPEG_FRAME_FRESH_MS = 8000;
-// Screenshot fallback refreshes every 2.5s. Three missed refreshes are enough
-// to treat its retained image as historical rather than safe control context.
+// Screenshot fallback refreshes every STILL_POLL_MS (2.5 s, or 0.4 s behind a
+// buffered tunnel). 8 s without a refresh is enough to treat its retained
+// image as historical rather than safe control context.
 const STILL_FRAME_FRESH_MS = 8000;
+// Cloudflare quick tunnels (*.trycloudflare.com) hold a streamed response
+// until it ends, so the H.264/MJPEG stream never arrives there: skip it and
+// poll stills quickly instead (see crates/server/src/remote.rs).
+const STREAMS_BUFFERED = /\.trycloudflare\.com$/i.test(location.hostname);
+const STILL_POLL_MS = STREAMS_BUFFERED ? 400 : 2500;
+// The interval as people read it ("2.5" / "0.4"), for the metrics and overlay.
+const STILL_POLL_SECS = String(STILL_POLL_MS / 1000);
 const STILL_REQUEST_TIMEOUT_MS = 7000;
 let directFeedActive = false;
 let stillsTimer = null, stillsStartTimer = null;
@@ -2692,7 +2720,8 @@ async function fetchStill(generation = stillsGeneration) {
   stillsAbortController = controller;
   const timeout = setTimeout(() => controller.abort(), STILL_REQUEST_TIMEOUT_MS);
   try {
-    const r = await fetch(BASE + '/agent/screenshot?t=' + Date.now(), {
+    const size = STREAMS_BUFFERED ? '&max_side=800' : '';
+    const r = await fetch(BASE + '/agent/screenshot?t=' + Date.now() + size, {
       cache: 'no-store',
       signal: controller.signal,
     });
@@ -2717,7 +2746,7 @@ async function fetchStill(generation = stillsGeneration) {
       stillFrame.onload = () => setScreenAspect(stillFrame.naturalWidth, stillFrame.naturalHeight);
       stillFrame.src = next;
       if (!mjpegLive) stillFrame.classList.add('active');
-      olSub.textContent = t('设备实时画面暂不可用 — 每 2.5 秒刷新，仍可点按操作');
+      olSub.textContent = t('设备实时画面暂不可用 — 每 {secs} 秒刷新，仍可点按操作', { secs: STILL_POLL_SECS });
       syncDirectFrameFreshness();
     }
   } catch (_) {
@@ -2739,7 +2768,7 @@ function startSnapshotFallback(generation) {
   ) return;
   if (!stillsTimer) {
     void fetchStill(generation);
-    stillsTimer = setInterval(() => void fetchStill(generation), 2500);
+    stillsTimer = setInterval(() => void fetchStill(generation), STILL_POLL_MS);
   }
 }
 function stopSnapshotPolling() {
@@ -3069,6 +3098,10 @@ function startMjpegAttempt(generation) {
     !directFeedActive ||
     backendStatus?.mode !== 'agent'
   ) return;
+  if (STREAMS_BUFFERED) {
+    startSnapshotFallback(generation);
+    return;
+  }
   clearMjpegAttempt();
   stopH264Stream();
   mjpegFrame.classList.remove('active');
@@ -3257,6 +3290,9 @@ window.addEventListener('pagehide', () => {
   cancelStatusPoll();
   setDirectControlReady(false);
   stopStills();
+  // The lease this page took with its taps is not released here: /agent/owner
+  // is a bearer-only route and the page holds a cookie. It lapses on its own
+  // (300 s), the same as the iOS app's lease.
 });
 window.addEventListener('pageshow', () => {
   if (document.visibilityState === 'visible') {
@@ -3463,6 +3499,7 @@ function sendDirectControl(obj) {
         headers: {
           'Content-Type': 'application/json',
           'X-Phone-Control': '1',
+          'X-Phone-Owner': WEB_OWNER,
         },
         body: JSON.stringify({
           ...obj,
@@ -5270,6 +5307,7 @@ flowRun.addEventListener('click', async () => {
       headers: {
         'Content-Type': 'application/json',
         'X-Phone-Control': '1',
+        'X-Phone-Owner': WEB_OWNER,
       },
       body: JSON.stringify({
         steps: batchSteps,
@@ -5993,7 +6031,9 @@ function noteOwnerRefusal(result) {
   syncOwnerBadge({ owner: lastOwnerRefusal.owner, owner_lease_remaining_secs: lastOwnerRefusal.owner_lease_remaining_secs });
 }
 function syncOwnerBadge(status) {
-  const owner = typeof status?.owner === 'string' ? status.owner.trim() : '';
+  let owner = typeof status?.owner === 'string' ? status.owner.trim() : '';
+  // This page's own lease (its taps renew it) is not another session.
+  if (owner === WEB_OWNER) owner = '';
   ownerBadge.hidden = !owner;
   if (!owner) return;
   const left = Number(status.owner_lease_remaining_secs);
@@ -6052,7 +6092,7 @@ function renderMetrics() {
   } else if (mjpegFrame.classList.contains('active')) {
     parts.push(['MJPEG', '']);
   } else if (stillFrame.classList.contains('active')) {
-    parts.push([t('截图'), '2.5 s']);
+    parts.push([t('截图'), `${STILL_POLL_SECS} s`]);
   }
   if (controlRttMs != null) parts.push([t('操作'), `${Math.round(controlRttMs)} ms`]);
   else if (Number.isFinite(backendStatus?.runner_rtt_ms)) parts.push([t('设备'), `${backendStatus.runner_rtt_ms} ms`]);
@@ -6077,7 +6117,20 @@ function renderMetrics() {
     metricsEl.title = t('画面编码 · 帧率 · 点按往返时间 · 手机连接方式');
   }
 }
-setInterval(renderMetrics, 1000);
+// A hidden tab renders no frames and nobody reads the pill: skip the work,
+// and restart the fps window on return so the first visible reading does
+// not average over the whole absence.
+let metricsWereHidden = false;
+function renderMetricsOnInterval() {
+  if (document.visibilityState !== 'visible') { metricsWereHidden = true; return; }
+  if (metricsWereHidden) {
+    metricsWereHidden = false;
+    renderedFrames = 0;
+    frameRateAt = performance.now();
+  }
+  renderMetrics();
+}
+setInterval(renderMetricsOnInterval, 1000);
 
 /* ── Screen geometry follows the stream ─────────────────────────── */
 function setScreenAspect(w, h) {

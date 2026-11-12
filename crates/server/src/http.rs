@@ -1,17 +1,29 @@
-//! axum HTTP app: the web client, the agent API, and the runner proxy.
+//! axum HTTP app: the web client, scan-to-connect pairing, and the agent API.
 //!
-//! Routes (contract from `web/index.html`):
-//!   * `GET  /phone`       — auth-gated; serves the embedded web client.
-//!   * `GET  /setup`       — auth-gated; serves the live iPhone connection guide.
-//!   * `GET  /login`       — password form.
-//!   * `POST /login`       — password check → set signed `phone_session` cookie.
-//!   * `GET  /logout`      — clear the cookie.
-//!   * `POST /pair/new`    — auth-gated; one-time scan-to-connect code + QR.
-//!   * `GET  /pair`        — landing page a scanned QR opens.
-//!   * `POST /pair`        — trade a code (or a device token) for a session.
-//!   * `GET  /turn-creds`  — auth-gated; `{iceServers:[...]}` (STUN + env TURN).
-//!   * `GET  /ws`          — auth-gated WebSocket; daemon-offerer signaling.
-//!   * `GET  /`            — redirect to `/phone`.
+//! Route families (see `router`):
+//!   * Pages: `GET /` → `/phone`; `GET /phone` and `GET /setup` (auth-gated,
+//!     the embedded web client and the live connection guide); `GET|POST
+//!     /login`, `GET /logout`; `GET /agent/reference` (the agent manual).
+//!   * Pairing: `POST /pair/new` (auth-gated one-time code + QR), `GET /pair`
+//!     (the page a scanned QR opens), `POST /pair` (code or device token →
+//!     session), `POST /pair/probe`.
+//!   * Browser control: `POST /control` (cookie + `X-Phone-Control`).
+//!   * Agent status and reads: `/agent/status`, `/agent/capabilities`,
+//!     `/agent/elements`, `/agent/subtree`, `/agent/value`, `/agent/collect`,
+//!     `/agent/scroll_find`, `/agent/screenshot`, `/agent/mjpeg`,
+//!     `/agent/h264[/keyframe]`, `/agent/activity`, `/agent/trace`,
+//!     `/agent/metrics`, `/agent/logs`, `/agent/crashes[/:name]`, `/agent/apps`.
+//!   * Agent control: `/agent/input`, `/agent/actions`, `/agent/run`,
+//!     `/agent/mode`, `/agent/owner`, `/agent/hold`, `/agent/prewarm`,
+//!     `/agent/location`, `/agent/record`, `/agent/home-layout`,
+//!     `/agent/runner-handoff`, `/agent/phone-daemon/pair`.
+//!   * Login assistant: `/agent/login`, `/agent/login/code`, `/agent/login-link`.
+//!   * Shortcuts bridge: `/agent/intent[s]`, `/agent/inbox[/drain]`.
+//!   * Flows and tasks: `/agent/flows`, `/agent/flow/{run,save,draft,record}`,
+//!     `/agent/task[s]`, `/agent/task/:id[/:verb]`, `/agent/schedules/…` and
+//!     `/schedules` (see `schedules`).
+//!   * `POST /browser/chrome` — the paired Mac's Chrome grant (own encryption,
+//!     never the HTTP session).
 //!
 //! Auth: the `phone_session` cookie value is an HMAC session token minted by
 //! [`core::auth::make_token`] and verified by [`core::auth::check_token`] using
@@ -105,7 +117,16 @@ impl AuthLimiter {
 
     /// Record an auth failure.  Starts or extends the lockout window once
     /// the failure count reaches [`AUTH_MAX_FAILURES`].
+    ///
+    /// A lockout that has already expired ends the failure streak it came
+    /// from: the counter starts over, so one wrong credential per lockout
+    /// window cannot keep the daemon locked forever (`failures` would have
+    /// stayed at the maximum and every single failure re-armed the lock).
     pub fn record_failure(&mut self) {
+        if self.locked_until.is_some() && !self.is_locked() {
+            self.failures = 0;
+            self.locked_until = None;
+        }
         self.failures += 1;
         if self.failures >= AUTH_MAX_FAILURES {
             self.locked_until =
@@ -765,6 +786,8 @@ async fn agent_owner_inner(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    // Bearer only (agent_loop_e2e pins this: a cookie never opens a bearer
+    // route). The web page therefore cannot end its own lease; it lapses.
     match agent_auth(&state, &headers) {
         AgentAuth::Locked => {
             return with_security_headers(
@@ -859,6 +882,24 @@ pub type ElementSnapshotCache =
     std::collections::VecDeque<(String, Arc<Vec<crate::runner::ElementRow>>)>;
 
 impl AppState {
+    /// Remote access through Tailscale / Cloudflare Tunnel (see `remote`).
+    pub fn remote_status(&self) -> serde_json::Value {
+        crate::remote::status(
+            &crate::instance::current().state_dir,
+            self.password.is_some(),
+            self.pairing.port.unwrap_or(crate::config::DEFAULT_PORT),
+        )
+    }
+
+    /// The URLs a phone or browser on another network can use right now.
+    pub fn remote_urls(&self) -> Vec<String> {
+        crate::remote::public_urls(
+            &crate::instance::current().state_dir,
+            self.password.is_some(),
+            self.pairing.port.unwrap_or(crate::config::DEFAULT_PORT),
+        )
+    }
+
     fn release_owner_lease(&self) {
         let mut traces = recover(self.action_traces.lock());
         let mut owner = recover(self.owner.lock());
@@ -1276,33 +1317,53 @@ fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 /// Build the `Set-Cookie` header value for a freshly-minted session.
-fn make_session_cookie(state: &AppState, secure: bool) -> String {
+fn make_session_cookie(state: &AppState, secure: bool, headers: &HeaderMap) -> String {
     let token = core::auth::make_token(&state.secret, state.session_ttl_secs, now_secs());
     let secure = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}={token}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
-        cookie_path(state),
+        cookie_path(state, headers),
         state.session_ttl_secs
     )
 }
 
 /// Build the cookie that clears the session.
-fn clear_session_cookie(state: &AppState, secure: bool) -> String {
+fn clear_session_cookie(state: &AppState, secure: bool, headers: &HeaderMap) -> String {
     let secure = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
-        cookie_path(state)
+        cookie_path(state, headers)
     )
 }
 
 /// The session cookie's `Path`: the base path, so daemons sharing a host do
-/// not overwrite each other's session.
-fn cookie_path(state: &AppState) -> &str {
-    if state.base_path.is_empty() {
-        "/"
-    } else {
-        &state.base_path
+/// not overwrite each other's session. Through the cloud relay every phone
+/// shares one host under `/p/<id>`; the relay says which prefix the browser
+/// used (`X-Forwarded-Prefix`), and the cookie is scoped to that phone, so a
+/// session for one phone is never sent to another daemon on the same relay
+/// (defense in depth: the token would not verify there either).
+fn cookie_path(state: &AppState, headers: &HeaderMap) -> String {
+    let prefix = headers
+        .get("x-forwarded-prefix")
+        .and_then(|value| value.to_str().ok())
+        .filter(|prefix| forwarded_prefix_ok(prefix))
+        .unwrap_or("");
+    match (prefix.is_empty(), state.base_path.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => state.base_path.clone(),
+        (false, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}{}", state.base_path),
     }
+}
+
+/// A forwarded prefix a cookie `Path` may carry: `/`-rooted, path characters
+/// only (no `;`, which would end the attribute), bounded.
+fn forwarded_prefix_ok(prefix: &str) -> bool {
+    prefix.starts_with('/')
+        && prefix.len() <= 128
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'/' | b'-'))
 }
 
 /// `path` (a daemon route such as `/phone`) as the browser must request it.
@@ -1559,7 +1620,7 @@ async fn login_submit(
 fn redirect_with_cookie(state: &AppState, to: &str, headers: &HeaderMap) -> Response {
     let secure = request_is_https(state, headers);
     let mut resp = Redirect::to(&based(state, to)).into_response();
-    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(state, secure)) {
+    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(state, secure, headers)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     with_security_headers(resp)
@@ -1568,7 +1629,7 @@ fn redirect_with_cookie(state: &AppState, to: &str, headers: &HeaderMap) -> Resp
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let secure = request_is_https(&state, &headers);
     let mut resp = Redirect::to(&based(&state, "/login")).into_response();
-    if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(&state, secure)) {
+    if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(&state, secure, &headers)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     with_security_headers(resp)
@@ -1635,7 +1696,11 @@ async fn pair_new(
     if !has_phone_control_header(&headers) {
         return missing_phone_control_header_response();
     }
-    if !state.pairing.lan_reachable {
+    let remote_urls = state.remote_urls();
+    let https = request_is_https(&state, &headers);
+    // A daemon on 127.0.0.1 is still reachable through a tunnel: the request
+    // itself came in over one (forwarded https), or a helper is running.
+    if !state.pairing.lan_reachable && remote_urls.is_empty() && !https {
         return pair_json(
             StatusCode::CONFLICT,
             serde_json::json!({
@@ -1650,15 +1715,26 @@ async fn pair_new(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let (request_host, request_port) = crate::pairing::split_host(host_header);
-    let https = request_is_https(&state, &headers);
     let mut hosts: Vec<String> = Vec::new();
     if !request_host.is_empty() && !crate::pairing::is_loopback_host(&request_host) {
         hosts.push(request_host.clone());
     }
-    for (_, ip) in crate::pairing::lan_addresses() {
-        let ip = ip.to_string();
-        if !hosts.contains(&ip) {
-            hosts.push(ip);
+    // Tailscale / Cloudflare addresses next: they work from any network.
+    let remote_origins: Vec<(String, String)> = remote_urls
+        .iter()
+        .filter_map(|url| crate::pairing::origin_host(url).map(|h| (h, url.clone())))
+        .collect();
+    for (host, _) in &remote_origins {
+        if !hosts.contains(host) {
+            hosts.push(host.clone());
+        }
+    }
+    if state.pairing.lan_reachable {
+        for (_, ip) in crate::pairing::lan_addresses() {
+            let ip = ip.to_string();
+            if !hosts.contains(&ip) {
+                hosts.push(ip);
+            }
         }
     }
     let Some(default_host) = hosts.first().cloned() else {
@@ -1675,14 +1751,21 @@ async fn pair_new(
         .host
         .filter(|h| hosts.contains(h))
         .unwrap_or(default_host);
-    let scheme = if https { "https" } else { "http" };
-    // Keep the port the browser used; a tunnel's https URL has none.
-    let port = match request_port {
-        Some(p) => format!(":{p}"),
-        None => String::new(),
+    let origin = match remote_origins.iter().find(|(h, _)| *h == host) {
+        // A remote address keeps its own scheme and port.
+        Some((_, url)) if host != request_host => crate::pairing::origin(url),
+        _ => {
+            let scheme = if https { "https" } else { "http" };
+            // Keep the port the browser used; a tunnel's https URL has none.
+            let port = match request_port {
+                Some(p) => format!(":{p}"),
+                None => String::new(),
+            };
+            format!("{scheme}://{host}{port}")
+        }
     };
     let code = state.pairing.issue();
-    let url = format!("{scheme}://{host}{port}{}/pair?c={code}", state.base_path);
+    let url = format!("{origin}{}/pair?c={code}", state.base_path);
     pair_json(
         StatusCode::OK,
         serde_json::json!({
@@ -1739,12 +1822,22 @@ async fn agent_login_link(State(state): State<Arc<AppState>>, headers: HeaderMap
     } else {
         None
     };
+    // The same page through Tailscale / Cloudflare, for a phone elsewhere.
+    let remote_url = state.remote_urls().first().map(|url| {
+        format!(
+            "{}{}/pair?c={}",
+            crate::pairing::origin(url),
+            state.base_path,
+            state.pairing.issue()
+        )
+    });
     pair_json(
         StatusCode::OK,
         serde_json::json!({
             "ok": true,
             "url": url,
             "lan_url": lan_url,
+            "remote_url": remote_url,
             "expires_in_secs": crate::pairing::CODE_TTL.as_secs(),
         }),
     )
@@ -1982,7 +2075,7 @@ async fn pair_submit(
         body["device_token_ttl_secs"] = crate::pairing::DEVICE_TOKEN_TTL_SECS.into();
     }
     let mut resp = pair_json(StatusCode::OK, body);
-    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(&state, secure)) {
+    if let Ok(v) = HeaderValue::from_str(&make_session_cookie(&state, secure, &headers)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
@@ -2093,8 +2186,11 @@ enum AgentAuth {
 /// Check the agent bearer token and advance the rate limiter.
 ///
 /// * Checks the limiter BEFORE credential verification.
-/// * Records a failure (wrong or missing bearer) or success (correct) in the
-///   shared [`AuthLimiter`].
+/// * Records a failure (wrong bearer) or success (correct) in the shared
+///   [`AuthLimiter`]. A request that presents no `Authorization` header at
+///   all is refused without touching the limiter: nothing was guessed, and a
+///   bare probe (a health check, a stale page, a scanner) must not be able to
+///   lock the daemon against the real client.
 /// * Open-mode (neither `agent_token` nor `password` configured): always returns
 ///   `Ok` without touching the limiter so open-mode integration tests stay clean.
 fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
@@ -2103,19 +2199,19 @@ fn agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
         crate::timing::authenticated();
         return AgentAuth::Ok;
     }
-    {
-        let limiter = state.auth_limiter.lock().unwrap();
-        if limiter.is_locked() {
-            return AgentAuth::Locked;
-        }
+    if recover(state.auth_limiter.lock()).is_locked() {
+        return AgentAuth::Locked;
+    }
+    if !headers.contains_key(header::AUTHORIZATION) {
+        return AgentAuth::Denied;
     }
     if check_bearer(state, headers) {
-        state.auth_limiter.lock().unwrap().record_success();
+        recover(state.auth_limiter.lock()).record_success();
         // Only now does the request count for task metrics.
         crate::timing::authenticated();
         AgentAuth::Ok
     } else {
-        state.auth_limiter.lock().unwrap().record_failure();
+        recover(state.auth_limiter.lock()).record_failure();
         AgentAuth::Denied
     }
 }
@@ -2127,10 +2223,15 @@ fn credentials_ok(state: &AppState, headers: &HeaderMap) -> bool {
     if state.agent_token.is_none() && state.password.is_none() {
         return true;
     }
-    if state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
+    // Same rule as `agent_auth_refusal` / `browser_or_agent_auth`: a minted
+    // session is not a guess, so the lockout does not apply to it.
+    if is_authed(state, headers) {
+        return true;
+    }
+    if recover(state.auth_limiter.lock()).is_locked() {
         return false;
     }
-    is_authed(state, headers) || check_bearer(state, headers)
+    check_bearer(state, headers)
 }
 
 /// The bearer-only gate (`agent_auth`) as a read-only predicate, for routes
@@ -2168,6 +2269,9 @@ fn trusted_owner(state: &AppState, headers: &HeaderMap) -> Option<String> {
 /// requests that actually present `Authorization` are allowed to advance the
 /// shared bearer limiter; otherwise a stale page polling in the background could
 /// repeatedly lock out a legitimate MCP client.
+///
+/// A valid cookie passes while the limiter is locked (see
+/// [`agent_auth_refusal`], which follows the same rule).
 fn browser_or_agent_auth(state: &AppState, headers: &HeaderMap) -> AgentAuth {
     if is_authed(state, headers) {
         crate::timing::authenticated();
@@ -2839,14 +2943,23 @@ async fn agent_status(
     let reconnecting = lifecycle == RunnerLifecycleTransition::Reconnecting;
     let hold_remaining = state.hold_remaining_secs();
     let screen_private_secs = state.screen_private_secs();
-    let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
+    let released = state.released.load(std::sync::atomic::Ordering::Acquire);
+    // The on-disk inputs, read at most once a second across all pollers
+    // (see `StatusFiles`); off the executor, like the files were not.
+    let files = {
+        let shared = state.clone();
+        match tokio::task::spawn_blocking(move || status_files(&shared)).await {
+            Ok(files) => files,
+            Err(_) => Arc::new(StatusFiles::read(&state)),
+        }
+    };
     let human_handoff = released && human_handoff_active();
     let ended_on_phone =
         ended_on_phone(released, human_handoff, &crate::instance::current().state_dir);
     let runner_parked = crate::phone_exit::parked(&crate::instance::current().state_dir);
-    let runner_parked_reason_json = serde_json::to_string(
-        &crate::phone_exit::reason(&crate::instance::current().state_dir).map(|reason| reason.as_str())
-    ).unwrap_or_else(|_| "null".into());
+    let parked_reason = crate::phone_exit::reason(&crate::instance::current().state_dir);
+    let runner_crashed = runner_parked && parked_reason == Some(crate::phone_exit::Reason::Crashed);
+    let runner_parked_reason = parked_reason.map(|reason| reason.as_str());
     // L2 health — action-level, not just /status (which lies: it reports
     // `ready` even when every UI action fails Code=41 because the phone is
     // locked or the test session was severed). `runner` stays "runner reachable"
@@ -2874,17 +2987,14 @@ async fn agent_status(
     // is not told to go back; any difference when a tag is not a version).
     let version = env!("CARGO_PKG_VERSION");
     let latest = recover(state.latest_release.lock()).clone();
-    let (latest_json, update_available) = match &latest {
-        Some(tag) => (
-            serde_json::to_string(tag).unwrap_or_else(|_| "null".to_string()),
-            crate::update::is_newer(tag, version),
-        ),
-        None => ("null".to_string(), false),
+    let update_available = match &latest {
+        Some(tag) => crate::update::is_newer(tag, version),
+        None => false,
     };
     // The daily auto-update job: whether it is on, and how its last upgrade went.
     let auto_update = crate::update::AutoUpdateState::read()
-        .and_then(|auto_update| serde_json::to_string(&auto_update).ok())
-        .unwrap_or_else(|| "null".to_string());
+        .and_then(|auto_update| serde_json::to_value(&auto_update).ok())
+        .unwrap_or(serde_json::Value::Null);
     let mjpeg_viewer_count = state
         .live_streams
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2909,9 +3019,6 @@ async fn agent_status(
     let mjpeg_stream_fresh = mjpeg_stream_age_ms.is_some_and(|age_ms| {
         age_ms <= u64::try_from(MJPEG_INACTIVITY_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
     });
-    let mjpeg_stream_age_json = mjpeg_stream_age_ms
-        .map(|age_ms| age_ms.to_string())
-        .unwrap_or_else(|| "null".to_string());
     let recovery_owner = if state.managed_runner {
         "daemon"
     } else if state.managed_runner_pending {
@@ -2923,35 +3030,19 @@ async fn agent_status(
     // ({phase, blocked_on, message, ts}) as it runs. Read it before selecting
     // the recovery hint: a concrete prerequisite failure must take precedence
     // over the generic "keep waiting" text while reconnecting.
-    let setup_status = if state.managed_runner {
-        read_structured_setup_status()
-    } else {
-        None
-    };
+    let setup_status = files.setup_status.clone();
     let setup_blocked_on = if state.managed_runner {
         // Passcode presence is not evidence of an unanswered prompt.
         crate::keep_runner::person_blocker(
-            &read_setup_blocked_on(),
+            &files.setup_blocked_on,
             crate::lock_readiness::passcode(),
         )
         .to_string()
     } else {
         String::new()
     };
-    let setup_phase_json = serde_json::to_string(
-        setup_status
-            .as_ref()
-            .map(|status| status.phase.as_str())
-            .unwrap_or(""),
-    )
-    .unwrap_or_else(|_| "\"\"".to_string());
-    let setup_message_json = serde_json::to_string(
-        setup_status
-            .as_ref()
-            .map(|status| status.message.as_str())
-            .unwrap_or(""),
-    )
-    .unwrap_or_else(|_| "\"\"".to_string());
+    let setup_phase = setup_status.as_ref().map(|status| status.phase.as_str()).unwrap_or("");
+    let setup_message = setup_status.as_ref().map(|status| status.message.as_str()).unwrap_or("");
     // A setup attempt bringing the runner up right now (the supervisor's
     // rebuild after an idle release, an upgrade rebuild): it is a reconnect
     // in progress whatever the daemon's own lifecycle says, or a person sees
@@ -2965,7 +3056,7 @@ async fn agent_status(
             && !reconnecting
             && (!runner || runner_locked != "true"),
         setup_status.as_ref(),
-        || setup_in_flight(&crate::instance::current().state_dir),
+        || files.setup_in_flight(),
     );
     let reconnecting = reconnecting || setup_working.is_some();
     // The KeepAlive supervisor's next automatic attempt after a failed setup
@@ -2993,14 +3084,14 @@ async fn agent_status(
     // than that the blocker went away.
     let runner_build = if state.managed_runner {
         derive_runner_build(
-            read_raw_setup_status().as_ref(),
+            files.raw_setup_status.as_ref(),
             now_secs(),
-            read_runner_log_tail,
+            || files.runner_log_tail().to_string(),
         )
     } else {
         RunnerBuild::unknown()
     }
-    .to_json();
+    .to_value();
     // When not drivable, tell the caller HOW to recover (the recovery differs by
     // state, and auto-recovery is blocked by macOS while the phone is in use).
     // Plain text only — kept free of quotes/braces so it drops into the JSON.
@@ -3025,6 +3116,8 @@ async fn agent_status(
             ("handoff", "the phone was handed to a person (mode=human) and the device runner is stopped so they can use it in hand — POST /agent/mode {mode:agent} takes it back")
         } else if ended_on_phone {
             ("ended_on_phone", "the session was ended on the iPhone (both volume keys) and nothing restarts the device runner on its own — ask the person before taking it back; the next action or reconnect starts it again")
+        } else if released && runner_crashed {
+            ("runner_crashed", "iOS ended the device runner's test process (a crash or watchdog kill, often on a very large screen tree), not the person — reconnect when the task needs the phone; if it keeps happening, read a smaller part of the screen")
         } else if released && runner_parked {
             ("session_parked", "the XCTest session ended with uncertain intent; the runner stays parked until a new explicit agent or web request")
         } else if released {
@@ -3073,7 +3166,8 @@ async fn agent_status(
     // phone has its own relay ports and needs `--instance NAME`.
     let hint = hint_for_this_daemon(hint, crate::instance::current(), &relay_ports_label());
     let hint = match setup_retry.get("next_in_secs").and_then(serde_json::Value::as_u64) {
-        Some(secs) if advice == "blocker" => format!(
+        // A full phone needs a person whatever the next retry does.
+        Some(secs) if advice == "blocker" && setup_blocked_on != "phone_storage_full" => format!(
             "{hint} — the supervisor retries on its own in {secs}s (attempt {}); wait for that retry before asking a person to act",
             setup_retry["attempt"]
         ),
@@ -3091,13 +3185,8 @@ async fn agent_status(
         crate::selfrunner::guidance(value, health.up && health.locked == Some(true))
     });
     let hint = guidance.map(|(_, en)| en.to_string()).unwrap_or(hint);
-    let self_runner_field = self_runner
-        .as_ref()
-        .map(|value| format!(",\"self_runner\":{value}"))
-        .unwrap_or_default();
-    let hint_json = serde_json::to_string(&hint).unwrap_or_else(|_| "\"\"".into());
     let recovery = setup_recovery(advice, &setup_blocked_on);
-    let next_step_json = guidance
+    let next_step = guidance
         .or_else(|| human_next_step(advice, &setup_blocked_on, runner_died_reason))
         .map(|(zh, en)| {
             let instance = crate::instance::current();
@@ -3105,9 +3194,7 @@ async fn agent_status(
                 "zh": for_instance(zh, instance),
                 "en": for_instance(en, instance),
             })
-            .to_string()
-        })
-        .unwrap_or_else(|| "null".to_string());
+        });
     let device_state = if releasing {
         "releasing"
     } else if !runner && !setup_blocked_on.is_empty() {
@@ -3152,7 +3239,7 @@ async fn agent_status(
     // that is merely up from one somebody is driving: since v0.6.3 runner stays
     // up indefinitely, so `device_state:"ready"` alone says nothing about use.
     let idle_secs = state.idle_for().as_secs();
-    let transport = managed_transport(&state).await;
+    let transport = managed_transport_from(&state, files.relay_record.as_deref()).await;
     let wifi_start_refused =
         state.managed_runner && wifi_start_refused(&crate::instance::current().state_dir);
     // Why idle release keeps this runner (a start needs a person), or null.
@@ -3172,11 +3259,9 @@ async fn agent_status(
             .flatten()
             .filter(|because| runner || because.keeps_down_runner()),
     );
-    let legacy_ios = legacy_ios_json(state.managed_runner, &crate::instance::current().state_dir);
+    let legacy_ios = files.legacy_ios.clone();
     let rtt = crate::runner::runner_rtt_ms();
-    let rtt_json = rtt.map_or("null".to_string(), |ms| ms.to_string());
-    let transport_hint = serde_json::to_string(&transport_hint(transport, rtt))
-        .unwrap_or_else(|_| "null".into());
+    let transport_hint = transport_hint(transport, rtt);
     // A reconnect a pre-warm started (see `crate::prewarm`).
     let warming = crate::prewarm::warming() && reconnecting;
     // Will this phone get stuck at the lock screen (cache only, no I/O).
@@ -3189,32 +3274,100 @@ async fn agent_status(
         DeviceServices::Simulator(simulator) => (
             crate::simulator::lock_readiness_json(),
             simulator.status_device_json(),
-            r#""target":"simulator","#,
+            Some("simulator"),
             Some(simulator.udid.clone()),
         ),
-        DeviceServices::Phone => (lock_readiness, device, "", state.device_udid.clone()),
+        DeviceServices::Phone => (lock_readiness, device, None, state.device_udid.clone()),
     };
     // Agent Do Not Disturb: whether it is on and the gate's last outcome with
     // its time, so a Shortcuts flash on a recording can be matched to it.
     let agent_focus = recover(state.agent_focus.lock()).status_json();
     // The daemon inside the runner on the phone, as its last /status said.
-    let phone_daemon = crate::phone_daemon::status_json(runner);
+    let phone_daemon = serde_json::from_str::<serde_json::Value>(&crate::phone_daemon::status_json(runner))
+        .unwrap_or(serde_json::Value::Null);
+    let remote = files.remote.clone();
     let (status_owner, status_owner_remaining, status_owner_epoch) = owner_status_versioned(&state);
-    let control_lease_json = control_lease_status(&state, status_owner.as_deref(), status_owner_epoch).to_string();
-    let body = format!(
-        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"control_lease":{control_lease_json},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"ended_on_phone":{ended_on_phone},"runner_parked":{runner_parked},"runner_parked_reason":{runner_parked_reason_json},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"recovery":{recovery},"setup_blocked_on":"{setup_blocked_on}","setup_retry":{setup_retry},"setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}{self_runner_field}}}"#,
-        crate::instance::current().name,
-        serde_json::to_string(&status_udid).unwrap_or_else(|_| "null".into()),
-        serde_json::to_string(&status_owner).unwrap_or_else(|_| "null".into()),
-        status_owner_remaining,
-        status_udid.is_some(),
-        state.managed_runner,
-        state.managed_runner_pending,
-    );
-    let body = with_pre_rename_status_fields(body);
+    let control_lease = control_lease_status(&state, status_owner.as_deref(), status_owner_epoch);
+    // One field per row: `serde_json::json!` with this many keys hits the
+    // macro recursion limit, and a map keeps the key order sorted anyway.
+    let mut fields = serde_json::Map::new();
+    for (key, value) in [
+        ("ok", serde_json::json!(true)),
+        ("backend", serde_json::json!("direct")),
+        ("instance", serde_json::json!(crate::instance::current().name)),
+        ("udid", serde_json::json!(status_udid)),
+        ("owner", serde_json::json!(status_owner)),
+        ("owner_lease_remaining_secs", serde_json::json!(status_owner_remaining)),
+        ("control_lease", serde_json::json!(control_lease)),
+        ("target_configured", serde_json::json!(status_udid.is_some())),
+        ("managed_runner", serde_json::json!(state.managed_runner)),
+        ("managed_runner_pending", serde_json::json!(state.managed_runner_pending)),
+        ("recovery_owner", serde_json::json!(recovery_owner)),
+        ("runner", serde_json::json!(runner)),
+        ("runner_actionable", serde_json::json!(runner_actionable)),
+        ("runner_locked", serde_json::json!(health.locked)),
+        ("drivable", serde_json::json!(drivable)),
+        ("mode", serde_json::json!(mode)),
+        ("device_state", serde_json::json!(device_state)),
+        ("screen_state", serde_json::json!(screen_state)),
+        ("releasing", serde_json::json!(releasing)),
+        ("reconnecting", serde_json::json!(reconnecting)),
+        ("warming", serde_json::json!(warming)),
+        ("released", serde_json::json!(released)),
+        ("human_handoff", serde_json::json!(human_handoff)),
+        ("ended_on_phone", serde_json::json!(ended_on_phone)),
+        ("runner_parked", serde_json::json!(runner_parked)),
+        ("runner_parked_reason", serde_json::json!(runner_parked_reason)),
+        ("hold_remaining_secs", serde_json::json!(hold_remaining)),
+        ("screen_private_secs", serde_json::json!(screen_private_secs)),
+        ("idle_secs", serde_json::json!(idle_secs)),
+        ("hint", serde_json::json!(hint)),
+        ("next_step", serde_json::json!(next_step)),
+        ("recovery", serde_json::json!(recovery)),
+        ("setup_blocked_on", serde_json::json!(setup_blocked_on)),
+        ("setup_retry", serde_json::json!(setup_retry)),
+        ("setup_phase", serde_json::json!(setup_phase)),
+        ("setup_message", serde_json::json!(setup_message)),
+        ("runner_build", serde_json::json!(runner_build)),
+        ("runner_died_reason", serde_json::json!(runner_died_reason)),
+        ("runner_died_at", serde_json::json!(runner_died_at)),
+        ("viewer_count", serde_json::json!(viewer_count)),
+        ("mjpeg_viewer_count", serde_json::json!(mjpeg_viewer_count)),
+        ("mjpeg_stream_fresh", serde_json::json!(mjpeg_stream_fresh)),
+        ("mjpeg_stream_age_ms", serde_json::json!(mjpeg_stream_age_ms)),
+        ("capture_redacted", serde_json::json!(capture_redacted)),
+        ("version", serde_json::json!(version)),
+        ("latest", serde_json::json!(latest)),
+        ("update_available", serde_json::json!(update_available)),
+        ("auto_update", serde_json::json!(auto_update)),
+        ("transport", serde_json::json!(transport)),
+        ("runner_rtt_ms", serde_json::json!(rtt)),
+        ("transport_hint", serde_json::json!(transport_hint)),
+        ("wifi_start_refused", serde_json::json!(wifi_start_refused)),
+        ("keep_runner_alive", serde_json::json!(keep_runner_alive)),
+        ("legacy_ios", serde_json::json!(legacy_ios)),
+        ("lock_readiness", serde_json::json!(lock_readiness)),
+        ("device", serde_json::json!(device)),
+        ("agent_focus", serde_json::json!(agent_focus)),
+        ("phone_daemon", serde_json::json!(phone_daemon)),
+        ("remote", serde_json::json!(remote)),
+    ] {
+        fields.insert(key.to_string(), value);
+    }
+    // A simulator says so; a phone's status has no `target` field.
+    if let Some(target) = target_field {
+        fields.insert("target".to_string(), serde_json::Value::String(target.to_string()));
+    }
+    // Self Runner gateway state, present only when this daemon drives an
+    // externally managed runner through one and the phone is not drivable.
+    if let Some(value) = self_runner {
+        fields.insert("self_runner".to_string(), value);
+    }
+    add_pre_rename_status_fields(&mut fields);
+    let body = serde_json::Value::Object(fields);
     let resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
+        .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     with_security_headers(resp)
 }
@@ -3235,28 +3388,130 @@ const PRE_RENAME_STATUS_FIELDS: &[(&str, &str)] = &[
     ("managed_runner_pending", "managed_wda_pending"),
 ];
 
-fn with_pre_rename_status_fields(body: String) -> String {
-    let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str(&body) else {
-        return body;
-    };
+fn add_pre_rename_status_fields(fields: &mut serde_json::Map<String, serde_json::Value>) {
     for (name, old) in PRE_RENAME_STATUS_FIELDS {
         if let Some(value) = fields.get(*name).cloned() {
             fields.insert((*old).to_string(), value);
         }
     }
-    serde_json::Value::Object(fields).to_string()
+}
+
+/// The on-disk inputs of `/agent/status`: the setup helper's status file
+/// (twice: filtered by the last bring-up, and raw for build progress), the
+/// blocker its log fallback scans (a 64 KB tail), whether a setup run is in
+/// flight (a `ps` round trip), the legacy-iOS record, the control relay's pid
+/// record and the remote-access status. Every browser tab, the iOS app and
+/// each MCP client poll status every 2–3 s, and reading all of this again
+/// for each poll was most of the handler's cost: one snapshot serves every
+/// poller for [`STATUS_FILES_TTL`].
+///
+/// Only this handler reads through the cache. Lifecycle code (the readiness
+/// loop, pre-warm, `/agent/mode`) keeps reading the files, so a status the
+/// helper writes is acted on at once and only *shown* up to a second late.
+struct StatusFiles {
+    /// [`read_structured_setup_status`].
+    setup_status: Option<RunnerSetupStatus>,
+    /// [`read_setup_blocked_on`] (empty for an unmanaged runner).
+    setup_blocked_on: String,
+    /// [`read_raw_setup_status`].
+    raw_setup_status: Option<RunnerSetupStatus>,
+    /// [`setup_in_flight`], asked on first use: only a status with working
+    /// advice needs it (see [`setup_working`]), and it spawns `ps`.
+    setup_in_flight: std::sync::OnceLock<bool>,
+    /// [`legacy_ios_value`].
+    legacy_ios: serde_json::Value,
+    /// `runner-relay.pid`, for [`runner_transport_from`].
+    relay_record: Option<String>,
+    /// [`AppState::remote_status`].
+    remote: serde_json::Value,
+    /// The xcodebuild log, read on first use: only a failed or stalled build
+    /// shows it (see [`derive_runner_build`]).
+    runner_log_tail: std::sync::OnceLock<String>,
+}
+
+impl StatusFiles {
+    fn read(state: &AppState) -> Self {
+        let instance = crate::instance::current();
+        let managed = state.managed_runner;
+        StatusFiles {
+            setup_status: managed.then(read_structured_setup_status).flatten(),
+            setup_blocked_on: if managed { read_setup_blocked_on() } else { String::new() },
+            raw_setup_status: managed.then(read_raw_setup_status).flatten(),
+            setup_in_flight: std::sync::OnceLock::new(),
+            legacy_ios: legacy_ios_value(managed, &instance.state_dir),
+            relay_record: managed.then(|| read_relay_record(&instance.state_dir)).flatten(),
+            remote: state.remote_status(),
+            runner_log_tail: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn runner_log_tail(&self) -> &str {
+        self.runner_log_tail.get_or_init(read_runner_log_tail)
+    }
+
+    fn setup_in_flight(&self) -> bool {
+        *self
+            .setup_in_flight
+            .get_or_init(|| setup_in_flight(&crate::instance::current().state_dir))
+    }
+}
+
+/// How long one [`StatusFiles`] snapshot answers status polls.
+const STATUS_FILES_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What, besides the files themselves, changes a [`StatusFiles`] answer: a
+/// snapshot taken for another key is never reused.
+#[derive(Clone, PartialEq, Eq)]
+struct StatusFilesKey {
+    state_dir: std::path::PathBuf,
+    managed: bool,
+    /// The bring-up this daemon last kicked (a status written before it is
+    /// the previous helper's; see [`read_structured_setup_status_at`]).
+    kicked_at: u64,
+    password_set: bool,
+}
+
+/// The current [`StatusFiles`], read at most once per [`STATUS_FILES_TTL`].
+/// Pollers that arrive while one reads wait for that read instead of each
+/// reading the files themselves.
+fn status_files(state: &AppState) -> Arc<StatusFiles> {
+    static CACHE: Mutex<Option<(StatusFilesKey, Instant, Arc<StatusFiles>)>> = Mutex::new(None);
+    let key = StatusFilesKey {
+        state_dir: crate::instance::current().state_dir.clone(),
+        managed: state.managed_runner,
+        kicked_at: setup_kicked_at(),
+        password_set: state.password.is_some(),
+    };
+    let mut slot = recover(CACHE.lock());
+    if let Some((cached_key, at, files)) = slot.as_ref() {
+        if *cached_key == key && at.elapsed() < STATUS_FILES_TTL {
+            return files.clone();
+        }
+    }
+    let files = Arc::new(StatusFiles::read(state));
+    *slot = Some((key, Instant::now(), files.clone()));
+    files
 }
 
 /// How control reaches the managed runner right now (`usb`, `wifi-tunnel`,
 /// `wifi`, `unknown`), or `external` for a runner this daemon does not manage.
 async fn managed_transport(state: &AppState) -> &'static str {
+    let record = state
+        .managed_runner
+        .then(|| read_relay_record(&crate::instance::current().state_dir))
+        .flatten();
+    managed_transport_from(state, record.as_deref()).await
+}
+
+/// [`managed_transport`] from an already-read `runner-relay.pid` record
+/// (`/agent/status` reads it once per second, see [`StatusFiles`]).
+async fn managed_transport_from(state: &AppState, relay_record: Option<&str>) -> &'static str {
     if !state.managed_runner {
         return "external";
     }
-    let state_dir = &crate::instance::current().state_dir;
-    let relayed = runner_transport(state_dir);
+    let relayed = runner_transport_from(relay_record);
     match (relayed, state.device_udid.as_deref()) {
-        ("usb", Some(udid)) if native_relay(state_dir) => native_relay_transport(udid).await,
+        ("usb", Some(udid)) if native_relay_from(relay_record) => native_relay_transport(udid).await,
         _ => relayed,
     }
 }
@@ -3264,7 +3519,12 @@ async fn managed_transport(state: &AppState) -> &'static str {
 /// `legacy_ios` in `/agent/status`: an iOS 15/16 phone on the legacy path
 /// (its iOS, whether the runner also answers on its LAN address, and whether
 /// it was started over Wi-Fi, so the cable can be pulled), else `null`.
+#[cfg(test)]
 fn legacy_ios_json(managed: bool, state_dir: &std::path::Path) -> String {
+    legacy_ios_value(managed, state_dir).to_string()
+}
+
+fn legacy_ios_value(managed: bool, state_dir: &std::path::Path) -> serde_json::Value {
     let record = managed
         .then(|| crate::setup::legacy_ios::read_record(state_dir))
         .flatten();
@@ -3279,9 +3539,8 @@ fn legacy_ios_json(managed: bool, state_dir: &std::path::Path) -> String {
             // Off the cable only the plain LAN relay reaches an iOS 15/16
             // runner (no CoreDevice tunnel), so both are needed.
             "unplug_ok": record.launch_transport == "wifi" && record.lan_relay,
-        })
-        .to_string(),
-        None => "null".to_string(),
+        }),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -3320,19 +3579,34 @@ fn idle_release_keeps_wifi_runner(start_refused: bool, transport: &str) -> bool 
 /// How control traffic reaches runner, from the relay setup-runner.sh recorded:
 /// `iphone-use relay` (usbmuxd, started only for a USB phone) or a legacy
 /// `iproxy` = USB, `socat` to the phone's address = Wi-Fi.
+#[cfg(test)]
 fn runner_transport(state_dir: &std::path::Path) -> &'static str {
-    match std::fs::read_to_string(state_dir.join("runner-relay.pid")) {
-        Ok(record) if record.contains("/iphone-use relay ") || record.contains("iproxy") => "usb",
-        Ok(record) if record.contains("socat") => "wifi",
+    runner_transport_from(read_relay_record(state_dir).as_deref())
+}
+
+/// The relay's pid record (`runner-relay.pid`: pid, start and command line).
+fn read_relay_record(state_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(state_dir.join("runner-relay.pid")).ok()
+}
+
+/// [`runner_transport`] from the record itself.
+fn runner_transport_from(record: Option<&str>) -> &'static str {
+    match record {
+        Some(record) if record.contains("/iphone-use relay ") || record.contains("iproxy") => "usb",
+        Some(record) if record.contains("socat") => "wifi",
         _ => "unknown",
     }
 }
 
 /// The control relay is `iphone-use relay`, which follows the phone from USB
 /// to its CoreDevice Wi-Fi tunnel (a legacy iproxy cannot).
+#[cfg(test)]
 fn native_relay(state_dir: &std::path::Path) -> bool {
-    std::fs::read_to_string(state_dir.join("runner-relay.pid"))
-        .is_ok_and(|record| record.contains("/iphone-use relay "))
+    native_relay_from(read_relay_record(state_dir).as_deref())
+}
+
+fn native_relay_from(record: Option<&str>) -> bool {
+    record.is_some_and(|record| record.contains("/iphone-use relay "))
 }
 
 /// The control relay falls back to the phone's LAN address (`--lan-host`, an
@@ -3724,6 +3998,10 @@ fn human_next_step(
                 "iPhone 上残留了旧的开发者磁盘映像，开发者服务起不来：请把 iPhone 重启一次，解锁后保持插线，会自动接着连接",
                 "An old developer disk image is stuck on the iPhone and its developer services will not start: restart the iPhone once, unlock it and keep it plugged in — connecting continues on its own",
             ),
+            "phone_storage_full" => (
+                "iPhone 存储空间不足，装不上设备服务：在 设置 › 通用 › iPhone 储存空间 里清出空间（重启一次 iPhone 也能收回部分「系统数据」），之后每隔几分钟会自动再试",
+                "The iPhone is out of storage, so the device runner cannot be installed: free space under Settings › General › iPhone Storage (restarting the iPhone also gives back some System Data) — it retries on its own every few minutes",
+            ),
             "legacy_needs_usb" => (
                 "这台 iOS 15/16 的 iPhone 现在既没插线、这台 Mac 也连不到它的 Wi-Fi：插一次线并保持解锁，大约 20 秒连上；之后可以拔线，走 Wi-Fi（手机需和这台 Mac 在同一网络）",
                 "This iOS 15/16 iPhone is neither plugged in nor reachable over Wi-Fi from this Mac: plug it in once and keep it unlocked — it connects in about 20 s, and after that it can be unplugged and used over Wi-Fi (on the same network as this Mac)",
@@ -3757,6 +4035,10 @@ fn human_next_step(
         "ended_on_phone" => (
             "已在手机上退出，这台 Mac 不会自动重连；需要远程操作时点「连接手机」",
             "Ended on the phone; this Mac will not reconnect on its own — choose Connect to control it again",
+        ),
+        "runner_crashed" => (
+            "设备 runner 被 iOS 结束了（不是有人在手机上退出）；需要远程操作时点「连接手机」",
+            "iOS ended the device runner (nobody ended it on the phone); choose Connect to control it again",
         ),
         "session_parked" => (
             "测试会话已结束，控制保持停驻；需要远程操作时点「连接手机」",
@@ -3904,6 +4186,9 @@ fn setup_blocker_hint(blocked_on: &str) -> Option<&'static str> {
         "ddi_needs_reboot" => Some(
             "the iOS 15/16 phone has a stale developer disk image mounted: lockdownd answers every developer service (testmanagerd) with InvalidService even after setup remounted the right image — have a person restart the iPhone once and keep it plugged in and unlocked; the managed service re-checks every few minutes, so do not send another reconnect request",
         ),
+        "phone_storage_full" => Some(
+            "the iPhone has no free storage left for the runner app (setup_message says how much it needs and how much is free) — have a person free space on the phone (Settings › General › iPhone Storage; restarting the iPhone also returns some System Data); the managed service re-checks every few minutes while the phone is not released, so do not send another reconnect request until the person says space is free (after an idle release, reconnect once then)",
+        ),
         "legacy_needs_usb" => Some(
             "the phone runs iOS 15/16 and is neither on USB nor reachable over Wi-Fi (its lockdownd does not answer on its LAN address, or that address is not known yet) — have a person plug it into this Mac once, unlocked; after that the runner starts over Wi-Fi and survives the unplug; the managed service starts it as soon as usbmuxd lists the phone on USB, so do not send another reconnect request",
         ),
@@ -3938,6 +4223,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<RunnerSetupStatus> {
             | "ios_too_old"
             | "wifi_automation_refused"
             | "ddi_needs_reboot"
+            | "phone_storage_full"
             | "legacy_needs_usb"
     ) {
         1200
@@ -3963,6 +4249,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<RunnerSetupStatus> {
             | "automation_not_allowed"
             | "wifi_automation_refused"
             | "ddi_needs_reboot"
+            | "phone_storage_full"
             | "legacy_needs_usb"
             | "not_connected"
             | "locked"
@@ -4024,15 +4311,19 @@ impl RunnerBuild {
         }
     }
 
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state,
+            "phase": self.phase,
+            "since": self.since,
+            "age_secs": self.age_secs,
+            "log_tail": self.log_tail,
+        })
+    }
+
+    #[cfg(test)]
     fn to_json(&self) -> String {
-        format!(
-            r#"{{"state":"{}","phase":{},"since":{},"age_secs":{},"log_tail":{}}}"#,
-            self.state,
-            serde_json::to_string(&self.phase).unwrap_or_else(|_| "\"\"".into()),
-            self.since,
-            self.age_secs,
-            serde_json::to_string(&self.log_tail).unwrap_or_else(|_| "\"\"".into()),
-        )
+        self.to_value().to_string()
     }
 }
 
@@ -4146,16 +4437,23 @@ fn runner_agent_label() -> &'static str {
     &crate::instance::current().runner_label
 }
 
-/// Current GUI launchd domain (`gui/<uid>`), via `id -u`.
+/// Current GUI launchd domain (`gui/<uid>`), via `id -u` — once: the uid
+/// never changes for the life of the process, and this is asked on every
+/// status poll's hint.
 fn gui_domain() -> String {
-    let uid = std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    format!("gui/{uid}")
+    static DOMAIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DOMAIN
+        .get_or_init(|| {
+            let uid = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            format!("gui/{uid}")
+        })
+        .clone()
 }
 
 fn xml_escape(value: &str) -> String {
@@ -5012,7 +5310,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 _ = tokio::time::sleep(POLL) => {}
                 _ = TASK_END_WAKE.notified() => {}
             }
-            if state.released.load(Ordering::Relaxed) {
+            if state.released.load(Ordering::Acquire) {
                 clear_task_end();
                 continue; // already let go — reconnect is on-demand (agent_input)
             }
@@ -5492,21 +5790,8 @@ async fn agent_prewarm(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
-    }
-    if !has_phone_control_header(&headers) {
-        return missing_phone_control_header_response();
+    if let Err(refused) = authorize_agent_write(&state, &headers) {
+        return refused;
     }
     let reason = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -6273,21 +6558,8 @@ async fn agent_capabilities(State(state): State<Arc<AppState>>, headers: HeaderM
 /// health and picks the reset client up on its next probe; otherwise the
 /// observation is published here.
 async fn agent_runner_handoff(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
-    }
-    if !has_phone_control_header(&headers) {
-        return missing_phone_control_header_response();
+    if let Err(refused) = authorize_agent_write(&state, &headers) {
+        return refused;
     }
     let json = |status: StatusCode, body: serde_json::Value| {
         with_security_headers(
@@ -8191,6 +8463,9 @@ async fn tap_snapshot_element(
                 .await
                 .map_err(SnapshotElementTapError::AfterDispatch);
         }
+        // Nothing clear to touch and nothing to scroll: a tap would land on
+        // the cover (or the home indicator strip) and still answer ok.
+        return Err(SnapshotElementTapError::Refused("element_occluded", ELEMENT_OCCLUDED_HINT));
     }
     if let Some(locator) = snapshot_row_locator(row) {
         // System-owned sheets and document pickers can publish stale or offset
@@ -9489,6 +9764,11 @@ async fn tap_unique_label(
                 RevealError::Dispatch(error) => UniqueLabelTapError::AfterDispatch(error),
             });
         }
+        // No live element to scroll and no clear part: refuse rather than
+        // tap a spot that does not reach the target.
+        if !off_screen && clear_tap_point(&rows, index).is_none() {
+            return Err(UniqueLabelTapError::Refused("element_occluded", ELEMENT_OCCLUDED_HINT));
+        }
     }
     // Never a tap outside the screen: it touches nothing and would read as ok.
     if !point_on_screen(&rows, x, y) {
@@ -9824,6 +10104,22 @@ fn occluding_row(rows: &[crate::runner::ElementRow], index: usize) -> Option<&cr
 /// Settings' 通用 row 8 pt above the search field's frame did nothing.
 const OCCLUDER_MARGIN: f64 = 14.0;
 
+/// Height of the strip along the bottom edge of a Face ID iPhone where a
+/// tap does not reach the app (the home indicator's gesture area).
+/// Hardware, 17 Pro Max (956 pt tall), iOS 27 Settings: coordinate taps on a
+/// row at y 892–916 opened it, even over the floating search pill; at y 924
+/// and below nothing happened, so a label tap on 控制中心 [20,902,400,49]
+/// (centre 927) answered ok and stayed on Settings.
+const HOME_INDICATOR_STRIP: f64 = 34.0;
+/// Shorter screens are home-button iPhones, which have no such strip.
+const HOME_INDICATOR_MIN_SCREEN: f64 = 800.0;
+
+/// The bottom strip a tap must avoid, as a `(top, bottom)` band.
+fn home_indicator_strip(rows: &[crate::runner::ElementRow]) -> Option<(f64, f64)> {
+    let [_, sy, _, sh] = screen_rect(rows)?;
+    (sh >= HOME_INDICATOR_MIN_SCREEN).then_some((sy + sh - HOME_INDICATOR_STRIP, sy + sh))
+}
+
 /// Where to tap `rows[index]` so the touch reaches it: its centre when no
 /// other control (a floating overlay grown by [`OCCLUDER_MARGIN`]) is over it, else the middle of
 /// the tallest horizontal band of the target that no control covers.
@@ -9872,6 +10168,7 @@ fn clear_tap_point(rows: &[crate::runner::ElementRow], index: usize) -> Option<(
         })
         .filter(|grown| grown[0] <= cx && cx <= grown[0] + grown[2])
         .map(|grown| (grown[1], grown[1] + grown[3]))
+        .chain(home_indicator_strip(rows))
         .collect();
     covers.extend(status_bar_band(rows, index));
     if !covers
@@ -9880,8 +10177,12 @@ fn clear_tap_point(rows: &[crate::runner::ElementRow], index: usize) -> Option<(
     {
         return Some((cx, cy));
     }
-    // Free vertical bands of the target along x = cx.
-    let mut free = vec![(ty, ty + th)];
+    // Free vertical bands of the target along x = cx, on the screen only: a
+    // band past the edge touches nothing.
+    let (top, bottom) = screen_rect(rows).map_or((ty, ty + th), |[_, sy, _, sh]| {
+        (ty.max(sy), (ty + th).min(sy + sh))
+    });
+    let mut free = vec![(top, bottom)];
     for (top, bottom) in covers {
         free = free
             .into_iter()
@@ -10274,7 +10575,8 @@ fn is_capture_or_volume(value: &serde_json::Value) -> bool {
 
 fn system_request_private_refusal(state: &AppState, value: &serde_json::Value) -> Option<Response> {
     (is_capture_or_volume(value) && screen_private_now(&state.private_until)).then(||
-        ControlRefusal::new(StatusCode::LOCKED, "screen_private", false)
+        ControlRefusal::new(StatusCode::LOCKED, SCREEN_PRIVATE, false)
+            .with("screen_private_secs", serde_json::json!(private_secs_left(&state.private_until)))
             .with("hint", serde_json::json!("the screen is private; no capture or volume request was sent"))
             .into_response())
 }
@@ -11891,7 +12193,7 @@ async fn direct_control(
     let lifecycle = state.runner_lifecycle.current();
     let releasing = lifecycle == RunnerLifecycleTransition::Releasing;
     let reconnecting = lifecycle == RunnerLifecycleTransition::Reconnecting;
-    let released = state.released.load(std::sync::atomic::Ordering::Relaxed);
+    let released = state.released.load(std::sync::atomic::Ordering::Acquire);
     if releasing || reconnecting || released {
         let error = if releasing {
             "releasing"
@@ -12355,6 +12657,29 @@ impl ControlRefusal {
         )
     }
 }
+
+/// The one body every JSON route answers while the runner is released,
+/// releasing or reconnecting (`agent_status` says which): the agent waits for
+/// `drivable=true` and retries. Routes that send a `text/plain` stream say
+/// [`DEVICE_TRANSITION_TEXT`] instead. Unlike [`control_readiness_refusal`]
+/// this never starts a recovery: reads and streams must not restart the
+/// runner under a person's hands.
+fn transition_refusal(state: &AppState) -> Option<ControlRefusal> {
+    (state.runner_lifecycle.is_transitioning()
+        || state.released.load(std::sync::atomic::Ordering::Acquire))
+    .then(|| {
+        ControlRefusal::new(StatusCode::SERVICE_UNAVAILABLE, "device_transition_in_progress", true)
+            .with("transitioning", serde_json::Value::Bool(true))
+            .with("hint", serde_json::json!(DEVICE_TRANSITION_HINT))
+    })
+}
+
+const DEVICE_TRANSITION_HINT: &str =
+    "the device runner is released, releasing or reconnecting — check /agent/status, reconnect if instructed, then retry once drivable=true";
+
+/// [`transition_refusal`] for the stream routes (`/agent/mjpeg`, `/agent/h264`),
+/// whose errors are plain text.
+const DEVICE_TRANSITION_TEXT: &str = "direct device is released, releasing, or reconnecting";
 
 /// How long the guard waits for the foreground app before refusing.
 const GUARD_FOREGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -13638,6 +13963,10 @@ fn ocr_expectation_observation(
     )
 }
 
+/// Longest side of the screenshot OCR reads (the same size a settled frame
+/// is kept at; see `SETTLED_FRAME_MAX_SIDE`).
+const OCR_MAX_SIDE: u32 = 1600;
+
 /// One screenshot through the held runner client, recognized by Vision.
 async fn agent_ocr_read(
     w: &mut crate::runner::RunnerClient,
@@ -13649,10 +13978,20 @@ async fn agent_ocr_read(
             .window_size()
             .await
             .map_err(|error| format!("screen size: {error:#}"))?;
+        // Sized on the phone: Vision reads 17 pt text fine at this size, and
+        // the full PNG of a big phone is megabytes the deadline may not carry.
+        // PNG, so `png_width` and the recognizer see what they always did.
+        let shot = crate::runner::ShotRequest {
+            max_side: Some(OCR_MAX_SIDE),
+            jpeg: false,
+            quality: crate::runner::ShotRequest::DEFAULT_QUALITY,
+        };
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         let png = w
-            .screenshot_png()
+            .screenshot_sized(shot, budget)
             .await
-            .map_err(|error| format!("screenshot: {error:#}"))?;
+            .map_err(|error| format!("screenshot: {error:#}"))?
+            .bytes;
         let pixels = png_width(&png).ok_or("the screenshot is not a PNG")?;
         if width <= 0.0 {
             return Err("the screen size is unknown".to_string());
@@ -14072,7 +14411,7 @@ fn private_batch_refusal(index: usize, completed: usize, applied: usize) -> Resp
     private_batch_refusal_with_steps(index, completed, applied, &[])
 }
 fn private_batch_refusal_with_steps(index: usize, completed: usize, applied: usize, steps: &[serde_json::Value]) -> Response {
-    agent_actions_failure(StatusCode::LOCKED, index, completed, applied, "screen_private",
+    agent_actions_failure(StatusCode::LOCKED, index, completed, applied, SCREEN_PRIVATE,
         "not_sent", applied == 0, steps, None)
 }
 
@@ -15192,13 +15531,8 @@ async fn agent_value(
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
-    if state.released.load(std::sync::atomic::Ordering::Acquire)
-        || state.runner_lifecycle.is_transitioning()
-    {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({"ok":false,"error":"device_unavailable"}),
-        );
+    if let Some(refusal) = transition_refusal(&state) {
+        return refusal.into_response();
     }
     let request = match serde_json::from_str::<ValueReadRequest>(&body) {
         Ok(request) => request,
@@ -15371,12 +15705,19 @@ fn scoped_list_read_failure(
     }
 }
 fn private_list_refusal(state: &AppState) -> Option<Response> {
-    screen_private_refusal(state).map(|_| {
-        json_response(
-            StatusCode::LOCKED,
-            serde_json::json!({"ok":false,"error":"screen_private","outcome":"not_sent",
-            "retry_safe":true,"swipes":0,"swipes_confirmed":0,"swipes_uncertain":0}),
-        )
+    let secs = private_secs_left(&state.private_until);
+    (secs > 0).then(|| {
+        let mut body = screen_private_body(secs);
+        for (key, value) in [
+            ("outcome", serde_json::json!("not_sent")),
+            ("retry_safe", serde_json::json!(true)),
+            ("swipes", serde_json::json!(0)),
+            ("swipes_confirmed", serde_json::json!(0)),
+            ("swipes_uncertain", serde_json::json!(0)),
+        ] {
+            body[key] = value;
+        }
+        json_response(StatusCode::LOCKED, body)
     })
 }
 fn list_read_scope(
@@ -15551,13 +15892,8 @@ async fn begin_list_control<'a>(
         crate::advice::reset(&owner);
     }
     let mut w = runner.lock().await;
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Acquire)
-    {
-        return Err(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({"ok": false, "error": "device_transition_in_progress", "transitioning": true, "retry_safe": true}),
-        ));
+    if let Some(refusal) = transition_refusal(state) {
+        return Err(refusal.into_response());
     }
     if let Err(interrupted) = unlock_before_action(state, &mut w, deadline, scope).await {
         return Err(match control_interruption_outcome(interrupted) {
@@ -16335,7 +16671,7 @@ async fn read_elements_once(
 async fn settle_frame(
     w: &mut crate::runner::RunnerClient,
     deadline: tokio::time::Instant,
-) -> Option<Vec<u8>> {
+) -> Option<crate::runner::Capture> {
     const SETTLE_FRAME_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
     // runner answers one request at a time: a frame that timed out still holds
     // it, and the tree read behind it waits. After one slow or failed frame
@@ -16344,8 +16680,19 @@ async fn settle_frame(
     if !w.observation_scope_current() || !w.settle_frames_usable() {
         return None;
     }
-    let cap = std::cmp::min(deadline, tokio::time::Instant::now() + SETTLE_FRAME_CAP);
-    let frame = tokio::time::timeout_at(cap, w.screenshot_png())
+    let now = tokio::time::Instant::now();
+    let cap = std::cmp::min(deadline, now + SETTLE_FRAME_CAP);
+    // Sized on the phone, PNG (lossless, so two frames of one still screen
+    // are byte-identical): the full-resolution PNG of a big phone is several
+    // MB per frame, twice per settle, and this frame is also what a following
+    // `/agent/screenshot` is served (`SETTLED_FRAME_MAX_SIDE` covers the size
+    // agents ask for).
+    let shot = crate::runner::ShotRequest {
+        max_side: Some(SETTLED_FRAME_MAX_SIDE),
+        jpeg: false,
+        quality: crate::runner::ShotRequest::DEFAULT_QUALITY,
+    };
+    let frame = tokio::time::timeout_at(cap, w.screenshot_sized(shot, cap.saturating_duration_since(now)))
         .await
         .ok()
         .and_then(Result::ok);
@@ -16520,7 +16867,7 @@ async fn settle_and_read_elements(
     // is identical whether or not the app moved, so it proves nothing.
     let frame_before = settle_frame(w, deadline)
         .await
-        .filter(|frame| !frame_is_blank(frame));
+        .filter(|frame| !frame_is_blank(&frame.bytes));
     let (mut id, mut rows) = match read_elements_once(w, deadline).await {
         SettleRead::Read(id, rows) => (id, rows),
         // No tree, but for opposite reasons: out of time vs. a broken read.
@@ -16549,11 +16896,11 @@ async fn settle_and_read_elements(
             .any(|row| row.focused == Some(true) && TEXT_INPUT_KINDS.contains(&row.kind.as_str()));
         if !typing && !report.sparse && tokio::time::Instant::now() < deadline {
             let after = settle_frame(w, deadline).await;
-            if after.as_ref() == Some(before) {
+            if after.as_ref().map(|frame| &frame.bytes) == Some(&before.bytes) {
                 // That frame IS the settled screen: keep it for a screenshot
                 // request, which then costs no capture.
                 if let Some(after) = after {
-                    w.remember_settled_frame(crate::runner::Capture::full_png(after));
+                    w.remember_settled_frame(after);
                 }
                 report.settled = true;
                 report.reason = SettleReason::Stable;
@@ -16750,23 +17097,7 @@ async fn agent_input_inner(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
-    }
-    if !has_phone_control_header(&headers) {
-        return missing_phone_control_header_response();
-    }
-    if let Err(refused) = claim_phone_owner(&state, &headers) {
+    if let Err(refused) = authorize_device_mutation(&state, &headers) {
         return refused;
     }
     let capture_scope = ScreenReadScope::capture(&state);
@@ -18070,11 +18401,38 @@ fn agent_json_response(status: StatusCode, body: serde_json::Value) -> Response 
     )
 }
 
+/// Independent encrypted Chrome grant: HTTP session credentials never unlock it.
+async fn browser_chrome(axum::Json(raw): axum::Json<serde_json::Value>) -> Response {
+    #[cfg(target_os = "macos")]
+    {
+        if raw.to_string().len()>512*1024 { return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"ok":false,"error":"request_too_large"}))).into_response(); }
+        let result=tokio::task::spawn_blocking(move || {
+            let file=ipu_browser_session::desktop::default_scope_file()?;
+            let home=std::env::var_os("HOME").ok_or("home_unavailable")?;
+            let sites=std::path::PathBuf::from(home).join(".chrome-use/sites");
+            ipu_browser_session::desktop::handle(&file,&sites,&raw,std::path::Path::new("chrome-use"))
+        }).await;
+        match result {
+            Ok(Ok(value))=>axum::Json(value).into_response(),
+            Ok(Err(code))=>(StatusCode::BAD_REQUEST,axum::Json(serde_json::json!({"ok":false,"error":code}))).into_response(),
+            Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,axum::Json(serde_json::json!({"ok":false,"error":"chrome_bridge_unavailable"}))).into_response(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _=raw; (StatusCode::NOT_IMPLEMENTED,axum::Json(serde_json::json!({"ok":false,"error":"chrome_requires_paired_mac"}))).into_response() }
+}
+
 /// The agent bearer token, or the session cookie the iPhone app holds (it
 /// pairs and renews a session, like the web page). Writes still need
 /// `X-Phone-Control`, which a cross-site form cannot send.
+///
+/// A valid cookie session is accepted even while the limiter is locked, the
+/// same as [`browser_or_agent_auth`]: the lockout slows down credential
+/// guessing, and a session that was already minted is not a guess. Locking
+/// the signed-in app out alongside the attacker would only let anyone on the
+/// network take the phone from its owner by sending five wrong bearers.
 fn agent_auth_refusal(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    if is_authed(state, headers) && !state.auth_limiter.lock().is_ok_and(|limiter| limiter.is_locked()) {
+    if is_authed(state, headers) {
         crate::timing::authenticated();
         return None;
     }
@@ -18692,14 +19050,9 @@ async fn agent_elements_inner(
     }
     // Inspecting the element tree is part of driving — keep the phone held.
     state.touch_activity();
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Acquire)
-    {
-        return json_body(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"elements":[],"error":"device_transition_in_progress","transitioning":true}"#
-                .to_string(),
-        );
+    if let Some(refusal) = transition_refusal(&state) {
+        // The elements contract: a list, empty when nothing was read.
+        return refusal.with("elements", serde_json::json!([])).into_response();
     }
     let Some(runner) = &state.runner else {
         return json_body(
@@ -19421,16 +19774,21 @@ fn set_screen_private(state: &AppState, private: bool, secs: u64) {
     }
 }
 
+/// The error every route names while the person signs in on the phone.
+const SCREEN_PRIVATE: &str = "screen_private";
+
+/// The 423 body for a screen read refused while the screen is private:
+/// `{ok:false, error:"screen_private", screen_private_secs, hint}`. Routes
+/// with a richer contract add their own fields to it.
+fn screen_private_body(secs: u64) -> serde_json::Value {
+    serde_json::json!({"ok": false, "error": SCREEN_PRIVATE, "screen_private_secs": secs,
+        "hint": "the person is signing in on the phone, so its screen is not read; wait for them, then clear the hold (phone_hold 0 / POST /agent/hold {\"secs\":0}) and read it again"})
+}
+
 /// 423 for every screen read while the person signs in on the phone.
 fn screen_private_refusal(state: &AppState) -> Option<Response> {
     let secs = private_secs_left(&state.private_until);
-    (secs > 0).then(|| {
-        json_response(
-            StatusCode::LOCKED,
-            serde_json::json!({"ok": false, "error": "screen_private", "screen_private_secs": secs,
-                "hint": "the person is signing in on the phone, so its screen is not read; wait for them, then clear the hold (phone_hold 0 / POST /agent/hold {\"secs\":0}) and read it again"}),
-        )
-    })
+    (secs > 0).then(|| json_response(StatusCode::LOCKED, screen_private_body(secs)))
 }
 
 /// The owner who takes a hold keeps the phone for as long as the hold lasts:
@@ -19478,37 +19836,12 @@ fn login_gate(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<Arc<tokio::sync::Mutex<crate::runner::RunnerClient>>, Response> {
-    match agent_auth(state, headers) {
-        AgentAuth::Locked => {
-            return Err(with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            ))
-        }
-        AgentAuth::Denied => {
-            return Err(with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            ))
-        }
-        AgentAuth::Ok => {}
-    }
-    if !has_phone_control_header(headers) {
-        return Err(missing_phone_control_header_response());
-    }
-    claim_phone_owner(state, headers)?;
+    authorize_device_mutation(state, headers)?;
     if state.managed_runner_pending {
         return Err(target_not_configured_response());
     }
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Acquire)
-    {
-        return Err(agent_actions_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({
-                "ok": false,
-                "error": "device_not_drivable",
-                "hint": "check /agent/status, reconnect if instructed, then retry once drivable=true"
-            }),
-        ));
+    if let Some(refusal) = transition_refusal(state) {
+        return Err(refusal.into_response());
     }
     state.runner.clone().ok_or_else(|| {
         agent_actions_json(
@@ -19625,23 +19958,7 @@ async fn agent_hold(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
-    }
-    if !has_phone_control_header(&headers) {
-        return missing_phone_control_header_response();
-    }
-    match claim_phone_owner(&state, &headers) {
+    match authorize_device_mutation_lease(&state, &headers) {
         Err(refused) => return refused,
         Ok(true) => prewarm_on_new_lease(&state, &headers),
         Ok(false) => {}
@@ -20269,16 +20586,8 @@ async fn agent_screenshot_capture(
     if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return with_security_headers(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "direct device is released, releasing, or reconnecting",
-            )
-                .into_response(),
-        );
+    if let Some(refusal) = transition_refusal(&state) {
+        return refusal.into_response();
     }
     // A screenshot means someone is looking at the phone — keep it held.
     state.touch_activity();
@@ -20589,32 +20898,15 @@ async fn agent_mjpeg(
     if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if transition_refusal(&state).is_some() {
         return with_security_headers(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "direct device is released, releasing, or reconnecting",
-            )
-                .into_response(),
+            (StatusCode::SERVICE_UNAVAILABLE, DEVICE_TRANSITION_TEXT).into_response(),
         );
     }
     // Opening the live feed counts as watching — stamp now, and hold a stream
     // guard (below) for the whole connection so the idle watchdog won't release
     // the phone while a viewer is on it.
     state.touch_activity();
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Acquire)
-    {
-        return with_security_headers(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "device transition in progress",
-            )
-                .into_response(),
-        );
-    }
     const MAX_MJPEG_VIEWERS: usize = 4;
     let Some(stream_guard) =
         StreamGuard::try_reserve(state.live_streams.clone(), MAX_MJPEG_VIEWERS)
@@ -20822,15 +21114,9 @@ async fn agent_h264(
     if state.managed_runner_pending {
         return target_not_configured_response();
     }
-    if state.runner_lifecycle.is_transitioning()
-        || state.released.load(std::sync::atomic::Ordering::Acquire)
-    {
+    if transition_refusal(&state).is_some() {
         return with_security_headers(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "direct device is released, releasing, or reconnecting",
-            )
-                .into_response(),
+            (StatusCode::SERVICE_UNAVAILABLE, DEVICE_TRANSITION_TEXT).into_response(),
         );
     }
     state.touch_activity();
@@ -22200,23 +22486,7 @@ async fn agent_intent(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    match agent_auth(&state, &headers) {
-        AgentAuth::Locked => {
-            return with_security_headers(
-                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
-            )
-        }
-        AgentAuth::Denied => {
-            return with_security_headers(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            )
-        }
-        AgentAuth::Ok => {}
-    }
-    if !has_phone_control_header(&headers) {
-        return missing_phone_control_header_response();
-    }
-    match claim_phone_owner(&state, &headers) {
+    match authorize_device_mutation_lease(&state, &headers) {
         Err(refused) => return refused,
         Ok(true) => prewarm_on_new_lease(&state, &headers),
         Ok(false) => {}
@@ -22395,12 +22665,8 @@ async fn agent_intent(
 // Small helpers
 // ---------------------------------------------------------------------------
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+/// Seconds since the Unix epoch (`core::clock::unix_now`, shared by every crate).
+pub(crate) use core::clock::unix_now as now_secs;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -22434,13 +22700,27 @@ fn agent_error(status: StatusCode, error: &str, hint: impl Into<String>) -> Resp
 /// What every state-changing device route needs, like `/agent/input`: the
 /// bearer, `X-Phone-Control: 1`, and the phone owner lease.
 fn authorize_device_mutation(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    authorize_device_mutation_lease(state, headers).map(|_| ())
+}
+
+/// [`authorize_device_mutation`], also saying whether this request took a
+/// new owner lease (`true`; see [`claim_phone_owner`]) — the routes that
+/// pre-warm the phone on a fresh lease need to know.
+fn authorize_device_mutation_lease(state: &AppState, headers: &HeaderMap) -> Result<bool, Response> {
+    authorize_agent_write(state, headers)?;
+    claim_phone_owner(state, headers)
+}
+
+/// The bearer and `X-Phone-Control: 1`, without an owner lease: for writes
+/// that do not drive the phone (pre-warm, a runner hand-off).
+fn authorize_agent_write(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     if let Some(refused) = auth_refusal(agent_auth(state, headers)) {
         return Err(refused);
     }
     if !has_phone_control_header(headers) {
         return Err(missing_phone_control_header_response());
     }
-    claim_phone_owner(state, headers).map(|_| ())
+    Ok(())
 }
 
 /// Which backend answers the device-service routes (device logs, crash
@@ -27169,6 +27449,38 @@ mod tests {
     }
 
     #[test]
+    fn a_tap_never_lands_in_the_home_indicator_strip() {
+        let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            rect,
+            depth,
+            ..Default::default()
+        };
+        // Hardware, 17 Pro Max, iOS 27 Settings scrolled so rows sit at the
+        // bottom edge behind the search pill.
+        let rows = vec![
+            row("Application", "设置", [0.0, 0.0, 440.0, 956.0], 0),
+            row("Button", "控制中心", [20.0, 902.0, 400.0, 49.0], 20),
+            row("Button", "待机显示", [20.0, 931.0, 400.0, 50.0], 20),
+            row("Button", "通用", [20.0, 783.0, 400.0, 50.0], 20),
+        ];
+        // Centre 926.5 is in the strip: the tap moves up into the row's clear part.
+        assert_eq!(clear_tap_point(&rows, 1), Some((220.0, 912.0)));
+        assert!(needs_reveal(&rows, 1));
+        // On screen only inside the strip: nothing clear, brought into view first.
+        assert_eq!(clear_tap_point(&rows, 2), None);
+        assert!(needs_reveal(&rows, 2));
+        // A row well above keeps its centre.
+        assert_eq!(clear_tap_point(&rows, 3), Some((220.0, 808.0)));
+        // A home-button iPhone has no strip.
+        let mut short = rows.clone();
+        short[0].rect = [0.0, 0.0, 375.0, 667.0];
+        short[1].rect = [0.0, 618.0, 375.0, 49.0];
+        assert_eq!(clear_tap_point(&short, 1), Some((187.5, 642.5)));
+    }
+
+    #[test]
     fn a_tab_bar_never_covers_its_own_items() {
         let row = |kind: &str, label: &str, rect: [f64; 4], depth: u32| crate::runner::ElementRow {
             kind: kind.to_string(),
@@ -27606,8 +27918,7 @@ mod tests {
             "xcode_too_old",
             "ios_too_old",
             "ddi_needs_reboot",
-            "legacy_needs_usb",
-            "ddi_needs_reboot",
+            "phone_storage_full",
             "legacy_needs_usb",
             "locked",
             "runner",
@@ -27800,7 +28111,7 @@ mod tests {
         assert_eq!(json["unplug_ok"], true);
         assert_eq!(json["launch_transport"], "wifi");
         assert_eq!(legacy_ios_json(false, dir.path()), "null");
-        for blocker in ["ddi_needs_reboot", "legacy_needs_usb"] {
+        for blocker in ["ddi_needs_reboot", "phone_storage_full", "legacy_needs_usb"] {
             let payload =
                 format!(r#"{{"phase":"prereq","blocked_on":"{blocker}","message":"m","ts":1000}}"#);
             assert_eq!(
@@ -27924,6 +28235,12 @@ mod tests {
         std::fs::write(dir.path().join(crate::phone_exit::PARKED_FILE), "unknown").unwrap();
         assert!(crate::phone_exit::parked(dir.path()));
         assert!(!ended_on_phone(true, false, dir.path()));
+        // #413: a watchdog kill parks too, but nobody ended it on the phone.
+        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::Crashed).unwrap();
+        assert_eq!(crate::phone_exit::reason(dir.path()), Some(crate::phone_exit::Reason::Crashed));
+        assert!(!ended_on_phone(true, false, dir.path()));
+        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::Exited).unwrap();
+        assert!(ended_on_phone(true, false, dir.path()));
     }
 
     #[test]
@@ -28480,6 +28797,52 @@ mod tests {
     }
 
     #[test]
+    fn auth_limiter_one_failure_after_expiry_does_not_relock() {
+        let mut limiter = AuthLimiter::new();
+        limiter.failures = AUTH_MAX_FAILURES;
+        limiter.locked_until = Some(Instant::now() - std::time::Duration::from_secs(1));
+        limiter.record_failure();
+        assert!(
+            !limiter.is_locked(),
+            "the first failure after an expired lockout starts a new streak"
+        );
+        assert_eq!(limiter.failures, 1, "the expired lockout's streak is forgotten");
+        // The new streak still locks at the usual count.
+        for _ in 1..AUTH_MAX_FAILURES {
+            limiter.record_failure();
+        }
+        assert!(limiter.is_locked());
+    }
+
+    #[test]
+    fn cookie_path_joins_the_relay_prefix_and_the_base_path() {
+        let mut state = fixture_app_state(None);
+        Arc::get_mut(&mut state).unwrap().base_path = "/ix".to_string();
+        let mut headers = HeaderMap::new();
+        assert_eq!(cookie_path(&state, &headers), "/ix");
+        headers.insert("x-forwarded-prefix", HeaderValue::from_static("/p/abc"));
+        assert_eq!(cookie_path(&state, &headers), "/p/abc/ix", "prefix first: the browser's path starts at the relay");
+        headers.insert("x-forwarded-prefix", HeaderValue::from_static("/p/abc;Path=/"));
+        assert_eq!(cookie_path(&state, &headers), "/ix", "a prefix that is not a path is ignored");
+        assert!(forwarded_prefix_ok("/p/0123456789abcdef"));
+        assert!(!forwarded_prefix_ok(""));
+        assert!(!forwarded_prefix_ok("p/x"));
+        assert!(!forwarded_prefix_ok(&format!("/{}", "a".repeat(128))));
+        assert!(forwarded_prefix_ok(&format!("/{}", "a".repeat(127))));
+    }
+
+    #[test]
+    fn auth_limiter_success_after_expiry_still_clears() {
+        let mut limiter = AuthLimiter::new();
+        limiter.failures = AUTH_MAX_FAILURES;
+        limiter.locked_until = Some(Instant::now() - std::time::Duration::from_secs(1));
+        limiter.record_success();
+        assert!(!limiter.is_locked());
+        assert_eq!(limiter.failures, 0);
+        assert!(limiter.locked_until.is_none());
+    }
+
+    #[test]
     fn session_cookie_parsing() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -28502,7 +28865,7 @@ mod tests {
         // Two daemons under different base paths on one host: the browser
         // sends both `phone_session` cookies; ours may come second.
         let state = fixture_app_state(Some("pw"));
-        let ours = make_session_cookie(&state, false);
+        let ours = make_session_cookie(&state, false, &HeaderMap::new());
         let token = ours
             .strip_prefix("phone_session=")
             .and_then(|rest| rest.split(';').next())
@@ -28825,7 +29188,7 @@ mod tests {
             invalid.insert(header::COOKIE, HeaderValue::from_static("phone_session=invalid"));
             assert_eq!(agent_flow_draft(State(state.clone()), invalid).await.status(), StatusCode::UNAUTHORIZED);
             let mut headers = HeaderMap::new();
-            headers.insert(header::COOKIE, HeaderValue::from_str(&make_session_cookie(&state, false)).unwrap());
+            headers.insert(header::COOKIE, HeaderValue::from_str(&make_session_cookie(&state, false, &HeaderMap::new())).unwrap());
             let response = agent_flow_draft(State(state), headers).await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -32617,27 +32980,6 @@ mod unlock_before_action_tests {
         assert!(!should_unlock_before_action(Some(false), LockReport::Unknown));
         assert!(!should_unlock_before_action(None, LockReport::Unlocked));
     }
-}
-
-/// Independent encrypted Chrome grant: HTTP session credentials never unlock it.
-async fn browser_chrome(axum::Json(raw): axum::Json<serde_json::Value>) -> Response {
-    #[cfg(target_os = "macos")]
-    {
-        if raw.to_string().len()>512*1024 { return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"ok":false,"error":"request_too_large"}))).into_response(); }
-        let result=tokio::task::spawn_blocking(move || {
-            let file=ipu_browser_session::desktop::default_scope_file()?;
-            let home=std::env::var_os("HOME").ok_or("home_unavailable")?;
-            let sites=std::path::PathBuf::from(home).join(".chrome-use/sites");
-            ipu_browser_session::desktop::handle(&file,&sites,&raw,std::path::Path::new("chrome-use"))
-        }).await;
-        match result {
-            Ok(Ok(value))=>axum::Json(value).into_response(),
-            Ok(Err(code))=>(StatusCode::BAD_REQUEST,axum::Json(serde_json::json!({"ok":false,"error":code}))).into_response(),
-            Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,axum::Json(serde_json::json!({"ok":false,"error":"chrome_bridge_unavailable"}))).into_response(),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    { let _=raw; (StatusCode::NOT_IMPLEMENTED,axum::Json(serde_json::json!({"ok":false,"error":"chrome_requires_paired_mac"}))).into_response() }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.27.40"
+version = "0.28.1"
 edition = "2021"
 
 # The daemon binary. Lib stays for unit-testable glue (http/signaling/webrtc
@@ -57,7 +57,8 @@ tempfile = "3"
 
 # runner (L2 element-tree control): screenshots arrive base64-encoded.
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
+hex = "0.4"
 # ES256 tokens for the App Store Connect API (legacy iOS signing) and the
 # SHA-1 codesign takes; already in the tree through rustls.
 ring = "0.17"
@@ -65,7 +66,7 @@ ring = "0.17"
 # Live video as H.264: runner's MJPEG frames are decoded (zune-jpeg) and
 # re-encoded on the Mac's hardware encoder (VideoToolbox), cutting a remote
 # viewer's bandwidth ~10x versus forwarding the JPEGs.
-zune-jpeg = "0.4"
+zune-jpeg = "0.5"
 
 # Scan-to-connect: the pairing page shows the one-time link as a QR code.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

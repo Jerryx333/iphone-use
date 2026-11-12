@@ -37,6 +37,7 @@ const PORT_IN_USE_WINDOW: Duration = Duration::from_secs(60);
 /// … and how long it waits between those attempts.
 const PORT_IN_USE_RETRY: Duration = Duration::from_secs(3);
 /// Published as `not_connected`; the daemon's hint says the same.
+const STORAGE_FULL_MESSAGE: &str = "the iPhone is out of storage, so the device runner app cannot be installed on it";
 const NOT_CONNECTED_MESSAGE: &str = "the iPhone isn't connected to this Mac — plug it in over USB (or join the same Wi-Fi) and unlock it";
 const AUTOMATION_MODE_HINT: &str = "check Settings › Developer › Enable UI Automation on the unlocked iPhone and handle any passcode or Allow prompt if it appears; if already authorized, inspect the CoreDevice connection and runner log";
 
@@ -409,6 +410,10 @@ impl Setup {
                     if previous != Some(Kind::NeedsReboot) {
                         warn("the iPhone's developer services need a restart of the iPhone; checking again every few minutes");
                     }
+                } else if self.failure_kind == Kind::StorageFull {
+                    if previous != Some(Kind::StorageFull) {
+                        warn("the iPhone has no room to install the device runner; checking again every few minutes (free space on the iPhone)");
+                    }
                 } else if self.failure_kind == Kind::PortInUse {
                     warn(&format!(
                         "a previous device runner still holds port {RUNNER_DEVICE_PORT} on the phone; next retry in {delay}s (failure {attempt})"
@@ -521,6 +526,9 @@ impl Setup {
             }
             crate::phone_exit::Reason::SessionInvalidated => {
                 "the XCTest connection was invalidated; operator intent is unknown, so the runner stays off until an explicit agent or web request"
+            }
+            crate::phone_exit::Reason::Crashed => {
+                "iOS ended the device runner's test process (a crash or watchdog kill), not the person; it stays off until the next agent or web request"
             }
             crate::phone_exit::Reason::PasscodeCanceled => {
                 "the passcode prompt was cancelled on the iPhone; the phone stays with its holder until someone takes it back (web 「交给 agent」 or iphone-use resume)"
@@ -880,6 +888,7 @@ impl Setup {
                 | "xcode_too_old"
                 | "automation_not_allowed"
                 | "wifi_automation_refused"
+                | "phone_storage_full"
         ) {
             previous.clone()
         } else {
@@ -1129,7 +1138,7 @@ impl Setup {
                 self.ctx.instance.name
             ));
         }
-        self.phase("prereq", "", "prerequisites passed");
+        self.phase("prereq", &self.build_blocker.clone(), "prerequisites passed");
         Ok(())
     }
 
@@ -2008,6 +2017,29 @@ impl Setup {
         die(message)
     }
 
+    /// The phone has no room for the runner app (#402). Its own blocker:
+    /// the product is kept, and a person frees space on the phone.
+    fn report_storage_full<T>(&mut self) -> Step<T> {
+        self.failure_kind = Kind::StorageFull;
+        let need = match runner::storage_full_bytes(&self.ctx.run_log) {
+            (Some(required), Some(available)) => format!(
+                " (installing it needs {} MB, {} MB is free)",
+                required.div_ceil(1_000_000),
+                available / 1_000_000
+            ),
+            (Some(required), None) => {
+                format!(" (installing it needs {} MB)", required.div_ceil(1_000_000))
+            }
+            _ => String::new(),
+        };
+        let message = format!("{STORAGE_FULL_MESSAGE}{need}");
+        self.phase("building-fail", "phone_storage_full", &message);
+        die(format!(
+            "{message}.\n   Free space on the iPhone (Settings › General › iPhone Storage; restarting the iPhone also gives back System Data), then rerun setup — KeepAlive retries every few minutes on its own. Log: {}",
+            self.ctx.run_log.display()
+        ))
+    }
+
     fn report_device_unavailable<T>(&mut self) -> Step<T> {
         // Gone from this Mac entirely is its own blocker; the next attempt
         // waits for the phone instead of building again.
@@ -2319,6 +2351,9 @@ impl Setup {
             }
             tries += 1;
             if tries > 360 {
+                if runner::log_shows_storage_full(&self.ctx.run_log) {
+                    return self.report_storage_full();
+                }
                 if runner::log_shows_product_failure(&self.ctx.run_log) {
                     runner::cache_drop(&self.ctx);
                     warn("the recorded runner product failed to install or launch; the next round rebuilds it");
@@ -2403,6 +2438,10 @@ impl Setup {
                     self.runner_port_in_use = true;
                     self.failure_kind = Kind::PortInUse;
                     return Err(Exit(1));
+                }
+                // A full phone rejects any product: keep this one.
+                if runner::log_shows_storage_full(&self.ctx.run_log) {
+                    return self.report_storage_full();
                 }
                 // Only a failure of the product itself evicts it; a dropped
                 // device link says nothing about the product.
@@ -3540,6 +3579,7 @@ impl Setup {
             cause,
             runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark),
             runner::log_shows_connection_invalidated(&self.ctx.run_log, log_mark),
+            runner::log_shows_runner_crash(&self.ctx.run_log, log_mark),
         ) {
             return self.park_on_phone(reason);
         }
@@ -3607,14 +3647,23 @@ impl Setup {
     }
 }
 
-/// An invalidated connection does not prove operator intent. Both outcomes
-/// park; only their reported evidence differs. Explicit revocation wins.
-fn runner_end_reason(cause: &str, revoked: bool, invalidated: bool) -> Option<crate::phone_exit::Reason> {
+/// An invalidated connection or a crash does not prove operator intent. All
+/// outcomes park; only their reported evidence differs. Explicit revocation
+/// wins; a crash (#413) comes before an invalidated connection, which a crash
+/// also leaves behind.
+fn runner_end_reason(
+    cause: &str,
+    revoked: bool,
+    invalidated: bool,
+    crashed: bool,
+) -> Option<crate::phone_exit::Reason> {
     use crate::phone_exit::Reason;
     match cause {
         "revoked" => Some(Reason::Exited),
-        "runner" if revoked || !invalidated => Some(Reason::Exited),
-        "runner" => Some(Reason::SessionInvalidated),
+        "runner" if revoked => Some(Reason::Exited),
+        "runner" if crashed => Some(Reason::Crashed),
+        "runner" if invalidated => Some(Reason::SessionInvalidated),
+        "runner" => Some(Reason::Exited),
         _ => None,
     }
 }
@@ -4151,11 +4200,16 @@ mod tests {
     #[test]
     fn session_end_evidence_never_enables_automatic_rebuild() {
         use crate::phone_exit::Reason;
-        assert_eq!(runner_end_reason("revoked", false, true), Some(Reason::Exited));
-        assert_eq!(runner_end_reason("runner", true, true), Some(Reason::Exited));
-        assert_eq!(runner_end_reason("runner", false, false), Some(Reason::Exited));
-        assert_eq!(runner_end_reason("runner", false, true), Some(Reason::SessionInvalidated));
-        assert_eq!(runner_end_reason("unreachable", false, true), None);
+        assert_eq!(runner_end_reason("revoked", false, true, false), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", true, true, false), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", false, false, false), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", false, true, false), Some(Reason::SessionInvalidated));
+        assert_eq!(runner_end_reason("unreachable", false, true, false), None);
+        // #413: a watchdog kill is iOS's doing, not the person's; revocation still wins.
+        assert_eq!(runner_end_reason("runner", false, false, true), Some(Reason::Crashed));
+        assert_eq!(runner_end_reason("runner", false, true, true), Some(Reason::Crashed));
+        assert_eq!(runner_end_reason("runner", true, false, true), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("unreachable", false, false, true), None);
     }
 
     #[test]
@@ -4239,6 +4293,37 @@ mod tests {
         assert_eq!(supervisor_ready(&path, &b, "product"), Ok(false));
         std::fs::write(path.clone(), b"not JSON").unwrap();
         assert_eq!(supervisor_ready(&path, &b, "product"), Ok(false));
+    }
+
+    #[test]
+    fn handoff_stops_only_on_this_attempts_own_storage_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let write = |generation: &str, phase: &str, blocked: &str| {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "supervisor_generation": generation,
+                    "phase": phase,
+                    "blocked_on": blocked,
+                    "message": "the iPhone is out of storage (installing it needs 53 MB, 0 MB is free)",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        // The sticky blocker from an earlier attempt, or this attempt still
+        // building with it kept: not a reason to stop.
+        write("old", "building-fail", "phone_storage_full");
+        assert_eq!(supervisor_storage_full(&path, "new"), None);
+        write("new", "building", "phone_storage_full");
+        assert_eq!(supervisor_storage_full(&path, "new"), None);
+        write("new", "building-fail", "runner");
+        assert_eq!(supervisor_storage_full(&path, "new"), None);
+        write("new", "building-fail", "phone_storage_full");
+        assert!(supervisor_storage_full(&path, "new").unwrap().contains("53 MB"));
+        std::fs::write(&path, b"not JSON").unwrap();
+        assert_eq!(supervisor_storage_full(&path, "new"), None);
     }
 
     #[test]
@@ -5177,6 +5262,19 @@ impl Setup {
                 }
                 last_phase = phase;
             }
+            // A full phone fails every round the same way: say so now, not
+            // after the whole start window (#402).
+            if let Some(message) = self
+                .supervisor_generation
+                .as_deref()
+                .and_then(|generation| supervisor_storage_full(&ctx.status_file, generation))
+            {
+                return die(format!(
+                    "{}.\n   Free space on the iPhone (Settings › General › iPhone Storage; restarting the iPhone also gives back System Data), then run iphone-use setup again.\n   Log: {}",
+                    if message.is_empty() { STORAGE_FULL_MESSAGE } else { &message },
+                    ctx.runner_agent_log.display()
+                ));
+            }
             if !ctx.runner_host.manages_test_app() {
                 if let Some(report) = std::fs::read(&ctx.status_file)
                     .ok()
@@ -5384,6 +5482,19 @@ fn ensure_supervisor_started(
 
 /// A fresh ready report with the wrong product cannot become this setup's
 /// success by waiting. Fail immediately rather than using the launch deadline.
+/// This supervisor attempt's own storage failure (its generation, the
+/// failed phase), with its message. The blocker alone is sticky across
+/// attempts, so a full phone from an earlier round must not end this one.
+fn supervisor_storage_full(path: &Path, expected_generation: &str) -> Option<String> {
+    let report = std::fs::read(path)
+        .ok()
+        .and_then(|s| serde_json::from_slice::<serde_json::Value>(&s).ok())?;
+    (report["supervisor_generation"] == expected_generation
+        && report["phase"] == "building-fail"
+        && report["blocked_on"] == "phone_storage_full")
+        .then(|| report["message"].as_str().unwrap_or("").to_string())
+}
+
 fn supervisor_ready(
     path: &Path,
     expected_generation: &str,
